@@ -805,7 +805,7 @@ static void rs_got_packet(fr_event_list_t *events, UNUSED int fd, void *ctx)
 		 */
 		if ((conf->limit > 0) && (count >= conf->limit)) {
 			INFO("Captured %i packets, exiting...", count);
-			fr_event_loop_exit(events, 0);
+			fr_event_loop_exit(events, 1);
 			return;
 		}
 	}
