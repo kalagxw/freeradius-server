@@ -1407,7 +1407,7 @@ int main(int argc, char *argv[])
 		if (conf->stats.interval) {
 			update.list = events;
 			update.stats = &stats;
-			update.in    = in;
+			update.in = in;
 
 			now.tv_sec += conf->stats.interval;
 			now.tv_usec = 0;
@@ -1415,7 +1415,7 @@ int main(int argc, char *argv[])
 		}
 
 		ret = fr_event_loop(events);	/* Enter the main event loop */
-	 }
+	}
 
 	INFO("Done sniffing");
 
