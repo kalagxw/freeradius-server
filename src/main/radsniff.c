@@ -457,11 +457,8 @@ static int _request_free(rs_request_t *request)
 	return 0;
 }
 
-static void rs_packet_process(rs_event_t *event, struct pcap_pkthdr const *header, uint8_t const *data)
+static void rs_packet_process(int count, rs_event_t *event, struct pcap_pkthdr const *header, uint8_t const *data)
 {
-
-	static int		count = 0;	/* Packets seen */
-
 	rs_stats_t		*stats = event->stats;
 	struct timeval		elapsed;
 	struct timeval		latency;
@@ -481,8 +478,6 @@ static void rs_packet_process(rs_event_t *event, struct pcap_pkthdr const *heade
 
 	RADIUS_PACKET *current;			/* Current packet were processing */
 	rs_request_t *original;
-
-	count++;
 
 	if (header->caplen <= 5) {
 		INFO("Packet too small, captured %i bytes", header->caplen);
@@ -859,10 +854,11 @@ static void rs_packet_process(rs_event_t *event, struct pcap_pkthdr const *heade
 	}
 }
 
-static void rs_got_packet(UNUSED fr_event_list_t *events, UNUSED int fd, void *ctx)
+static void rs_got_packet(fr_event_list_t *events, UNUSED int fd, void *ctx)
 {
-	rs_event_t *event = ctx;
-	pcap_t *handle = event->in->handle;
+	static int	count = 0;	/* Packets seen */
+	rs_event_t	*event = ctx;
+	pcap_t		*handle = event->in->handle;
 
 	int i;
 	int ret;
@@ -880,7 +876,17 @@ static void rs_got_packet(UNUSED fr_event_list_t *events, UNUSED int fd, void *c
 			return;
 		}
 
-		rs_packet_process(event, header, data);
+		count++;
+		rs_packet_process(count, event, header, data);
+
+		/*
+		 *	We've hit our capture limit, break out of the event loop
+		 */
+		if ((conf->limit > 0) && (count >= conf->limit)) {
+			INFO("Captured %i packets, exiting...", count);
+			fr_event_loop_exit(events, 0);
+			return;
+		}
 	}
 }
 
@@ -946,8 +952,6 @@ int main(int argc, char *argv[])
 	fr_pcap_t *out = NULL;
 
 	int ret = 1;					/* Exit status */
-	int limit = -1;					/* How many packets to sniff */
-
 	char errbuf[PCAP_ERRBUF_SIZE];			/* Error buffer */
 	int port = 1812;
 
@@ -980,6 +984,7 @@ int main(int argc, char *argv[])
 	 *	Set some defaults
 	 */
 	conf->print_packet = true;
+	conf->limit = -1;
 
 	/*
 	 *  Get options
@@ -987,9 +992,9 @@ int main(int argc, char *argv[])
 	while ((opt = getopt(argc, argv, "c:d:DFf:hi:I:p:qr:s:Svw:xXW:P:O:")) != EOF) {
 		switch (opt) {
 		case 'c':
-			limit = atoi(optarg);
-			if (limit <= 0) {
-				fprintf(stderr, "radsniff: Invalid number of packets \"%s\"", optarg);
+			conf->limit = atoi(optarg);
+			if (conf->limit <= 0) {
+				ERROR("Invalid number of packets \"%s\"", optarg);
 				exit(1);
 			}
 			break;
@@ -1271,8 +1276,8 @@ int main(int argc, char *argv[])
 		if (conf->to_file || conf->to_stdout) {
 			DEBUG1("  Writing to               : [%s]", out->name);
 		}
-		if (limit > 0)	{
-			DEBUG1("  Capture limit (packets)  : [%d]", limit);
+		if (conf->limit > 0)	{
+			DEBUG1("  Capture limit (packets)  : [%d]", conf->limit);
 		}
 			DEBUG1("  PCAP filter              : [%s]", conf->pcap_filter);
 			DEBUG1("  RADIUS secret            : [%s]", conf->radius_secret);

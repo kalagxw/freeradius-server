@@ -204,6 +204,8 @@ struct rs {
 	char			*pcap_filter;		//!< PCAP filter string applied to live capture devices.
 	char			*radius_filter;		//!< RADIUS filter string.
 
+	int			limit;			//!< Maximum number of packets to capture
+
 	struct {
 		int			interval;		//!< Time between stats updates in seconds.
 		stats_out_t		out;			//!< Where to write stats.
