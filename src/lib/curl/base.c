@@ -28,8 +28,18 @@
 
 #include <freeradius-devel/util/talloc.h>
 
+#include "attrs.h"
+
 static uint32_t instance_count = 0;
+
+fr_dict_attr_t const *attr_tls_cert;
 static fr_dict_t const *dict_freeradius; /*internal dictionary for server*/
+
+extern fr_dict_attr_autoload_t curl_attr[];
+fr_dict_attr_autoload_t curl_attr[] = {
+	{ .out = &attr_tls_cert, .name = "TLS-Cert", .type = FR_TYPE_TLV, .dict = &dict_freeradius },
+	{ NULL }
+};
 
 static fr_dict_autoload_t curl_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
@@ -52,8 +62,12 @@ CONF_PARSER fr_curl_tls_config[] = {
 	{ FR_CONF_OFFSET("private_key_password", FR_TYPE_STRING | FR_TYPE_SECRET, fr_curl_tls_t, private_key_password) },
 	{ FR_CONF_OFFSET("random_file", FR_TYPE_STRING, fr_curl_tls_t, random_file) },
 	{ FR_CONF_OFFSET("require_cert", FR_TYPE_VOID, fr_curl_tls_t, require_cert),
-       	.func = cf_table_parse_int32, .uctx = &(cf_table_parse_ctx_t){ .table = fr_curl_sslcode_table, .len = &fr_curl_sslcode_table_len },
-	.dflt = "allow" },
+       		.func = cf_table_parse_int,
+       		.uctx = &(cf_table_parse_ctx_t){
+       			.table = fr_curl_sslcode_table,
+       			.len = &fr_curl_sslcode_table_len
+       		},
+		.dflt = "allow" },
 	{ FR_CONF_OFFSET("check_cert", FR_TYPE_BOOL, fr_curl_tls_t, check_cert), .dflt = "yes" },
 	{ FR_CONF_OFFSET("check_cert_cn", FR_TYPE_BOOL, fr_curl_tls_t, check_cert_cn), .dflt = "yes" },
 	{ FR_CONF_OFFSET("extract_cert_attrs", FR_TYPE_BOOL, fr_curl_tls_t, extract_cert_attrs), .dflt = "no" },
@@ -85,6 +99,11 @@ int fr_curl_init(void)
 #endif
 
 	if (fr_dict_autoload(curl_dict) < 0) {
+		PERROR("Failed loading dictionaries for curl");
+		return -1;
+	}
+
+	if (fr_dict_attr_autoload(curl_attr) < 0) {
 		PERROR("Failed loading dictionaries for curl");
 		return -1;
 	}
@@ -149,7 +168,7 @@ int fr_curl_response_certinfo(request_t *request, fr_curl_io_request_t *randle)
 	CURLcode		ret;
 	int			i;
 	char		 	buffer[265];
-	char			*p , *q, *attr = buffer;
+	char			*p , *q;
 	fr_pair_list_t		cert_vps;
 	/*
 	 *	Examples and documentation show cert_info being
@@ -173,11 +192,13 @@ int fr_curl_response_certinfo(request_t *request, fr_curl_io_request_t *randle)
 		return -1;
 	}
 
-	attr += strlcpy(attr, "TLS-Cert-", sizeof(buffer));
-
 	RDEBUG2("Chain has %i certificate(s)", ptr.to_certinfo->num_of_certs);
 	for (i = 0; i < ptr.to_certinfo->num_of_certs; i++) {
 		struct curl_slist *cert_attrs;
+		fr_pair_t *container;
+
+		MEM(container = fr_pair_afrom_da(request->request_ctx, attr_tls_cert));
+		fr_pair_append(&cert_vps, container);
 
 		RDEBUG2("Processing certificate %i",i);
 
@@ -193,19 +214,19 @@ int fr_curl_response_certinfo(request_t *request, fr_curl_io_request_t *randle)
 				continue;
 			}
 
-			strlcpy(attr, cert_attrs->data, (q - cert_attrs->data) + 1);
-			for (p = attr; *p != '\0'; p++) if (*p == ' ') *p = '-';
+			strlcpy(buffer, cert_attrs->data, (q - cert_attrs->data) + 1);
+			for (p = buffer; *p != '\0'; p++) if (*p == ' ') *p = '-';
 
-			da = fr_dict_attr_by_name(NULL, fr_dict_root(dict_freeradius), buffer);
+			da = fr_dict_attr_by_name(NULL, attr_tls_cert, buffer);
 			if (!da) {
 				RDEBUG3("Skipping %s += '%s'", buffer, q + 1);
 				RDEBUG3("If this value is required, define attribute \"%s\"", buffer);
 				continue;
 			}
-			MEM(vp = fr_pair_afrom_da(request->request_ctx, da));
+			MEM(vp = fr_pair_afrom_da(container, da));
 			fr_pair_value_from_str(vp, q + 1, -1, '\0', true);
 
-			fr_pair_append(&cert_vps, vp);
+			fr_pair_append(&container->vp_group, vp);
 		}
 		/*
 		 *	Add a copy of the cert_vps to the request list.

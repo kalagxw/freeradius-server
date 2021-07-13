@@ -274,11 +274,6 @@ jobs:
         make ci-test
 
       env:
-        SMTP_TEST_SERVER: 127.0.0.1
-        SMTP_TEST_SERVER_PORT: 2525
-        IMAP_TEST_SERVER: 127.0.0.1
-        IMAP_TEST_SERVER_PORT: 1430
-        IMAP_TEST_SERVER_SSL_PORT: 1431
         SQL_MYSQL_TEST_SERVER: 127.0.0.1
         SQL_POSTGRESQL_TEST_SERVER: 127.0.0.1
         LDAP_TEST_SERVER: 127.0.0.1
@@ -286,8 +281,13 @@ jobs:
         REST_TEST_SERVER: 127.0.0.1
         REST_TEST_SERVER_PORT: 8080
         REST_TEST_SERVER_SSL_PORT: 8443
+#       SMTP_TEST_SERVER: 127.0.0.1
+#       SMTP_TEST_SERVER_PORT: 2525
 #       REDIS_TEST_SERVER: 127.0.0.1
 #       REDIS_IPPOOL_TEST_SERVER: 127.0.0.1
+#       IMAP_TEST_SERVER: 127.0.0.1
+#       IMAP_TEST_SERVER_PORT: 1430
+#       IMAP_TEST_SERVER_SSL_PORT: 1431
 
     # Includes hack to disable trunk tests on MacOS which are currently broken
     # Also, no detect_leaks support for ASAN
@@ -319,8 +319,24 @@ jobs:
       if: ${{ matrix.env.TEST_TYPE == 'fuzzing' && failure() }}
 
     #
-    #  If the CI has failed and the branch is ci-debug then start a tmate
-    #  session. SSH rendezvous point is emited continuously in the job output.
+    #  If the CI has failed and the branch is ci-debug then we start a tmate
+    #  session to provide interactive shell access to the session.
+    #
+    #  The SSH rendezvous point will be emited continuously in the job output,
+    #  which will look something like:
+    #
+    #      SSH: ssh VfuX8SrNuU5pGPMyZcz7TpJTa@sfo2.tmate.io
+    #
+    #  For example:
+    #
+    #      git push origin ci-debug --force
+    #
+    #  Look at the job output in: https://github.com/FreeRADIUS/freeradius-server/actions
+    #
+    #      ssh VfuX8SrNuU5pGPMyZcz7TpJTa@sfo2.tmate.io
+    #
+    #  Access requires that you have the private key corresponding to the
+    #  public key of the GitHub user that initiated the job.
     #
     - name: "Debug: Start tmate"
       uses: mxschmitt/action-tmate@v3
@@ -396,7 +412,7 @@ jobs:
       - name: "Report whether PERSONAL_ACCESS_TOKEN secret exists"
         id: merge-preflight
         run: |
-          [ -n "$PERSONAL_ACCESS_TOKEN" ] && echo "::set-output name=PERSONAL_ACCESS_TOKEN_EXISTS::1"
+          if [ -n "$PERSONAL_ACCESS_TOKEN" ]; then echo "::set-output name=PERSONAL_ACCESS_TOKEN_EXISTS::1"; fi
         env:
           PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
     outputs:

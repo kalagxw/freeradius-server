@@ -54,7 +54,7 @@ static ssize_t encode_value(fr_dbuff_t *dbuff,
 			    fr_dcursor_t *cursor, UNUSED fr_dhcpv4_ctx_t *encode_ctx)
 {
 	fr_pair_t	*vp = fr_dcursor_current(cursor);
-	fr_dbuff_t	work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t	work_dbuff = FR_DBUFF(dbuff);
 	ssize_t		slen;
 
 	FR_PROTO_STACK_PRINT(da_stack, depth);
@@ -212,7 +212,7 @@ static ssize_t encode_rfc_hdr(fr_dbuff_t *dbuff,
 	fr_dbuff_marker_t	hdr, hdr_io;
 	fr_dict_attr_t const	*da = da_stack->da[depth];
 	fr_pair_t		*vp = fr_dcursor_current(cursor);
-	fr_dbuff_t		work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 
 	FR_PROTO_STACK_PRINT(da_stack, depth);
 
@@ -285,6 +285,91 @@ static ssize_t encode_rfc_hdr(fr_dbuff_t *dbuff,
 	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
+static ssize_t encode_vsio_hdr(fr_dbuff_t *dbuff,
+			       fr_da_stack_t *da_stack, unsigned int depth,
+			       fr_dcursor_t *cursor, void *encode_ctx);
+
+static ssize_t encode_tlv_hdr(fr_dbuff_t *dbuff,
+			      fr_da_stack_t *da_stack, unsigned int depth,
+			      fr_dcursor_t *cursor, fr_dhcpv4_ctx_t *encode_ctx);
+
+static ssize_t encode_option_data(fr_dbuff_t *dbuff,
+				  fr_da_stack_t *da_stack, unsigned int depth,
+				  fr_dcursor_t *cursor, fr_dhcpv4_ctx_t *encode_ctx)
+{
+	ssize_t len;
+	fr_pair_t *vp = fr_dcursor_current(cursor);
+	fr_dcursor_t child_cursor;
+	fr_dbuff_t work_dbuff;
+
+	if (da_stack->da[depth]) {
+		/*
+		 *	Determine the nested type and call the appropriate encoder
+		 */
+		switch (da_stack->da[depth]->type) {
+		case FR_TYPE_TLV:
+			if (!da_stack->da[depth + 1]) goto do_child;
+
+			return encode_tlv_hdr(dbuff, da_stack, depth, cursor, encode_ctx);
+
+		case FR_TYPE_VSA:
+			if (!da_stack->da[depth + 1]) goto do_child;
+
+			return encode_vsio_hdr(dbuff, da_stack, depth, cursor, encode_ctx);
+
+		default:
+			break;
+		}
+
+		return encode_rfc_hdr(dbuff, da_stack, depth, cursor, encode_ctx);
+	}
+
+	if (!da_stack->da[depth]) {
+		switch (vp->da->type) {
+		case FR_TYPE_STRUCTURAL:
+			break;
+
+		default:	
+			fr_strerror_printf("Internal sanity check failed");
+			return -1;
+		}
+	}
+
+do_child:
+	fr_dcursor_init(&child_cursor, &vp->vp_group);
+	work_dbuff = FR_DBUFF(dbuff);
+
+	while ((vp = fr_dcursor_current(&child_cursor)) != NULL) {
+		fr_proto_da_stack_build(da_stack, vp->da);
+
+		switch (da_stack->da[depth]->type) {
+		case FR_TYPE_VSA:
+			len = encode_vsio_hdr(&work_dbuff, da_stack, depth, &child_cursor, encode_ctx);
+			break;
+
+		case FR_TYPE_TLV:
+			len = encode_tlv_hdr(&work_dbuff, da_stack, depth, &child_cursor, encode_ctx);
+			break;
+
+		default:
+			len = encode_rfc_hdr(&work_dbuff, da_stack, depth, &child_cursor, encode_ctx);
+			break;
+		}
+
+		if (len <= 0) return len;
+	}
+
+	/*
+	 *	Skip over the attribute we just encoded.
+	 */
+	vp = fr_dcursor_next(cursor);
+	fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
+
+	return fr_dbuff_set(dbuff, &work_dbuff);
+}
+
+
+
 /** Write out a TLV header (and any sub TLVs or values)
  *
  * @param[out] dbuff		buffer to write the TLV to.
@@ -302,7 +387,7 @@ static ssize_t encode_tlv_hdr(fr_dbuff_t *dbuff,
 			      fr_dcursor_t *cursor, fr_dhcpv4_ctx_t *encode_ctx)
 {
 	ssize_t			len;
-	fr_dbuff_t		work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 	fr_dbuff_marker_t	hdr, next_hdr, dest, hdr_io;
 	fr_pair_t const		*vp = fr_dcursor_current(cursor);
 	fr_dict_attr_t const	*da = da_stack->da[depth];
@@ -330,14 +415,7 @@ static ssize_t encode_tlv_hdr(fr_dbuff_t *dbuff,
 	 *	Encode any sub TLVs or values
 	 */
 	while (fr_dbuff_extend_lowat(NULL, &work_dbuff, 3) >= 3) {
-		/*
-		 *	Determine the nested type and call the appropriate encoder
-		 */
-		if (da_stack->da[depth + 1]->type == FR_TYPE_TLV) {
-			len = encode_tlv_hdr(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
-		} else {
-			len = encode_rfc_hdr(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
-		}
+		len = encode_option_data(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
 		if (len < 0) return len;
 		if (len == 0) break;		/* Insufficient space */
 
@@ -411,7 +489,7 @@ static ssize_t encode_vsio_hdr(fr_dbuff_t *dbuff,
 			       fr_da_stack_t *da_stack, unsigned int depth,
 			       fr_dcursor_t *cursor, void *encode_ctx)
 {
-	fr_dbuff_t		work_dbuff = FR_DBUFF_MAX_NO_ADVANCE(dbuff, 255 - 4 - 1 - 2);
+	fr_dbuff_t		work_dbuff = FR_DBUFF_MAX(dbuff, 255 - 4 - 1 - 2);
 	fr_dbuff_marker_t	hdr;
 	fr_dict_attr_t const	*da = da_stack->da[depth];
 	fr_dict_attr_t const	*dv;
@@ -479,19 +557,8 @@ static ssize_t encode_vsio_hdr(fr_dbuff_t *dbuff,
 	da = da_stack->da[depth + 1];
 
 	while (true) {
-		/*
-		 *	Encode the different data types
-		 *
-		 *	@todo - encode all options which have the same parent vendor.
-		 */
-		if (da->type == FR_TYPE_TLV) {
-			len = encode_tlv_hdr(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
-		} else {
-			/*
-			 *	Normal vendor option
-			 */
-			len = encode_rfc_hdr(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
-		}
+		len = encode_option_data(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
+		if (len == 0) break; /* insufficient space */
 		if (len < 0) return len;
 
 		vp = fr_dcursor_current(cursor);
@@ -532,7 +599,7 @@ ssize_t fr_dhcpv4_encode_option(fr_dbuff_t *dbuff, fr_dcursor_t *cursor, void *e
 	unsigned int		depth = 0;
 	fr_da_stack_t		da_stack;
 	ssize_t			len;
-	fr_dbuff_t		work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 
 	vp = fr_dcursor_current(cursor);
 	if (!vp) return -1;

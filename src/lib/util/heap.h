@@ -67,7 +67,7 @@ typedef struct fr_heap_s fr_heap_t;
 #define fr_heap_talloc_alloc(_ctx, _cmp, _talloc_type, _field) \
 	_fr_heap_alloc(_ctx, _cmp, #_talloc_type, (size_t)offsetof(_talloc_type, _field))
 
-fr_heap_t	*_fr_heap_alloc(TALLOC_CTX *ctx, fr_heap_cmp_t cmp, char const *talloc_type, size_t offset);
+fr_heap_t	*_fr_heap_alloc(TALLOC_CTX *ctx, fr_heap_cmp_t cmp, char const *talloc_type, size_t offset) CC_HINT(nonnull(2));
 
 /** Check if an entry is inserted into a heap
  *
@@ -78,7 +78,7 @@ static inline bool fr_heap_entry_inserted(int32_t heap_id)
 }
 
 int		fr_heap_insert(fr_heap_t *hp, void *data) CC_HINT(nonnull);
-int		fr_heap_extract(fr_heap_t *hp, void *data) CC_HINT(nonnull(1));
+int		fr_heap_extract(fr_heap_t *hp, void *data) CC_HINT(nonnull);
 void		*fr_heap_pop(fr_heap_t *hp) CC_HINT(nonnull);
 void		*fr_heap_peek(fr_heap_t *hp);
 void		*fr_heap_peek_tail(fr_heap_t *hp);

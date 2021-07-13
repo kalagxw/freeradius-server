@@ -130,10 +130,6 @@ void		talloc_destructor_disarm(fr_talloc_destructor_t *d);
 
 int		talloc_link_ctx(TALLOC_CTX *parent, TALLOC_CTX *child);
 
-fr_talloc_destructor_t *talloc_add_destructor(TALLOC_CTX *chunk, fr_talloc_free_func_t func, void const *uctx);
-
-void		talloc_disarm_destructor(fr_talloc_destructor_t *d);
-
 TALLOC_CTX	*talloc_page_aligned_pool(TALLOC_CTX *ctx, void **start, void **end, size_t size);
 TALLOC_CTX	*talloc_aligned_array(TALLOC_CTX *ctx, void **start, size_t alignment, size_t size);
 
@@ -177,6 +173,8 @@ char		*talloc_typed_strdup(TALLOC_CTX *ctx, char const *p);
 char		*talloc_typed_asprintf(TALLOC_CTX *ctx, char const *fmt, ...) CC_HINT(format (printf, 2, 3));
 
 char		*talloc_typed_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap) CC_HINT(format (printf, 2, 0)) CC_HINT(nonnull (2));
+
+uint8_t		*talloc_typed_memdup(TALLOC_CTX *ctx, uint8_t const *in, size_t inlen);
 
 char		*talloc_bstrdup(TALLOC_CTX *ctx, char const *in);
 

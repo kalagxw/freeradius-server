@@ -2,10 +2,11 @@ SUBMAKEFILES := \
     radclient.mk \
     radict.mk \
     radiusd.mk \
-    radsniff.mk \
-    radwho.mk \
-    radsnmp.mk \
     radlast.mk \
+    radlock.mk \
+    radsniff.mk \
+    radsnmp.mk \
+    radwho.mk \
     radtest.mk \
     radzap.mk \
     dhcpclient.mk \
@@ -22,7 +23,7 @@ SUBMAKEFILES := \
 #  The fuzzer binary needs special magic to run, as it doesn't parse
 #  command-line options.  See fuzzer.mk for details.
 #
-FUZZER_PROTOCOLS = radius dhcpv4 dhcpv6 tacacs vmps
+FUZZER_PROTOCOLS = radius dhcpv4 dhcpv6 tacacs vmps tftp
 
 #
 #  Add the fuzzer only if everything was built with the fuzzing flags.

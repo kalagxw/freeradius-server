@@ -26,20 +26,22 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/cf_file.h>
-#include <freeradius-devel/server/cond.h>
 #include <freeradius-devel/server/client.h>
+#include <freeradius-devel/server/cond.h>
 #include <freeradius-devel/server/dependency.h>
 #include <freeradius-devel/server/main_config.h>
 #include <freeradius-devel/server/map_proc.h>
 #include <freeradius-devel/server/modpriv.h>
 #include <freeradius-devel/server/module.h>
-#include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/server/util.h>
 #include <freeradius-devel/server/virtual_servers.h>
 
 #include <freeradius-devel/util/conf.h>
+#include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/dict.h>
 #include <freeradius-devel/util/file.h>
+#include <freeradius-devel/util/perm.h>
+#include <freeradius-devel/util/sem.h>
 
 #include <sys/stat.h>
 #include <pwd.h>
@@ -96,10 +98,13 @@ static int gid_parse(TALLOC_CTX *ctx, void *out, UNUSED void *parent, CONF_ITEM 
  */
 static const CONF_PARSER initial_log_subsection_config[] = {
 	{ FR_CONF_OFFSET("destination", FR_TYPE_STRING, main_config_t, log_dest), .dflt = "files" },
-	{ FR_CONF_OFFSET("syslog_facility", FR_TYPE_INT32, main_config_t, syslog_facility), .dflt = "daemon",
-	  .func = cf_table_parse_int32,
-	  .uctx = &(cf_table_parse_ctx_t){ .table = syslog_facility_table, .len = &syslog_facility_table_len } },
-
+	{ FR_CONF_OFFSET("syslog_facility", FR_TYPE_VOID, main_config_t, syslog_facility), .dflt = "daemon",
+		.func = cf_table_parse_int,
+			.uctx = &(cf_table_parse_ctx_t){
+				.table = syslog_facility_table,
+				.len = &syslog_facility_table_len
+			}
+		},
 	{ FR_CONF_OFFSET("local_state_dir", FR_TYPE_STRING, main_config_t, local_state_dir), .dflt = "${prefix}/var"},
 	{ FR_CONF_OFFSET("logdir", FR_TYPE_STRING, main_config_t, log_dir), .dflt = "${local_state_dir}/log"},
 	{ FR_CONF_OFFSET("file", FR_TYPE_STRING, main_config_t, log_file), .dflt = "${logdir}/radius.log" },
@@ -162,7 +167,12 @@ static const CONF_PARSER thread_config[] = {
 	{ FR_CONF_OFFSET("num_workers", FR_TYPE_UINT32, main_config_t, max_workers), .dflt = STRINGIFY(4),
 	  .func = num_workers_parse },
 
-	{ FR_CONF_OFFSET("stats_interval | FR_TYPE_HIDDEN", FR_TYPE_TIME_DELTA, main_config_t, stats_interval), },
+	{ FR_CONF_OFFSET("stats_interval", FR_TYPE_TIME_DELTA | FR_TYPE_HIDDEN, main_config_t, stats_interval), },
+
+#ifdef HAVE_OPENSSL_CRYPTO_H
+	{ FR_CONF_OFFSET("openssl_async_pool_init", FR_TYPE_SIZE, main_config_t, openssl_async_pool_init), .dflt = "64" },
+	{ FR_CONF_OFFSET("openssl_async_pool_max", FR_TYPE_SIZE, main_config_t, openssl_async_pool_max), .dflt = "1024" },
+#endif
 
 	CONF_PARSER_TERMINATOR
 };
@@ -368,7 +378,7 @@ static int uid_parse(TALLOC_CTX *ctx, void *out, UNUSED void *parent,
 
 	uid_name = cf_pair_value(cf_item_to_pair(ci));
 
-	if (rad_getpwnam(ctx, &user, uid_name) < 0) {
+	if (fr_perm_getpwnam(ctx, &user, uid_name) < 0) {
 		cf_log_perr(ci, "Cannot get passwd entry for user \"%s\"", uid_name);
 		return 0;
 	}
@@ -388,7 +398,7 @@ static int gid_parse(TALLOC_CTX *ctx, void *out, UNUSED void *parent,
 
 	gid_name = cf_pair_value(cf_item_to_pair(ci));
 
-	if (rad_getgrnam(ctx, &group, gid_name) < 0) {
+	if (fr_perm_getgrnam(ctx, &group, gid_name) < 0) {
 		cf_log_perr(ci, "Cannot resolve group name \"%s\"", gid_name);
 		return 0;
 	}
@@ -625,7 +635,7 @@ static int switch_users(main_config_t *config, CONF_SECTION *cs)
 		{
 			struct passwd *user;
 
-			if (rad_getpwuid(config, &user, config->uid) < 0) {
+			if (fr_perm_getpwuid(config, &user, config->uid) < 0) {
 				fprintf(stderr, "%s: Failed resolving UID %i: %s\n",
 					config->name, (int)config->uid, fr_syserror(errno));
 				return -1;
@@ -686,7 +696,7 @@ static int switch_users(main_config_t *config, CONF_SECTION *cs)
 		if (setgid(config->server_gid) < 0) {
 			struct group *group;
 
-			if (rad_getgrgid(config, &group, config->gid) < 0) {
+			if (fr_perm_getgrgid(config, &group, config->gid) < 0) {
 					fprintf(stderr, "%s: Failed resolving GID %i: %s\n",
 						config->name, (int)config->gid, fr_syserror(errno));
 					return -1;
@@ -816,6 +826,85 @@ void main_config_raddb_dir_set(main_config_t *config, char const *name)
 		config->raddb_dir = NULL;
 	}
 	if (name) config->raddb_dir = talloc_typed_strdup(config, name);
+}
+
+/** Clean up the semaphore when the main config is freed
+ *
+ * This helps with permissions issues if the user is switching between
+ * running the process under something like systemd and running it under
+ * debug mode.
+ */
+void main_config_exclusive_proc_done(main_config_t const *config)
+{
+	if (config->multi_proc_sem_id >= 0) fr_sem_close(config->multi_proc_sem_id, NULL);
+}
+
+/** Increment the semaphore in the child process so that it's not released when the parent exits
+ *
+ * @param[in] config	specifying the path to the main config file.
+ * @return
+ *	- 0 on success.
+ *      - -1 on failure.
+ */
+int main_config_exclusive_proc_child(main_config_t const *config)
+{
+	return fr_sem_take(config->multi_proc_sem_id, config->multi_proc_sem_path, true);
+}
+
+/** Check to see if we're the only process using this configuration file
+ *
+ * @param[in] config	specifying the path to the main config file.
+ * @return
+ *	- 1 if another process is running with this config file
+ *	- 0 if no other process is running with this config file.
+ *	- -1 on error.
+ */
+int main_config_exclusive_proc(main_config_t *config)
+{
+	char *path;
+	int sem_id;
+	int ret;
+	static bool sem_initd;
+
+	if (unlikely(sem_initd)) return 0;
+
+	MEM(path = talloc_asprintf(config, "%s/%s.conf", config->raddb_dir, config->name));
+	sem_id = fr_sem_get(path, 0,
+			    main_config->uid_is_set ? main_config->uid : geteuid(),
+			    main_config->gid_is_set ? main_config->gid : getegid(),
+			    true, false);
+	if (sem_id < 0) {
+		talloc_free(path);
+		return -1;
+	}
+
+	config->multi_proc_sem_id = -1;
+
+	ret = fr_sem_wait(sem_id, path, true, true);
+	switch (ret) {
+	case 0:	/* we have the semaphore */
+		config->multi_proc_sem_id = sem_id;
+		config->multi_proc_sem_path = path;
+		sem_initd = true;
+		break;
+
+	case 1:	/* another process has the semaphore */
+	{
+		pid_t pid;
+
+		fr_sem_pid(&pid, sem_id);
+		fr_strerror_printf("Refusing to start - PID %u already running with \"%s\"", pid, path);
+		talloc_free(path);
+	}
+		break;
+
+	default:
+		talloc_free(path);
+		break;
+	}
+
+
+	return ret;
 }
 
 /** Set the global dictionary directory.

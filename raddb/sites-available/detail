@@ -22,7 +22,12 @@ server detail {
 	#
 	directory = ${radacctdir}/detail
 
-	listen {
+	#
+	#  The "listen" section MUST have a second name here, which
+	#  says "load the detail file processor, and not the typical
+	#  RADIUS UDP / TCP socket IO.
+	#
+	listen detail {
 		#
 		#  Types of packets we are reading.
 		#
@@ -225,7 +230,7 @@ server detail {
 #
 recv Accounting-Request {
 	update request {
-		&Acct-Delay-Time := "%{expr:%{%{Acct-Delay-Time}:-0} + %c - %{%(integer:%{Event-Timestamp}):-%(integer:%{Packet-Original-Timestamp})}}"
+		&Acct-Delay-Time := "%{expr:%{%{Acct-Delay-Time}:-0} + %c - %(integer:%{%{Event-Timestamp}:-%{Packet-Original-Timestamp}})}"
 	}
 
 	#

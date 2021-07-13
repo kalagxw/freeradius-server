@@ -165,7 +165,8 @@ static int dict_root_set(fr_dict_t *dict, char const *name, unsigned int proto_n
 		return -1;
 	}
 
-	da = dict_attr_alloc(dict->pool, NULL, name, proto_number, FR_TYPE_TLV, &flags);
+	da = dict_attr_alloc(dict->pool, NULL, name, proto_number, FR_TYPE_TLV,
+			     &(dict_attr_args_t){ .flags = &flags });
 	if (unlikely(!da)) return -1;
 
 	dict->root = da;
@@ -599,17 +600,25 @@ static int dict_read_process_alias(dict_tokenize_ctx_t *ctx, char **argv, int ar
 	 *	i.e. you can lookup the ALIAS by "name", but you
 	 *	actually get returned "ref".
 	 */
-	self = dict_attr_alloc(ctx->dict->pool, parent, argv[0], da->attr, da->type, &da->flags);
-	if (unlikely(!self)) return -1;
+	{
+		fr_dict_attr_flags_t flags = da->flags;
+
+		flags.is_alias = 1;	/* These get followed automatically by public functions */
+
+		self = dict_attr_alloc(ctx->dict->pool, parent, argv[0], da->attr, da->type,
+				       &(dict_attr_args_t){ .flags = &flags, .ref = da });
+		if (unlikely(!self)) return -1;
+	}
 
 	self->dict = ctx->dict;
-	dict_attr_ref_set(self, da);
+
+	fr_assert(fr_dict_attr_ref(self) == da);
 
 	namespace = dict_attr_namespace(parent);
 	if (!namespace) {
 		fr_strerror_printf("Attribute '%s' does not contain a namespace", parent->name);
 	error:
-		talloc_const_free(da);
+		talloc_free(self);
 		return -1;
 	}
 
@@ -1296,8 +1305,7 @@ static int dict_read_process_struct(dict_tokenize_ctx_t *ctx, char **argv, int a
 	return 0;
 }
 
-static int dict_read_parse_format(char const *format, unsigned int *pvalue, int *ptype, int *plength,
-				  bool *pcontinuation)
+static int dict_read_parse_format(char const *format, int *ptype, int *plength, bool *pcontinuation)
 {
 	char const *p;
 	int type, length;
@@ -1348,9 +1356,8 @@ static int dict_read_parse_format(char const *format, unsigned int *pvalue, int 
 		}
 		continuation = true;
 
-		if ((*pvalue != VENDORPEC_WIMAX) ||
-		    (type != 1) || (length != 1)) {
-			fr_strerror_const("Only WiMAX VSAs can have continuations");
+		if ((type != 1) || (length != 1)) {
+			fr_strerror_const("Only VSAs with 'format=1,1' can have continuations");
 			return -1;
 		}
 	}
@@ -1525,7 +1532,7 @@ static int dict_read_process_vendor(fr_dict_t *dict, char **argv, int argc)
 	 *	Look for a format statement.  Allow it to over-ride the hard-coded formats below.
 	 */
 	if (argc == 3) {
-		if (dict_read_parse_format(argv[2], &value, &type, &length, &continuation) < 0) return -1;
+		if (dict_read_parse_format(argv[2], &type, &length, &continuation) < 0) return -1;
 
 	} else {
 		type = length = 1;
@@ -1543,7 +1550,7 @@ static int dict_read_process_vendor(fr_dict_t *dict, char **argv, int argc)
 	mutable = UNCONST(fr_dict_vendor_t *, dv);
 	mutable->type = type;
 	mutable->length = length;
-	mutable->flags = continuation;
+	mutable->continuation = continuation;
 
 	return 0;
 }
@@ -1689,7 +1696,7 @@ static int _dict_from_file(dict_tokenize_ctx_t *ctx,
 	memset(&base_flags, 0, sizeof(base_flags));
 
 	while (fgets(buf, sizeof(buf), fp) != NULL) {
-		ctx->stack[ctx->stack_depth].line = line++;
+		ctx->stack[ctx->stack_depth].line = ++line;
 
 		switch (buf[0]) {
 		case '#':
@@ -1840,7 +1847,17 @@ static int _dict_from_file(dict_tokenize_ctx_t *ctx,
 			 *	parent.
 			 */
 
-			ret = _dict_from_file(ctx, dir, argv[1], fn, line);
+			/*
+			 *	Allow limited macro capability, so
+			 *	people don't have to remember where
+			 *	the root dictionaries are located.
+			 */
+			if (strncmp(argv[1], "${dictdir}/", 11) != 0) {
+				ret = _dict_from_file(ctx, dir, argv[1], fn, line);
+			} else {
+				ret = _dict_from_file(ctx, fr_dict_global_ctx_dir(), argv[1] + 11, fn, line);
+			}
+
 			if ((ret == -2) && (argv[0][8] == '-')) {
 				fr_strerror_clear(); /* delete all errors */
 				ret = 0;
@@ -2192,7 +2209,8 @@ static int _dict_from_file(dict_tokenize_ctx_t *ctx,
 				}
 
 				new = dict_attr_alloc(ctx->dict->pool,
-						      vsa_da, argv[1], vendor->pen, FR_TYPE_VENDOR, &flags);
+						      vsa_da, argv[1], vendor->pen, FR_TYPE_VENDOR,
+						      &(dict_attr_args_t){ .flags = &flags });
 				if (unlikely(!new)) goto error;
 
 				if (dict_attr_child_add(UNCONST(fr_dict_attr_t *, vsa_da), new) < 0) {
@@ -2345,6 +2363,8 @@ int fr_dict_internal_afrom_file(fr_dict_t **out, char const *dict_subdir, char c
 		    talloc_asprintf(NULL, "%s%c%s", fr_dict_global_ctx_dir(), FR_DIR_SEP, dict_subdir) :
 		    talloc_strdup(NULL, fr_dict_global_ctx_dir());
 
+	fr_strerror_clear();	/* Ensure we don't report spurious errors */
+
 	dict = dict_alloc(dict_gctx);
 	if (!dict) {
 	error:
@@ -2375,7 +2395,7 @@ int fr_dict_internal_afrom_file(fr_dict_t **out, char const *dict_subdir, char c
 		type_name = talloc_typed_asprintf(NULL, "Tmp-Cast-%s", p->name.str);
 
 		n = dict_attr_alloc(dict->pool, dict->root, type_name,
-				    FR_CAST_BASE + p->value, p->value, &flags);
+				    FR_CAST_BASE + p->value, p->value, &(dict_attr_args_t){ .flags = &flags});
 		if (!n) {
 			talloc_free(type_name);
 			goto error;
@@ -2457,6 +2477,8 @@ int fr_dict_protocol_afrom_file(fr_dict_t **out, char const *proto_name, char co
 	} else {
 		dict_dir = talloc_asprintf(NULL, "%s%c%s", fr_dict_global_ctx_dir(), FR_DIR_SEP, proto_dir);
 	}
+
+	fr_strerror_clear();	/* Ensure we don't report spurious errors */
 
 	/*
 	 *	Start in the context of the internal dictionary,

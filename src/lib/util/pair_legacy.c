@@ -175,7 +175,7 @@ fr_pair_t *fr_pair_make(TALLOC_CTX *ctx, fr_dict_t const *dict, fr_pair_list_t *
 	 *	It's not found in the dictionary, so we use
 	 *	another method to create the attribute.
 	 */
-	da = fr_dict_attr_search_by_qualified_oid(NULL, dict, attrname, true);
+	da = fr_dict_attr_search_by_qualified_oid(NULL, dict, attrname, true, true);
 	if (!da) {
 		vp = fr_pair_make_unknown(ctx, dict, attrname, value, op);
 		if (!vp) return NULL;
@@ -720,13 +720,14 @@ int fr_pair_list_afrom_file(TALLOC_CTX *ctx, fr_dict_t const *dict, fr_pair_list
  *
  * @param[in,out] to destination list.
  * @param[in,out] from source list.
+ * @param[in] op operator for list move.
  *
  * @see radius_pairmove
  */
-void fr_pair_list_move(fr_pair_list_t *to, fr_pair_list_t *from)
+void fr_pair_list_move(fr_pair_list_t *to, fr_pair_list_t *from, fr_token_t op)
 {
 	fr_pair_t *i, *found;
-	fr_pair_list_t head_new;
+	fr_pair_list_t head_new, head_prepend;
 
 	if (!to || fr_pair_list_empty(from)) return;
 
@@ -737,6 +738,12 @@ void fr_pair_list_move(fr_pair_list_t *to, fr_pair_list_t *from)
 	 *	them during the editing process.
 	 */
 	fr_pair_list_init(&head_new);
+
+	/*
+	 *	Any attributes that are requested to be prepended
+	 *	are added to a temporary list here
+	 */
+	fr_pair_list_init(&head_prepend);
 
 	/*
 	 *	We're looping over the "from" list, moving some
@@ -808,11 +815,32 @@ void fr_pair_list_move(fr_pair_list_t *to, fr_pair_list_t *from)
 			fr_pair_append(&head_new, i);
 			i = j;
 			continue;
+		case T_OP_PREPEND:
+			j = fr_pair_list_next(from, i);
+			fr_pair_remove(from, i);
+			fr_pair_prepend(&head_prepend, i);
+			i = j;
+			continue;
 		}
 	} /* loop over the "from" list. */
 
 	/*
-	 *	Take the "new" list, and append it to the "to" list.
+	 *	If the op parameter was prepend, add the "new list
+	 *	attributes first as those whose individual operator
+	 *	is prepend should be prepended to the resulting list
 	 */
-	fr_pair_list_append(to, &head_new);
+	if (op == T_OP_PREPEND) fr_pair_list_prepend(to, &head_new);
+
+	/*
+	 *	If there are any items in the prepend list prepend
+	 *	it to the "to" list
+	 */
+	fr_pair_list_prepend(to, &head_prepend);
+
+	/*
+	 *	If the op parameter was not prepend, take the "new"
+	 *	list, and append it to the "to" list.
+	 */
+	if (op != T_OP_PREPEND) fr_pair_list_append(to, &head_new);
+
 }

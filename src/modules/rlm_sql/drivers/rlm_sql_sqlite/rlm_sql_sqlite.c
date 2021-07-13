@@ -58,6 +58,7 @@ typedef struct {
 typedef struct {
 	char const	*filename;
 	uint32_t	busy_timeout;
+	bool		bootstrap;
 } rlm_sql_sqlite_t;
 
 static const CONF_PARSER driver_config[] = {
@@ -429,6 +430,11 @@ static int CC_HINT(nonnull) sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_co
 
 	if (!conn->db || (sql_check_error(conn->db, status) != RLM_SQL_OK)) {
 		sql_print_error(conn->db, status, "Error opening SQLite database \"%s\"", inst->filename);
+#ifdef HAVE_SQLITE3_OPEN_V2
+		if (!inst->bootstrap) {
+			INFO("Use the sqlite driver 'bootstrap' option to automatically create the database file");
+		}
+#endif
 		return RLM_SQL_ERROR;
 	}
 	status = sqlite3_busy_timeout(conn->db, inst->busy_timeout);
@@ -699,8 +705,12 @@ static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_
 		return -1;
 	}
 
-	if (cf_pair_find(cs, "bootstrap") && !exists) {
-#  ifdef HAVE_SQLITE3_OPEN_V2
+	if (cf_pair_find(cs, "bootstrap")) {
+		inst->bootstrap = true;
+	}
+
+	if (inst->bootstrap && !exists) {
+#ifdef HAVE_SQLITE3_OPEN_V2
 		int		status;
 		int		ret;
 		char const	*p;
@@ -730,13 +740,13 @@ static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_
 
 		status = sqlite3_open_v2(inst->filename, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
 		if (!db) {
-#    ifdef HAVE_SQLITE3_ERRSTR
+#  ifdef HAVE_SQLITE3_ERRSTR
 			ERROR("Failed creating opening/creating SQLite database: %s",
 			      sqlite3_errstr(status));
-#    else
+#  else
 			ERROR("Failed creating opening/creating SQLite database, got code (%i)",
 			      status);
-#    endif
+#  endif
 
 			goto unlink;
 		}

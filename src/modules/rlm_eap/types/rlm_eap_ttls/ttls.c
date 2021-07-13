@@ -26,6 +26,7 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/eap/chbind.h>
+#include <freeradius-devel/tls/log.h>
 #include "eap_ttls.h"
 
 #define FR_DIAMETER_AVP_FLAG_VENDOR	0x80
@@ -272,17 +273,21 @@ do_value:
 		 *	we're not too worried about the Id.
 		 */
 		if ((vp->da == attr_chap_challenge) || (vp->da == attr_ms_chap_challenge)) {
-			uint8_t	challenge[16];
-			char	label[] = "ttls challenge";
+			uint8_t	challenge[17];
+			static const char label[] = "ttls challenge";
 
 			if ((vp->vp_length < 8) || (vp->vp_length > 16)) {
 				fr_strerror_const("Tunneled challenge has invalid length");
 				goto error;
 			}
 
-			if (SSL_export_keying_material(ssl, challenge, sizeof(challenge),
+			/*
+			 *	TLSv1.3 exports a different key depending on the length
+			 *	requested so ask for *exactly* what the spec requires
+			 */
+			if (SSL_export_keying_material(ssl, challenge, vp->vp_length + 1,
 						       label, sizeof(label) - 1, NULL, 0, 0) != 1) {
-				tls_strerror_printf("Failed generating phase2 challenge");
+				fr_tls_log_strerror_printf("Failed generating phase2 challenge");
 				goto error;
 			}
 

@@ -52,7 +52,7 @@ RCSID("$Id$")
 #include <freeradius-devel/util/dcursor.h>
 #include <freeradius-devel/util/dbuff.h>
 #include <freeradius-devel/util/hash.h>
-#include <freeradius-devel/util/hex.h>
+#include <freeradius-devel/util/base16.h>
 #include <freeradius-devel/util/net.h>
 #include <freeradius-devel/util/strerror.h>
 #include <freeradius-devel/util/talloc.h>
@@ -1059,6 +1059,8 @@ int fr_value_box_hton(fr_value_box_t *dst, fr_value_box_t const *src)
 	case FR_TYPE_IPV4_PREFIX:
 	case FR_TYPE_IPV6_ADDR:
 	case FR_TYPE_IPV6_PREFIX:
+	case FR_TYPE_COMBO_IP_ADDR:
+	case FR_TYPE_COMBO_IP_PREFIX:
 	case FR_TYPE_IFID:
 	case FR_TYPE_ETHERNET:
 	case FR_TYPE_SIZE:
@@ -1187,7 +1189,7 @@ size_t fr_value_box_network_length(fr_value_box_t *value)
 ssize_t fr_value_box_to_network(fr_dbuff_t *dbuff, fr_value_box_t const *value)
 {
 	size_t		min, max;
-	fr_dbuff_t	work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t	work_dbuff = FR_DBUFF(dbuff);
 
 	/*
 	 *	Variable length types
@@ -1517,7 +1519,7 @@ ssize_t fr_value_box_from_network_dbuff(TALLOC_CTX *ctx,
 					bool tainted)
 {
 	size_t		min, max;
-	fr_dbuff_t	work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t	work_dbuff = FR_DBUFF(dbuff);
 
 	min = network_min_size(type);
 	max = network_max_size(type);
@@ -4475,7 +4477,7 @@ parse:
 
 		ret = len >> 1;
 		p = talloc_array(ctx, uint8_t, ret);
-		if (fr_hex2bin(NULL, &FR_DBUFF_TMP(p, ret), &FR_SBUFF_IN(in + 2, len), false) != (ssize_t)ret) {
+		if (fr_base16_decode(NULL, &FR_DBUFF_TMP(p, ret), &FR_SBUFF_IN(in + 2, len), false) != (ssize_t)ret) {
 			talloc_free(p);
 			fr_strerror_const("Invalid hex data");
 			return -1;
@@ -4799,8 +4801,8 @@ ssize_t fr_value_box_print(fr_sbuff_t *out, fr_value_box_t const *data, fr_sbuff
 
 	case FR_TYPE_OCTETS:
 		FR_SBUFF_IN_CHAR_RETURN(&our_out, '0', 'x');
-		if (data->vb_length) FR_SBUFF_RETURN(fr_bin2hex, &our_out,
-							&FR_DBUFF_TMP(data->vb_octets, data->vb_length), SIZE_MAX);
+		if (data->vb_length) FR_SBUFF_RETURN(fr_base16_encode, &our_out,
+						     &FR_DBUFF_TMP(data->vb_octets, data->vb_length));
 		break;
 
 	/*

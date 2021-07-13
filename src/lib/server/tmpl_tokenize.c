@@ -33,7 +33,7 @@ RCSID("$Id$")
 #include <freeradius-devel/protocol/freeradius/freeradius.internal.h>
 
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/util/hex.h>
+#include <freeradius-devel/util/base16.h>
 #include <freeradius-devel/util/misc.h>
 
 #include <freeradius-devel/util/sbuff.h>
@@ -534,6 +534,16 @@ void tmpl_set_name(tmpl_t *vpt, fr_token_t quote, char const *name, ssize_t len)
 	vpt->name = talloc_bstrndup(vpt, name, len < 0 ? strlen(name) : (size_t)len);
 	vpt->len = talloc_array_length(vpt->name) - 1;
 	vpt->quote = quote;
+}
+
+/** Change the default dictionary in the tmpl's resolution rules
+ *
+ * @param[in] vpt	to alter.
+ * @param[in] dict	to set.
+ */
+void tmpl_set_dict_def(tmpl_t *vpt, fr_dict_t const *dict)
+{
+	vpt->rules.dict_def = dict;
 }
 
 /** Initialise a tmpl using a format string to create the name
@@ -1437,12 +1447,13 @@ static inline int tmpl_attr_afrom_attr_substr(TALLOC_CTX *ctx, tmpl_attr_error_t
 		slen = fr_dict_attr_search_by_qualified_name_substr(&dict_err, &da,
 								    t_rules->dict_def,
 								    name, p_rules ? p_rules->terminals : NULL,
-								    !t_rules->disallow_internal);
+								    !t_rules->disallow_internal,
+								    t_rules->allow_foreign);
 		/*
 		 *	We can't know which dictionary the
 		 *	attribute will be resolved in, so the
-		 *	only way of recording the parent is
-		 *	by looking at the da.
+		 *	only way of recording what the parent
+		 *	is by looking at the da.
 		 */
 		if (da) our_parent = da->parent;
 	/*
@@ -1614,7 +1625,7 @@ static inline int tmpl_attr_afrom_attr_substr(TALLOC_CTX *ctx, tmpl_attr_error_t
 	 *	errors from the dictionary code.
 	 */
 	if (!t_rules->allow_unresolved) {
-		fr_strerror_const_push("Unresolved attributes not allowed here");
+		fr_strerror_const_push("Unresolved attributes are not allowed here");
 		if (err) *err = TMPL_ATTR_ERROR_UNRESOLVED_NOT_ALLOWED;
 		fr_sbuff_set(name, &m_s);
 		goto error;
@@ -1782,7 +1793,7 @@ static inline int tmpl_request_ref_afrom_attr_substr(TALLOC_CTX *ctx, tmpl_attr_
 						     tmpl_t *vpt,
 						     fr_sbuff_t *name,
 						     fr_sbuff_parse_rules_t const *p_rules,
-					      	     tmpl_rules_t const *t_rules,
+						     tmpl_rules_t const **pt_rules,
 					      	     unsigned int depth)
 {
 	tmpl_request_ref_t	ref;
@@ -1790,6 +1801,7 @@ static inline int tmpl_request_ref_afrom_attr_substr(TALLOC_CTX *ctx, tmpl_attr_
 	tmpl_request_t		*rr;
 	fr_dlist_head_t		*list = &vpt->data.attribute.rr;
 	fr_sbuff_marker_t	s_m;
+	tmpl_rules_t const	*t_rules = *pt_rules;
 
 	fr_sbuff_marker(&s_m, name);
 	fr_sbuff_out_by_longest_prefix(&ref_len, &ref, tmpl_request_ref_table, name, t_rules->request_def);
@@ -1852,10 +1864,18 @@ static inline int tmpl_request_ref_afrom_attr_substr(TALLOC_CTX *ctx, tmpl_attr_
 	fr_dlist_insert_tail(list, rr);
 
 	/*
+	 *	Update the parsing rules if we go to the parent.
+	 */
+	 if (((ref == REQUEST_OUTER) || (ref == REQUEST_PARENT)) && t_rules->parent) {
+		t_rules = t_rules->parent;
+		*pt_rules = t_rules;
+	}
+
+	/*
 	 *	Advance past the separator (if there is one)
 	 */
 	if (fr_sbuff_next_if_char(name, '.')) {
-		if (tmpl_request_ref_afrom_attr_substr(ctx, err, vpt, name, p_rules, t_rules, depth + 1) < 0) {
+		if (tmpl_request_ref_afrom_attr_substr(ctx, err, vpt, name, p_rules, pt_rules, depth + 1) < 0) {
 			fr_dlist_talloc_free_tail(list); /* Remove and free rr */
 			return -1;
 		}
@@ -1971,7 +1991,7 @@ ssize_t tmpl_afrom_attr_substr(TALLOC_CTX *ctx, tmpl_attr_error_t *err,
 	/*
 	 *	Parse one or more request references
 	 */
-	ret = tmpl_request_ref_afrom_attr_substr(vpt, err, vpt, &our_name, p_rules, t_rules, 0);
+	ret = tmpl_request_ref_afrom_attr_substr(vpt, err, vpt, &our_name, p_rules, &t_rules, 0);
 	if (ret < 0) {
 	error:
 		talloc_free(vpt);
@@ -2191,7 +2211,7 @@ static ssize_t tmpl_afrom_octets_substr(TALLOC_CTX *ctx, tmpl_t **out, fr_sbuff_
 
 	tmpl_set_name(vpt, T_BARE_WORD, fr_sbuff_start(&our_in), fr_sbuff_used(&our_in));
 
-	(void)fr_hex2bin(NULL, &FR_DBUFF_TMP(bin, binlen), &FR_SBUFF_IN(hex, len), false);
+	(void)fr_base16_decode(NULL, &FR_DBUFF_TMP(bin, binlen), &FR_SBUFF_IN(hex, len), false);
 	MEM(bin = talloc_realloc_size(vpt, bin, binlen));	/* Realloc to the correct length */
 	(void)fr_value_box_memdup_shallow(&vpt->data.literal, NULL, bin, binlen, false);
 
@@ -2221,7 +2241,7 @@ static ssize_t tmpl_afrom_ipv4_substr(TALLOC_CTX *ctx, tmpl_t **out, fr_sbuff_t 
 	/*
 	 *	Check for char sequence
 	 *
-	 *	xxx.xxxx.xxx.xxx
+	 *	xxx.xxx.xxx.xxx
 	 */
 	if (!(fr_sbuff_out(NULL, &octet, &our_in) && fr_sbuff_next_if_char(&our_in, '.') &&
 	      fr_sbuff_out(NULL, &octet, &our_in) && fr_sbuff_next_if_char(&our_in, '.') &&
@@ -2378,6 +2398,74 @@ static ssize_t tmpl_afrom_ipv6_substr(TALLOC_CTX *ctx, tmpl_t **out, fr_sbuff_t 
 		talloc_free(vpt);
 		goto error;
 	}
+	*out = vpt;
+
+	return fr_sbuff_set(in, &our_in);
+}
+
+
+/** Try and parse signed or unsigned integers
+ *
+ * @param[in] ctx	to allocate tmpl to.
+ * @param[out] out	where to write tmpl.
+ * @param[in] in	sbuff to parse.
+ * @param[in] p_rules	formatting rules.
+ * @return
+ *	- 0 sbuff does not contain a mac address.
+ *	- > 0 how many bytes were parsed.
+ */
+static ssize_t tmpl_afrom_ether_substr(TALLOC_CTX *ctx, tmpl_t **out, fr_sbuff_t *in,
+				       fr_sbuff_parse_rules_t const *p_rules)
+{
+	tmpl_t			*vpt;
+	fr_sbuff_t		our_in = FR_SBUFF_NO_ADVANCE(in);
+	uint8_t			buff[6];
+	fr_dbuff_t		dbuff;
+	fr_value_box_t		*vb;
+	fr_sbuff_parse_error_t	err;
+
+	fr_dbuff_init(&dbuff, buff, sizeof(buff));
+
+	fr_base16_decode(&err, &dbuff, &our_in, true);
+	if (err != FR_SBUFF_PARSE_OK) return 0;
+
+	if (!fr_sbuff_next_if_char(&our_in, ':')) return 0;
+
+	fr_base16_decode(&err, &dbuff, &our_in, true);
+	if (err != FR_SBUFF_PARSE_OK) return 0;
+
+	if (!fr_sbuff_next_if_char(&our_in, ':')) return 0;
+
+	fr_base16_decode(&err, &dbuff, &our_in, true);
+	if (err != FR_SBUFF_PARSE_OK) return 0;
+
+	if (!fr_sbuff_next_if_char(&our_in, ':')) return 0;
+
+	fr_base16_decode(&err, &dbuff, &our_in, true);
+	if (err != FR_SBUFF_PARSE_OK) return 0;
+
+	if (!fr_sbuff_next_if_char(&our_in, ':')) return 0;
+
+	fr_base16_decode(&err, &dbuff, &our_in, true);
+	if (err != FR_SBUFF_PARSE_OK) return 0;
+
+	if (!fr_sbuff_next_if_char(&our_in, ':')) return 0;
+
+	fr_base16_decode(&err, &dbuff, &our_in, true);
+	if (err != FR_SBUFF_PARSE_OK) return 0;
+
+	if (!tmpl_substr_terminal_check(&our_in, p_rules)) {
+		fr_strerror_const("Unexpected text after mac address");
+		return 0;
+	}
+
+	MEM(vpt = tmpl_alloc(ctx, TMPL_TYPE_DATA,
+			     T_BARE_WORD, fr_sbuff_start(&our_in), fr_sbuff_used(&our_in)));
+	vb = tmpl_value(vpt);
+
+	fr_value_box_init(vb, FR_TYPE_ETHERNET, NULL, false);
+	memcpy(vb->vb_ether, buff, sizeof(vb->vb_ether));
+
 	*out = vpt;
 
 	return fr_sbuff_set(in, &our_in);
@@ -2570,6 +2658,16 @@ ssize_t tmpl_afrom_substr(TALLOC_CTX *ctx, tmpl_t **out,
 		if (slen > 0) goto done_bareword;
 
 		/*
+		 *	See if it's a mac address
+		 *
+		 *	Needs to be before IPv6 as the pton functions
+		 *	are too greedy, and on macOS will happily
+		 *	convert a mac address to an IPv6 address.
+		 */
+		slen = tmpl_afrom_ether_substr(ctx, out, &our_in, p_rules);
+		if (slen > 0) goto done_bareword;
+
+		/*
 		 *	See if it's an IPv4 address or prefix
 		 */
 		slen = tmpl_afrom_ipv4_substr(ctx, out, &our_in, p_rules);
@@ -2587,11 +2685,6 @@ ssize_t tmpl_afrom_substr(TALLOC_CTX *ctx, tmpl_t **out,
 //		slen = tmpl_afrom_float_substr(ctx, out, &our_in);
 //		if (slen > 0) return fr_sbuff_set(in, &our_in);
 
-		/*
-		 *	See if it's a mac address
-		 */
-//		slen = tmpl_afrom_mac_address_substr(ctx, out, &our_in);
-//		if (slen > 0) return fr_sbuff_set(in, &our_in);
 
 		/*
 		 *	See if it's a integer
@@ -3054,7 +3147,8 @@ static inline CC_HINT(always_inline) int tmpl_attr_resolve(tmpl_t *vpt)
 							 &FR_SBUFF_IN(ar->ar_unresolved,
 							 	      talloc_array_length(ar->ar_unresolved) - 1),
 							 NULL,
-							 !vpt->rules.disallow_internal);
+							 !vpt->rules.disallow_internal,
+							 vpt->rules.allow_foreign);
 		if (!da) return -2;	/* Can't resolve, maybe the caller can resolve later */
 
 		ar->ar_type = TMPL_ATTR_TYPE_NORMAL;

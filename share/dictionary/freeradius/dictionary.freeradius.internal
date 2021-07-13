@@ -21,6 +21,7 @@ FLAGS	internal
 # 	These attributes CAN go in the reply item list.
 ATTRIBUTE	Fall-Through				500	bool
 ATTRIBUTE	Relax-Filter				501	bool
+ATTRIBUTE	Next-Shortest-Prefix			502	bool
 #
 # Exec-Program and Exec-Program-Wait are no longer supported in v4.
 #
@@ -57,13 +58,6 @@ ATTRIBUTE	Session-State				5	group
 #
 ATTRIBUTE	Protocol				11	integer
 ATTRIBUTE	Auth-Type				12	integer
-#ATTRIBUTE	Autz-Type				13	integer
-#ATTRIBUTE	Acct-Type				14	integer
-#ATTRIBUTE	Session-Type				15	integer
-#ATTRIBUTE	Post-Auth-Type				16	integer
-#ATTRIBUTE	Pre-Proxy-Type				17	integer
-#ATTRIBUTE	Post-Proxy-Type				18	integer
-#ATTRIBUTE	Pre-Acct-Type				19	integer
 
 #
 #	Range:	20 - 49
@@ -71,7 +65,7 @@ ATTRIBUTE	Auth-Type				12	integer
 #
 ATTRIBUTE	Load-Balance-Key			20	string
 ATTRIBUTE	Proxy-To-Realm				21	string
-ATTRIBUTE	Replicate-To-Realm			22	string
+# 22 - was Replicate-To-Realm
 ATTRIBUTE	Virtual-Server				23	string virtual
 ATTRIBUTE	Module-Return-Code			24	integer virtual
 
@@ -138,16 +132,6 @@ ATTRIBUTE	Packet-Original-Timestamp		56	date
 ATTRIBUTE	Huntgroup-Name				101	string
 ATTRIBUTE	Simultaneous-Use			102	integer
 ATTRIBUTE	Strip-User-Name				103	integer
-ATTRIBUTE	Hint					104	string
-ATTRIBUTE	Send-Disconnect-Request			105	integer
-
-VALUE	Send-Disconnect-Request		No			0
-VALUE	Send-Disconnect-Request		Yes			1
-
-ATTRIBUTE	Send-CoA-Request			106	integer
-
-VALUE	Send-CoA-Request		No			0
-VALUE	Send-CoA-Request		Yes			1
 
 #	Range:	1000-2000
 #		Policy attributes
@@ -180,27 +164,19 @@ ATTRIBUTE	SQL-User-Name				1023	string
 ATTRIBUTE	SMB-Account-CTRL			1024	integer
 ATTRIBUTE	SMB-Account-CTRL-TEXT			1025	string
 ATTRIBUTE	User-Profile				1026	string
-ATTRIBUTE	Digest-Realm				1027	string
-ATTRIBUTE	Digest-Nonce				1028	string
-ATTRIBUTE	Digest-Method				1029	string
-ATTRIBUTE	Digest-URI				1030	string
-ATTRIBUTE	Digest-QOP				1031	string
-ATTRIBUTE	Digest-Algorithm			1032	string
-ATTRIBUTE	Digest-Body-Digest			1033	string
-ATTRIBUTE	Digest-CNonce				1034	string
-ATTRIBUTE	Digest-Nonce-Count			1035	string
-ATTRIBUTE	Digest-User-Name			1036	string
+# 1027-1036 were Digest attributes.
 
 ATTRIBUTE	Module-Success-Message			1037	string
 ATTRIBUTE	Module-Failure-Message			1038	string
 ATTRIBUTE	Rewrite-Rule				1039	string
-ATTRIBUTE	Digest-HA1				1040	string
+# 1040 was Digest-HA1
+
 ATTRIBUTE	MS-CHAP-Use-NTLM-Auth			1041	bool
 ATTRIBUTE	NTLM-User-Name				1042	string
 ATTRIBUTE	MS-CHAP-User-Name			1043	string
 
 ATTRIBUTE	Time-Of-Day				1089	string
-ATTRIBUTE	Inner-Tunnel-User-Name			1102	string
+
 ATTRIBUTE	SQL-Table-Name				1110	string
 ATTRIBUTE	Home-Server-Pool			1111	string
 ATTRIBUTE	Result-Status				1112	string
@@ -308,76 +284,9 @@ ATTRIBUTE	Inner-Realm-Name			1252	string
 ATTRIBUTE	Request-Lifetime			1253	integer
 
 #
-#	Range:	1254 - 1279
+#	Range:	1254 - 1699
 #		Unused
 #
-
-#
-#	Range:	1280 - 1535
-#		EAP-type specific attributes
-#
-#  egrep VALUE dictionary.freeradius.internal | grep EAP-Type | awk '{print "ATTRIBUTE EAP-Type-" $3 " " 1280+$4 " octets"}' > foo;./format.pl foo freeradius.dictionary.internal
-#
-ATTRIBUTE	EAP-Type-Base				1280	octets
-ATTRIBUTE	EAP-Type-VALUE				1280	octets
-ATTRIBUTE	EAP-Type-None				1280	octets
-ATTRIBUTE	EAP-Type-Identity			1281	octets
-ATTRIBUTE	EAP-Type-Notification			1282	octets
-ATTRIBUTE	EAP-Type-NAK				1283	octets
-ATTRIBUTE	EAP-Type-MD5-Challenge			1284	octets
-ATTRIBUTE	EAP-Type-One-Time-Password		1285	octets
-ATTRIBUTE	EAP-Type-Generic-Token-Card		1286	octets
-ATTRIBUTE	EAP-Type-RSA-Public-Key			1289	octets
-ATTRIBUTE	EAP-Type-DSS-Unilateral			1290	octets
-ATTRIBUTE	EAP-Type-KEA				1291	octets
-ATTRIBUTE	EAP-Type-KEA-Validate			1292	octets
-ATTRIBUTE	EAP-Type-EAP-TLS			1293	octets
-ATTRIBUTE	EAP-Type-Defender-Token			1294	octets
-ATTRIBUTE	EAP-Type-RSA-SecurID-EAP		1295	octets
-ATTRIBUTE	EAP-Type-Arcot-Systems-EAP		1296	octets
-ATTRIBUTE	EAP-Type-Cisco-LEAP			1297	octets
-ATTRIBUTE	EAP-Type-Nokia-IP-Smart-Card		1298	octets
-ATTRIBUTE	EAP-Type-SIM				1298	octets
-ATTRIBUTE	EAP-Type-SRP-SHA1			1299	octets
-ATTRIBUTE	EAP-Type-EAP-TTLS			1301	octets
-ATTRIBUTE	EAP-Type-Remote-Access-Service		1302	octets
-ATTRIBUTE	EAP-Type-AKA				1303	octets
-ATTRIBUTE	EAP-Type-EAP-3Com-Wireless		1304	octets
-ATTRIBUTE	EAP-Type-PEAP				1305	octets
-ATTRIBUTE	EAP-Type-MS-EAP-Authentication		1306	octets
-ATTRIBUTE	EAP-Type-MAKE				1307	octets
-ATTRIBUTE	EAP-Type-CRYPTOCard			1308	octets
-ATTRIBUTE	EAP-Type-EAP-MSCHAP-V2			1309	octets
-ATTRIBUTE	EAP-Type-DynamID			1310	octets
-ATTRIBUTE	EAP-Type-Rob-EAP			1311	octets
-ATTRIBUTE	EAP-Type-SecurID-EAP			1312	octets
-ATTRIBUTE	EAP-Type-MS-Authentication-TLV		1313	octets
-ATTRIBUTE	EAP-Type-SentriNET			1314	octets
-ATTRIBUTE	EAP-Type-EAP-Actiontec-Wireless		1315	octets
-ATTRIBUTE	EAP-Type-Cogent-Biomentric-EAP		1316	octets
-ATTRIBUTE	EAP-Type-AirFortress-EAP		1317	octets
-ATTRIBUTE	EAP-Type-EAP-HTTP-Digest		1318	octets
-ATTRIBUTE	EAP-Type-SecuriSuite-EAP		1319	octets
-ATTRIBUTE	EAP-Type-DeviceConnect-EAP		1320	octets
-ATTRIBUTE	EAP-Type-EAP-SPEKE			1321	octets
-ATTRIBUTE	EAP-Type-EAP-MOBAC			1322	octets
-ATTRIBUTE	EAP-Type-EAP-FAST			1323	octets
-ATTRIBUTE	EAP-Type-Zonelabs			1324	octets
-ATTRIBUTE	EAP-Type-EAP-Link			1325	octets
-ATTRIBUTE	EAP-Type-EAP-PAX			1326	octets
-ATTRIBUTE	EAP-Type-EAP-PSK			1327	octets
-ATTRIBUTE	EAP-Type-EAP-SAKE			1328	octets
-ATTRIBUTE	EAP-Type-EAP-IKEv2			1329	octets
-ATTRIBUTE	EAP-Type-EAP-AKA-Prime			1330	octets
-ATTRIBUTE	EAP-Type-EAP-GPSK			1331	octets
-ATTRIBUTE	EAP-Type-EAP-PWD			1332	octets
-ATTRIBUTE	EAP-Type-EAP-EVEv1			1333	octets
-ATTRIBUTE	EAP-Type-PT				1334	octets
-ATTRIBUTE	EAP-Type-TEAP				1335	octets
-
-ATTRIBUTE	EAP-Type-Microsoft-MS-CHAPv2		1306	octets
-ATTRIBUTE	EAP-Type-Cisco-MS-CHAPv2		1309	octets
-ATTRIBUTE	EAP-Type-MS-CHAP-V2			1306	octets
 
 #
 #	Range: 1700-1899
@@ -497,36 +406,29 @@ ATTRIBUTE	Log-Type				1896	integer
 #
 ATTRIBUTE	WiMAX-MN-NAI				1900	string
 
-ATTRIBUTE	TLS-Cert-Serial				1910	string
-ATTRIBUTE	TLS-Cert-Expiration			1911	date
-ATTRIBUTE	TLS-Cert-Issuer				1912	string
-ATTRIBUTE	TLS-Cert-Subject			1913	string
-ATTRIBUTE	TLS-Cert-Common-Name			1914	string
-ATTRIBUTE	TLS-Cert-Subject-Alt-Name-Email		1915	string
-ATTRIBUTE	TLS-Cert-Subject-Alt-Name-Dns		1916	string
-ATTRIBUTE	TLS-Cert-Subject-Alt-Name-Upn		1917	string
-# 1918 - 1919: reserved for future cert attributes
-ATTRIBUTE	TLS-Client-Cert-Serial			1920	string
-ATTRIBUTE	TLS-Client-Cert-Expiration		1921	date
-ATTRIBUTE	TLS-Client-Cert-Issuer			1922	string
-ATTRIBUTE	TLS-Client-Cert-Subject			1923	string
-ATTRIBUTE	TLS-Client-Cert-Common-Name		1924	string
-ATTRIBUTE	TLS-Client-Cert-Filename		1925	string
-ATTRIBUTE	TLS-Client-Cert-Subject-Alt-Name-Email	1926	string
-ATTRIBUTE	TLS-Client-Cert-X509v3-Extended-Key-Usage 1927	string
-ATTRIBUTE	TLS-Client-Cert-X509v3-Subject-Key-Identifier 1928	string
-ATTRIBUTE	TLS-Client-Cert-X509v3-Authority-Key-Identifier 1929	string
-ATTRIBUTE	TLS-Client-Cert-X509v3-Basic-Constraints 1930	string
-ATTRIBUTE	TLS-Client-Cert-Subject-Alt-Name-Dns	1931	string
-ATTRIBUTE	TLS-Client-Cert-Subject-Alt-Name-Upn	1932	string
+ATTRIBUTE	TLS-Cert				1901	tlv
+BEGIN-TLV	TLS-Cert
+ATTRIBUTE	Serial					1	octets
+ATTRIBUTE	Signature				2	octets
+ATTRIBUTE	Signature-Algorithm			3	string
+ATTRIBUTE	Issuer					4	string
+ATTRIBUTE	Not-Before				5	date
+ATTRIBUTE	Not-After				6	date
+ATTRIBUTE	Subject					7	string
+ATTRIBUTE	Common-Name				8	string
+ATTRIBUTE	Crl-Last-Update				9	date
+ATTRIBUTE	Crl-Next-Update				10	date
+ATTRIBUTE	Subject-Alt-Name-Email			11	string
+ATTRIBUTE	Subject-Alt-Name-DNS			12	string
+ATTRIBUTE	Subject-Alt-Name-UPN			13	string
+ATTRIBUTE	X509v3-Extended-Key-Usage		14	string
+ATTRIBUTE	X509v3-Subject-Key-Identifier		15	string
+ATTRIBUTE	X509v3-Authority-Key-Identifier		16	string
+ATTRIBUTE	X509v3-Basic-Constraints		17	string
+END-TLV		TLS-Cert
+
 ATTRIBUTE	TLS-PSK-Identity			1933	string
 ATTRIBUTE	TLS-Session-Cert-File			1934	string
-
-# 1936 - 1939: reserved for future cert attributes
-
-# 1940 - 1949: reserved for session caching
-ATTRIBUTE	Session-Id				1940	octets
-ATTRIBUTE	Session-Data				1942	octets
 
 # Set and retrieved by EAP-TLS code
 ATTRIBUTE	TLS-OCSP-Cert-Valid			1943	integer

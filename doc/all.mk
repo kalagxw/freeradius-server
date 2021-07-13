@@ -6,7 +6,7 @@
 #  to fix that.  So, only run those shell scripts if we're going to
 #  build the documentation.
 #
-WITH_DOC := $(strip $(foreach x,install doc html man pdf doxygen,$(findstring $(x),$(MAKECMDGOALS))))
+WITH_DOC := $(strip $(foreach x,doc html man pdf doxygen,$(findstring $(x),$(MAKECMDGOALS))))
 
 #
 #  Convert adoc to man, and then let "install.man" deal with things.
@@ -31,51 +31,32 @@ $(BUILD_DIR)/make/man.mk: $(ADOC2MAN_FILES) | $(BUILD_DIR)/make
 ALL_INSTALL += $(AUTO_MAN_FILES)
 
 #
-#  We're installing the documentation, but there's no "docdir".
+#  Skip documentation if any of the necessary prerequisites are missing.
 #
+ifeq "$(ASCIIDOCTOR)" ""
+WITH_DOC=
+endif
+
+ifeq "$(PANDOC)" ""
+WITH_DOC=
+endif
+
 ifneq "$(findstring install,$(WITH_DOC))" ""
 ifeq "$(docdir)" "no"
-$(error 'docdir' is required to do 'make install')
-endif
-
-#
-#  Skip "make install*" if asciidoctor and pandoc are missing.
-#
-ifeq "$(ASCIIDOCTOR)" ""
 WITH_DOC=
 endif
-ifeq "$(PANDOC)" ""
-WITH_DOC=
 endif
 
-endif
-
-ifneq "$(WITH_DOC)" ""
-
-#
-#  We're building a documentation target, but there's no "asciidoc".
-#
-ifeq "$(ASCIIDOCTOR)" ""
-$(error asciidoc is required to build the documentation)
-endif
-
-#
-#  We're building a documentation target, but there's no "pandoc".
-#
-ifeq "$(PANDOC)" ""
-$(error pandoc is required to build the documentation)
-endif
-
-#
-#  We're building a documentation target, but there's no "antora".
-#  Which we ONLY need for "docsite"
-#
+ifneq "$(findstring docsite,$(WITH_DOC))" ""
 ifeq "$(ANTORA)" ""
-ifneq "$(findstring docsite,$(MAKECMDGOALS))" ""
-$(error antora is required to build the documentation)
+WITH_DOC=
 endif
 endif
 
+#
+#  If we still decide to build the documentation, then add in all of the documentation rules.
+#
+ifneq "$(WITH_DOC)" ""
 #
 #	TODO: The 'pdf' target is broken. we should enable here soon.
 #
@@ -90,7 +71,11 @@ clean: clean.doc
 #
 CONF_FILES := $(filter-out %~,$(wildcard raddb/*conf raddb/mods-available/* raddb/sites-available/* raddb/dictionary))
 BASE_ADOC_FILES := $(wildcard doc/*.adoc doc/*/*.adoc doc/*/*/*.adoc) doc/raddb/mods-available/all_modules.adoc
+
+# don't automatically re-build raddb/ -> doc/*.adoc
+ifneq "$(findstring asciidoc,$(MAKECMDGOALS))" ""
 AUTO_ADOC_FILES := $(patsubst raddb/%,doc/raddb/%.adoc,$(CONF_FILES))
+endif
 ADOC_FILES	:= $(BASE_ADOC_FILES) $(AUTO_ADOC_FILES)
 PDF_FILES := $(patsubst doc/%.adoc,doc/%.pdf,$(ADOC_FILES))
 HTML_FILES := $(filter %html,$(patsubst doc/%.adoc,doc/%.html,$(ADOC_FILES)) \
@@ -226,6 +211,10 @@ build/docsite/sitemap.xml: $(ADOC_FILES)
 	${Q}$(ANTORA) $(ANTORA_FLAGS) site.yml
 
 #
+#  Only re-build the adoc files if specifically told to.
+#
+ifneq "$(findstring asciidoc,$(MAKECMDGOALS))" ""
+#
 #  Markdown files get converted to asciidoc via pandoc.
 #
 #  Many documentation files are in markdown because it's a simpler
@@ -260,6 +249,7 @@ README_MODULES := $(filter-out $(IGNORE_MODULES), $(wildcard src/modules/rlm_*/R
 doc/raddb/mods-available/all_modules.adoc: $(README_MODULES)
 	@echo ADOC mods-available/all_modules.adoc
 	${Q}./scripts/asciidoc/mod_readme2adoc $(README_MODULES) > $@
+endif
 
 #
 #	Converting *.adoc to *.html
@@ -317,4 +307,5 @@ pdf: $(PDF_FILES)
 
 doc: build/docsite/sitemap.xml $(HTML_FILES)
 
+# end of WITH_DOC
 endif

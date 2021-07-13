@@ -37,7 +37,7 @@ RCSID("$Id$")
 
 #include <freeradius-devel/util/base64.h>
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/util/hex.h>
+#include <freeradius-devel/util/base16.h>
 #include <freeradius-devel/util/md5.h>
 #include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/rand.h>
@@ -1558,13 +1558,13 @@ static xlat_action_t xlat_func_base64_encode(TALLOC_CTX *ctx, fr_dcursor_t *out,
 		return XLAT_ACTION_FAIL;
 	}
 
-	elen = fr_base64_encode(buff, alen + 1, in->vb_octets, in->vb_length);
+	elen = fr_base64_encode(&FR_SBUFF_OUT(buff, talloc_array_length(buff)),
+				&FR_DBUFF_TMP(in->vb_octets, in->vb_length), true);
 	if (elen < 0) {
 		RPEDEBUG("Base64 encoding failed");
 		talloc_free(vb);
 		return XLAT_ACTION_FAIL;
 	}
-
 	fr_assert((size_t)elen <= alen);
 	vb->tainted = in->tainted;
 	fr_dcursor_append(out, vb);
@@ -1593,23 +1593,26 @@ static xlat_action_t xlat_func_base64_decode(TALLOC_CTX *ctx, fr_dcursor_t *out,
 					     fr_value_box_list_t *args)
 {
 	size_t		alen;
-	ssize_t		declen;
+	ssize_t		declen = 0;
 	uint8_t		*decbuf;
 	fr_value_box_t	*vb;
 	fr_value_box_t	*in = fr_dlist_head(args);
 
 	alen = FR_BASE64_DEC_LENGTH(in->vb_length);
-
 	MEM(vb = fr_value_box_alloc_null(ctx));
-	MEM(fr_value_box_mem_alloc(vb, &decbuf, vb, NULL, alen, in->tainted) == 0);
-	declen = fr_base64_decode(decbuf, alen, in->vb_strvalue, in->vb_length);
-	if (declen < 0) {
-		REDEBUG("Base64 string invalid");
-		talloc_free(vb);
-		return XLAT_ACTION_FAIL;
+	if (alen > 0) {
+		MEM(fr_value_box_mem_alloc(vb, &decbuf, vb, NULL, alen, in->tainted) == 0);
+		declen = fr_base64_decode(&FR_DBUFF_TMP(decbuf, alen),
+					  &FR_SBUFF_IN(in->vb_strvalue, in->vb_length), true, true);
+		if (declen < 0) {
+			RPEDEBUG("Base64 string invalid");
+			talloc_free(vb);
+			return XLAT_ACTION_FAIL;
+		}
+
+		MEM(fr_value_box_mem_realloc(vb, NULL, vb, declen) == 0);
 	}
 
-	MEM(fr_value_box_mem_realloc(vb, NULL, vb, declen) == 0);
 	vb->tainted = in->tainted;
 	fr_dcursor_append(out, vb);
 
@@ -1664,7 +1667,7 @@ static xlat_action_t xlat_func_bin(TALLOC_CTX *ctx, fr_dcursor_t *out,
 
 	MEM(result = fr_value_box_alloc_null(ctx));
 	MEM(fr_value_box_mem_alloc(result, &bin, result, NULL, outlen, fr_value_box_list_tainted(in)) == 0);
-	fr_hex2bin(&err, &FR_DBUFF_TMP(bin, outlen), &FR_SBUFF_IN(p, end - p), true);
+	fr_base16_decode(&err, &FR_DBUFF_TMP(bin, outlen), &FR_SBUFF_IN(p, end - p), true);
 	if (err) {
 		REDEBUG2("Invalid hex string");
 		talloc_free(result);
@@ -1755,8 +1758,8 @@ static xlat_action_t xlat_func_hex(UNUSED TALLOC_CTX *ctx, fr_dcursor_t *out, UN
 	 */
 	MEM(new_buff = talloc_zero_array(bin, char, (bin->vb_length * 2) + 1));
 	if (bin->vb_length) {
-		fr_bin2hex(&FR_SBUFF_OUT(new_buff, (bin->vb_length * 2) + 1),
-					 &FR_DBUFF_TMP(bin->vb_octets, bin->vb_length), SIZE_MAX);
+		fr_base16_encode(&FR_SBUFF_OUT(new_buff, (bin->vb_length * 2) + 1),
+					       &FR_DBUFF_TMP(bin->vb_octets, bin->vb_length));
 		fr_value_box_clear_value(bin);
 		fr_value_box_strdup_shallow(bin, NULL, new_buff, bin->tainted);
 	/*
@@ -2550,10 +2553,8 @@ EVP_MD_XLAT(sha2_256, sha256)
 EVP_MD_XLAT(sha2_384, sha384)
 EVP_MD_XLAT(sha2_512, sha512)
 
-#  if OPENSSL_VERSION_NUMBER >= 0x10100000L
 EVP_MD_XLAT(blake2s_256, blake2s256)
 EVP_MD_XLAT(blake2b_512, blake2b512)
-#  endif
 
 #  if OPENSSL_VERSION_NUMBER >= 0x10101000L
 EVP_MD_XLAT(sha3_224, sha3_224)
@@ -3135,10 +3136,8 @@ do { \
 	XLAT_REGISTER_MONO("sha2_384", xlat_func_sha2_384, xlat_func_sha_arg);
 	XLAT_REGISTER_MONO("sha2_512", xlat_func_sha2_512, xlat_func_sha_arg);
 
-#  if OPENSSL_VERSION_NUMBER >= 0x10100000L
 	XLAT_REGISTER_MONO("blake2s_256", xlat_func_blake2s_256, xlat_func_sha_arg);
 	XLAT_REGISTER_MONO("blake2b_512", xlat_func_blake2b_512, xlat_func_sha_arg);
-#  endif
 
 #  if OPENSSL_VERSION_NUMBER >= 0x10101000L
 	XLAT_REGISTER_MONO("sha3_224", xlat_func_sha3_224, xlat_func_sha_arg);

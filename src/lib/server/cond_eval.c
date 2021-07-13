@@ -526,7 +526,7 @@ static int cond_compare_attrs(request_t *request, fr_value_box_t *lhs, map_t con
 	if (tmpl_is_attr(map->lhs) && fr_type_is_null(map->lhs->cast)) da = tmpl_da(map->lhs);
 
 	rhs = NULL;		/* shut up clang scan */
-	fr_value_box_clear(&rhs_cast);
+	fr_value_box_init_null(&rhs_cast);
 
 	for (vp = tmpl_pair_cursor_init(&rcode, request, &cc, &cursor, request, map->rhs);
 	     vp;
@@ -1107,4 +1107,35 @@ return_to_parent:
 	a->c = c;
 	a->state = COND_EVAL_STATE_INIT;
 	goto redo;
+}
+
+/** Evaluate a map as if it is a condition.
+ *
+ */
+int fr_cond_eval_map(request_t *request, map_t const *map)
+{
+	fr_cond_t cond;
+
+	memset(&cond, 0, sizeof(cond));
+
+	/*
+	 *	Convert !* and =* to existence checks.
+	 */
+	switch (map->op) {
+	case T_OP_CMP_FALSE:
+		cond.negate = true;
+		FALL_THROUGH;
+
+	case T_OP_CMP_TRUE:
+		cond.type = COND_TYPE_TMPL;
+		cond.data.vpt = UNCONST(tmpl_t *, map->lhs);
+		break;
+
+	default:
+		cond.type = COND_TYPE_MAP;
+		cond.data.map = UNCONST(map_t *, map);
+		break;
+	}
+
+	return cond_eval(request, RLM_MODULE_NOOP, &cond);
 }

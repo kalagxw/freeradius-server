@@ -27,7 +27,7 @@ RCSID("$Id$")
 #include <freeradius-devel/util/proto.h>
 #include <ctype.h>
 
-ssize_t fr_dict_print_flags(fr_sbuff_t *out, fr_dict_t const *dict, fr_type_t type, fr_dict_attr_flags_t const *flags)
+ssize_t fr_dict_attr_flags_print(fr_sbuff_t *out, fr_dict_t const *dict, fr_type_t type, fr_dict_attr_flags_t const *flags)
 {
 	fr_sbuff_t	our_out = FR_SBUFF_NO_ADVANCE(out);
 
@@ -43,9 +43,27 @@ ssize_t fr_dict_print_flags(fr_sbuff_t *out, fr_dict_t const *dict, fr_type_t ty
 
 	if (dict && !flags->extra && flags->subtype) {
 		FR_SBUFF_IN_STRCPY_RETURN(&our_out, fr_table_str_by_value(dict->subtype_table, flags->subtype, "?"));
+		FR_SBUFF_IN_CHAR_RETURN(&our_out, ',');
 	}
 
-	if (flags->length) FR_SBUFF_IN_SPRINTF_RETURN(&our_out, "length=%i,", flags->length);
+	if (flags->length) {
+		switch (type) {
+		case FR_TYPE_FIXED_SIZE:
+			/*
+			 *	Bit fields are in the dicts as various
+			 *	`uint*` types.  But with special flags
+			 *	saying they're bit fields.
+			 */
+			if (flags->extra && (flags->subtype == FLAG_BIT_FIELD)) {
+				FR_SBUFF_IN_SPRINTF_RETURN(&our_out, "bit[%u],", flags->length);
+			}
+			break;
+
+		default:
+			FR_SBUFF_IN_SPRINTF_RETURN(&our_out, "length=%i,", flags->length);
+			break;
+		}
+	}
 	if (flags->extra) {
 		switch (flags->subtype) {
 		case FLAG_KEY_FIELD:
@@ -53,6 +71,10 @@ ssize_t fr_dict_print_flags(fr_sbuff_t *out, fr_dict_t const *dict, fr_type_t ty
 			break;
 
 		case FLAG_LENGTH_UINT16:
+			FR_SBUFF_IN_STRCPY_LITERAL_RETURN(&our_out, "length=uint16,");
+			break;
+
+		case FLAG_BIT_FIELD:
 			FR_SBUFF_IN_STRCPY_LITERAL_RETURN(&our_out, "length=uint16,");
 			break;
 
@@ -74,17 +96,19 @@ ssize_t fr_dict_print_flags(fr_sbuff_t *out, fr_dict_t const *dict, fr_type_t ty
 	return fr_sbuff_set(out, &our_out);
 }
 
-/** Build the da_stack for the specified DA and encode the path in OID form
+/** Build the da_stack for the specified DA and encode the path by name in OID form
  *
  * @param[out] out		Where to write the OID.
  * @param[in] ancestor		If not NULL, only print OID portion between ancestor and da.
  * @param[in] da		to print OID string for.
+ * @param[in] numeric		print the OID components as numbers, not attribute names.
  * @return
  *	- >0 The number of bytes written to the buffer.
  *	- <= 0 The number of bytes we would have needed to write the
  *        next OID component.
  */
-ssize_t fr_dict_attr_oid_print(fr_sbuff_t *out, fr_dict_attr_t const *ancestor, fr_dict_attr_t const *da)
+ssize_t fr_dict_attr_oid_print(fr_sbuff_t *out,
+			       fr_dict_attr_t const *ancestor, fr_dict_attr_t const *da, bool numeric)
 {
 	int			i;
 	int			depth = 0;
@@ -111,10 +135,18 @@ ssize_t fr_dict_attr_oid_print(fr_sbuff_t *out, fr_dict_attr_t const *ancestor, 
 	 *	We don't print the ancestor, we print the OID
 	 *	between it and the da.
 	 */
-	FR_SBUFF_IN_STRCPY_RETURN(&our_out, da_stack.da[depth]->name);
-	for (i = depth + 1; i < (int)da->depth; i++) {
-		FR_SBUFF_IN_CHAR_RETURN(&our_out, '.');
-		FR_SBUFF_IN_STRCPY_RETURN(&our_out, da_stack.da[i]->name);
+	if (numeric) {
+		FR_SBUFF_IN_SPRINTF_RETURN(&our_out, "%u", da_stack.da[depth]->attr);
+		for (i = depth + 1; i < (int)da->depth; i++) {
+			FR_SBUFF_IN_CHAR_RETURN(&our_out, '.');
+			FR_SBUFF_IN_SPRINTF_RETURN(&our_out, "%u", da_stack.da[i]->attr);
+		}
+	} else {
+		FR_SBUFF_IN_STRCPY_RETURN(&our_out, da_stack.da[depth]->name);
+		for (i = depth + 1; i < (int)da->depth; i++) {
+			FR_SBUFF_IN_CHAR_RETURN(&our_out, '.');
+			FR_SBUFF_IN_STRCPY_RETURN(&our_out, da_stack.da[i]->name);
+		}
 	}
 	return fr_sbuff_set(out, &our_out);
 }
@@ -123,6 +155,7 @@ typedef struct {
 	fr_dict_t const		*dict;
 	char			prefix[256];
 	char			flags[256];
+	char			oid[256];
 	unsigned int		start_depth;
 } fr_dict_attr_debug_t;
 
@@ -133,7 +166,7 @@ static int dict_attr_debug(fr_dict_attr_t const *da, void *uctx)
 	fr_dict_enum_t const		*enumv;
 	fr_dict_attr_ext_enumv_t 	*ext;
 
-	fr_dict_print_flags(&FR_SBUFF_OUT(our_uctx->flags, sizeof(our_uctx->flags)),
+	fr_dict_attr_flags_print(&FR_SBUFF_OUT(our_uctx->flags, sizeof(our_uctx->flags)),
 			      our_uctx->dict, da->type, &da->flags);
 
 	snprintf(our_uctx->prefix, sizeof(our_uctx->prefix),
@@ -200,4 +233,41 @@ void fr_dict_attr_debug(fr_dict_attr_t const *da)
 void fr_dict_debug(fr_dict_t const *dict)
 {
 	fr_dict_attr_debug(fr_dict_root(dict));
+}
+
+static int dict_attr_export(fr_dict_attr_t const *da, void *uctx)
+{
+	fr_dict_attr_debug_t 		*our_uctx = uctx;
+
+	(void) fr_dict_attr_oid_print(&FR_SBUFF_OUT(our_uctx->prefix, sizeof(our_uctx->prefix)),
+				      NULL, da, false);
+	(void) fr_dict_attr_oid_print(&FR_SBUFF_OUT(our_uctx->oid, sizeof(our_uctx->oid)),
+				      NULL, da, true);
+	*our_uctx->flags = 0;	/* some attributes don't have flags */
+	fr_dict_attr_flags_print(&FR_SBUFF_OUT(our_uctx->flags, sizeof(our_uctx->flags)),
+				 our_uctx->dict, da->type, &da->flags);
+
+	FR_FAULT_LOG("ATTRIBUTE\t%-40s\t%-20s\t%s\t%s",
+		     our_uctx->prefix,
+		     our_uctx->oid,
+		     fr_table_str_by_value(fr_value_box_type_table, da->type, "???"),
+		     our_uctx->flags);
+
+	return 0;
+}
+
+static void fr_dict_attr_export(fr_dict_attr_t const *da)
+{
+	fr_dict_attr_debug_t	uctx = { .dict = fr_dict_by_da(da), .start_depth = da->depth };
+
+	dict_attr_export(da, &uctx);
+	(void)fr_dict_walk(da, dict_attr_export, &uctx);
+}
+
+/** Export in the standard form: ATTRIBUTE name oid flags
+ *
+ */
+void fr_dict_export(fr_dict_t const *dict)
+{
+	fr_dict_attr_export(fr_dict_root(dict));
 }

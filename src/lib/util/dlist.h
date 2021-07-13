@@ -56,6 +56,17 @@ typedef struct {
 	size_t		num_elements;
 } fr_dlist_head_t;
 
+
+/** Iterate over the contents of a list
+ *
+ * @param[in] _list_head	to iterate over.
+ * @param[in] _type		of item the list contains.
+ * @param[in] _iter		Name of iteration variable.
+ *				Will be declared in the scope of the loop.
+ */
+#define fr_dlist_foreach(_list_head, _type, _iter) \
+	for (_type *_iter = fr_dlist_head(_list_head); _iter; _iter = fr_dlist_next(_list_head, _iter))
+
 /** Find the dlist pointers within a list item
  *
  */
@@ -645,7 +656,7 @@ static inline CC_HINT(nonnull) void fr_dlist_verify(char const *file, int line, 
 #  define FR_DLIST_VERIFY(_head)
 #endif
 
-/** Merge two lists, inserting the tail of one into the other
+/** Merge two lists, inserting the source at the tail of the destination
  *
  */
 static inline CC_HINT(nonnull) void fr_dlist_move(fr_dlist_head_t *list_dst, fr_dlist_head_t *list_src)
@@ -680,6 +691,43 @@ static inline CC_HINT(nonnull) void fr_dlist_move(fr_dlist_head_t *list_dst, fr_
 
 	dst->prev->next = src->next;
 	dst->prev = src->prev;
+
+	list_dst->num_elements += list_src->num_elements;
+
+	fr_dlist_entry_init(src);
+	list_src->num_elements = 0;
+}
+
+/** Merge two lists, inserting the source at the head of the destination
+ *
+ */
+static inline CC_HINT(nonnull) void fr_dlist_move_head(fr_dlist_head_t *list_dst, fr_dlist_head_t *list_src)
+{
+	fr_dlist_t *dst = &(list_dst->entry);
+	fr_dlist_t *src = &(list_src->entry);
+
+#ifdef WITH_VERIFY_PTR
+	/*
+	 *	Must be both talloced or both not
+	 */
+	if (!fr_cond_assert((list_dst->type && list_src->type) || (!list_dst->type && !list_src->type))) return;
+
+	/*
+	 *	Must be of the same type
+	 */
+	if (!fr_cond_assert(!list_dst->type || (strcmp(list_dst->type, list_src->type) == 0))) return;
+#endif
+
+	if (!fr_cond_assert(dst->next != NULL)) return;
+	if (!fr_cond_assert(dst->prev != NULL)) return;
+
+	if (fr_dlist_empty(list_src)) return;
+
+	src->next->prev = dst;
+	src->prev->next = dst->next;
+
+	dst->next->prev = src->prev;
+	dst->next = src->next;
 
 	list_dst->num_elements += list_src->num_elements;
 
@@ -881,7 +929,7 @@ static inline void fr_dlist_recursive_sort(fr_dlist_head_t *head, void **ptr, fr
  * @param[in,out] list	to sort
  * @param[in] cmp	comparison function to sort with
  */
-static inline void fr_dlist_sort (fr_dlist_head_t *list, fr_cmp_t cmp)
+static inline void fr_dlist_sort(fr_dlist_head_t *list, fr_cmp_t cmp)
 {
 	void *head;
 	fr_dlist_t *entry;
@@ -920,9 +968,7 @@ static inline void fr_dlist_sort (fr_dlist_head_t *list, fr_cmp_t cmp)
 		}
 		head = fr_dlist_next(list, head);
 	}
-
 }
-
 
 #ifdef __cplusplus
 }

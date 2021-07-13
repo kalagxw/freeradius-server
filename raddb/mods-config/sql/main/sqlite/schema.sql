@@ -39,7 +39,8 @@ CREATE TABLE radacct (
 	framedipv6address varchar(45) NOT NULL default '',
 	framedipv6prefix varchar(45) NOT NULL default '',
 	framedinterfaceid varchar(44) NOT NULL default '',
-	delegatedipv6prefix varchar(45) NOT NULL default ''
+	delegatedipv6prefix varchar(45) NOT NULL default '',
+	class varchar(64) default NULL
 );
 
 CREATE UNIQUE INDEX acctuniqueid ON radacct(acctuniqueid);
@@ -126,7 +127,8 @@ CREATE TABLE radpostauth (
 	username varchar(64) NOT NULL default '',
 	pass varchar(64) NOT NULL default '',
 	reply varchar(32) NOT NULL default '',
-	authdate timestamp NOT NULL
+	authdate timestamp NOT NULL,
+	class varchar(64) NOT NULL default ''
 );
 
 --

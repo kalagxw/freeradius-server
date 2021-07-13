@@ -23,13 +23,14 @@
 
 RCSID("$Id$")
 
-#include <freeradius-devel/util/dbuff.h>
-#include <freeradius-devel/util/base.h>
-#include <freeradius-devel/util/sha1.h>
-#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/io/test_point.h>
 #include <freeradius-devel/server/module.h>
 #include <freeradius-devel/tls/base.h>
-#include <freeradius-devel/io/test_point.h>
+#include <freeradius-devel/tls/log.h>
+#include <freeradius-devel/util/base.h>
+#include <freeradius-devel/util/dbuff.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/sha1.h>
 
 #include <freeradius-devel/eap/types.h>
 #include "base.h"
@@ -102,7 +103,7 @@ static ssize_t encode_iv(fr_dbuff_t *dbuff, void *encode_ctx)
 {
 	fr_aka_sim_ctx_t	*packet_ctx = encode_ctx;
 	uint32_t		iv[4];
-	fr_dbuff_t		work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 
 	/*
 	 *	One IV per packet
@@ -153,7 +154,7 @@ static ssize_t encode_encrypted_value(fr_dbuff_t *dbuff,
 			     	      uint8_t const *in, size_t inlen, void *encode_ctx)
 {
 	size_t			total_len, pad_len, encr_len, len = 0;
-	fr_dbuff_t		work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 	uint8_t			*encr = NULL;
 	fr_aka_sim_ctx_t	*packet_ctx = encode_ctx;
 	EVP_CIPHER_CTX		*evp_ctx;
@@ -200,7 +201,7 @@ static ssize_t encode_encrypted_value(fr_dbuff_t *dbuff,
 	evp_ctx = aka_sim_crypto_cipher_ctx();
 	if (unlikely(EVP_EncryptInit_ex(evp_ctx, evp_cipher, NULL,
 					packet_ctx->k_encr, packet_ctx->iv) != 1)) {
-		tls_strerror_printf("Failed initialising AES-128-ECB context");
+		fr_tls_log_strerror_printf("Failed initialising AES-128-ECB context");
 	error:
 		talloc_free(encr);
 		return PAIR_ENCODE_FATAL_ERROR;
@@ -225,13 +226,13 @@ static ssize_t encode_encrypted_value(fr_dbuff_t *dbuff,
 	 */
 	EVP_CIPHER_CTX_set_padding(evp_ctx, 0);
 	if (unlikely(EVP_EncryptUpdate(evp_ctx, encr, (int *)&len, fr_dbuff_start(&work_dbuff), total_len) != 1)) {
-		tls_strerror_printf("%s: Failed encrypting attribute", __FUNCTION__);
+		fr_tls_log_strerror_printf("%s: Failed encrypting attribute", __FUNCTION__);
 		goto error;
 	}
 	encr_len = len;
 
 	if (unlikely(EVP_EncryptFinal_ex(evp_ctx, encr + encr_len, (int *)&len) != 1)) {
-		tls_strerror_printf("%s: Failed finalising encrypted attribute", __FUNCTION__);
+		fr_tls_log_strerror_printf("%s: Failed finalising encrypted attribute", __FUNCTION__);
 		goto error;
 	}
 	encr_len += len;
@@ -270,7 +271,7 @@ static ssize_t encode_value(fr_dbuff_t *dbuff,
 			    fr_da_stack_t *da_stack, int depth,
 			    fr_dcursor_t *cursor, void *encode_ctx)
 {
-	fr_dbuff_t		work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 	fr_pair_t const		*vp = fr_dcursor_current(cursor);
 	fr_dict_attr_t const	*da = da_stack->da[depth];
 	fr_aka_sim_ctx_t	*packet_ctx = encode_ctx;
@@ -517,8 +518,8 @@ static ssize_t encode_array(fr_dbuff_t *dbuff,
 	size_t			pad_len;
 	size_t			element_len;
 	size_t			actual_len;
-	fr_dbuff_t		len_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
-	fr_dbuff_t		work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t		len_dbuff = FR_DBUFF(dbuff);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 	fr_dict_attr_t const	*da = da_stack->da[depth];
 	fr_assert(da->flags.array);
 
@@ -587,8 +588,8 @@ static ssize_t encode_rfc_hdr(fr_dbuff_t *dbuff, fr_da_stack_t *da_stack, unsign
 	size_t			pad_len;
 	fr_dict_attr_t const	*da;
 	ssize_t			slen;
-	fr_dbuff_t		work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
-	fr_dbuff_t		hdr_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
+	fr_dbuff_t		hdr_dbuff = FR_DBUFF(dbuff);
 
 	FR_PROTO_STACK_PRINT(da_stack, depth);
 
@@ -622,10 +623,10 @@ static ssize_t encode_rfc_hdr(fr_dbuff_t *dbuff, fr_da_stack_t *da_stack, unsign
 	fr_dbuff_advance(&work_dbuff, 2);
 
 	if (da->flags.array) {
-		slen = encode_array(&FR_DBUFF_MAX(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN - 2),
+		slen = encode_array(&FR_DBUFF_MAX_BIND_CURRENT(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN - 2),
 				    da_stack, depth, cursor, encode_ctx);
 	} else {
-		slen = encode_value(&FR_DBUFF_MAX(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN - 2),
+		slen = encode_value(&FR_DBUFF_MAX_BIND_CURRENT(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN - 2),
 				    da_stack, depth, cursor, encode_ctx);
 	}
 	if (slen <= 0) return slen;
@@ -651,7 +652,7 @@ static inline ssize_t encode_tlv_internal(fr_dbuff_t *dbuff,
 					  fr_dcursor_t *cursor, void *encode_ctx)
 {
 	ssize_t			slen;
-	fr_dbuff_t		work_dbuff = FR_DBUFF_MAX_NO_ADVANCE(dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN);
+	fr_dbuff_t		work_dbuff = FR_DBUFF_MAX(dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN);
 	fr_dbuff_t		value_dbuff;
 	fr_dbuff_marker_t	value_start;
 	fr_pair_t const		*vp = fr_dcursor_current(cursor);
@@ -659,7 +660,7 @@ static inline ssize_t encode_tlv_internal(fr_dbuff_t *dbuff,
 
 	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, 0x00, 0x00);
 
-	value_dbuff = FR_DBUFF_NO_ADVANCE(&work_dbuff);
+	value_dbuff = FR_DBUFF(&work_dbuff);
 	fr_dbuff_marker(&value_start, &value_dbuff);
 
 	for (;;) {
@@ -729,7 +730,7 @@ static ssize_t encode_tlv_hdr(fr_dbuff_t *dbuff,
 	ssize_t			len;
 	fr_dict_attr_t const	*da;
 	fr_dbuff_t		tl_dbuff;
-	fr_dbuff_t		work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 
 	VP_VERIFY(fr_dcursor_current(cursor));
 	FR_PROTO_STACK_PRINT(da_stack, depth);
@@ -754,13 +755,13 @@ static ssize_t encode_tlv_hdr(fr_dbuff_t *dbuff,
 		len = encode_iv(&work_dbuff, encode_ctx);
 		if (len < 0) return len;
 	}
-	tl_dbuff = FR_DBUFF_NO_ADVANCE(&work_dbuff);
+	tl_dbuff = FR_DBUFF(&work_dbuff);
 
 	FR_DBUFF_EXTEND_LOWAT_OR_RETURN(&work_dbuff, 2);
 	fr_dbuff_advance(&work_dbuff, 2);
 
 	da = da_stack->da[depth];
-	len = encode_tlv_internal(&FR_DBUFF_MAX(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN - 2),
+	len = encode_tlv_internal(&FR_DBUFF_MAX_BIND_CURRENT(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN - 2),
 				  da_stack, depth, cursor, encode_ctx);
 	if (len <= 0) return len;
 
@@ -780,7 +781,7 @@ static ssize_t encode_tlv_hdr(fr_dbuff_t *dbuff,
 ssize_t fr_aka_sim_encode_pair(fr_dbuff_t *dbuff, fr_dcursor_t *cursor, void *encode_ctx)
 {
 	fr_pair_t const		*vp;
-	fr_dbuff_t		work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 	fr_dbuff_marker_t	m;
 	ssize_t			slen;
 
@@ -819,7 +820,7 @@ ssize_t fr_aka_sim_encode_pair(fr_dbuff_t *dbuff, fr_dcursor_t *cursor, void *en
 		da_stack.da[1] = NULL;
 		da_stack.depth = 1;
 		FR_PROTO_STACK_PRINT(&da_stack, 0);
-		return encode_rfc_hdr(&FR_DBUFF_MAX(dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN + 2),
+		return encode_rfc_hdr(&FR_DBUFF_MAX_BIND_CURRENT(dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN + 2),
 				      &da_stack, 0, cursor, encode_ctx);
 	}
 
@@ -836,13 +837,13 @@ ssize_t fr_aka_sim_encode_pair(fr_dbuff_t *dbuff, fr_dcursor_t *cursor, void *en
 	 *	Supported types
 	 */
 	default:
-		slen = encode_rfc_hdr(&FR_DBUFF_MAX(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN + 2),
+		slen = encode_rfc_hdr(&FR_DBUFF_MAX_BIND_CURRENT(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN + 2),
 				      &da_stack, 0, cursor, encode_ctx);
 		if (slen < 0) return slen;
 		break;
 
 	case FR_TYPE_TLV:
-		slen = encode_tlv_hdr(&FR_DBUFF_MAX(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN + 2),
+		slen = encode_tlv_hdr(&FR_DBUFF_MAX_BIND_CURRENT(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN + 2),
 				      &da_stack, 0, cursor, encode_ctx);
 		if (slen < 0) return slen;
 		break;

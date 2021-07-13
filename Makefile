@@ -77,13 +77,16 @@ PROTOCOLS    := \
 	radius \
 	snmp \
 	tacacs \
-	vmps
+	vmps \
+	tftp \
+	tls
 
 #
 #  If we're building packages or crossbuilding, just do that.
 #  Don't try to do a local build.
 #
 ifneq "$(MAKECMDGOALS)" "deb"
+ifneq "$(MAKECMDGOALS)" "rpm"
 ifeq "$(findstring crossbuild,$(MAKECMDGOALS))" ""
 #
 #  Include all of the autoconf definitions into the Make variable space
@@ -114,7 +117,7 @@ ifeq "$(findstring libfreeradius-make,$(MAKECMDGOALS))" ""
 _:=$(shell $(MAKE) libfreeradius-make-dlopen.a libfreeradius-make-version.a)
 
 ifeq "${LIBRARY_EXT}" ""
-ifneq "$(findstring Darwin,$(shell hostinfo))" ""
+ifneq "$(findstring Darwin,$(shell hostinfo 2>/dev/null))" ""
 LIBRARY_EXT := dylib
 else
 LIBRARY_EXT := so
@@ -139,6 +142,7 @@ endif
 #  Load the huge boilermake framework.
 #
 include scripts/boiler.mk
+endif
 endif
 endif
 
@@ -444,6 +448,13 @@ endif
 #
 ifneq "$(findstring coverage,$(MAKECMDGOALS))" ""
 include scripts/build/coverage.mk
+endif
+
+#
+#  The "coccinelle" target
+#
+ifneq "$(findstring coccinelle,$(MAKECMDGOALS))" ""
+include scripts/build/coccinelle.mk
 endif
 
 #

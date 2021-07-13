@@ -6,6 +6,9 @@
 TARGET		:= libfreeradius-util.a
 
 SOURCES		:= \
+		   atexit.c \
+		   base16.c \
+		   base32.c \
 		   base64.c \
 		   cap.c \
 		   cursor.c \
@@ -31,7 +34,6 @@ SOURCES		:= \
 		   getaddrinfo.c \
 		   hash.c \
 		   heap.c \
-		   hex.c \
 		   hmac_md5.c \
 		   hmac_sha1.c \
 		   htrie.c \
@@ -51,6 +53,7 @@ SOURCES		:= \
 		   pair_tokenize.c \
 		   paths.c \
 		   pcap.c \
+		   perm.c \
 		   print.c \
 		   proto.c \
 		   rand.c \
@@ -58,6 +61,7 @@ SOURCES		:= \
 		   regex.c \
 		   retry.c \
 		   sbuff.c \
+		   sem.c \
 		   sha1.c \
 		   snprintf.c \
 		   socket.c \
@@ -68,7 +72,6 @@ SOURCES		:= \
 		   syserror.c \
 		   table.c \
 		   talloc.c \
-		   atexit.c \
 		   time.c \
 		   timeval.c \
 		   token.c \

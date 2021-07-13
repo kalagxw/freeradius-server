@@ -34,7 +34,7 @@ USES_APPLE_DEPRECATED_API
 
 #include <freeradius-devel/util/base64.h>
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/util/hex.h>
+#include <freeradius-devel/util/base16.h>
 #include <freeradius-devel/util/md5.h>
 #include <freeradius-devel/util/sha1.h>
 
@@ -421,7 +421,7 @@ static inline CC_HINT(nonnull) unlang_action_t pap_auth_pbkdf2_parse(rlm_rcode_t
 	int			digest_type;
 	size_t			digest_len;
 
-	uint32_t		iterations;
+	uint32_t		iterations = 0;
 
 	uint8_t			*salt = NULL;
 	size_t			salt_len;
@@ -535,8 +535,9 @@ static inline CC_HINT(nonnull) unlang_action_t pap_auth_pbkdf2_parse(rlm_rcode_t
 	 */
 	} else {
 		fr_strerror_clear();
-		slen = fr_base64_decode((uint8_t *)&iterations, sizeof(iterations), (char const *)p, q - p);
-		if (slen < 0) {
+		slen = fr_base64_decode(&FR_DBUFF_TMP((uint8_t *)&iterations, sizeof(iterations)),
+					&FR_SBUFF_IN((char const *)p, (char const *)q), false, false);
+		if (slen <= 0) {
 			RPEDEBUG("Failed decoding PBKDF2-Password iterations component (%.*s)", (int)(q - p), p);
 			goto finish;
 		}
@@ -560,8 +561,9 @@ static inline CC_HINT(nonnull) unlang_action_t pap_auth_pbkdf2_parse(rlm_rcode_t
 	}
 
 	MEM(salt = talloc_array(request, uint8_t, FR_BASE64_DEC_LENGTH(q - p)));
-	slen = fr_base64_decode(salt, talloc_array_length(salt), (char const *) p, q - p);
-	if (slen < 0) {
+	slen = fr_base64_decode(&FR_DBUFF_TMP(salt, talloc_array_length(salt)),
+				&FR_SBUFF_IN((char const *) p, (char const *)q), false, false);
+	if (slen <= 0) {
 		RPEDEBUG("Failed decoding PBKDF2-Password salt component");
 		goto finish;
 	}
@@ -574,8 +576,9 @@ static inline CC_HINT(nonnull) unlang_action_t pap_auth_pbkdf2_parse(rlm_rcode_t
 		goto finish;
 	}
 
-	slen = fr_base64_decode(hash, sizeof(hash), (char const *)p, end - p);
-	if (slen < 0) {
+	slen = fr_base64_decode(&FR_DBUFF_TMP(hash, sizeof(hash)),
+				&FR_SBUFF_IN((char const *)p, (char const *)end), false, false);
+	if (slen <= 0) {
 		RPEDEBUG("Failed decoding PBKDF2-Password hash component");
 		goto finish;
 	}
@@ -735,10 +738,10 @@ static unlang_action_t CC_HINT(nonnull) pap_auth_lm(rlm_rcode_t *p_result,
 		RETURN_MODULE_INVALID;
 	}
 
-	len = xlat_eval(charbuf, sizeof(charbuf), request, "%{mschap:LM-Hash %{User-Password}}", NULL, NULL);
+	len = xlat_eval(charbuf, sizeof(charbuf), request, "%(mschap:LM-Hash %{User-Password})", NULL, NULL);
 	if (len < 0) RETURN_MODULE_FAIL;
 
-	if ((fr_hex2bin(NULL, &FR_DBUFF_TMP(digest, sizeof(digest)), &FR_SBUFF_IN(charbuf, len), false) !=
+	if ((fr_base16_decode(NULL, &FR_DBUFF_TMP(digest, sizeof(digest)), &FR_SBUFF_IN(charbuf, len), false) !=
 	     (ssize_t)known_good->vp_length) ||
 	    (fr_digest_cmp(digest, known_good->vp_octets, known_good->vp_length) != 0)) {
 		REDEBUG("LM digest does not match \"known good\" digest");
@@ -769,7 +772,7 @@ static unlang_action_t CC_HINT(nonnull) pap_auth_ns_mta_md5(rlm_rcode_t *p_resul
 	/*
 	 *	Sanity check the value of NS-MTA-MD5-Password
 	 */
-	if (fr_hex2bin(NULL, &FR_DBUFF_TMP(digest, sizeof(digest)),
+	if (fr_base16_decode(NULL, &FR_DBUFF_TMP(digest, sizeof(digest)),
 		       &FR_SBUFF_IN(known_good->vp_strvalue, known_good->vp_length), false) != 16) {
 		REDEBUG("\"known good\" NS-MTA-MD5-Password has invalid value");
 		RETURN_MODULE_INVALID;

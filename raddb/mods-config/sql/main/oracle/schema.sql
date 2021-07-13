@@ -40,7 +40,8 @@ CREATE TABLE radacct (
 	framedinterfaceid	VARCHAR(44),
 	delegatedipv6prefix	VARCHAR(45),
 	acctstartdelay		NUMERIC(12),
-	acctstopdelay		NUMERIC(12)
+	acctstopdelay		NUMERIC(12),
+	class 			VARCHAR(64)
 );
 
 CREATE UNIQUE INDEX radacct_idx0
@@ -206,7 +207,8 @@ CREATE TABLE radpostauth (
 	  UserName      VARCHAR(64) NOT NULL,
 	  Pass          VARCHAR(64),
 	  Reply         VARCHAR(64),
-	  AuthDate 	TIMESTAMP(6) WITH TIME ZONE
+	  AuthDate 	TIMESTAMP(6) WITH TIME ZONE,
+	  Class         VARCHAR(64)
 );
 
 CREATE SEQUENCE radpostauth_seq START WITH 1 INCREMENT BY 1;

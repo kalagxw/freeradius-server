@@ -60,6 +60,7 @@ fr_dict_attr_t const *attr_eap_message;
 fr_dict_attr_t const *attr_message_authenticator;
 fr_dict_attr_t const *attr_state;
 fr_dict_attr_t const *attr_vendor_specific;
+fr_dict_attr_t const *attr_nas_filter_rule;
 
 extern fr_dict_attr_autoload_t libfreeradius_radius_dict_attr[];
 fr_dict_attr_autoload_t libfreeradius_radius_dict_attr[] = {
@@ -72,6 +73,7 @@ fr_dict_attr_autoload_t libfreeradius_radius_dict_attr[] = {
 	{ .out = &attr_message_authenticator, .name = "Message-Authenticator", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_state, .name = "State", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_vendor_specific, .name = "Vendor-Specific", .type = FR_TYPE_VSA, .dict = &dict_radius },
+	{ .out = &attr_nas_filter_rule, .name = "NAS-Filter-Rule", .type = FR_TYPE_STRING, .dict = &dict_radius },
 	{ NULL }
 };
 
@@ -235,7 +237,7 @@ ssize_t fr_radius_ascend_secret(fr_dbuff_t *dbuff, uint8_t const *in, size_t inl
 	fr_md5_ctx_t		*md5_ctx;
 	size_t			i;
 	uint8_t			digest[MD5_DIGEST_LENGTH];
-	fr_dbuff_t		work_dbuff = FR_DBUFF_NO_ADVANCE(dbuff);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 
 	FR_DBUFF_EXTEND_LOWAT_OR_RETURN(&work_dbuff, sizeof(digest));
 
@@ -919,10 +921,10 @@ ssize_t fr_radius_encode_dbuff(fr_dbuff_t *dbuff, uint8_t const *original,
 	/*
 	 *	The RADIUS header can't do more than 64K of data.
 	 */
-	work_dbuff = FR_DBUFF_MAX_NO_ADVANCE(dbuff, 65535);
+	work_dbuff = FR_DBUFF_MAX(dbuff, 65535);
 
 	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, code, id);
-	length_dbuff = FR_DBUFF_NO_ADVANCE(&work_dbuff);
+	length_dbuff = FR_DBUFF(&work_dbuff);
 	FR_DBUFF_IN_RETURN(&work_dbuff, (uint16_t) RADIUS_HEADER_LENGTH);
 
 	switch (code) {
@@ -1117,11 +1119,6 @@ static fr_table_num_ordered_t const subtype_table[] = {
 static bool attr_valid(UNUSED fr_dict_t *dict, fr_dict_attr_t const *parent,
 		       UNUSED char const *name, UNUSED int attr, fr_type_t type, fr_dict_attr_flags_t *flags)
 {
-	if (flags->array) {
-		fr_strerror_const("RADIUS does not support the 'array' flag.");
-		return false;
-	}
-
 	if (parent->type == FR_TYPE_STRUCT) {
 		if (flag_extended(flags)) {
 			fr_strerror_const("Attributes of type 'extended' cannot be used inside of a 'struct'");

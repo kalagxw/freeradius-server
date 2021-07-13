@@ -46,7 +46,8 @@ CREATE TABLE [radacct] (
 	[FramedInterfaceId] [varchar] (44) NOT NULL,
 	[DelegatedIPv6Prefix] [varchar] (45) NOT NULL,
 	[AcctStartDelay] [int] NULL,
-	[AcctStopDelay] [int] NULL
+	[AcctStopDelay] [int] NULL,
+	[Class] [varchar] (64) NULL
 ) ON [PRIMARY]
 GO
 
@@ -79,6 +80,7 @@ ALTER TABLE [radacct] WITH NOCHECK ADD
 	CONSTRAINT [DF_radacct_DelegatedIPv6Prefix] DEFAULT ('') FOR [DelegatedIPv6Prefix],
 	CONSTRAINT [DF_radacct_AcctStartDelay] DEFAULT (null) FOR [AcctStartDelay],
 	CONSTRAINT [DF_radacct_AcctStopDelay] DEFAULT (null) FOR [AcctStopDelay],
+	CONSTRAINT [DF_radacct_Class] DEFAULT (null) FOR [Class],
 	CONSTRAINT [PK_radacct] PRIMARY KEY NONCLUSTERED
 	(
 		[RadAcctId]
@@ -116,6 +118,9 @@ CREATE INDEX [AcctStopTime] ON [radacct]([AcctStopTime]) ON [PRIMARY]
 GO
 
 CREATE INDEX [NASIPAddress] ON [radacct]([NASIPAddress]) ON [PRIMARY]
+GO
+
+CREATE INDEX [Class] ON [radacct]([Class]) ON [PRIMARY]
 GO
 
 -- For use by onoff
@@ -271,7 +276,8 @@ CREATE TABLE [radpostauth] (
 	[userName] [varchar] (64) NOT NULL ,
 	[pass] [varchar] (64) NOT NULL ,
 	[reply] [varchar] (32) NOT NULL ,
-	[authdate] [datetime] NOT NULL
+	[authdate] [datetime] NOT NULL,
+	[class] [varchar] (64) NULL
 )
 GO
 
@@ -280,6 +286,7 @@ ALTER TABLE [radpostauth] WITH NOCHECK ADD
 	CONSTRAINT [DF_radpostauth_pass] DEFAULT ('') FOR [pass],
 	CONSTRAINT [DF_radpostauth_reply] DEFAULT ('') FOR [reply],
 	CONSTRAINT [DF_radpostauth_authdate] DEFAULT (getdate()) FOR [authdate],
+	CONSTRAINT [DF_radpostauth_class] DEFAULT ('') FOR [class],
 	CONSTRAINT [PK_radpostauth] PRIMARY KEY NONCLUSTERED
 	(
 		[id]

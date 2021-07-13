@@ -39,19 +39,19 @@ RCSID("$Id$")
 static _Thread_local unlang_interpret_t *intp_thread_default;
 
 static fr_table_num_ordered_t const unlang_action_table[] = {
-	{ L("unwind"), 		UNLANG_ACTION_UNWIND },
+	{ L("unwind"), 			UNLANG_ACTION_UNWIND },
 	{ L("calculate-result"),	UNLANG_ACTION_CALCULATE_RESULT },
-	{ L("next"),		UNLANG_ACTION_EXECUTE_NEXT },
-	{ L("pushed-child"),	UNLANG_ACTION_PUSHED_CHILD },
-	{ L("stop"),		UNLANG_ACTION_STOP_PROCESSING },
-	{ L("yield"),		UNLANG_ACTION_YIELD }
+	{ L("next"),			UNLANG_ACTION_EXECUTE_NEXT },
+	{ L("pushed-child"),		UNLANG_ACTION_PUSHED_CHILD },
+	{ L("stop"),			UNLANG_ACTION_STOP_PROCESSING },
+	{ L("yield"),			UNLANG_ACTION_YIELD }
 };
 static size_t unlang_action_table_len = NUM_ELEMENTS(unlang_action_table);
 
 static fr_table_num_ordered_t const unlang_frame_action_table[] = {
-	{ L("pop"), 		UNLANG_FRAME_ACTION_POP		},
-	{ L("next"),		UNLANG_FRAME_ACTION_NEXT	},
-	{ L("yield"),		UNLANG_FRAME_ACTION_YIELD	}
+	{ L("pop"), 			UNLANG_FRAME_ACTION_POP		},
+	{ L("next"),			UNLANG_FRAME_ACTION_NEXT	},
+	{ L("yield"),			UNLANG_FRAME_ACTION_YIELD	}
 };
 static size_t unlang_frame_action_table_len = NUM_ELEMENTS(unlang_frame_action_table);
 
@@ -73,6 +73,10 @@ static void instruction_dump(request_t *request, unlang_t const *instruction)
 
 static void frame_dump(request_t *request, unlang_stack_frame_t *frame)
 {
+	unlang_op_t	*op = NULL;
+
+	if (frame->instruction) op = &unlang_ops[frame->instruction->type];
+
 	instruction_dump(request, frame->instruction);
 
 	RINDENT();
@@ -89,6 +93,12 @@ static void frame_dump(request_t *request, unlang_stack_frame_t *frame)
 	RDEBUG2("break_point    %s", is_break_point(frame) ? "yes" : "no");
 	RDEBUG2("return_point   %s", is_return_point(frame) ? "yes" : "no");
 	RDEBUG2("resumable      %s", is_yielded(frame) ? "yes" : "no");
+
+	/*
+	 *	Call the custom frame dump function
+	 */
+	if (op && op->dump) op->dump(request, frame);
+
 	REXDENT();
 }
 
@@ -134,7 +144,7 @@ int unlang_interpret_push(request_t *request, unlang_t const *instruction,
 	fr_assert(instruction || top_frame);
 
 #ifndef NDEBUG
-	if (DEBUG_ENABLED5) RDEBUG3("unlang_interpret_push called with instruction %s - args %s %s",
+	if (DEBUG_ENABLED5) RDEBUG3("unlang_interpret_push called with instruction type \"%s\" - args %s %s",
 				    instruction ? instruction->debug_name : "<none>",
 				    do_next_sibling ? "UNLANG_NEXT_SIBLING" : "UNLANG_NEXT_STOP",
 				    top_frame ? "UNLANG_TOP_FRAME" : "UNLANG_SUB_FRAME");
@@ -206,7 +216,7 @@ unlang_frame_action_t result_calculate(request_t *request, unlang_stack_frame_t 
 	/*
 	 *	Don't set action or priority if we don't have one.
 	 */
-	if (*result == RLM_MODULE_UNKNOWN) return UNLANG_FRAME_ACTION_NEXT;
+	if (*result == RLM_MODULE_NOT_SET) return UNLANG_FRAME_ACTION_NEXT;
 
 	/*
 	 *	The child's action says return.  Do so.
@@ -327,7 +337,7 @@ unlang_frame_action_t frame_eval(request_t *request, unlang_stack_frame_t *frame
 	 */
 	while (frame->instruction) {
 		unlang_t const		*instruction = frame->instruction;
-		unlang_action_t		action = UNLANG_ACTION_UNWIND;
+		unlang_action_t		ua = UNLANG_ACTION_UNWIND;
 
 		DUMP_STACK;
 
@@ -374,15 +384,26 @@ unlang_frame_action_t frame_eval(request_t *request, unlang_stack_frame_t *frame
 			unlang_ops[instruction->type].name);
 
 		fr_assert(frame->process != NULL);
-		action = frame->process(result, request, frame);
+
+		/*
+		 *	Clear the repeatable flag so this frame
+		 *	won't get executed again unless it specifically
+		 *	requests it.
+		 *
+		 *	The flag may still be set again during the
+		 *	process function to indicate that the frame
+		 *	should be evaluated again.
+		 */
+		repeatable_clear(frame);
+		ua = frame->process(result, request, frame);
 
 		RDEBUG4("** [%i] %s << %s (%d)", stack->depth, __FUNCTION__,
-			fr_table_str_by_value(unlang_action_table, action, "<INVALID>"), *priority);
+			fr_table_str_by_value(unlang_action_table, ua, "<INVALID>"), *priority);
 
 		fr_assert(*priority >= -1);
 		fr_assert(*priority <= MOD_PRIORITY_MAX);
 
-		switch (action) {
+		switch (ua) {
 		/*
 		 *	The request is now defunct, and we should not
 		 *	continue processing it.
@@ -414,39 +435,23 @@ unlang_frame_action_t frame_eval(request_t *request, unlang_stack_frame_t *frame
 
 		/*
 		 *	Yield control back to the scheduler, or whatever
-		 *	called the interpret.
+		 *	called the interpreter.
 		 */
 		case UNLANG_ACTION_YIELD:
-			/*
-			 *	Detach is magic.  The parent "subrequest" function
-			 *	takes care of bumping the instruction
-			 *	pointer...
-			 */
-			switch (frame->instruction->type) {
-				/*
-				 *	For sanity, we ensure that
-				 *	only known keywords can yield.
-				 */
-			case UNLANG_TYPE_MODULE:
-			case UNLANG_TYPE_PARALLEL:
-			case UNLANG_TYPE_SUBREQUEST:
-			case UNLANG_TYPE_XLAT:
-			case UNLANG_TYPE_CALL:
-			case UNLANG_TYPE_DETACH:
-			case UNLANG_TYPE_FUNCTION:
-			case UNLANG_TYPE_TMPL:
-				repeatable_set(frame);
-				yielded_set(frame);
-				RDEBUG4("** [%i] %s - yielding with current (%s %d)", stack->depth, __FUNCTION__,
-					fr_table_str_by_value(mod_rcode_table, frame->result, "<invalid>"),
-					frame->priority);
-				DUMP_STACK;
-				return UNLANG_FRAME_ACTION_YIELD;
+			yielded_set(frame);
+			RDEBUG4("** [%i] %s - yielding with current (%s %d)", stack->depth, __FUNCTION__,
+				fr_table_str_by_value(mod_rcode_table, frame->result, "<invalid>"),
+				frame->priority);
+			DUMP_STACK;
+			return UNLANG_FRAME_ACTION_YIELD;
 
-			default:
-				fr_assert(0);
-				return UNLANG_FRAME_ACTION_YIELD;
-			}
+		/*
+		 *	This action is intended to be returned by library
+		 *	functions.  It reduces the boilerplate.
+		 */
+		case UNLANG_ACTION_FAIL:
+			*result = RLM_MODULE_FAIL;
+			FALL_THROUGH;
 
 		/*
 		 *	Instruction finished execution,
@@ -454,10 +459,6 @@ unlang_frame_action_t frame_eval(request_t *request, unlang_stack_frame_t *frame
 		 *	the section rcode and priority.
 		 */
 		case UNLANG_ACTION_CALCULATE_RESULT:
-			fr_assert(*result != RLM_MODULE_UNKNOWN);
-
-			repeatable_clear(frame);
-
 			if (unlang_ops[instruction->type].debug_braces) {
 				REXDENT();
 
@@ -474,7 +475,11 @@ unlang_frame_action_t frame_eval(request_t *request, unlang_stack_frame_t *frame
 				}
 			}
 
-			*priority = instruction->actions[*result];
+			/*
+			 *	RLM_MODULE_NOT_SET means the instruction
+			 *	doesn't want to modify the result.
+			 */
+			if (*result != RLM_MODULE_NOT_SET) *priority = instruction->actions[*result];
 
 			if (result_calculate(request, frame, result, priority) == UNLANG_FRAME_ACTION_POP) {
 				return UNLANG_FRAME_ACTION_POP;
@@ -485,7 +490,7 @@ unlang_frame_action_t frame_eval(request_t *request, unlang_stack_frame_t *frame
 		 *	Execute the next instruction in this frame
 		 */
 		case UNLANG_ACTION_EXECUTE_NEXT:
-			if ((action == UNLANG_ACTION_EXECUTE_NEXT) && unlang_ops[instruction->type].debug_braces) {
+			if ((ua == UNLANG_ACTION_EXECUTE_NEXT) && unlang_ops[instruction->type].debug_braces) {
 				REXDENT();
 				RDEBUG2("}");
 			}
@@ -648,7 +653,7 @@ CC_HINT(hot) rlm_rcode_t unlang_interpret(request_t *request)
 	/*
 	 *	Nothing in this section, use the top frame stack->result.
 	 */
-	if ((stack->priority < 0) || (stack->result == RLM_MODULE_UNKNOWN)) {
+	if ((stack->priority < 0) || (stack->result == RLM_MODULE_NOT_SET)) {
 			RDEBUG4("** [%i] %s - empty section, using stack result (%s %d)", stack->depth, __FUNCTION__,
 				fr_table_str_by_value(mod_rcode_table, stack->result, "<invalid>"), stack->priority);
 		stack->result = frame->result;
@@ -786,7 +791,7 @@ void *unlang_interpret_stack_alloc(TALLOC_CTX *ctx)
 	 *	like too low level to make into a tuneable.
 	 */
 	stack = talloc_zero_pooled_object(ctx, unlang_stack_t, UNLANG_STACK_MAX, 128);	/* 128 bytes per state */
-	stack->result = RLM_MODULE_UNKNOWN;
+	stack->result = RLM_MODULE_NOT_SET;
 
 	return stack;
 }
@@ -997,6 +1002,13 @@ bool unlang_request_is_scheduled(request_t const *request)
 	unlang_interpret_t	*intp = stack->intp;
 
 	return intp->funcs.scheduled(request, intp->uctx);
+}
+
+/** Return whether a request has been cancelled
+ */
+bool unlang_request_is_cancelled(request_t const *request)
+{
+	return (request->master_state == REQUEST_STOP_PROCESSING);
 }
 
 /** Check if a request as resumable.

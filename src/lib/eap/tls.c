@@ -71,6 +71,7 @@
 RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
+#include <freeradius-devel/unlang/function.h>
 #include "tls.h"
 #include "attrs.h"
 
@@ -86,7 +87,7 @@ fr_table_num_ordered_t const eap_tls_status_table[] = {
 
 	{ L("first"),			EAP_TLS_RECORD_RECV_FIRST	},
 	{ L("more"),			EAP_TLS_RECORD_RECV_MORE	},
-	{ L("complete"),			EAP_TLS_RECORD_RECV_COMPLETE	}
+	{ L("complete"),		EAP_TLS_RECORD_RECV_COMPLETE	}
 };
 size_t eap_tls_status_table_len = NUM_ELEMENTS(eap_tls_status_table);
 
@@ -113,7 +114,7 @@ int eap_tls_compose(request_t *request, eap_session_t *eap_session, eap_tls_stat
 {
 	eap_round_t		*eap_round = eap_session->this_round;
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
-	fr_tls_session_t		*tls_session = eap_tls_session->tls_session;
+	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
 	uint8_t			*p;
 	size_t			len = 1;	/* Flags */
 
@@ -253,19 +254,12 @@ int eap_tls_start(request_t *request, eap_session_t *eap_session)
  *
  * @param[in] request			The current subrequest.
  * @param[in] eap_session		that completed successfully.
- * @param[in] keying_prf_label		PRF label to use for generating keying material.
- *					If NULL, no MPPE keys will be generated.
- * @param[in] keying_prf_label_len	Length of the keying PRF label.
- * @param[in] sessid_prf_label		PRF label to use when generating the session ID.
- *					If NULL, session ID will be based on client/server randoms.
- * @param[in] sessid_prf_label_len	Length of the session ID PRF label.
+ * @param[in] prf_label			PRF label struct
  * @return
  *	- 0 on success.
  *	- -1 on failure.
  */
-int eap_tls_success(request_t *request, eap_session_t *eap_session,
-		    char const *keying_prf_label, size_t keying_prf_label_len,
-		    char const *sessid_prf_label, size_t sessid_prf_label_len)
+int eap_tls_success(request_t *request, eap_session_t *eap_session, eap_tls_prf_label_t *prf_label)
 {
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
 	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
@@ -274,41 +268,18 @@ int eap_tls_success(request_t *request, eap_session_t *eap_session,
 
 	eap_session->finished = true;
 
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-	/*
-	 *	Check session resumption is allowed, disabling it
-	 *	if it's not.
-	 */
-	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_REQUEST, request);
-	fr_tls_cache_disable_cb(tls_session->ssl, -1);
-	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_REQUEST, NULL);	//-V575
-#endif
-
-	/*
-	 *	Write the session to the session cache
-	 *
-	 *	We do this here (instead of relying on OpenSSL to call the
-	 *	session caching callback), because we only want to write
-	 *	session data to the cache if all phases were successful.
-	 *
-	 *	If we wrote out the cache data earlier, and the server
-	 *	exited whilst the session was in progress, the supplicant
-	 *	could resume the session (and get access) even if phase2
-	 *	never completed.
-	 */
-	fr_tls_cache_write(request, tls_session);
-
 	/*
 	 *	Build the success packet
 	 */
 	if (eap_tls_compose(request, eap_session, EAP_TLS_ESTABLISHED,
 			    eap_tls_session->base_flags, NULL, 0, 0) < 0) return -1;
 
+	if (!prf_label) return 0;
+
 	/*
 	 *	Automatically generate MPPE keying material.
 	 */
-	if (keying_prf_label) if (eap_crypto_mppe_keys(request->parent, tls_session->ssl,
-						       keying_prf_label, keying_prf_label_len) < 0) return -1;
+	if (eap_crypto_mppe_keys(request->parent, tls_session->ssl, prf_label) < 0) return -1;
 
 	/*
 	 *	Add the EAP session ID to the request
@@ -318,9 +289,8 @@ int eap_tls_success(request_t *request, eap_session_t *eap_session,
 		fr_pair_t	*vp;
 
 		MEM(pair_append_reply(&vp, attr_eap_session_id) >= 0);
-		if (eap_crypto_tls_session_id(vp, request, tls_session->ssl,
-					      &session_id, eap_session->type,
-					      sessid_prf_label, sessid_prf_label_len) < 0) {
+		if (eap_crypto_tls_session_id(vp, request, tls_session->ssl, prf_label,
+					      &session_id, eap_session->type) < 0) {
 			pair_delete_reply(vp);
 			return -1;
 		}
@@ -350,7 +320,7 @@ int eap_tls_success(request_t *request, eap_session_t *eap_session,
 int eap_tls_fail(request_t *request, eap_session_t *eap_session)
 {
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
-	fr_tls_session_t		*tls_session = eap_tls_session->tls_session;
+	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
 
 	fr_assert(request->parent);	/* must be a subrequest */
 
@@ -400,7 +370,7 @@ int eap_tls_fail(request_t *request, eap_session_t *eap_session)
 int eap_tls_request(request_t *request, eap_session_t *eap_session)
 {
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
-	fr_tls_session_t		*tls_session = eap_tls_session->tls_session;
+	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
 	uint8_t			flags = eap_tls_session->base_flags;
 	size_t			frag_len;
 	bool			length_included;
@@ -818,29 +788,82 @@ ignore_length:
 	return EAP_TLS_RECORD_RECV_COMPLETE;
 }
 
-/** Continue with the handshake
+/** Process the result from the last TLS handshake round
  *
- * @param[in] request		the current subrequest.
- * @param[in] eap_session	to continue.
  * @return
- *	- EAP_TLS_FAIL if the message is invalid.
- *	- EAP_TLS_HANDLED if we need to send an additional request to the peer.
- *	- EAP_TLS_ESTABLISHED if the handshake completed successfully, and there's
- *	  no more data to send.
+ *	- eap_tls_session->state = EAP_TLS_FAIL if the message is invalid.
+ *	- eap_tls_session->state = EAP_TLS_HANDLED if we need to send an
+ *	  additional request to the peer.
+ *	- eap_tls_session->state = EAP_TLS_ESTABLISHED if the handshake
+ *	  completed successfully, and there's no more data to send.
  */
-static eap_tls_status_t eap_tls_handshake(request_t *request, eap_session_t *eap_session)
+static unlang_action_t eap_tls_handshake_resume(UNUSED rlm_rcode_t *p_result, UNUSED int *priority,
+						request_t *request, void *uctx)
 {
+	eap_session_t		*eap_session = talloc_get_type_abort(uctx, eap_session_t);
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
-	fr_tls_session_t		*tls_session = eap_tls_session->tls_session;
+	fr_tls_session_t	*tls_session = talloc_get_type_abort(eap_tls_session->tls_session, fr_tls_session_t);
 
-	/*
-	 *	Continue the TLS handshake
-	 */
-	if (fr_tls_session_handshake(request, tls_session) < 0) {
+	switch (tls_session->result) {
+	case FR_TLS_RESULT_IN_PROGRESS:
+	default:
+		fr_assert(0);	/* Shouldn't have been called */
+		goto finish;
+
+	case FR_TLS_RESULT_ERROR:
 		REDEBUG("TLS receive handshake failed during operation");
 		fr_tls_cache_deny(tls_session);
-		return EAP_TLS_FAIL;
+		eap_tls_session->state = EAP_TLS_FAIL;
+		goto finish;
+
+	case FR_TLS_RESULT_SUCCESS:
+		break;
 	}
+
+#ifdef TLS1_3_VERSION
+	/*
+	 *	https://tools.ietf.org/html/draft-ietf-emu-eap-tls13#section-2.5
+	 *
+	 *	We need to signal the other end that TLS negotiation
+	 *	is done.  We can't send a zero-length application data
+	 *	message, so we send application data which is one byte
+	 *	of zero.
+	 *
+	 *	Note this is only done for when there is no application
+	 *	data to be sent. So this is done always for EAP-TLS but
+	 *	notibly not for PEAP even on resumption.
+	 *
+	 *	We only want to send this application data IF:
+	 *
+	 *      * EAP-TLS / TTLS / PEAP - session was resumed
+	 *	* EAP-TLS
+	 *		* SSL init is finished (presumed to be checked elsewhere)
+	 *		* we saw the client cert
+	 *		* OR we're using unauthenticated EAP-TLS where
+	 *		  the administrator has decided to not ask for
+	 *		  the client cert
+	 */
+	if ((tls_session->info.version == TLS1_3_VERSION) &&
+	    (tls_session->client_cert_ok || eap_tls_session->authentication_success || SSL_session_reused(tls_session->ssl))) {
+		if ((eap_session->type == FR_EAP_METHOD_TLS) || SSL_session_reused(tls_session->ssl)) {
+			eap_tls_session->authentication_success = true;
+
+			RDEBUG("(TLS) EAP Sending final Commitment Message.");
+			tls_session->record_from_buff(&tls_session->clean_in, "\0", 1);
+		}
+
+		/*
+		 *	Always returns UNLANG_ACTION_CALCULATE_RESULT
+		 */
+		(void) fr_tls_session_async_handshake_push(request, tls_session);
+		if (tls_session->result != FR_TLS_RESULT_SUCCESS) {
+			REDEBUG("TLS receive handshake failed during operation");
+			fr_tls_cache_deny(tls_session);
+			eap_tls_session->state = EAP_TLS_FAIL;
+			return UNLANG_ACTION_CALCULATE_RESULT;
+		}
+	}
+#endif
 
 	/*
 	 *	FIXME: return success/fail.
@@ -849,7 +872,8 @@ static eap_tls_status_t eap_tls_handshake(request_t *request, eap_session_t *eap
 	 */
 	if (tls_session->dirty_out.used > 0) {
 		eap_tls_request(request, eap_session);
-		return EAP_TLS_HANDLED;
+		eap_tls_session->state = EAP_TLS_HANDLED;
+		goto finish;
 	}
 
 	/*
@@ -868,14 +892,43 @@ static eap_tls_status_t eap_tls_handshake(request_t *request, eap_session_t *eap
 		 *	application data.
 		 */
 		tls_session->info.content_type = SSL3_RT_APPLICATION_DATA;
-		return EAP_TLS_ESTABLISHED;
+		eap_tls_session->state = EAP_TLS_ESTABLISHED;
+		goto finish;
 	}
 
 	/*
 	 *	Who knows what happened...
 	 */
 	REDEBUG("TLS failed during operation");
-	return EAP_TLS_FAIL;
+	eap_tls_session->state = EAP_TLS_FAIL;
+
+finish:
+	return UNLANG_ACTION_CALCULATE_RESULT;
+}
+
+/** Push functions to continue the handshake asynchronously
+ *
+ * @param[in] request		the current subrequest.
+ * @param[in] eap_session	to continue.
+ * @return
+ *	- UNLANG_ACTION_PUSHED_CHILD
+ */
+static inline CC_HINT(always_inline) unlang_action_t eap_tls_handshake_push(request_t *request, eap_session_t *eap_session)
+{
+	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
+	fr_tls_session_t	*tls_session = talloc_get_type_abort(eap_tls_session->tls_session, fr_tls_session_t);
+
+	/*
+	 *	Will run after the handshake round completes
+	 */
+	if (unlang_function_push(request,
+				 NULL,
+				 eap_tls_handshake_resume,
+				 NULL, UNLANG_SUB_FRAME, eap_session) < 0) return UNLANG_ACTION_FAIL;
+
+	if (fr_tls_session_async_handshake_push(request, tls_session) < 0) return UNLANG_ACTION_FAIL;
+
+	return UNLANG_ACTION_PUSHED_CHILD;
 }
 
 /** Process an EAP TLS request
@@ -901,13 +954,12 @@ static eap_tls_status_t eap_tls_handshake(request_t *request, eap_session_t *eap
  *	- EAP_TLS_ESTABLISHED
  *	- EAP_TLS_HANDLED
  */
-eap_tls_status_t eap_tls_process(request_t *request, eap_session_t *eap_session)
+unlang_action_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 {
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
-	fr_tls_session_t		*tls_session = eap_tls_session->tls_session;
+	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
 
 	eap_round_t		*this_round = eap_session->this_round;
-	eap_tls_status_t	status;
 
 	eap_tls_data_t		*eap_tls_data;
 	uint8_t			*data;
@@ -920,15 +972,15 @@ eap_tls_status_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 	/*
 	 *	Call eap_tls_verify to sanity check the incoming EAP data.
 	 */
-	status = eap_tls_verify(request, eap_session);
-	switch (status) {
+	eap_tls_session->state = eap_tls_verify(request, eap_session);
+	switch (eap_tls_session->state) {
 	case EAP_TLS_INVALID:
 	case EAP_TLS_FAIL:
-		REDEBUG("[eap-tls verify] = %s", fr_table_str_by_value(eap_tls_status_table, status, "<INVALID>"));
+		REDEBUG("[eap-tls verify] = %s", fr_table_str_by_value(eap_tls_status_table, eap_tls_session->state, "<INVALID>"));
 		break;
 
 	default:
-		RDEBUG2("[eap-tls verify] = %s", fr_table_str_by_value(eap_tls_status_table, status, "<INVALID>"));
+		RDEBUG2("[eap-tls verify] = %s", fr_table_str_by_value(eap_tls_status_table, eap_tls_session->state, "<INVALID>"));
 		break;
 	}
 
@@ -937,7 +989,7 @@ eap_tls_status_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 	 *	for EAP-TLS, based on what state OpenSSL reported the TLS session
 	 *	to be in, and what flags were last received from the peer.
 	 */
-	switch (status) {
+	switch (eap_tls_session->state) {
 	/*
 	 *	We've received a complete TLS record, this is the same as receiving a
 	 *	fragment, except we also process the complete record.
@@ -973,16 +1025,16 @@ eap_tls_status_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 		 */
 		if ((tls_session->record_from_buff)(&tls_session->dirty_in, data, data_len) != data_len) {
 			REDEBUG("Exceeded maximum record size");
-			status = EAP_TLS_FAIL;
+			eap_tls_session->state = EAP_TLS_FAIL;
 			goto done;
 		}
 
 		/*
 		 *	ACK fragments until we get a complete TLS record.
 		 */
-		if (status != EAP_TLS_RECORD_RECV_COMPLETE) {
+		if (eap_tls_session->state != EAP_TLS_RECORD_RECV_COMPLETE) {
 			eap_tls_ack(request, eap_session);
-			status = EAP_TLS_HANDLED;
+			eap_tls_session->state = EAP_TLS_HANDLED;
 			goto done;
 		}
 
@@ -999,19 +1051,22 @@ eap_tls_status_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 			ret = fr_tls_session_recv(request, tls_session);
 			switch (ret) {
 			case 0:
-				status = EAP_TLS_RECORD_RECV_COMPLETE;
+				eap_tls_session->state = EAP_TLS_RECORD_RECV_COMPLETE;
 				break;
 
 			case 1:
-				status = EAP_TLS_RECORD_RECV_MORE;
+				eap_tls_session->state = EAP_TLS_RECORD_RECV_MORE;
 				break;
 
 			default:
-				status = EAP_TLS_FAIL;
+				eap_tls_session->state = EAP_TLS_FAIL;
 				break;
 			}
 		} else {
-			status = eap_tls_handshake(request, eap_session);
+			/*
+			 *	Asynchronously process more handshake data
+			 */
+			return eap_tls_handshake_push(request, eap_session);
 		}
 		break;
 	/*
@@ -1025,11 +1080,12 @@ eap_tls_status_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 		if (!eap_tls_session->phase2 && (tls_session->dirty_out.used == 0) &&
 		    SSL_is_init_finished(tls_session->ssl)) {
 			eap_tls_session->phase2 = true;
-			return EAP_TLS_RECORD_RECV_COMPLETE;
+			eap_tls_session->state = EAP_TLS_ESTABLISHED;
+			goto done;
 		}
 
 		eap_tls_request(request, eap_session);
-		status = EAP_TLS_HANDLED;
+		eap_tls_session->state = EAP_TLS_HANDLED;
 		goto done;
 
 	/*
@@ -1048,7 +1104,8 @@ eap_tls_status_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 	}
 
  done:
-	return status;
+
+	return UNLANG_ACTION_CALCULATE_RESULT;
 }
 
 /** Create a new fr_tls_session_t associated with an #eap_session_t
@@ -1059,17 +1116,18 @@ eap_tls_status_t eap_tls_process(request_t *request, eap_session_t *eap_session)
  *
  * @param[in] request		The current subrequest.
  * @param[in] eap_session	to use as a context for the eap_tls_session_t
- * @param[in] tls_conf		to use to configure the fr_tls_session_t.
+ * @param[in] ssl_ctx		to use to configure the fr_tls_session_t.
  * @param[in] client_cert	Whether we require the peer to prevent a certificate.
  * @return
  *	- A new eap_tls_session on success.
  *	- NULL on error.
  */
 eap_tls_session_t *eap_tls_session_init(request_t *request, eap_session_t *eap_session,
-					fr_tls_conf_t *tls_conf, bool client_cert)
+					SSL_CTX *ssl_ctx, bool client_cert)
 {
 	eap_tls_session_t	*eap_tls_session;
-	fr_tls_session_t		*tls_session;
+	fr_tls_session_t	*tls_session;
+	fr_tls_conf_t		*conf = fr_tls_ctx_conf(ssl_ctx);
 
 	fr_assert(request->parent);	/* must be a subrequest */
 
@@ -1077,7 +1135,7 @@ eap_tls_session_t *eap_tls_session_init(request_t *request, eap_session_t *eap_s
 	 *	This EAP session is associated with a TLS session
 	 */
 	eap_session->tls = true;
-	eap_tls_session = talloc_zero(eap_session, eap_tls_session_t);
+	MEM(eap_tls_session = talloc_zero(eap_session, eap_tls_session_t));
 
 	/*
 	 *	Initial state.
@@ -1099,20 +1157,40 @@ eap_tls_session_t *eap_tls_session_init(request_t *request, eap_session_t *eap_s
 	 *	in the SSL session's opaque data so that we can use
 	 *	these data structures when we get the response.
 	 */
-	eap_tls_session->tls_session = tls_session = fr_tls_session_init_server(eap_tls_session, tls_conf,
-									     request, client_cert);
-	if (!tls_session) return NULL;
+	eap_tls_session->tls_session = tls_session = fr_tls_session_alloc_server(eap_tls_session, ssl_ctx,
+										 request, client_cert);
+	if (unlikely(!tls_session)) return NULL;
+
+	/*
+	 *	Add the EAP-Identity value to the TLS session so
+	 *	it's available in all the TLS callbacks.
+	 */
+	{
+		fr_pair_t	*identity;
+
+		MEM(identity = fr_pair_afrom_da(tls_session, attr_eap_identity));
+		fr_pair_value_bstrdup_buffer(identity, eap_session->identity, true);
+		fr_tls_session_extra_pair_add_shallow(tls_session, identity);
+	}
+
+	/*
+	 *	Add the EAP-Type we're running to the subrequest.
+	 */
+	{
+		fr_pair_t	*type_vp;
+
+		MEM(type_vp = fr_pair_afrom_da(tls_session, attr_eap_type));
+		type_vp->vp_uint32 = eap_session->type;
+		fr_tls_session_extra_pair_add_shallow(tls_session, type_vp);
+	}
 
 	/*
 	 *	Associate various bits of opaque data with the session.
 	 */
 	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_EAP_SESSION, (void *)eap_session);
 	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_TLS_SESSION, (void *)tls_session);
-	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_CONF, (void *)tls_conf);
+	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_CONF, (void *)conf);
 	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_IDENTITY, (void *)&(eap_session->identity));
-#ifdef HAVE_OPENSSL_OCSP_H
-	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_STORE, (void *)tls_conf->ocsp.store);
-#endif
 
 	return eap_tls_session;
 }

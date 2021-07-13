@@ -32,6 +32,10 @@ USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 #include "eap_fast.h"
 #include "eap_fast_crypto.h"
 
+typedef struct {
+	SSL_CTX		*ssl_ctx;		//!< Thread local SSL_CTX.
+} rlm_eap_fast_thread_t;
+
 /*
  *	An instance of EAP-FAST
  */
@@ -177,63 +181,6 @@ fr_dict_attr_autoload_t rlm_eap_fast_dict_attr[] = {
 	{ NULL }
 };
 
-/*
- *	Attach the module.
- */
-static int mod_instantiate(void *instance, CONF_SECTION *cs)
-{
-	rlm_eap_fast_t		*inst = talloc_get_type_abort(instance, rlm_eap_fast_t);
-
-	if (!virtual_server_find(inst->virtual_server)) {
-		cf_log_err_by_child(cs, "virtual_server", "Unknown virtual server '%s'", inst->virtual_server);
-		return -1;
-	}
-
-	inst->default_provisioning_method = eap_name2type(inst->default_provisioning_method_name);
-	if (!inst->default_provisioning_method) {
-		cf_log_err_by_child(cs, "default_provisioning_eap_type", "Unknown EAP type %s",
-				   inst->default_provisioning_method_name);
-		return -1;
-	}
-
-	/*
-	 *	Read tls configuration, either from group given by 'tls'
-	 *	option, or from the eap-tls configuration.
-	 */
-	inst->tls_conf = eap_tls_conf_parse(cs, "tls");
-
-	if (!inst->tls_conf) {
-		cf_log_err_by_child(cs, "tls", "Failed initializing SSL context");
-		return -1;
-	}
-
-	if (talloc_array_length(inst->pac_opaque_key) - 1 != 32) {
-		cf_log_err_by_child(cs, "pac_opaque_key", "Must be 32 bytes long");
-		return -1;
-	}
-
-	/*
-	 *	Allow anything for the TLS version, we try to forcibly
-	 *	disable TLSv1.2 later.
-	 */
-	if (inst->tls_conf->tls_min_version > (float) 1.1) {
-		cf_log_err_by_child(cs, "tls_min_version", "require tls_min_version <= 1.1");
-		return -1;
-	}
-
-	if (!inst->pac_lifetime) {
-		cf_log_err_by_child(cs, "pac_lifetime", "must be non-zero");
-		return -1;
-	}
-
-	fr_assert(PAC_A_ID_LENGTH == MD5_DIGEST_LENGTH);
-
-	fr_md5_calc(inst->a_id, (uint8_t const *)inst->authority_identity,
-		    talloc_array_length(inst->authority_identity) - 1);
-
-	return 0;
-}
-
 /** Allocate the FAST per-session data
  *
  */
@@ -272,20 +219,13 @@ static void eap_fast_session_ticket(fr_tls_session_t *tls_session, const SSL *s,
 	*secret_len = SSL_MAX_MASTER_KEY_LENGTH;
 }
 
-// hostap:src/crypto/tls_openssl.c:tls_sess_sec_cb()
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-static int _session_secret(SSL *s, void *secret, int *secret_len,
-			   UNUSED STACK_OF(SSL_CIPHER) *peer_ciphers,
-			   UNUSED SSL_CIPHER **cipher, void *arg)
-#else
 static int _session_secret(SSL *s, void *secret, int *secret_len,
 			   UNUSED STACK_OF(SSL_CIPHER) *peer_ciphers,
 			   UNUSED SSL_CIPHER const **cipher, void *arg)
-#endif
 {
 	// FIXME enforce non-anon cipher
 
-	request_t		*request = (request_t *)SSL_get_ex_data(s, FR_TLS_EX_INDEX_REQUEST);
+	request_t		*request = fr_tls_session_request(s);
 	fr_tls_session_t	*tls_session = arg;
 	eap_fast_tunnel_t	*t;
 
@@ -315,8 +255,8 @@ static int _session_secret(SSL *s, void *secret, int *secret_len,
  */
 static int _session_ticket(SSL *s, uint8_t const *data, int len, void *arg)
 {
-	fr_tls_session_t		*tls_session = talloc_get_type_abort(arg, fr_tls_session_t);
-	request_t			*request = talloc_get_type_abort(SSL_get_ex_data(s, FR_TLS_EX_INDEX_REQUEST), request_t);
+	fr_tls_session_t	*tls_session = talloc_get_type_abort(arg, fr_tls_session_t);
+	request_t		*request = fr_tls_session_request(s);
 	eap_fast_tunnel_t	*t;
 	fr_pair_list_t		fast_vps;
 	fr_pair_t		*vp;
@@ -443,36 +383,20 @@ error:
 	return 1;
 }
 
-
-/*
- *	Do authentication, by letting EAP-TLS do most of the work.
- */
-static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t mod_handshake_resume(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx,
+					    request_t *request, void *rctx)
 {
-	rlm_eap_fast_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_eap_fast_t);
-	eap_tls_status_t	status;
-
-	eap_session_t		*eap_session = eap_session_get(request->parent);
+	eap_session_t		*eap_session = talloc_get_type_abort(rctx, eap_session_t);
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
 	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
 
-	/*
-	 *	We need FAST data associated with the session, so
-	 *	allocate it here, if it wasn't already alloacted.
-	 */
-	if (!tls_session->opaque) tls_session->opaque = eap_fast_alloc(tls_session, inst);
-
-	/*
-	 *	Process TLS layer until done.
-	 */
-	status = eap_tls_process(request, eap_session);
-	if ((status == EAP_TLS_INVALID) || (status == EAP_TLS_FAIL)) {
-		REDEBUG("[eap-tls process] = %s", fr_table_str_by_value(eap_tls_status_table, status, "<INVALID>"));
+	if ((eap_tls_session->state == EAP_TLS_INVALID) || (eap_tls_session->state == EAP_TLS_FAIL)) {
+		REDEBUG("[eap-tls process] = %s", fr_table_str_by_value(eap_tls_status_table, eap_tls_session->state, "<INVALID>"));
 	} else {
-		RDEBUG2("[eap-tls process] = %s", fr_table_str_by_value(eap_tls_status_table, status, "<INVALID>"));
+		RDEBUG2("[eap-tls process] = %s", fr_table_str_by_value(eap_tls_status_table, eap_tls_session->state, "<INVALID>"));
 	}
 
-	switch (status) {
+	switch (eap_tls_session->state) {
 	/*
 	 *	EAP-TLS handshake was successful, tell the
 	 *	client to keep talking.
@@ -529,19 +453,42 @@ static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mc
 		eap_tls_request(request, eap_session);
 		RETURN_MODULE_HANDLED;
 
-		/*
-		 *	Success: Automatically return MPPE keys.
-		 */
+	/*
+	 *	Success.
+	 */
 	case FR_RADIUS_CODE_ACCESS_ACCEPT:
-		if (eap_tls_success(request, eap_session, NULL, 0, NULL, 0) < 0) RETURN_MODULE_FAIL;
-		RETURN_MODULE_OK;
+		if (eap_tls_success(request, eap_session, NULL) < 0) RETURN_MODULE_FAIL;
 
 		/*
-		 *	No response packet, MUST be proxying it.
-		 *	The main EAP module will take care of discovering
-		 *	that the request now has a "proxy" packet, and
-		 *	will proxy it, rather than returning an EAP packet.
+		 *	@todo - generate MPPE keys, which have their own magical deriviation.
 		 */
+
+		/*
+		 *	Result is always OK, even if we fail to persist the
+		 *	session data.
+		 */
+		*p_result = RLM_MODULE_OK;
+
+		/*
+		 *	Write the session to the session cache
+		 *
+		 *	We do this here (instead of relying on OpenSSL to call the
+		 *	session caching callback), because we only want to write
+		 *	session data to the cache if all phases were successful.
+		 *
+		 *	If we wrote out the cache data earlier, and the server
+		 *	exited whilst the session was in progress, the supplicant
+		 *	could resume the session (and get access) even if phase2
+		 *	never completed.
+		 */
+		return fr_tls_cache_pending_push(request, tls_session);
+
+	/*
+	 *	No response packet, MUST be proxying it.
+	 *	The main EAP module will take care of discovering
+	 *	that the request now has a "proxy" packet, and
+	 *	will proxy it, rather than returning an EAP packet.
+	 */
 	case FR_RADIUS_CODE_STATUS_CLIENT:
 		RETURN_MODULE_OK;
 
@@ -557,11 +504,31 @@ static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mc
 }
 
 /*
+ *	Do authentication, by letting EAP-TLS do most of the work.
+ */
+static unlang_action_t mod_handshake_process(UNUSED rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx,
+					     request_t *request)
+{
+	eap_session_t		*eap_session = eap_session_get(request->parent);
+
+	/*
+	 *	Setup the resumption frame to process the result
+	 */
+	(void)unlang_module_yield(request, mod_handshake_resume, NULL, eap_session);
+
+	/*
+	 *	Process TLS layer until done.
+	 */
+	return eap_tls_process(request, eap_session);
+}
+
+/*
  *	Send an initial eap-tls request to the peer, using the libeap functions.
  */
 static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
 	rlm_eap_fast_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_eap_fast_t);
+	rlm_eap_fast_thread_t	*thread = talloc_get_type_abort(mctx->thread, rlm_eap_fast_thread_t);
 	eap_session_t		*eap_session = eap_session_get(request->parent);
 	eap_tls_session_t 	*eap_tls_session;
 	fr_tls_session_t	*tls_session;
@@ -582,7 +549,7 @@ static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t cons
 		client_cert = inst->req_client_cert;
 	}
 
-	eap_session->opaque = eap_tls_session = eap_tls_session_init(request, eap_session, inst->tls_conf, client_cert);
+	eap_session->opaque = eap_tls_session = eap_tls_session_init(request, eap_session, thread->ssl_ctx, client_cert);
 	if (!eap_tls_session) RETURN_MODULE_FAIL;
 
 	tls_session = eap_tls_session->tls_session;
@@ -625,7 +592,8 @@ static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t cons
 	}
 
 	tls_session->record_init(&tls_session->clean_in);
-	eap_session->process = mod_process;
+	tls_session->opaque = eap_fast_alloc(tls_session, inst);
+	eap_session->process = mod_handshake_process;
 
 	if (!SSL_set_session_ticket_ext_cb(tls_session->ssl, _session_ticket, tls_session)) {
 		RERROR("Failed setting SSL session ticket callback");
@@ -635,6 +603,84 @@ static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t cons
 	RETURN_MODULE_HANDLED;
 }
 
+static int mod_thread_instantiate(UNUSED CONF_SECTION const *cs, void *instance,
+				  UNUSED fr_event_list_t *el, void *thread)
+{
+	rlm_eap_fast_t		*inst = talloc_get_type_abort(instance, rlm_eap_fast_t);
+	rlm_eap_fast_thread_t	*t = talloc_get_type_abort(thread, rlm_eap_fast_thread_t);
+
+	t->ssl_ctx = fr_tls_ctx_alloc(inst->tls_conf, false);
+	if (!t->ssl_ctx) return -1;
+
+	return 0;
+}
+
+static int mod_thread_detach(UNUSED fr_event_list_t *el, void *thread)
+{
+	rlm_eap_fast_thread_t	*t = talloc_get_type_abort(thread, rlm_eap_fast_thread_t);
+
+	if (likely(t->ssl_ctx != NULL)) SSL_CTX_free(t->ssl_ctx);
+	t->ssl_ctx = NULL;
+
+	return 0;
+}
+
+/*
+ *	Attach the module.
+ */
+static int mod_instantiate(void *instance, CONF_SECTION *cs)
+{
+	rlm_eap_fast_t		*inst = talloc_get_type_abort(instance, rlm_eap_fast_t);
+
+	if (!virtual_server_find(inst->virtual_server)) {
+		cf_log_err_by_child(cs, "virtual_server", "Unknown virtual server '%s'", inst->virtual_server);
+		return -1;
+	}
+
+	inst->default_provisioning_method = eap_name2type(inst->default_provisioning_method_name);
+	if (!inst->default_provisioning_method) {
+		cf_log_err_by_child(cs, "default_provisioning_eap_type", "Unknown EAP type %s",
+				   inst->default_provisioning_method_name);
+		return -1;
+	}
+
+	/*
+	 *	Read tls configuration, either from group given by 'tls'
+	 *	option, or from the eap-tls configuration.
+	 */
+	inst->tls_conf = eap_tls_conf_parse(cs, "tls");
+
+	if (!inst->tls_conf) {
+		cf_log_err_by_child(cs, "tls", "Failed initializing SSL context");
+		return -1;
+	}
+
+	if (talloc_array_length(inst->pac_opaque_key) - 1 != 32) {
+		cf_log_err_by_child(cs, "pac_opaque_key", "Must be 32 bytes long");
+		return -1;
+	}
+
+	/*
+	 *	Allow anything for the TLS version, we try to forcibly
+	 *	disable TLSv1.2 later.
+	 */
+	if (inst->tls_conf->tls_min_version > (float) 1.1) {
+		cf_log_err_by_child(cs, "tls_min_version", "require tls_min_version <= 1.1");
+		return -1;
+	}
+
+	if (!inst->pac_lifetime) {
+		cf_log_err_by_child(cs, "pac_lifetime", "must be non-zero");
+		return -1;
+	}
+
+	fr_assert(PAC_A_ID_LENGTH == MD5_DIGEST_LENGTH);
+
+	fr_md5_calc(inst->a_id, (uint8_t const *)inst->authority_identity,
+		    talloc_array_length(inst->authority_identity) - 1);
+
+	return 0;
+}
 
 /*
  *	The module name should be the only globally exported symbol.
@@ -642,13 +688,17 @@ static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t cons
  */
 extern rlm_eap_submodule_t rlm_eap_fast;
 rlm_eap_submodule_t rlm_eap_fast = {
-	.name		= "eap_fast",
-	.magic		= RLM_MODULE_INIT,
+	.name			= "eap_fast",
+	.magic			= RLM_MODULE_INIT,
 
-	.provides	= { FR_EAP_METHOD_FAST },
-	.inst_size	= sizeof(rlm_eap_fast_t),
-	.config		= submodule_config,
-	.instantiate	= mod_instantiate,	/* Create new submodule instance */
+	.provides		= { FR_EAP_METHOD_FAST },
+	.inst_size		= sizeof(rlm_eap_fast_t),
+	.config			= submodule_config,
+	.instantiate		= mod_instantiate,	/* Create new submodule instance */
 
-	.session_init	= mod_session_init,	/* Initialise a new EAP session */
+	.thread_inst_size	= sizeof(rlm_eap_fast_thread_t),
+	.thread_instantiate	= mod_thread_instantiate,
+	.thread_detach		= mod_thread_detach,
+
+	.session_init		= mod_session_init,	/* Initialise a new EAP session */
 };

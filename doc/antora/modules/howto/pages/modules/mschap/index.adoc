@@ -43,7 +43,7 @@ several options for the arguments, in particular username and domain:
 
 * `–username=%{User-Name}` - this will fail if you’re using realms or
 host-based auth
-* `–username=%{mschap:User-Name}` - this will fail if using using suffix
+* `–username=%(mschap:User-Name)` - this will fail if using using suffix
 i.e. user@domain
 
 You’ll need to fit this to your local needs.
@@ -81,8 +81,8 @@ mschap {
 
     # initial data to send
     # this MUST be supplied
-    ntlm_auth_username = "username: %{mschap:User-Name}"
-    ntlm_auth_domain = "nt-domain: %{%{mschap:NT-Domain}:-YOURDOMAIN}"
+    ntlm_auth_username = "username: %(mschap:User-Name)"
+    ntlm_auth_domain = "nt-domain: %{%(mschap:NT-Domain):-YOURDOMAIN}"
 
     # Or, you could try:
     ntlm_auth_username = "full-username: %{User-Name}"
@@ -176,7 +176,7 @@ Or:
 . update via exec/script
 
 ```
-local_cpw = `%{exec:/my/script %{User-Name} %{MS-CHAP-New-Password.Cleartext}}`
+local_cpw = `%(exec:/my/script %{User-Name} %{MS-CHAP-New-Password.Cleartext})`
 ```
 
 WARNING: Wherever possible, you should use `MS-CHAP-New-NT-Password`. The

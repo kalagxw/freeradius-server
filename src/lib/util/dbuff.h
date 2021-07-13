@@ -55,7 +55,7 @@ extern "C" {
  * dbuffs are intended to be organised into hierarchies, with one dbuff per stack
  * frame, initialised from a parent in a higher stack frame.
  *
- * Each time a dbuff is copied (using one of the provided FR_DBUFF_COPY_* macros),
+ * Each time a dbuff is copied (using one of the provided FR_DBUFF_BIND_CURRENT_* macros),
  * the copy's 'start' position is updated to be the 'current' position of its
  * parent.  This ensures length macros report only spaced used/available in the
  * new dbuff and not its parent.
@@ -121,6 +121,11 @@ struct fr_dbuff_marker_s {
 	fr_dbuff_t		*parent;	//!< Owner of the marker.
 };
 
+#define FR_DBUFF_ADV_PARENT_CURRENT	0x01		//!< Advance current position of parent.
+							//!< Useful for nested encoders/decoders.
+#define FR_DBUFF_ADV_PARENT_END		0x02		//!< Advance end pointer of parent.
+							///< Useful for producer/consumer
+
 /** A dbuff
  * @private
  */
@@ -153,8 +158,8 @@ struct fr_dbuff_s {
 		uint8_t *p;				//!< Mutable 'current' pointer.
 	};
 
-	uint8_t			is_const:1;	//!< The buffer this dbuff wraps is const.
-	uint8_t			adv_parent:1;	//!< Whether we advance the parent
+	uint8_t			is_const:1;		//!< The buffer this dbuff wraps is const.
+	uint8_t			adv_parent:2;	//!< Whether we advance the parent
 						///< of this dbuff.
 
 	size_t			shifted;	//!< How many bytes this sbuff has been
@@ -192,7 +197,7 @@ do { \
  *
  * @private
  */
-#define _FR_DBUFF_COPY(_dbuff_or_marker, _start, _adv_parent) \
+#define _FR_DBUFF(_dbuff_or_marker, _start, _adv_parent) \
 ((fr_dbuff_t){ \
 	.buff		= fr_dbuff_buff(_dbuff_or_marker), \
 	.start		= (_start), \
@@ -207,38 +212,55 @@ do { \
 })
 /* @endcond */
 
-/** Prevent an dbuff being advanced by operations on its child
+/** Create a new dbuff pointing to the same underlying buffer
  *
- * @private
+ * - Parent will _NOT_ be advanced by operations on its child.
+ * - Child will have its `start` pointer set to the `p` pointer of the parent.
  *
  * @param[in] _dbuff_or_marker	to make an ephemeral copy of.
  */
-#define FR_DBUFF_NO_ADVANCE(_dbuff_or_marker) _FR_DBUFF_COPY(_dbuff_or_marker, fr_dbuff_current(_dbuff_or_marker), false)
+#define FR_DBUFF(_dbuff_or_marker) _FR_DBUFF(_dbuff_or_marker, fr_dbuff_current(_dbuff_or_marker), 0x00)
 
-/** Prevent an dbuff being advanced by operations on its child
+/** Create a new dbuff pointing to the same underlying buffer
  *
- * Does not change the start pointer of the new dbuff.
+ * - Parent will _NOT_ be advanced by operations on its child.
+ * - Child will have its `start` pointer set to the `start` pointer of the parent.
  *
  * @param[in] _dbuff_or_marker	to make an ephemeral copy of.
  */
-#define FR_DBUFF_NO_ADVANCE_ABS(_dbuff_or_marker) _FR_DBUFF_COPY(_dbuff_or_marker, fr_dbuff_start(_dbuff_or_marker), false)
+#define FR_DBUFF_ABS(_dbuff_or_marker) _FR_DBUFF(_dbuff_or_marker, fr_dbuff_start(_dbuff_or_marker), 0x00)
 
-/** Let the dbuff be advanced by operations on its child
+/** Create a new dbuff pointing to the same underlying buffer
+ *
+ * - Parent `p` pointer will be advanced with child's `p` pointer.
+ * - Child will have its `start` pointer set to the `p` pointer of the parent.
  *
  * @param[in] _dbuff_or_marker	to make an ephemeral copy of.
  */
-#define FR_DBUFF_COPY(_dbuff_or_marker) _FR_DBUFF_COPY(_dbuff_or_marker, fr_dbuff_current(_dbuff_or_marker), true)
+#define FR_DBUFF_BIND_CURRENT(_dbuff_or_marker) _FR_DBUFF(_dbuff_or_marker, fr_dbuff_current(_dbuff_or_marker), FR_DBUFF_ADV_PARENT_CURRENT)
 
-/** Let the dbuff be advanced by operations on its child
+/** Create a new dbuff pointing to the same underlying buffer
  *
- * Does not change the start pointer of the new dbuff.
+ * - Parent `p` pointer will be advanced with child's `p` pointer.
+ * - Child will have its `start` pointer set to the `start` pointer of the parent.
  *
  * @param[in] _dbuff_or_marker	to make an ephemeral copy of.
  */
-#define FR_DBUFF_COPY_ABS(_dbuff_or_marker) _FR_DBUFF_COPY_ABS(_dbuff_or_marker, fr_dbuff_start(_dbuff_or_marker), true)
+#define FR_DBUFF_BIND_CURRENT_ABS(_dbuff_or_marker) FR_DBUFF_ABS(_dbuff_or_marker, fr_dbuff_start(_dbuff_or_marker), FR_DBUFF_ADV_PARENT_CURRENT)
+
+/** Create a new dbuff pointing to the same underlying buffer
+ *
+ * This is used to create the producer of a producer/consumer pairs of dbuffs.
+ *
+ * - Parent `end` pointer will be advanced with child's `p` pointer.
+ * - Child will have its `start` pointer set to the `start` pointer of the parent.
+ *
+ * @param[in] _dbuff_or_marker	to make an ephemeral copy of.
+ */
+#define FR_DBUFF_BIND_END_ABS(_dbuff_or_marker) _FR_DBUFF(_dbuff_or_marker, fr_dbuff_start(_dbuff_or_marker), FR_DBUFF_ADV_PARENT_END)
 
 /** @cond */
-/** Limit available bytes in the dbufft to _max when passing it to another function
+/** Limit available bytes in the dbuff to _max when passing it to another function
  *
  * @private
  */
@@ -260,24 +282,7 @@ do { \
 /** Limit the maximum number of bytes available in the dbuff when passing it to another function
  *
  @code{.c}
- my_child_encoder(&FR_DBUFF_MAX(dbuff, 253), vp);
- @endcode
- *
- * @note Do not use to re-initialise the contents of _dbuff, i.e. to
- *	permanently shrink the exiting dbuff. The parent pointer will loop.
- *
- * @note Do not modify the "child" dbuff directly.  Use the functions
- *	 supplied as part of this API.
- *
- * @param[in] _dbuff_or_marker	to reserve bytes in.
- * @param[in] _max		The maximum number of bytes the caller is allowed to write to.
- */
-#define FR_DBUFF_MAX(_dbuff_or_marker,  _max) _FR_DBUFF_MAX(_dbuff_or_marker, _max, true)
-
-/** Limit the maximum number of bytes available in the dbuff when passing it to another function
- *
- @code{.c}
- fr_dbuff_t tlv = FR_DBUFF_MAX_NO_ADVANCE(dbuff, UINT8_MAX);
+ fr_dbuff_t tlv = FR_DBUFF_MAX(dbuff, UINT8_MAX);
 
  if (my_child_encoder(&tlv, vp) < 0) return -1;
 
@@ -293,12 +298,29 @@ do { \
  * @param[in] _dbuff_or_marker	to reserve bytes in.
  * @param[in] _max		The maximum number of bytes the caller is allowed to write to.
  */
-#define FR_DBUFF_MAX_NO_ADVANCE(_dbuff_or_marker,  _max) _FR_DBUFF_MAX(_dbuff_or_marker, _max, false)
+#define FR_DBUFF_MAX(_dbuff_or_marker,  _max) _FR_DBUFF_MAX(_dbuff_or_marker, _max, 0x00)
+
+/** Limit the maximum number of bytes available in the dbuff when passing it to another function
+ *
+ @code{.c}
+ my_child_encoder(&FR_DBUFF_MAX_BIND_CURRENT(dbuff, 253), vp);
+ @endcode
+ *
+ * @note Do not use to re-initialise the contents of _dbuff, i.e. to
+ *	permanently shrink the exiting dbuff. The parent pointer will loop.
+ *
+ * @note Do not modify the "child" dbuff directly.  Use the functions
+ *	 supplied as part of this API.
+ *
+ * @param[in] _dbuff_or_marker	to reserve bytes in.
+ * @param[in] _max		The maximum number of bytes the caller is allowed to write to.
+ */
+#define FR_DBUFF_MAX_BIND_CURRENT(_dbuff_or_marker,  _max) _FR_DBUFF_MAX(_dbuff_or_marker, _max, FR_DBUFF_ADV_PARENT_CURRENT)
 
 /** Does the actual work of initialising a dbuff
  * @private
  */
-static inline void _fr_dbuff_init(fr_dbuff_t *out, uint8_t const *start, uint8_t const *end, bool is_const)
+static inline CC_HINT(nonnull) void _fr_dbuff_init(fr_dbuff_t *out, uint8_t const *start, uint8_t const *end, bool is_const)
 {
 	if (unlikely(end < start)) end = start;	/* Could be an assert? */
 
@@ -339,6 +361,8 @@ _fr_dbuff_init(_out, \
 	       ))
 
 size_t	_fr_dbuff_extend_talloc(fr_dbuff_t *dbuff, size_t extension);
+
+int	fr_dbuff_trim_talloc(fr_dbuff_t *dbuff, size_t len);
 
 /** Talloc extension structure use by #fr_dbuff_init_talloc
  * @private
@@ -400,6 +424,14 @@ static inline fr_dbuff_t *fr_dbuff_init_talloc(TALLOC_CTX *ctx,
 	};
 
 	return dbuff;
+}
+
+/** Free the talloc buffer associated with a dbuff
+ *
+ */
+static inline void fr_dbuff_free_talloc(fr_dbuff_t *dbuff)
+{
+	TALLOC_FREE(dbuff->buff);
 }
 
 size_t	_fr_dbuff_extend_fd(fr_dbuff_t *dbuff, size_t extension);
@@ -867,10 +899,12 @@ size_t	fr_dbuff_shift(fr_dbuff_t *dbuff, size_t shift);
 /** Set a new 'current' position in a dbuff or marker
  * @private
  */
-static inline void _fr_dbuff_set_recurse(fr_dbuff_t *dbuff, uint8_t const *p)
+static inline void _fr_dbuff_set_recurse(fr_dbuff_t *dbuff, uint8_t adv_parent_flags, uint8_t const *p)
 {
-	dbuff->p_i = p;
-	if (dbuff->adv_parent && dbuff->parent) _fr_dbuff_set_recurse(dbuff->parent, p);
+	if (adv_parent_flags & FR_DBUFF_ADV_PARENT_CURRENT) dbuff->p_i = p;
+	if (adv_parent_flags & FR_DBUFF_ADV_PARENT_END) dbuff->end_i = p;
+
+	if (dbuff->adv_parent && dbuff->parent) _fr_dbuff_set_recurse(dbuff->parent, dbuff->adv_parent, p);
 }
 
 /** Set a new 'current' position in a dbuff or marker
@@ -893,7 +927,7 @@ static inline ssize_t _fr_dbuff_set(uint8_t **pos_p, fr_dbuff_t *dbuff, uint8_t 
 	if (unlikely(p < dbuff->start)) return 0;
 
 	c = *pos_p;
-	if (dbuff->adv_parent && dbuff->parent) _fr_dbuff_set_recurse(dbuff->parent, p);
+	if (dbuff->adv_parent && dbuff->parent) _fr_dbuff_set_recurse(dbuff->parent, dbuff->adv_parent, p);
 	*pos_p = UNCONST(uint8_t *, p);
 
 	return p - c;
@@ -933,6 +967,44 @@ _fr_dbuff_set(\
  */
 #define FR_DBUFF_SET_RETURN(_dst, _src) FR_DBUFF_RETURN(fr_dbuff_set, _dst, _src)
 
+/** Set a new 'end' position in a dbuff or marker
+ * @private
+ *
+ * @param[out] dbuff		dbuff to use for constraints checks.
+ * @param[in] p			Position to set.
+ * @return
+ *	- 0	not advanced (p before dbuff start) or after dbuff end.
+ *	- >0	the number of bytes the dbuff was trimmed by.
+ */
+static inline ssize_t _fr_dbuff_set_end(fr_dbuff_t *dbuff, uint8_t const *p)
+{
+	if (unlikely(p > dbuff->end)) return -(p - dbuff->end);
+	if (unlikely(p < dbuff->start)) return 0;
+
+	dbuff->end = UNCONST(uint8_t *, p);
+
+	return dbuff->end - p;
+}
+
+/** Set a new 'end' position in a dbuff or marker
+ *
+ * @param[out] _dst		dbuff to use for constraints checks.
+ * @param[in] _end		Position to set.
+ * @return
+ *	- 0	not advanced (p before dbuff start) or after dbuff end.
+ *	- >0	the number of bytes the dbuff was trimmed by.
+ */
+#define fr_dbuff_set_end(_dst, _end) \
+_fr_dbuff_set_end(\
+	fr_dbuff_ptr(_dst), \
+	_Generic((_end), \
+		fr_dbuff_t *			: fr_dbuff_current((fr_dbuff_t const *)(_end)), \
+		fr_dbuff_marker_t *		: fr_dbuff_current((fr_dbuff_marker_t const *)(_end)), \
+		uint8_t const *			: (uint8_t const *)(_end), \
+		uint8_t *			: (uint8_t const *)(_end) \
+	) \
+)
+
 /** Advance 'current' position in dbuff or marker by _len bytes
  *
  * @param[in] _dbuff_or_marker	to advance.
@@ -960,6 +1032,68 @@ _fr_dbuff_set(\
  * @copydetails fr_dbuff_advance
  */
 #define FR_DBUFF_ADVANCE_RETURN(_dbuff_or_marker, _len) FR_DBUFF_RETURN(fr_dbuff_advance, _dbuff_or_marker, _len)
+
+/** Advance a dbuff or marker potentially extending it
+ * @private
+ *
+ * @param[in,out] pos_p		position pointer to modify.
+ * @param[out] dbuff		dbuff to use for constraints checks.
+ * @param[in] len		Number of bytes to advance by.
+ * @return
+ *	- 0	not advanced, specified length would take us
+ *		past the end of the buffer, and we couldn't extend
+ *		by enough bytes.
+ *	- >0	the number of bytes the dbuff advanced by.
+ *      - <0	the number of bytes we'd need to complete the advance.
+ *
+ */
+static inline ssize_t _fr_dbuff_advance_extend(uint8_t **pos_p, fr_dbuff_t *dbuff, size_t len)
+{
+	uint8_t *p = *pos_p + len;
+
+	if (p > dbuff->end) {
+		size_t rel = p - dbuff->start;				/* Get relative position to the start */
+
+		if (!dbuff->extend) {
+		oos:
+			return -((dbuff->start + rel) - dbuff->end);
+		}
+
+	 	dbuff->extend(dbuff, p - dbuff->end);			/* Try and extend by the number of bytes over */
+	 	if ((dbuff->start + rel) > dbuff->end) goto oos;
+
+	 	*pos_p = dbuff->start + rel;				/* Update pos_p */
+	} else {
+		*pos_p += len;
+	}
+
+	if (dbuff->adv_parent && dbuff->parent) _fr_dbuff_set_recurse(dbuff->parent, dbuff->adv_parent, *pos_p);
+
+	return len;
+}
+
+/** Advance current'position in dbuff or marker by _len bytes (extending if necessary)
+ *
+ * @param[in] _dbuff_or_marker	to advance.
+ * @param[in] _len		How much to advance dbuff by.
+ *				Must be a positive integer.
+ * @return
+ *	- 0	not advanced.
+ *	- >0	the number of bytes the dbuff or marker was advanced by.
+ *      - <0	the number of bytes we'd need to complete the advance.
+ */
+#define fr_dbuff_advance_extend(_dbuff_or_marker, _len)  \
+	_fr_dbuff_advance(_fr_dbuff_current_ptr(_dbuff_or_marker), fr_dbuff_ptr(_dbuff_or_marker), \
+			  (_Generic((_len), \
+			  	unsigned char : (size_t)(_len), \
+			 	unsigned short : (size_t)(_len), \
+			  	unsigned int : (size_t)(_len), \
+			 	unsigned long : (size_t)(_len), \
+			  	unsigned long long : (size_t)(_len), \
+			  	int : (size_t)(_len) \
+			  )))
+
+#define FR_DBUFF_BIND_EXTEND_RETURN(_dbuff_or_marker, _len) FR_DBUFF_RETURN(fr_dbuff_advance_extend, _dbuff_or_marker, _len)
 
 /** Reset the 'current' position of the dbuff or marker to the 'start' of the buffer
  *
@@ -1217,12 +1351,9 @@ static inline size_t _fr_dbuff_in_memcpy_partial(uint8_t **pos_p, fr_dbuff_t *ou
 static inline size_t _fr_dbuff_in_memcpy_partial_dbuff(uint8_t **pos_p, fr_dbuff_t *out,
 						       uint8_t * const *in_p, fr_dbuff_t const *in, size_t inlen)
 {
-	fr_dbuff_t	*our_in;
-	uint8_t		**our_in_p;
+	fr_dbuff_t	*our_in = UNCONST(fr_dbuff_t *, in);	/* Stupid const issues caused by generics */
+	uint8_t		**our_in_p = UNCONST(uint8_t **, in_p);	/* Stupid const issues caused by generics */
 	size_t		ext_len;
-
-	memcpy(&our_in, &in, sizeof(our_in));		/* Stupid const issues caused by generics */
-	memcpy(&our_in_p, &in_p, sizeof(our_in_p));	/* Stupid const issues caused by generics */
 
 	ext_len = _fr_dbuff_extend_lowat(NULL, our_in, fr_dbuff_end(our_in) - (*our_in_p), inlen);
 	if (ext_len < inlen) inlen = ext_len;

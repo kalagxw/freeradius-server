@@ -499,6 +499,26 @@ void *fr_pair_iter_next_by_ancestor(fr_dlist_head_t *list, void *to_eval, void *
 	return c;
 }
 
+/** Return the number of instances of a given da in the specified list
+ *
+ * @param[in] list	to search in.
+ * @param[in] da	to look for in the list.
+ * @return
+ *	- 0 if no instances exist.
+ *	- >0 the number of instance of a given attribute.
+ */
+unsigned int fr_pair_count_by_da(fr_pair_list_t const *list, fr_dict_attr_t const *da)
+{
+	fr_pair_t	*vp = NULL;
+	unsigned int	count = 0;
+
+	if (fr_dlist_empty(&list->head)) return 0;
+
+	while ((vp = fr_pair_list_next(list, vp))) if (da == vp->da) count++;
+
+	return count;
+}
+
 /** Find a pair with a matching da
  *
  * @param[in] list	to search in.
@@ -842,16 +862,21 @@ int fr_pair_prepend_by_da(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *list
  *			care about manipulating the fr_pair_t.
  * @param[in,out] list	to search for attributes in or append attributes to.
  * @param[in] da	of attribute to locate or alloc.
+ * @param[in] n		update the n'th instance of this da.
+ *			Note: If we can't find the n'th instance the attribute created
+ *			won't necessarily be at index n.  So use cases for this are
+ *			limited .
  * @return
  *	- 1 if attribute already existed.
  *	- 0 if we allocated a new attribute.
  *	- -1 on failure.
  */
-int fr_pair_update_by_da(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *list, fr_dict_attr_t const *da)
+int fr_pair_update_by_da(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *list,
+			 fr_dict_attr_t const *da, unsigned int n)
 {
 	fr_pair_t	*vp;
 
-	vp = fr_pair_find_by_da(list, da, 0);
+	vp = fr_pair_find_by_da(list, da, n);
 	if (vp) {
 		VP_VERIFY(vp);
 		if (out) *out = vp;
@@ -872,7 +897,7 @@ int fr_pair_update_by_da(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *list,
 
 /** Delete matching pairs from the specified list
  *
- * @param[in,out] list	to search for attributes in or prepend attributes to.
+ * @param[in,out] list	to search for attributes in or delete attributes from.
  * @param[in] da	to match.
  * @return
  *	- >0 the number of pairs deleted.
@@ -2218,8 +2243,8 @@ void fr_pair_verify(char const *file, int line, fr_pair_t const *vp)
 		fr_fatal_assert_fail("CONSISTENCY CHECK FAILED %s[%u]: fr_pair_t da pointer was NULL", file, line);
 	}
 
-	fr_dict_verify(file, line, vp->da);
-	if (vp->data.enumv) fr_dict_verify(file, line, vp->data.enumv);
+	fr_dict_attr_verify(file, line, vp->da);
+	if (vp->data.enumv) fr_dict_attr_verify(file, line, vp->data.enumv);
 
 	if (vp->vp_ptr) switch (vp->vp_type) {
 	case FR_TYPE_OCTETS:
@@ -2524,6 +2549,16 @@ void fr_pair_list_afrom_box(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_t cons
 void fr_pair_list_append(fr_pair_list_t *dst, fr_pair_list_t *src)
 {
 	fr_dlist_move(&dst->head, &src->head);
+}
+
+/** Move a list of fr_pair_t from a temporary list to the head of a destination list
+ *
+ * @param dst list to move pairs into
+ * @param src from which to take pairs
+ */
+void fr_pair_list_prepend(fr_pair_list_t *dst, fr_pair_list_t *src)
+{
+	fr_dlist_move_head(&dst->head, &src->head);
 }
 
 /** Evaluation function for matching if vp matches a given da

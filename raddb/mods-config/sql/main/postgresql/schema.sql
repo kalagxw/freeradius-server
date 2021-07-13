@@ -42,7 +42,8 @@ CREATE TABLE radacct (
 	FramedIPv6Address	inet,
 	FramedIPv6Prefix	inet,
 	FramedInterfaceId	text,
-	DelegatedIPv6Prefix	inet
+	DelegatedIPv6Prefix	inet,
+	Class 			text
 );
 -- This index may be useful..
 -- CREATE UNIQUE INDEX radacct_whoson on radacct (AcctStartTime, nasipaddress);
@@ -151,7 +152,8 @@ CREATE TABLE radpostauth (
 	reply			text,
 	CalledStationId		text,
 	CallingStationId	text,
-	authdate		timestamp with time zone NOT NULL default now()
+	authdate		timestamp with time zone NOT NULL default now(),
+	Class			text
 );
 
 --

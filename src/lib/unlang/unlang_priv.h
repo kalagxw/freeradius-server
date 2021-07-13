@@ -183,6 +183,13 @@ typedef unlang_action_t (*unlang_process_t)(rlm_rcode_t *p_result, request_t *re
 typedef void (*unlang_signal_t)(request_t *request,
 				unlang_stack_frame_t *frame, fr_state_signal_t action);
 
+/** Custom callback for dumping information about frame state
+ *
+ * @param[in] request		The current request.
+ * @param[in] frame		to provide additional information for.
+ */
+typedef void (*unlang_dump_t)(request_t *request, unlang_stack_frame_t *frame);
+
 /** An unlang operation
  *
  * These are like the opcodes in other interpreters.  Each operation, when executed
@@ -194,6 +201,8 @@ typedef struct {
 	unlang_process_t	interpret;     			//!< Function to interpret the keyword
 
 	unlang_signal_t		signal;				//!< Function to signal stop / dup / whatever
+
+	unlang_dump_t		dump;				//!< Dump additional information about the frame state.
 
 	bool			debug_braces;			//!< Whether the operation needs to print braces
 								///< in debug mode.
@@ -416,6 +425,15 @@ static inline void frame_pop(unlang_stack_t *stack)
 	if (stack->unwind && is_repeatable(frame) && !is_break_point(frame) && !is_return_point(frame)) {
 		repeatable_clear(frame);
 	}
+}
+
+/** Mark the current stack frame up for repeat, and set a new process function
+ *
+ */
+static inline void frame_repeat(unlang_stack_frame_t *frame, unlang_process_t process)
+{
+	repeatable_set(frame);
+	frame->process = process;
 }
 
 /** @name Conversion functions for converting #unlang_t to its specialisations

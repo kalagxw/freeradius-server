@@ -64,17 +64,6 @@ extern "C" {
  */
 #undef unix
 
-/*
- *	The ubiquitous stringify macros
- */
-#define XSTRINGIFY(x) #x
-#define STRINGIFY(x) XSTRINGIFY(x)
-#define JOINSTR(x,y) XSTRINGIFY(x ## y)
-
-/** Helper for initialising arrays of string literals.
- */
-#define L(_str)		{ _str, sizeof(_str) - 1 }
-
 /** Evaluates to +1 for a > b, and -1 for a < b
  */
 #define CMP_PREFER_SMALLER(_a,_b)	(((_a) > (_b)) - ((_a) < (_b)))
@@ -87,13 +76,36 @@ extern "C" {
  */
 #define CMP(_a, _b)			CMP_PREFER_SMALLER(_a, _b)
 
-/*
- *	Callbacks which make comparisons easier.
+/** Return if the comparison is not 0 (is unequal)
+ *
+ * @param[in] _a	pointer to first structure.
+ * @param[in] _b	pointer to second structure.
+ * @param[in] _filed	within the structs to compare.
+ * @return The result of the comparison.
  */
-#define CMP_RETURN(_field) do { \
-		ret = CMP(a->_field, b->_field); \
-		if (ret != 0) return ret; \
-	} while (0)
+#define CMP_RETURN(_a, _b, _field) \
+do { \
+	int8_t _ret = CMP((_a)->_field, (_b)->_field); \
+	if (_ret != 0) return _ret; \
+} while (0)
+
+/** Return if the contents of the specified field is not identical between the specified structures
+ *
+ * @param[in] _a		pointer to first structure.
+ * @param[in] _b		pointer to second structure.
+ * @param[in] _field		within the structs to compare.
+ * @param[in] _len_field	within the structs, specifying the length of the data.
+ * @return The result of the comparison.
+ */
+#define MEMCMP_RETURN(_a, _b, _field, _len_field) \
+do { \
+	int8_t _ret = CMP((_a)->_len_field, (_b)->_len_field); \
+	int _mret; \
+	if (_ret != 0) return _ret; \
+	_mret = memcmp((_a)->_field, (_b)->_field, (_a)->_len_field); \
+	_ret = CMP(_mret, 0); \
+	if (_ret != 0) return _ret; \
+} while (0)
 
 /** Remove const qualification from a pointer
  *
@@ -102,8 +114,8 @@ extern "C" {
  */
 #define UNCONST(_type, _ptr)		((_type)((uintptr_t)(_ptr)))
 
-/*
- *	HEX concatenation macros
+/** HEX concatenation macros
+ *
  */
 #ifndef HEXIFY
 #  define XHEXIFY4(b1,b2,b3,b4)	(0x ## b1 ## b2 ## b3 ## b4)
@@ -119,8 +131,31 @@ extern "C" {
 #  define HEXIFY(b1)		XHEXIFY(b1)
 #endif
 
-/*
- *	Pass caller information to the function
+/** The ubiquitous stringify macros
+ *
+ */
+#define XSTRINGIFY(x) #x
+#define STRINGIFY(x) XSTRINGIFY(x)
+#define JOINSTR(x,y) XSTRINGIFY(x ## y)
+
+/** Helper for initialising arrays of string literals
+ */
+#define L(_str)		{ _str, sizeof(_str) - 1 }
+
+/** Fill macros for array initialisation
+ */
+#define F1(_idx, _val)		[_idx] = _val
+#define F2(_idx, _val)		F1(_idx, _val), F1(_idx + 1, _val)
+#define F4(_idx, _val)		F2(_idx, _val), F2(_idx + 2, _val)
+#define F8(_idx, _val)		F4(_idx, _val), F4(_idx + 4, _val)
+#define F16(_idx, _val)		F8(_idx, _val), F8(_idx + 8, _val)
+#define F32(_idx, _val)		F16(_idx, _val), F16(_idx + 16, _val)
+#define F64(_idx, _val)		F32(_idx, _val), F32(_idx + 32, _val)
+#define F128(_idx, _val)	F64(_idx, _val), F64(_idx + 64, _val)
+#define F256(_idx, _val)	F128(_idx, _val), F128(_idx + 128, _val)
+
+/** Pass caller information to the function
+ *
  */
 #ifndef NDEBUG
 #  define NDEBUG_LOCATION_ARGS			char const *file, int line,
@@ -151,7 +186,6 @@ extern "C" {
 #define UNUSED			CC_HINT(unused)
 
 /** clang 10 doesn't recognised the FALL-THROUGH comment anymore
- *
  */
 #if (defined(__clang__) && (__clang_major__ >= 10)) || (defined(__GNUC__) && __GNUC__ >= 7)
 #  define FALL_THROUGH		CC_HINT(fallthrough)

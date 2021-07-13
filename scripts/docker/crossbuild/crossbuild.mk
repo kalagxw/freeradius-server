@@ -25,6 +25,11 @@ CB_IMAGES:=$(sort $(patsubst $(DT)/build-%,%,$(wildcard $(DT)/build-*)))
 # Location of the .git dir (may be different for e.g. submodules)
 GITDIR:=$(shell perl -MCwd -e 'print Cwd::abs_path shift' $$(git rev-parse --git-dir))
 
+# Don't use the Docker cache if asked
+ifneq "$(NOCACHE)" ""
+    NO_CACHE=--no-cache
+endif
+
 CB_CPREFIX:=fr-crossbuild-
 CB_IPREFIX:=freeradius-build
 
@@ -77,6 +82,8 @@ crossbuild.help: crossbuild.info
 	@echo "    crossbuild.IMAGE.reset   - remove cache of docker state"
 	@echo "    crossbuild.IMAGE.clean   - stop container and tidy up"
 	@echo "    crossbuild.IMAGE.wipe    - remove Docker image"
+	@echo ""
+	@echo "Use 'make NOCACHE=1 ...' to disregard the Docker cache on build"
 
 #
 #  Remove stamp files, so that we try and create images again
@@ -117,7 +124,7 @@ crossbuild.${1}.status:
 #
 $(DD)/stamp-image.${1}:
 	${Q}echo "BUILD ${1} ($(CB_IPREFIX)/${1}) > $(DD)/build.${1}"
-	${Q}docker build $(DT)/build-${1} -f $(DT)/build-${1}/Dockerfile.deps -t $(CB_IPREFIX)/${1} >$(DD)/build.${1} 2>&1
+	${Q}docker build $(NO_CACHE) $(DT)/build-${1} -f $(DT)/build-${1}/Dockerfile.deps -t $(CB_IPREFIX)/${1} >$(DD)/build.${1} 2>&1
 	${Q}touch $(DD)/stamp-image.${1}
 
 #
@@ -145,18 +152,18 @@ crossbuild.${1}.up: $(DD)/stamp-up.${1}
 .PHONY: $(DD)/docker.refresh.${1}
 $(DD)/docker.refresh.${1}: $(DD)/stamp-up.${1}
 	${Q}echo "REFRESH ${1}"
-	${Q}docker container exec $(CB_CPREFIX)${1} sh -c 'rsync -a /srv/src/ /srv/local-src/'
-	${Q}docker container exec $(CB_CPREFIX)${1} sh -c 'git config -f /srv/local-src/config core.bare true'
-	${Q}docker container exec $(CB_CPREFIX)${1} sh -c 'git config -f /srv/local-src/config --unset core.worktree || true'
-	${Q}docker container exec $(CB_CPREFIX)${1} sh -c '[ -d /srv/build ] || git clone /srv/local-src /srv/build'
-	${Q}docker container exec $(CB_CPREFIX)${1} sh -c '(cd /srv/build && git pull --rebase)'
-	${Q}docker container exec $(CB_CPREFIX)${1} sh -c '[ -e /srv/build/config.log ] || echo CONFIGURE ${1}'
-	${Q}docker container exec $(CB_CPREFIX)${1} sh -c '[ -e /srv/build/config.log ] || (cd /srv/build && ./configure -C)' > $(DD)/configure.${1} 2>&1
+	${Q}docker container exec $(CB_CPREFIX)${1} sh -lc 'rsync -a /srv/src/ /srv/local-src/'
+	${Q}docker container exec $(CB_CPREFIX)${1} sh -lc 'git config -f /srv/local-src/config core.bare true'
+	${Q}docker container exec $(CB_CPREFIX)${1} sh -lc 'git config -f /srv/local-src/config --unset core.worktree || true'
+	${Q}docker container exec $(CB_CPREFIX)${1} sh -lc '[ -d /srv/build ] || git clone /srv/local-src /srv/build'
+	${Q}docker container exec $(CB_CPREFIX)${1} sh -lc '(cd /srv/build && git pull --rebase)'
+	${Q}docker container exec $(CB_CPREFIX)${1} sh -lc '[ -e /srv/build/config.log ] || echo CONFIGURE ${1}'
+	${Q}docker container exec $(CB_CPREFIX)${1} sh -lc '[ -e /srv/build/config.log ] || (cd /srv/build && ./configure -C)' > $(DD)/configure.${1} 2>&1
 
 .PHONY: $(DD)/docker.run.${1}
 $(DD)/docker.run.${1}: $(DD)/docker.refresh.${1}
 	${Q}echo "TEST ${1} > $(DD)/log.${1}"
-	${Q}docker container exec $(CB_CPREFIX)${1} sh -c '(cd /srv/build && make && make test)' > $(DD)/log.${1} 2>&1 || echo FAIL ${1}
+	${Q}docker container exec $(CB_CPREFIX)${1} sh -lc '(cd /srv/build && make && make test)' > $(DD)/log.${1} 2>&1 || echo FAIL ${1}
 
 #
 #  Stop the docker container

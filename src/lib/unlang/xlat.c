@@ -203,7 +203,7 @@ int unlang_xlat_push(TALLOC_CTX *ctx, fr_value_box_list_t *out,
 	/*
 	 *	Push a new xlat eval frame onto the stack
 	 */
-	if (unlang_interpret_push(request, &xlat_instruction, RLM_MODULE_UNKNOWN, UNLANG_NEXT_STOP, top_frame) < 0) {
+	if (unlang_interpret_push(request, &xlat_instruction, RLM_MODULE_NOT_SET, UNLANG_NEXT_STOP, top_frame) < 0) {
 		return -1;
 	}
 	frame = &stack->frame[stack->depth];
@@ -222,29 +222,19 @@ int unlang_xlat_push(TALLOC_CTX *ctx, fr_value_box_list_t *out,
 	return 0;
 }
 
-/** Stub function for calling the xlat interpreter
- *
- * Calls the xlat interpreter and translates its wants and needs into
- * unlang_action_t codes.
- */
-static unlang_action_t unlang_xlat(rlm_rcode_t *p_result, request_t *request, unlang_stack_frame_t *frame)
+static unlang_action_t unlang_xlat_repeat(rlm_rcode_t *p_result, request_t *request, unlang_stack_frame_t *frame)
 {
 	unlang_frame_state_xlat_t	*state = talloc_get_type_abort(frame->state, unlang_frame_state_xlat_t);
-	xlat_exp_t const		*child = NULL;
 	xlat_action_t			xa;
+	xlat_exp_t const		*child = NULL;
 
-	if (is_repeatable(frame)) {
-		xa = xlat_frame_eval_repeat(state->ctx, &state->values, &child,
-					    &state->alternate, request, &state->exp, &state->rhead);
-	} else {
-		xa = xlat_frame_eval(state->ctx, &state->values, &child, request, &state->exp);
-	}
-
+	xa = xlat_frame_eval_repeat(state->ctx, &state->values, &child,
+				    &state->alternate, request, &state->exp, &state->rhead);
 	switch (xa) {
 	case XLAT_ACTION_PUSH_CHILD:
 		fr_assert(child);
 
-		repeatable_set(frame);
+		repeatable_set(frame);	/* Was cleared by the interpreter */
 
 		/*
 		 *	Clear out the results of any previous expansions
@@ -263,6 +253,7 @@ static unlang_action_t unlang_xlat(rlm_rcode_t *p_result, request_t *request, un
 			RWDEBUG("Missing call to unlang_xlat_yield()");
 			goto fail;
 		}
+		repeatable_set(frame);
 		return UNLANG_ACTION_YIELD;
 
 	case XLAT_ACTION_DONE:
@@ -270,14 +261,67 @@ static unlang_action_t unlang_xlat(rlm_rcode_t *p_result, request_t *request, un
 		return UNLANG_ACTION_CALCULATE_RESULT;
 
 	case XLAT_ACTION_FAIL:
-		fail:
+	fail:
 		*p_result = RLM_MODULE_FAIL;
 		return UNLANG_ACTION_CALCULATE_RESULT;
-	}
 
-	fr_assert(0);
-	*p_result = RLM_MODULE_FAIL;
-	return UNLANG_ACTION_CALCULATE_RESULT;
+	default:
+		fr_assert(0);
+		goto fail;
+	}
+}
+
+/** Stub function for calling the xlat interpreter
+ *
+ * Calls the xlat interpreter and translates its wants and needs into
+ * unlang_action_t codes.
+ */
+static unlang_action_t unlang_xlat(rlm_rcode_t *p_result, request_t *request, unlang_stack_frame_t *frame)
+{
+	unlang_frame_state_xlat_t	*state = talloc_get_type_abort(frame->state, unlang_frame_state_xlat_t);
+	xlat_action_t			xa;
+	xlat_exp_t const		*child = NULL;
+
+	xa = xlat_frame_eval(state->ctx, &state->values, &child, request, &state->exp);
+	switch (xa) {
+	case XLAT_ACTION_PUSH_CHILD:
+		fr_assert(child);
+
+		frame_repeat(frame, unlang_xlat_repeat);
+
+		/*
+		 *	Clear out the results of any previous expansions
+		 *	at this level.  A frame may be used to evaluate
+		 *	multiple sibling nodes.
+		 */
+		fr_dlist_talloc_free(&state->rhead);
+		if (unlang_xlat_push(state->ctx, &state->rhead, request, child, false) < 0) {
+			*p_result = RLM_MODULE_FAIL;
+			return UNLANG_ACTION_STOP_PROCESSING;
+		}
+		return UNLANG_ACTION_PUSHED_CHILD;
+
+	case XLAT_ACTION_YIELD:
+		if (!state->resume) {
+			RWDEBUG("Missing call to unlang_xlat_yield()");
+			goto fail;
+		}
+		repeatable_set(frame);
+		return UNLANG_ACTION_YIELD;
+
+	case XLAT_ACTION_DONE:
+		*p_result = RLM_MODULE_OK;
+		return UNLANG_ACTION_CALCULATE_RESULT;
+
+	case XLAT_ACTION_FAIL:
+	fail:
+		*p_result = RLM_MODULE_FAIL;
+		return UNLANG_ACTION_CALCULATE_RESULT;
+
+	default:
+		fr_assert(0);
+		goto fail;
+	}
 }
 
 /** Send a signal (usually stop) to a request that's running an xlat expansions
@@ -336,6 +380,7 @@ static unlang_action_t unlang_xlat_resume(rlm_rcode_t *p_result, request_t *requ
 				    request, &state->rhead, state->rctx);
 	switch (xa) {
 	case XLAT_ACTION_YIELD:
+		repeatable_set(frame);
 		return UNLANG_ACTION_YIELD;
 
 	case XLAT_ACTION_DONE:

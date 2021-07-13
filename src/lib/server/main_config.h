@@ -93,6 +93,7 @@ struct main_config_s {
 	char const	*dict_dir;			//!< Where to load dictionaries from.
 
 	size_t		talloc_pool_size;		//!< Size of pool to allocate to hold each #request_t.
+
 	uint32_t	max_requests;			//!< maximum number of requests outstanding
 
 	bool		write_pid;			//!< write the PID file
@@ -113,6 +114,12 @@ struct main_config_s {
 #ifdef HAVE_OPENSSL_CRYPTO_H
 	bool		openssl_fips_mode;		//!< Whether OpenSSL fips mode is enabled or disabled.
 	bool		openssl_fips_mode_is_set;	//!< Whether the user specified a value.
+
+	size_t		openssl_async_pool_init;		//!< Tuning option to set the minimum number of requests
+							///< in the async ctx pool.
+
+	size_t		openssl_async_pool_max;		//!< Tuning option to set the maximum number of requests
+							///< in the async ctx pool.
 #endif
 
 	fr_dict_t	*dict;				//!< Main dictionary.
@@ -133,6 +140,12 @@ struct main_config_s {
 							//!< Can only be used when the server is running in single
 							//!< threaded mode.
 
+	bool		allow_multiple_procs;		//!< Allow multiple instances of radiusd to run with the
+							///< same config file.
+
+	int		multi_proc_sem_id;		//!< Semaphore we use to prevent multiple processes running.
+	char		*multi_proc_sem_path;		//!< Semaphore path.
+
 	uint32_t	max_networks;			//!< for the scheduler
 	uint32_t	max_workers;			//!< for the scheduler
 	fr_time_delta_t	stats_interval;			//!< for the scheduler
@@ -142,6 +155,10 @@ struct main_config_s {
 void			main_config_name_set_default(main_config_t *config, char const *name, bool overwrite_config);
 void			main_config_raddb_dir_set(main_config_t *config, char const *path);
 void			main_config_dict_dir_set(main_config_t *config, char const *path);
+
+void			main_config_exclusive_proc_done(main_config_t  const *config);
+int			main_config_exclusive_proc_child(main_config_t const *config);
+int			main_config_exclusive_proc(main_config_t *config);
 
 main_config_t		*main_config_alloc(TALLOC_CTX *ctx);
 int			main_config_init(main_config_t *config);

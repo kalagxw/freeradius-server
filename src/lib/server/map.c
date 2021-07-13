@@ -34,7 +34,7 @@ RCSID("$Id$")
 #include <freeradius-devel/server/cond.h>
 
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/util/hex.h>
+#include <freeradius-devel/util/base16.h>
 #include <freeradius-devel/util/pair_legacy.h>
 #include <freeradius-devel/util/misc.h>
 
@@ -56,10 +56,17 @@ static void map_dump(request_t *request, map_t const *map)
 }
 #endif
 
-static inline map_t *map_alloc(TALLOC_CTX *ctx)
+static inline map_t *map_alloc(TALLOC_CTX *ctx, map_t *parent)
 {
 	map_t *map;
-	map = talloc_zero(ctx, map_t);
+
+	if (parent) {
+		map = talloc_zero(parent, map_t);
+	} else {
+		map = talloc_zero(ctx, map_t);
+	}
+	map->parent = parent;
+
 	fr_map_list_init(&map->child);
 	return map;
 }
@@ -77,6 +84,7 @@ static inline map_t *map_alloc(TALLOC_CTX *ctx)
  *
  * @param[in] ctx		for talloc.
  * @param[in] out		Where to write the pointer to the new #map_t.
+ * @param[in] parent		the parent map
  * @param[in] cp		to convert to map.
  * @param[in] lhs_rules		rules for parsing LHS attribute references.
  * @param[in] rhs_rules		rules for parsing RHS attribute references.
@@ -84,7 +92,7 @@ static inline map_t *map_alloc(TALLOC_CTX *ctx)
  *	- #map_t if successful.
  *	- NULL on error.
  */
-int map_afrom_cp(TALLOC_CTX *ctx, map_t **out, CONF_PAIR *cp,
+int map_afrom_cp(TALLOC_CTX *ctx, map_t **out, map_t *parent, CONF_PAIR *cp,
 		 tmpl_rules_t const *lhs_rules, tmpl_rules_t const *rhs_rules)
 {
 	map_t	*map;
@@ -96,7 +104,7 @@ int map_afrom_cp(TALLOC_CTX *ctx, map_t **out, CONF_PAIR *cp,
 
 	if (!cp) return -1;
 
-	MEM(map = map_alloc(ctx));
+	MEM(map = map_alloc(ctx, parent));
 	map->op = cf_pair_operator(cp);
 	map->ci = cf_pair_to_item(cp);
 
@@ -282,7 +290,8 @@ fr_sbuff_parse_rules_t const *map_parse_rules_quoted[T_TOKEN_LAST] = {
  *
  * @param[in] ctx		for talloc.
  * @param[in] out		Where to write the pointer to the new #map_t.
- * @param[in] in		to convert to map.
+ * @param[in,out] parent_p	the parent map, updated for relative maps
+ * @param[in] in		the data to parse for creating the map.
  * @param[in] op_table		for lhs OP rhs
  * @param[in] op_table_len	length of op_table
  * @param[in] lhs_rules		rules for parsing LHS attribute references.
@@ -293,7 +302,7 @@ fr_sbuff_parse_rules_t const *map_parse_rules_quoted[T_TOKEN_LAST] = {
  *	- >0 on success.
  *	- <=0 on error.
  */
-ssize_t map_afrom_substr(TALLOC_CTX *ctx, map_t **out, fr_sbuff_t *in,
+ssize_t map_afrom_substr(TALLOC_CTX *ctx, map_t **out, map_t **parent_p, fr_sbuff_t *in,
 			 fr_table_num_sorted_t const *op_table, size_t op_table_len,
 			 tmpl_rules_t const *lhs_rules, tmpl_rules_t const *rhs_rules,
 			 fr_sbuff_parse_rules_t const *p_rules)
@@ -301,14 +310,24 @@ ssize_t map_afrom_substr(TALLOC_CTX *ctx, map_t **out, fr_sbuff_t *in,
 	ssize_t			slen;
 	fr_token_t		token;
 	map_t			*map;
+	bool			is_child;
 	fr_sbuff_t		our_in = FR_SBUFF_NO_ADVANCE(in);
-	fr_sbuff_marker_t	m_lhs, m_rhs;
+	fr_sbuff_marker_t	m_lhs, m_rhs, m_op;
 	fr_sbuff_term_t const	*tt = p_rules ? p_rules->terminals : NULL;
+	map_t			*parent, *new_parent;
+
+	if (parent_p) {
+		new_parent = parent = *parent_p;
+	} else {
+		new_parent = parent = NULL;
+	}
 
 	*out = NULL;
-	MEM(map = map_alloc(ctx));
+	MEM(map = map_alloc(ctx, parent));
 
 	(void)fr_sbuff_adv_past_whitespace(&our_in, SIZE_MAX, tt);
+
+	is_child = false;
 
 	fr_sbuff_marker(&m_lhs, &our_in);
 	fr_sbuff_out_by_longest_prefix(&slen, &token, cond_quote_table, &our_in, T_BARE_WORD);
@@ -322,6 +341,61 @@ ssize_t map_afrom_substr(TALLOC_CTX *ctx, map_t **out, fr_sbuff_t *in,
 		break;
 
 	default:
+		/*
+		 *	Allow for ".foo" to refer to the current
+		 *	parents list.  Allow for "..foo" to refer to
+		 *	the grandparent list.
+		 */
+		if (lhs_rules->prefix == TMPL_ATTR_REF_PREFIX_NO) {
+			tmpl_rules_t our_lhs_rules;
+
+			/*
+			 *	One '.' means "the current parent".
+			 */
+			if (fr_sbuff_next_if_char(&our_in, '.')) {
+				if (!parent) {
+				no_parent:
+					fr_strerror_const("Unexpected location for relative attribute - no parent attribute exists");
+					goto error;
+				}
+
+				is_child = true;
+			}
+
+			/*
+			 *	Multiple '.' means "go to our parents parent".
+			 */
+			while (fr_sbuff_next_if_char(&our_in, '.')) {
+				if (!parent) goto no_parent;
+				new_parent = parent = parent->parent;
+			}
+
+			/*
+			 *	Allow this as a "WTF, why not".
+			 */
+			if (!parent) is_child = false;
+
+			/*
+			 *	Start looking in the correct parent, not in whatever we were handed.
+			 */
+			if (is_child) {
+				our_lhs_rules = *lhs_rules;
+				fr_assert(tmpl_is_attr(parent->lhs));
+				our_lhs_rules.attr_parent = tmpl_da(parent->lhs);
+
+				slen = tmpl_afrom_attr_substr(map, NULL, &map->lhs, &our_in,
+							      &map_parse_rules_bareword_quoted, &our_lhs_rules);
+				break;
+			}
+
+			/*
+			 *	There's no '.', so this
+			 *	attribute MUST come from the
+			 *	root of the dictionary tree.
+			 */
+			new_parent = parent = NULL;
+		}
+
 		slen = tmpl_afrom_attr_substr(map, NULL, &map->lhs, &our_in,
 					      &map_parse_rules_bareword_quoted, lhs_rules);
 		break;
@@ -359,6 +433,7 @@ ssize_t map_afrom_substr(TALLOC_CTX *ctx, map_t **out, fr_sbuff_t *in,
 	}
 
 	(void)fr_sbuff_adv_past_whitespace(&our_in, SIZE_MAX, tt);
+	fr_sbuff_marker(&m_op, &our_in);
 
 	/*
 	 *	Parse operator.
@@ -376,6 +451,77 @@ ssize_t map_afrom_substr(TALLOC_CTX *ctx, map_t **out, fr_sbuff_t *in,
 	 *	minor modifications.
 	 */
 	fr_sbuff_marker(&m_rhs, &our_in);
+
+	/*
+	 *	If the LHS is a structural attribute, then (for now),
+	 *	the RHS can only be {}.  This limitation should only
+	 *	be temporary, as we should really recurse to create
+	 *	child maps.  And then the child maps should not have
+	 *	'.' as prefixes, and should require that the LHS can
+	 *	only be an attribute, etc.  Not trivial, so we'll just
+	 *	skip all that for now.
+	 */
+	if (tmpl_is_attr(map->lhs)) switch (tmpl_da(map->lhs)->type) {
+		case FR_TYPE_STRUCTURAL:
+			if ((map->op == T_OP_REG_EQ) || (map->op == T_OP_REG_NE)) {
+				fr_sbuff_set(&our_in, &m_op);
+				fr_strerror_const("Regular expressions cannot be used for structural attributes");
+				goto error;
+			}
+
+			/*
+			 *	To match Vendor-Specific =* ANY
+			 *
+			 *	Which is a damned hack.
+			 */
+			if (map->op == T_OP_CMP_TRUE) goto parse_rhs;
+
+			/*
+			 *	@todo - check for, and allow '&'
+			 *	attribute references.  If found, then
+			 *	we're copying an attribute on the RHS.
+			 */
+			if (!fr_sbuff_next_if_char(&our_in, '{')) {
+				fr_sbuff_set(&our_in, &m_rhs);
+				fr_strerror_const("Expected '{' after structural attribute");
+				goto error;
+			}
+
+			fr_sbuff_adv_past_whitespace(&our_in, SIZE_MAX, tt);
+
+			/*
+			 *	Peek at the next character.  If it's
+			 *	'}', stop.  Otherwise, call ourselves
+			 *	recursively, with a special flag
+			 *	saying '.' is no longer necessary.
+			 *
+			 *	We could put the flag into
+			 *	tmpl_rules_t, but it's likely the
+			 *	wrong place, as tmpl_rules_t doesn't
+			 *	contain the parent map.
+			 */
+			if (!fr_sbuff_next_if_char(&our_in, '}')) {
+				fr_sbuff_set(&our_in, &m_rhs);
+				fr_strerror_const("No matching '}'");
+				goto error;
+			}
+
+			/*
+			 *	We are the new parent
+			 */
+			new_parent = map;
+
+			/*
+			 *	We've parsed the RHS, so skip the rest
+			 *	of the RHS parsing.
+			 */
+			goto check_for_child;
+
+		default:
+			break;
+	}
+
+parse_rhs:
 	fr_sbuff_out_by_longest_prefix(&slen, &token, cond_quote_table, &our_in, T_BARE_WORD);
 	switch (token) {
 	case T_SOLIDUS_QUOTED_STRING:
@@ -438,11 +584,48 @@ ssize_t map_afrom_substr(TALLOC_CTX *ctx, map_t **out, fr_sbuff_t *in,
 		}
 	}
 
+	if (tmpl_contains_regex(map->lhs)) {
+		fr_sbuff_set(&our_in, &m_lhs);
+		fr_strerror_const("Unexpected regular expression");
+		goto error;
+	}
+
+	if ((map->op == T_OP_REG_EQ) || (map->op == T_OP_REG_NE)) {
+		if (!tmpl_contains_regex(map->rhs)) {
+			fr_sbuff_set(&our_in, &m_rhs);
+			fr_strerror_const("Expected regular expression after regex operator");
+			goto error;
+		}
+	} else {
+		if (tmpl_contains_regex(map->rhs)) {
+			fr_sbuff_set(&our_in, &m_rhs);
+			fr_strerror_const("Unexpected regular expression");
+			goto error;
+		}
+	}
+
+check_for_child:
+	/*
+	 *	Add this map to to the parents list.  Note that the
+	 *	caller will have to check for this!
+	 */
+	if (is_child && parent) {
+		fr_dlist_insert_tail(&parent->child, map);
+	}
+
+	if (parent_p) *parent_p = new_parent;
+
 	MAP_VERIFY(map);
 	*out = map;
 
 	return fr_sbuff_set(in, &our_in);
 }
+
+
+static int _map_afrom_cs(TALLOC_CTX *ctx, fr_map_list_t *out, map_t *parent, CONF_SECTION *cs,
+				tmpl_rules_t const *lhs_rules, tmpl_rules_t const *rhs_rules,
+				map_validate_t validate, void *uctx,
+				unsigned int max);
 
 
 /** Convert an 'update' config section into an attribute map.
@@ -466,6 +649,14 @@ int map_afrom_cs(TALLOC_CTX *ctx, fr_map_list_t *out, CONF_SECTION *cs,
 		 map_validate_t validate, void *uctx,
 		 unsigned int max)
 {
+	return _map_afrom_cs(ctx, out, NULL, cs, lhs_rules, rhs_rules, validate, uctx, max);
+}
+
+static int _map_afrom_cs(TALLOC_CTX *ctx, fr_map_list_t *out, map_t *parent, CONF_SECTION *cs,
+			 tmpl_rules_t const *lhs_rules, tmpl_rules_t const *rhs_rules,
+			 map_validate_t validate, void *uctx,
+			 unsigned int max)
+{
 	char const	*cs_list, *p;
 
 	CONF_ITEM 	*ci;
@@ -473,15 +664,15 @@ int map_afrom_cs(TALLOC_CTX *ctx, fr_map_list_t *out, CONF_SECTION *cs,
 
 	unsigned int 	total = 0;
 	map_t		*map;
-	TALLOC_CTX	*parent;
+	TALLOC_CTX	*parent_ctx;
 
 	tmpl_rules_t	our_lhs_rules = *lhs_rules;	/* Mutable copy of the destination */
 
 	/*
-	 *	The first map has ctx as the parent.
-	 *	The rest have the previous map as the parent.
+	 *	The first map has ctx as the parent context.
+	 *	The rest have the previous map as the parent context.
 	 */
-	parent = ctx;
+	parent_ctx = ctx;
 
 	ci = cf_section_to_item(cs);
 
@@ -511,7 +702,7 @@ int map_afrom_cs(TALLOC_CTX *ctx, fr_map_list_t *out, CONF_SECTION *cs,
 		error:
 			/*
 			 *	Free in reverse as successive entries have their
-			 *	prececessors as talloc parents
+			 *	prececessors as talloc parent contexts
 			 */
 			fr_dlist_talloc_reverse_free(out);
 			return -1;
@@ -537,7 +728,7 @@ int map_afrom_cs(TALLOC_CTX *ctx, fr_map_list_t *out, CONF_SECTION *cs,
 				goto error;
 			}
 
-			MEM(map = map_alloc(parent));
+			MEM(map = map_alloc(parent_ctx, parent));
 			map->op = token;
 			map->ci = ci;
 
@@ -593,8 +784,12 @@ int map_afrom_cs(TALLOC_CTX *ctx, fr_map_list_t *out, CONF_SECTION *cs,
 			 *	messages.  We MAY want to print out
 			 *	additional ones, but that might get
 			 *	complex and confusing.
+			 *
+			 *	We call out internal _map_afrom_cs()
+			 *	function, in order to pass in the
+			 *	correct parent map.
 			 */
-			if (map_afrom_cs(map, &child_list, cf_item_to_section(ci),
+			if (_map_afrom_cs(map, &child_list, map, cf_item_to_section(ci),
 					 &our_lhs_rules, rhs_rules, validate, uctx, max) < 0) {
 				fr_dlist_talloc_free(&child_list);
 				talloc_free(map);
@@ -615,7 +810,7 @@ int map_afrom_cs(TALLOC_CTX *ctx, fr_map_list_t *out, CONF_SECTION *cs,
 		cp = cf_item_to_pair(ci);
 		fr_assert(cp != NULL);
 
-		if (map_afrom_cp(parent, &map, cp, &our_lhs_rules, rhs_rules) < 0) {
+		if (map_afrom_cp(parent_ctx, &map, parent, cp, &our_lhs_rules, rhs_rules) < 0) {
 			cf_log_err(ci, "Failed creating map from '%s = %s'",
 				   cf_pair_attr(cp), cf_pair_value(cp));
 			goto error;
@@ -629,7 +824,7 @@ int map_afrom_cs(TALLOC_CTX *ctx, fr_map_list_t *out, CONF_SECTION *cs,
 		if (validate && (validate(map, uctx) < 0)) goto error;
 
 	next:
-		parent = map;
+		parent_ctx = map;
 		fr_dlist_insert_tail(out, map);
 	}
 
@@ -664,7 +859,7 @@ int map_afrom_value_box(TALLOC_CTX *ctx, map_t **out,
 	ssize_t slen;
 	map_t *map;
 
-	map = map_alloc(ctx);
+	map = map_alloc(ctx, NULL);
 
 	slen = tmpl_afrom_substr(map, &map->lhs,
 				 &FR_SBUFF_IN(lhs, strlen(lhs)),
@@ -711,7 +906,7 @@ int map_afrom_attr_str(TALLOC_CTX *ctx, map_t **out, char const *vp_str,
 {
 	fr_sbuff_t sbuff = FR_SBUFF_IN(vp_str, strlen(vp_str));
 
-	if (map_afrom_substr(ctx, out, &sbuff, map_assignment_op_table, map_assignment_op_table_len,
+	if (map_afrom_substr(ctx, out, NULL, &sbuff, map_assignment_op_table, map_assignment_op_table_len,
 			    lhs_rules, rhs_rules, NULL) < 0) {
 		return -1;
 	}
@@ -743,7 +938,7 @@ int map_afrom_vp(TALLOC_CTX *ctx, map_t **out, fr_pair_t *vp, tmpl_rules_t const
 
 	map_t *map;
 
-	map = map_alloc(ctx);
+	map = map_alloc(ctx, NULL);
 	if (!map) {
 	oom:
 		fr_strerror_const("Out of memory");
@@ -908,7 +1103,6 @@ int map_to_vp(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *request, map_t co
 
 	MAP_VERIFY(map);
 	if (!fr_cond_assert(map->lhs != NULL)) return -1;
-	if (!fr_cond_assert(map->rhs != NULL)) return -1;
 
 	fr_assert(tmpl_is_list(map->lhs) || tmpl_is_attr(map->lhs));
 
@@ -916,6 +1110,64 @@ int map_to_vp(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *request, map_t co
 	 *	Special case for !*, we don't need to parse RHS as this is a unary operator.
 	 */
 	if (map->op == T_OP_CMP_FALSE) return 0;
+
+	/*
+	 *	Hoist this early, too.
+	 */
+	if (map->op == T_OP_CMP_TRUE) {
+		MEM(n = fr_pair_afrom_da(ctx, tmpl_da(map->lhs)));
+		n->op = map->op;
+		fr_pair_append(out, n);
+		return 0;
+	}
+
+	/*
+	 *	If there's no RHS, then it MUST be an attribute, and
+	 *	it MUST be structural.  And it MAY have children.
+	 */
+	if (!map->rhs) {
+		map_t *child;
+
+		if (!tmpl_is_attr(map->lhs)) return -1;
+
+		switch (tmpl_da(map->lhs)->type) {
+		case FR_TYPE_STRUCTURAL:
+			break;
+
+		default:
+			return -1;
+		}
+
+		/*
+		 *	Create the parent attribute, and
+		 *	recurse to generate the children into
+		 *	vp->vp_group
+		 */
+		MEM(n = fr_pair_afrom_da(ctx, tmpl_da(map->lhs)));
+		n->op = map->op;
+
+		for (child = fr_dlist_next(&map->child, NULL);
+		     child != NULL;
+		     child = fr_dlist_next(&map->child, child)) {
+			fr_pair_list_t list;
+
+			/*
+			 *	map_to_vp() frees "out", so we need to
+			 *	work around that by creating a
+			 *	temporary list.
+			 */
+			fr_pair_list_init(&list);
+			if (map_to_vp(n, &list, request, child, NULL) < 0) {
+				talloc_free(n);
+				return -1;
+			}
+
+			fr_pair_list_append(&n->vp_group, &list);
+		}
+
+		fr_pair_append(out, n);
+		return 0;
+	}
 
 	/*
 	 *	List to list found, this is a special case because we don't need
@@ -1069,13 +1321,12 @@ int map_to_vp(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *request, map_t co
 				talloc_free(n);
 				goto error;
 			}
-		} else if (map->op != T_OP_CMP_TRUE) {
-			if (fr_value_box_cast(n, &n->data, n->vp_type, n->da, tmpl_value(map->rhs)) < 0) {
-				RPEDEBUG("Implicit cast failed");
-				rcode = -1;
-				talloc_free(n);
-				goto error;
-			}
+
+		} else if (fr_value_box_cast(n, &n->data, n->vp_type, n->da, tmpl_value(map->rhs)) < 0) {
+			RPEDEBUG("Implicit cast failed");
+			rcode = -1;
+			talloc_free(n);
+			goto error;
 		}
 		n->op = map->op;
 		fr_pair_append(out, n);
@@ -1315,9 +1566,14 @@ int map_to_request(request_t *request, map_t const *map, radius_map_getvalue_t f
 				FALL_THROUGH;
 
 		case T_OP_ADD:
-				fr_pair_list_move(list, &src_list);
+				fr_pair_list_move(list, &src_list, T_OP_ADD);
 				fr_pair_list_free(&src_list);
 			}
+			goto update;
+
+		case T_OP_PREPEND:
+			fr_pair_list_move(list, &src_list, map->op);
+			fr_pair_list_free(&src_list);
 			goto update;
 
 		default:
@@ -1535,6 +1791,14 @@ int map_to_request(request_t *request, map_t const *map, radius_map_getvalue_t f
 		fr_assert(fr_dlist_num_elements(&interior) == 0);
 		fr_dlist_talloc_free(&leaf);
 	}
+		break;
+
+	/*
+	 *	^= - Prepend src_list attributes to the destination
+	 */
+	case T_OP_PREPEND:
+		fr_pair_list_prepend(list, &src_list);
+		fr_pair_list_free(&src_list);
 		break;
 
 	/*

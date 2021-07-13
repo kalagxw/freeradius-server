@@ -47,7 +47,6 @@ typedef struct {
 	fr_rb_node_t		node;			//!< Entry in the namespace tree.
 	char const		*namespace;		//!< Namespace function is registered to.
 	fr_dict_t const		*dict;			//!< dictionary to use
-	fr_virtual_server_compile_t	func;		//!< Function to call to compile sections.
 } fr_virtual_namespace_t;
 
 typedef struct {
@@ -195,7 +194,7 @@ void virtual_server_dict_set(CONF_SECTION *server_cs, fr_dict_t const *dict, boo
 	p->server = talloc_strdup(p, cf_section_name2(server_cs));
 	talloc_set_destructor(p, _virtual_server_dict_free);
 
-	if (reference) fr_dict_dependent_add(fr_dict_unconst(dict), p->server);
+	if (reference) fr_dict_dependent_add(dict, p->server);
 
 	cf_data_add(server_cs, p, "dictionary", true);
 }
@@ -230,9 +229,6 @@ static int namespace_on_read(TALLOC_CTX *ctx, UNUSED void *out, UNUSED void *par
 	CONF_PAIR		*cp = cf_item_to_pair(ci);
 	CONF_SECTION		*server_cs = cf_item_to_section(cf_parent(ci));
 	char const		*namespace = cf_pair_value(cp);
-	char const		*file;
-	char const		*dir = NULL;
-	fr_dict_t		*dict;
 	dl_module_t const      	*module;
 	char			*module_name, *p, *end;
 
@@ -240,38 +236,6 @@ static int namespace_on_read(TALLOC_CTX *ctx, UNUSED void *out, UNUSED void *par
 		cf_log_err(ci, "Missing value for 'namespace'");
 		return -1;
 	}
-
-	/*
-	 *	The "control" socket does not have a dictionary.
-	 */
-	if (strcmp(namespace, "control") == 0) {
-		dict = fr_dict_unconst(fr_dict_internal());
-		goto set;
-	}
-
-	file = namespace;	/* the default */
-
-	/*
-	 *	These are all equivalent.  Rewrite the names to be our
-	 *	canonical version.
-	 */
-	if ((strcmp(namespace, "eap-aka-prime") == 0) ||
-	    (strcmp(namespace, "eap-aka") == 0) ||
-	    (strcmp(namespace, "eap-sim") == 0)) {
-		dir = "eap/aka-sim";
-		file = "eap-aka-sim";
-	}
-
-	/*
-	 *	@todo - print out the entire error stack?
-	 */
-	if (fr_dict_protocol_afrom_file(&dict, file, dir, cf_section_name2(server_cs)) < 0) {
-		cf_log_perr(ci, "Failed loading namespace '%s'", namespace);
-		return -1;
-	}
-
-set:
-	virtual_server_dict_set(server_cs, dict, false);
 
 	module_name = talloc_strdup(ctx, namespace);
 
@@ -289,23 +253,14 @@ set:
 	 */
 	module = dl_module(server_cs, NULL, module_name, DL_MODULE_TYPE_PROCESS);
 	talloc_free(module_name);
-#ifndef NDEBUG
 	if (module) {
 		fr_process_module_t const *process = (fr_process_module_t const *) module->common;
 
-		/*
-		 *	It MUST have the same dictionary as the
-		 *	namespace.
-		 *
-		 *	@todo - once we have process functions for all
-		 *	state machines, remove the code just above
-		 *	which manually loads the dictionary.  And
-		 *	instead set the dictionary from *process->dict.
-		 */
-		fr_assert(process->dict);
-		fr_assert(*process->dict == dict);
+		if (*process->dict) {
+			virtual_server_dict_set(server_cs, *process->dict, false);
+		}
 	}
-#endif
+
 	if (!module) {
 		cf_log_perr(ci, "Failed loading process module");
 		return -1;
@@ -530,7 +485,7 @@ static int server_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *parent,
  *
  *	Short-term hack
  */
-int virtual_server_push(request_t *request, CONF_SECTION *server_cs, bool top_frame)
+unlang_action_t virtual_server_push(request_t *request, CONF_SECTION *server_cs, bool top_frame)
 {
 	fr_virtual_server_t *server;
 	fr_process_module_t const *process;
@@ -540,7 +495,7 @@ int virtual_server_push(request_t *request, CONF_SECTION *server_cs, bool top_fr
 	server = cf_data_value(cf_data_find(server_cs, fr_virtual_server_t, "vs"));
 	if (!server) {
 		REDEBUG("server_cs does not contain virtual server data");
-		return -1;
+		return UNLANG_ACTION_FAIL;
 	}
 
 	mi->name = server->process_module->name;
@@ -567,9 +522,9 @@ int virtual_server_push(request_t *request, CONF_SECTION *server_cs, bool top_fr
 	 *	src/lib/server/module.c, that reserves 0 for "nothing
 	 *	is initialized".
 	 */
-	if (unlang_module_push(&request->rcode, request, mi, process->process, top_frame) < 0) return -1;
+	if (unlang_module_push(&request->rcode, request, mi, process->process, top_frame) < 0) return UNLANG_ACTION_FAIL;
 
-	return 0;
+	return UNLANG_ACTION_PUSHED_CHILD;
 }
 
 /** Allow dynamic clients in this virtual server.
@@ -701,12 +656,12 @@ static int8_t listen_addr_cmp(void const *one, void const *two)
 	/*
 	 *	UDP vs TCP
 	 */
-	CMP_RETURN(app_io_addr->proto);
+	CMP_RETURN(a, b, app_io_addr->proto);
 
 	/*
 	 *	Check ports.
 	 */
-	CMP_RETURN(app_io_addr->inet.src_port);
+	CMP_RETURN(a, b, app_io_addr->inet.src_port);
 
 	/*
 	 *	Don't call fr_ipaddr_cmp(), as we need to do our own
@@ -717,14 +672,14 @@ static int8_t listen_addr_cmp(void const *one, void const *two)
 	/*
 	 *	Different address families.
 	 */
-	CMP_RETURN(app_io_addr->inet.src_ipaddr.af);
+	CMP_RETURN(a, b, app_io_addr->inet.src_ipaddr.af);
 
 	/*
 	 *	If both are bound to interfaces, AND the interfaces
 	 *	are different, then there is no conflict.
 	 */
 	if (a->app_io_addr->inet.src_ipaddr.scope_id && b->app_io_addr->inet.src_ipaddr.scope_id) {
-		CMP_RETURN(app_io_addr->inet.src_ipaddr.scope_id);
+		CMP_RETURN(a, b, app_io_addr->inet.src_ipaddr.scope_id);
 	}
 
 	ret = a->app_io_addr->inet.src_ipaddr.prefix - b->app_io_addr->inet.src_ipaddr.prefix;
@@ -810,7 +765,6 @@ static int process_instantiate(CONF_SECTION *server_cs, dl_module_inst_t *dl_ins
 int virtual_servers_instantiate(void)
 {
 	size_t		i, server_cnt = virtual_servers ? talloc_array_length(virtual_servers) : 0;
-	fr_rb_tree_t	*vns_tree = cf_data_value(cf_data_find(virtual_server_root, fr_rb_tree_t, "vns_tree"));
 
 	fr_assert(virtual_servers);
 
@@ -841,23 +795,6 @@ int virtual_servers_instantiate(void)
 		DEBUG("Compiling policies in server %s { ... }", cf_section_name2(server_cs));
 
 		fr_assert(virtual_servers[i]->namespace != NULL);
-
-		/*
-		 *	Compile EAP-AKA, SIM, etc.  This code is a
-		 *	place-holder until such time as the
-		 *	process_foo() modules are done.
-		 */
-		if (vns_tree) {
-			fr_virtual_namespace_t	find = { .namespace = virtual_servers[i]->namespace };
-			fr_virtual_namespace_t	*found;
-
-			found = fr_rb_find(vns_tree, &find);
-			if (found) {
-				fr_assert(dict && (dict->dict == found->dict));
-
-				if (found->func(server_cs) < 0) return -1;
-			}
-		}
 
 		for (j = 0; j < listen_cnt; j++) {
 			fr_virtual_listen_t *listen = listener[j];
@@ -1172,77 +1109,6 @@ int virtual_server_cf_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *pare
 	return 0;
 }
 
-/** Free a virtual namespace callback
- *
- */
-static void _virtual_namespace_free(void *data)
-{
-	talloc_free(data);
-}
-
-/** Compare two virtual namespace callbacks
- *
- */
-static int8_t _virtual_namespace_cmp(void const *one, void const *two)
-{
-	fr_virtual_namespace_t const *a = one;
-	fr_virtual_namespace_t const *b = two;
-	int ret;
-
-	ret = strcmp(a->namespace, b->namespace);
-	return CMP(ret, 0);
-}
-
-/** Add a callback for a specific namespace
- *
- *  This allows modules to register unlang compilation functions for specific namespaces
- *
- * @param[in] namespace		to register.
- * @param[in] dict		Dictionary name to use for this namespace
- * @param[in] func		to call to compile sections in the virtual server.
- * @return
- *	- 0 on success.
- *	- -1 on failure.
- */
-int virtual_namespace_register(char const *namespace, fr_dict_t const *dict,
-			       fr_virtual_server_compile_t func)
-{
-	fr_rb_tree_t		*vns_tree;
-	fr_virtual_namespace_t	*vns;
-
-	fr_assert(virtual_server_root);	/* Virtual server bootstrap must be called first */
-
-	MEM(vns = talloc_zero(NULL, fr_virtual_namespace_t));
-	vns->namespace = talloc_strdup(vns, namespace);
-	vns->dict = dict;
-	vns->func = func;
-
-	vns_tree = cf_data_value(cf_data_find(virtual_server_root, fr_rb_tree_t, "vns_tree"));
-	if (!vns_tree) {
-		/*
-		 *	Tree will be freed when the cf_data is freed
-		 *	so it shouldn't be parented from
-		 *	virtual_server_root.
-		 */
-		MEM(vns_tree = fr_rb_inline_talloc_alloc(NULL,
-							 fr_virtual_namespace_t, node,
-							 _virtual_namespace_cmp,
-							 _virtual_namespace_free));
-
-		if (!cf_data_add(virtual_server_root, vns_tree, "vns_tree", true)) {
-			ERROR("Failed adding namespace tree data to config");
-			talloc_free(vns_tree);
-			return -1;
-		}
-	}
-
-	if (fr_rb_replace(NULL, vns_tree, vns) < 0) {
-		ERROR("Failed inserting namespace into tree");
-		return -1;
-	}
-
-	return 0;
-}
 
 /** Return the namespace for a given virtual server
  *
@@ -1471,8 +1337,16 @@ rlm_rcode_t virtual_server_process_auth(request_t *request, CONF_SECTION *virtua
  *
  *  This function walks down the registration table, compiling each
  *  named section.
+ *
+ * @parma[in] server	to search for sections in.
+ * @param[in] list	of sections to compiler.
+ * @param[in] rules	to apply for pass1.
+ * @param[in] instance	module instance data.  The offset value in
+ *			the rules array will be added to this to
+ *			determine where to write pointers to the
+ *			various CONF_SECTIONs.
  */
-int virtual_server_compile_sections(CONF_SECTION *server, virtual_server_compile_t const *list, tmpl_rules_t const *rules, void *uctx)
+int virtual_server_compile_sections(CONF_SECTION *server, virtual_server_compile_t const *list, tmpl_rules_t const *rules, void *instance)
 {
 	int i, found;
 	CONF_SECTION *subcs = NULL;
@@ -1503,8 +1377,8 @@ int virtual_server_compile_sections(CONF_SECTION *server, virtual_server_compile
 				/*
 				 *	Initialise CONF_SECTION pointer for missing section
 				 */
-				if ((uctx) && (list[i].offset > 0)) {
-					*(CONF_SECTION **) (((uint8_t *) uctx) + list[i].offset) = NULL;
+				if ((instance) && !list[i].dont_cache) {
+					*(CONF_SECTION **) (((uint8_t *) instance) + list[i].offset) = NULL;
 				}
 				continue;
 			}
@@ -1526,12 +1400,12 @@ int virtual_server_compile_sections(CONF_SECTION *server, virtual_server_compile
 			/*
 			 *	Cache the CONF_SECTION which was found.
 			 */
-			if (uctx) {
-				if (list[i].offset > 0) {
-					*(CONF_SECTION **) (((uint8_t *) uctx) + list[i].offset) = subcs;
+			if (instance) {
+				if (!list[i].dont_cache) {
+					*(CONF_SECTION **) (((uint8_t *) instance) + list[i].offset) = subcs;
 				}
 				if (list[i].instruction > 0) {
-					*(void **) (((uint8_t *) uctx) + list[i].instruction) = instruction;
+					*(void **) (((uint8_t *) instance) + list[i].instruction) = instruction;
 				}
 			}
 

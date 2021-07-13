@@ -81,6 +81,13 @@ typedef struct {
 	char const	*prefix;	//!< To add to log messages.
 } log_fd_event_ctx_t;
 
+/** Function signature for log_request functions
+ *
+ */
+typedef void (*log_request_func_t)(fr_log_type_t type, fr_log_lvl_t lvl, request_t *request,
+		    		   char const *file, int line,
+				   char const *fmt, ...);
+
 extern fr_table_num_sorted_t const syslog_facility_table[];
 extern size_t syslog_facility_table_len;
 extern fr_table_num_sorted_t const syslog_severity_table[];
@@ -116,6 +123,9 @@ void	log_request_error(fr_log_type_t type, fr_log_lvl_t lvl, request_t *request,
 void	log_request_perror(fr_log_type_t type, fr_log_lvl_t lvl, request_t *request,
 			   char const *file, int line, char const *fmt, ...)
 	CC_HINT(format (printf, 6, 7)) CC_HINT(nonnull (3));
+
+void	log_request_pair(fr_log_lvl_t lvl, request_t *request,
+			 fr_pair_t const *parent, fr_pair_t const *vp, char const *prefix) CC_HINT(nonnull(2));
 
 void	log_request_pair_list(fr_log_lvl_t lvl, request_t *request,
 			      fr_pair_t const *parent, fr_pair_list_t const *vps, char const *prefix)

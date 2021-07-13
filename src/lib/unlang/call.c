@@ -31,13 +31,32 @@ RCSID("$Id$")
 #include "module_priv.h"
 #include "unlang_priv.h"
 
+static unlang_action_t unlang_call_resume(UNUSED rlm_rcode_t *p_result, request_t *request,
+					  unlang_stack_frame_t *frame)
+{
+	unlang_group_t			*g = unlang_generic_to_group(frame->instruction);
+	unlang_call_t			*gext = unlang_group_to_call(g);
+	fr_pair_t			*packet_type_vp = NULL;
+
+	switch (pair_update_reply(&packet_type_vp, gext->attr_packet_type)) {
+	case 0:
+		packet_type_vp->vp_uint32 = request->reply->code;
+		break;
+
+	case 1:
+		break;	/* Don't change */
+	}
+
+	return UNLANG_ACTION_CALCULATE_RESULT;
+}
+
 static unlang_action_t unlang_call_frame_init(rlm_rcode_t *p_result, request_t *request,
 					      unlang_stack_frame_t *frame)
 {
 	unlang_group_t			*g;
 	unlang_call_t			*gext;
 	fr_dict_enum_t const		*type_enum;
-	fr_pair_t			*packet_type_vp;
+	fr_pair_t			*packet_type_vp = NULL;
 
 	/*
 	 *	Do not check for children here.
@@ -54,11 +73,22 @@ static unlang_action_t unlang_call_frame_init(rlm_rcode_t *p_result, request_t *
 	 */
 	type_enum = fr_dict_enum_by_value(gext->attr_packet_type, fr_box_uint32(request->packet->code));
 	if (!type_enum) {
-		REDEBUG("No such value '%d' of attribute 'Packet-Type' for server %s",
-			request->packet->code, cf_section_name2(gext->server_cs));
-	error:
-		*p_result = RLM_MODULE_FAIL;
-		return UNLANG_ACTION_CALCULATE_RESULT;
+		packet_type_vp = fr_pair_find_by_da(&request->request_pairs, gext->attr_packet_type, 0);
+		if (!packet_type_vp) {
+		bad_packet_type:
+			REDEBUG("No such value '%d' of attribute 'Packet-Type' for server %s",
+				request->packet->code, cf_section_name2(gext->server_cs));
+		error:
+			*p_result = RLM_MODULE_FAIL;
+			return UNLANG_ACTION_CALCULATE_RESULT;
+		}
+		type_enum = fr_dict_enum_by_value(packet_type_vp->da, &packet_type_vp->data);
+		if (!type_enum) goto bad_packet_type;
+
+		/*
+		 *	Sync up packet->code
+		 */
+		request->packet->code = packet_type_vp->vp_uint32;
 	}
 
 	/*
@@ -66,7 +96,7 @@ static unlang_action_t unlang_call_frame_init(rlm_rcode_t *p_result, request_t *
 	 *
 	 *	Fixme - packet->code needs to die...
 	 */
-	switch (pair_update_control(&packet_type_vp, gext->attr_packet_type)) {
+	if (!packet_type_vp) switch (pair_update_request(&packet_type_vp, gext->attr_packet_type)) {
 	case 0:
 		packet_type_vp->vp_uint32 = request->packet->code;
 		break;
@@ -79,6 +109,16 @@ static unlang_action_t unlang_call_frame_init(rlm_rcode_t *p_result, request_t *
 		goto error;
 	}
 
+	/*
+	 *	Need to add reply.Packet-Type if it
+	 *	wasn't set by the virtual server...
+	 *
+	 *	AGAIN packet->code NEEDS TO DIE.
+	 *	DIE DIE DIE DIE DIE DIE DIE DIE DIE
+	 *	DIE DIE DIE DIE DIE DIE DIE DIE DIE.
+	 */
+	frame_repeat(frame, unlang_call_resume);
+
 	if (virtual_server_push(request, gext->server_cs, UNLANG_SUB_FRAME) < 0) goto error;
 
 	return UNLANG_ACTION_PUSHED_CHILD;
@@ -88,7 +128,7 @@ static unlang_action_t unlang_call_frame_init(rlm_rcode_t *p_result, request_t *
  *
  * This should be used instead of virtual_server_push in the majority of the code
  */
-int unlang_call_push(request_t *request, CONF_SECTION *server_cs, bool top_frame)
+unlang_action_t unlang_call_push(request_t *request, CONF_SECTION *server_cs, bool top_frame)
 {
 	unlang_stack_t			*stack = request->stack;
 	unlang_call_t			*c;
@@ -101,14 +141,14 @@ int unlang_call_push(request_t *request, CONF_SECTION *server_cs, bool top_frame
 	 */
 	dict = virtual_server_dict(server_cs);
 	if (!dict) {
-		REDEBUG("No dictionary associated with virtual server");
-		return -1;
+		REDEBUG("Virtual server \"%s\" not compiled", cf_section_name2(server_cs));
+		return UNLANG_ACTION_FAIL;
 	}
 
 	attr_packet_type = fr_dict_attr_by_name(NULL, fr_dict_root(dict), "Packet-Type");
 	if (!attr_packet_type) {
 		REDEBUG("No Packet-Type attribute available");
-		return -1;
+		return UNLANG_ACTION_FAIL;
 	}
 
 	/*
@@ -145,12 +185,12 @@ int unlang_call_push(request_t *request, CONF_SECTION *server_cs, bool top_frame
 	 *	Push a new call frame onto the stack
 	 */
 	if (unlang_interpret_push(request, unlang_call_to_generic(c),
-				  RLM_MODULE_UNKNOWN, UNLANG_NEXT_STOP, top_frame) < 0) {
+				  RLM_MODULE_NOT_SET, UNLANG_NEXT_STOP, top_frame) < 0) {
 		talloc_free(c);
-		return -1;
+		return UNLANG_ACTION_FAIL;
 	}
 
-	return 0;
+	return UNLANG_ACTION_PUSHED_CHILD;
 }
 
 /** Return the last virtual server that was called

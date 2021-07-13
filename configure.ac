@@ -1199,10 +1199,10 @@ if test "x$WITH_OPENSSL" = xyes; then
       ]
     )
 
-    AC_MSG_CHECKING([for OpenSSL version >= 1.0.2])
+    AC_MSG_CHECKING([for OpenSSL version >= 1.1.1])
     AC_EGREP_CPP(yes,
       [#include <openssl/crypto.h>
-       #if (OPENSSL_VERSION_NUMBER >= 0x10002000L)
+       #if (OPENSSL_VERSION_NUMBER >= 0x10101000L)
        yes
        #endif
       ],
@@ -2467,7 +2467,7 @@ dnl #############################################################
 AC_CONFIG_COMMANDS([stamp-h], [echo timestamp > src/include/stamp-h])
 AC_CONFIG_COMMANDS([build-radpaths-h], [(cd ./src/include && /bin/sh ./build-radpaths-h)])
 AC_CONFIG_COMMANDS([main-chmod], [(cd ./src/bin && chmod +x checkrad radlast radtest)])
-AC_CONFIG_COMMANDS([scripts-chmod], [(cd ./scripts && chmod +x rc.radiusd cron/radiusd.cron.daily cron/radiusd.cron.monthly cryptpasswd)])
+AC_CONFIG_COMMANDS([scripts-chmod], [(cd ./scripts && chmod +x rc.radiusd cron/radiusd.cron.daily cron/radiusd.cron.monthly util/cryptpasswd)])
 
 dnl #
 dnl #  Substitute whatever libraries we found to be necessary
@@ -2484,7 +2484,7 @@ AC_OUTPUT(\
   ./scripts/rc.radiusd \
   ./scripts/cron/radiusd.cron.daily \
   ./scripts/cron/radiusd.cron.monthly \
-  ./scripts/cryptpasswd \
+  ./scripts/util/cryptpasswd \
   ./raddb/radrelay.conf \
   ./raddb/radiusd.conf
 )

@@ -93,7 +93,7 @@ ssize_t cond_print(fr_sbuff_t *out, fr_cond_t const *in)
 			break;
 
 		case COND_TYPE_RCODE:
-			fr_assert(c->data.rcode != RLM_MODULE_UNKNOWN);
+			fr_assert(c->data.rcode != RLM_MODULE_NOT_SET);
 			FR_SBUFF_IN_STRCPY_RETURN(&our_out, fr_table_str_by_value(rcode_table, c->data.rcode, ""));
 			break;
 
@@ -1283,8 +1283,8 @@ static ssize_t cond_tokenize(TALLOC_CTX *ctx, fr_cond_t **out,
 		if (tmpl_is_unresolved(lhs) && (lhs->quote == T_BARE_WORD)) {
 			rlm_rcode_t rcode;
 
-			rcode = fr_table_value_by_str(rcode_table, lhs->data.unescaped, RLM_MODULE_UNKNOWN);
-			if (rcode == RLM_MODULE_UNKNOWN) {
+			rcode = fr_table_value_by_str(rcode_table, lhs->data.unescaped, RLM_MODULE_NOT_SET);
+			if (rcode == RLM_MODULE_NOT_SET) {
 				fr_strerror_const("Expected a module return code");
 				fr_sbuff_set(&our_in, &m_lhs);
 				goto error;
@@ -1588,47 +1588,42 @@ ssize_t fr_cond_tokenize(CONF_SECTION *cs, fr_cond_t **head, tmpl_rules_t const 
 	return slen + diff;
 }
 
-/*
- *	Walk in order.
+/** Initialise a cond iterator
+ *
+ * Will return the first leaf condition node.
+ *
+ * @param[out] iter	to initialise.
+ * @param[in] head	the root of the condition structure.
+ * @return The first leaf condition node.
  */
-bool fr_cond_walk(fr_cond_t *c, bool (*callback)(fr_cond_t *cond, void *uctx), void *uctx)
+fr_cond_t *fr_cond_iter_init(fr_cond_iter_t *iter, fr_cond_t *head)
 {
-	while (c) {
-		/*
-		 *	Process this one, exit on error.
-		 */
-		if (!callback(c, uctx)) return false;
+	fr_cond_t *c;
 
-		switch (c->type) {
-		case COND_TYPE_INVALID:
-			return false;
+	for (c = head; c->type == COND_TYPE_CHILD; c = c->data.child);	/* Deepest condition */
 
-		case COND_TYPE_RCODE:
-		case COND_TYPE_TMPL:
-		case COND_TYPE_MAP:
-		case COND_TYPE_AND:
-		case COND_TYPE_OR:
-		case COND_TYPE_TRUE:
-		case COND_TYPE_FALSE:
-			break;
+	return iter->cond = c;
+}
 
-		case COND_TYPE_CHILD:
-			/*
-			 *	Walk over the child.
-			 */
-			if (!fr_cond_walk(c->data.child, callback, uctx)) {
-				return false;
-			}
-			break;
-		}
+/** Get the next leaf condition node
+ *
+ * @param[in] iter	to iterate over.
+ * @return The next leaf condition node.
+ */
+fr_cond_t *fr_cond_iter_next(fr_cond_iter_t *iter)
+{
+	fr_cond_t *c;
 
-		/*
-		 *	process the next sibling
-		 */
-		c = c->next;
+	/*
+	 *	Walk up the tree, maybe...
+	 */
+	for (c = iter->cond; c; c = c->parent) {
+		if (!c->next) continue; /* Done with this level */
+		for (c = c->next; c->type == COND_TYPE_CHILD; c = c->data.child);	/* down we go... */
+		break;
 	}
 
-	return true;
+	return iter->cond = c;
 }
 
 /** Update the condition with "is async required".
@@ -1685,36 +1680,4 @@ void fr_cond_async_update(fr_cond_t *c)
 		}
 		c = c->next;
 	}
-}
-
-/** Convert a single map to a condition.
- *
- * @param ctx	the talloc context where the condition is allocated
- * @param[out]	head the newly allocated condition.  Should only be one!
- * @param[in]	map the map to convert. MAY be freed.
- * @return
- *	- <0 on error "map" is untouched.
- *	- 0 on success - "map" MAY be freed
- */
-int fr_cond_from_map(TALLOC_CTX *ctx, fr_cond_t **head, map_t *map)
-{
-	fr_cond_t *cond = talloc_zero(ctx, fr_cond_t);
-
-	if (!cond) return -1;
-
-	cond->type = COND_TYPE_MAP;
-	cond->data.map = map;
-
-	if (cond_normalise(ctx, T_BARE_WORD, &cond) < 0) return -1;
-
-	/*
-	 *	If the condition is still a MAP, then make the map
-	 *	owned by the condition.
-	 */
-	if (cond->type == COND_TYPE_MAP) {
-		(void) talloc_steal(cond, map);
-	}
-
-	*head = cond;
-	return 0;
 }

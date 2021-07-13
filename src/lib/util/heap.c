@@ -64,8 +64,6 @@ fr_heap_t *_fr_heap_alloc(TALLOC_CTX *ctx, fr_heap_cmp_t cmp, char const *type, 
 {
 	fr_heap_t *fh;
 
-	if (!cmp) return NULL;
-
 	fh = talloc_zero(ctx, fr_heap_t);
 	if (!fh) return NULL;
 
@@ -216,30 +214,22 @@ int fr_heap_extract(fr_heap_t *hp, void *data)
 	int32_t parent, child, max;
 
 	/*
-	 *	Extract element.  Default is the first one (pop)
+	 *	Extract element.
 	 */
-	if (!data) {
-		if (unlikely((hp->num_elements == 0) || !hp->p[0])) {
-			fr_strerror_const("Tried to extract element from empty heap");
-			return -1;
-		}
-		parent = 0;
-	} else {		/* extract from the middle */
-		parent = index_get(hp, data);
+	parent = index_get(hp, data);
 
-		/*
-		 *	Out of bounds.
-		 */
-		if (unlikely((parent < 0) || (parent >= hp->num_elements))) {
-			fr_strerror_printf("Heap parent (%i) out of bounds (0-%i)", parent, hp->num_elements);
-			return -1;
-		}
+	/*
+	 *	Out of bounds.
+	 */
+	if (unlikely((parent < 0) || (parent >= hp->num_elements))) {
+		fr_strerror_printf("Heap parent (%i) out of bounds (0-%i)", parent, hp->num_elements);
+		return -1;
+	}
 
-		if (unlikely(data != hp->p[parent])) {
-			fr_strerror_printf("Invalid heap index.  Expected data %p at offset %i, got %p", data,
-					   parent, hp->p[parent]);
-			return -1;
-		}
+	if (unlikely(data != hp->p[parent])) {
+		fr_strerror_printf("Invalid heap index.  Expected data %p at offset %i, got %p", data,
+				   parent, hp->p[parent]);
+		return -1;
 	}
 	max = hp->num_elements - 1;
 

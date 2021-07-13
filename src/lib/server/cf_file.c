@@ -38,6 +38,7 @@ RCSID("$Id$")
 #include <freeradius-devel/server/virtual_servers.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/misc.h>
+#include <freeradius-devel/util/perm.h>
 #include <freeradius-devel/util/syserror.h>
 
 #include <sys/types.h>
@@ -503,9 +504,8 @@ static bool cf_template_merge(CONF_SECTION *cs, CONF_SECTION const *template)
 static int8_t _inode_cmp(void const *one, void const *two)
 {
 	cf_file_t const *a = one, *b = two;
-	int ret;
 
-	CMP_RETURN(buf.st_dev);
+	CMP_RETURN(a, b, buf.st_dev);
 
 	return CMP(a->buf.st_ino, b->buf.st_ino);
 }
@@ -623,7 +623,7 @@ bool cf_file_check(CONF_SECTION *cs, char const *filename, bool check_perms)
 	if (!check_perms) {
 		if (stat(filename, &file->buf) < 0) {
 		perm_error:
-			rad_file_error(errno);	/* Write error and euid/egid to error buff */
+			fr_perm_file_error(errno);	/* Write error and euid/egid to error buff */
 			PERROR("Unable to open file \"%s\"", filename);
 		error:
 			if (fd >= 0) close(fd);
@@ -1781,7 +1781,7 @@ static int parse_input(cf_stack_t *stack)
 	 *	so we check for them first.
 	 */
 	if (!((*ptr == '=') || (*ptr == '!') || (*ptr == '>') || (*ptr == '<') ||
-	      (*ptr == '-') || (*ptr == '+') || (*ptr == ':'))) {
+	      (*ptr == '-') || (*ptr == '+') || (*ptr == ':') || (*ptr == '^'))) {
 		ERROR("%s[%d]: Parse error at unexpected text: %s",
 		      frame->filename, frame->lineno, ptr);
 		return -1;
@@ -1811,6 +1811,7 @@ static int parse_input(cf_stack_t *stack)
 
 	case T_OP_EQ:
 	case T_OP_SET:
+	case T_OP_PREPEND:
 		fr_skip_whitespace(ptr);
 		op_token = name2_token;
 		break;

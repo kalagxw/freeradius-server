@@ -7,6 +7,7 @@ Build-Depends: @BUILDDEPS@ debhelper (>= 9),
  libcurl4-openssl-dev | libcurl4-gnutls-dev,
  libcap-dev,
  libgdbm-dev,
+ libidn11-dev,
  libjson-perl,
  libjson-c (>= 1.13) | libjson-c4 | libjson-c5,
  libjson-c-dev,
@@ -133,7 +134,7 @@ Description: kerberos module for FreeRADIUS server
 
 Package: freeradius-ldap
 Architecture: any
-Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}
+Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}, libsasl2-modules-gssapi-mit
 Description: LDAP module for FreeRADIUS server
  The FreeRADIUS server can use LDAP to authenticate users, and this module
  is necessary for that.

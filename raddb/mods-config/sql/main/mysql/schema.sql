@@ -44,6 +44,7 @@ CREATE TABLE radacct (
   framedipv6prefix varchar(45) NOT NULL default '',
   framedinterfaceid varchar(44) NOT NULL default '',
   delegatedipv6prefix varchar(45) NOT NULL default '',
+  class varchar(64) default NULL,
   PRIMARY KEY (radacctid),
   UNIQUE KEY acctuniqueid (acctuniqueid),
   KEY username (username),
@@ -146,6 +147,7 @@ CREATE TABLE radpostauth (
   pass varchar(64) NOT NULL default '',
   reply varchar(32) NOT NULL default '',
   authdate timestamp(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  class varchar(64) NOT NULL default '',
   PRIMARY KEY  (id)
 ) ENGINE = INNODB;
 

@@ -46,11 +46,19 @@ typedef bool (*fr_htrie_delete_t)(fr_htrie_t *ht, void const *data);
 
 typedef uint32_t (*fr_htrie_num_elements_t)(fr_htrie_t *ht);
 
+typedef enum {
+	FR_HTRIE_INVALID = 0,
+	FR_HTRIE_HASH,		//!< Data is stored in a hash.
+	FR_HTRIE_RB,		//!< Data is stored in a rb tree.
+	FR_HTRIE_TRIE,		//!< Data is stored in a prefix trie.
+} fr_htrie_type_t;
+
 /** Which functions are used for the different operations
  *
  */
 typedef struct {
 	fr_htrie_find_t		find;		//!< Absolute or prefix match.
+	fr_htrie_find_t		match;		//!< exact prefix match
 	fr_htrie_insert_t	insert;		//!< Insert a new item into the store.
 	fr_htrie_replace_t	replace;	//!< Replace an existing item in store.
 	fr_htrie_remove_t	remove;		//!< Remove an item from the store.
@@ -62,16 +70,10 @@ typedef struct {
  *
  */
 struct fr_htrie_s {
+	fr_htrie_type_t		type;		//!< type of the htrie
 	void			*store;		//!< What we're using to store node data
 	fr_htrie_funcs_t	funcs;		//!< Function pointers for the various operations.
 };
-
-typedef enum {
-	FR_HTRIE_INVALID = 0,
-	FR_HTRIE_HASH,		//!< Data is stored in a hash.
-	FR_HTRIE_RB,		//!< Data is stored in a rb tree.
-	FR_HTRIE_TRIE,		//!< Data is stored in a prefix trie.
-} fr_htrie_type_t;
 
 fr_htrie_t *fr_htrie_alloc(TALLOC_CTX *ctx,
 			   fr_htrie_type_t type,
@@ -79,6 +81,14 @@ fr_htrie_t *fr_htrie_alloc(TALLOC_CTX *ctx,
 			   fr_cmp_t cmp_data,
 			   fr_trie_key_t get_key,
 			   fr_free_t free_data);
+
+/** Match data in a htrie
+ *
+ */
+static inline CC_HINT(nonnull) void *fr_htrie_match(fr_htrie_t *ht, void const *data)
+{
+	return ht->funcs.match(ht->store, data);
+}
 
 /** Find data in a htrie
  *

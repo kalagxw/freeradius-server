@@ -129,13 +129,16 @@ typedef struct {
 	fr_tls_session_t	*tls_session;		//!< TLS session used to authenticate peer
 							//!< or tunnel sensitive data.
 
+	int			base_flags;		//!< Some protocols use the reserved bits of the EAP-TLS
+							//!< flags (such as PEAP).  This allows the base flags to
+							//!< be set.
+
 	bool			phase2;			//!< Whether we're in phase 2
 
 	bool			include_length;		//!< A flag to include length in every TLS Data/Alert packet.
 							//!< If set to no then only the first fragment contains length.
-	int			base_flags;		//!< Some protocols use the reserved bits of the EAP-TLS
-							//!< flags (such as PEAP).  This allows the base flags to
-							//!< be set.
+
+	bool			authentication_success;	//! for methods with inner auth, if the inner auth succeeded.
 
 	bool			record_out_started;	//!< Whether a record transfer to the peer is currently
 							//!< in progress.
@@ -148,19 +151,32 @@ typedef struct {
 	size_t			record_in_recvd_len;	//!< How much of the record we've received so far.
 } eap_tls_session_t;
 
+typedef struct {
+	char const		*keying_prf_label;	//!< PRF label to use for generating keying material.
+							//!< If NULL, no MPPE keys will be generated.
+	size_t			keying_prf_label_len;	//!< length of the keying PRF label.
+
+	char const		*sessid_prf_label;	//!< PRF label to use when generating the session ID.
+							//!< If NULL, session ID will be based on client/server randoms.
+	size_t			sessid_prf_label_len;	//!< Length of the session ID PRF label.
+
+	uint8_t			context[1];		//!< for TLS 1.3 context, is the EAP Type code
+	size_t			context_len;		//!< length of the context
+
+	int			use_context;		//!< for SSL_export_keying_material().
+} eap_tls_prf_label_t;
+
 extern fr_table_num_ordered_t const eap_tls_status_table[];
 extern size_t eap_tls_status_table_len;
 
 /*
  *	Externally exported TLS functions.
  */
-eap_tls_status_t	eap_tls_process(request_t *request, eap_session_t *eap_session) CC_HINT(nonnull);
+unlang_action_t		eap_tls_process(request_t *request, eap_session_t *eap_session) CC_HINT(nonnull);
 
 int			eap_tls_start(request_t *request, eap_session_t *eap_session) CC_HINT(nonnull);
 
-int			eap_tls_success(request_t *request, eap_session_t *eap_session,
-					char const *keying_prf_label, size_t keying_prf_label_len,
-					char const *sessid_prf_label, size_t sessid_prf_label_len) CC_HINT(nonnull(1));
+int			eap_tls_success(request_t *request, eap_session_t *eap_session, eap_tls_prf_label_t *prf_label) CC_HINT(nonnull(1,2));
 
 int			eap_tls_fail(request_t *request, eap_session_t *eap_session) CC_HINT(nonnull);
 
@@ -171,15 +187,18 @@ int			eap_tls_compose(request_t *request, eap_session_t *eap_session,
 		    			fr_tls_record_t *record, size_t record_len, size_t frag_len);
 
 /* MPPE key generation */
-int			eap_crypto_mppe_keys(request_t *request, SSL *ssl,
-					     char const *prf_label, size_t prf_label_len) CC_HINT(nonnull);
+void			eap_crypto_prf_label_init(eap_tls_prf_label_t *prf_label, eap_session_t *eap_session,
+						  char const *keying_prf_label, size_t keying_prf_label_len);
 
-int			eap_crypto_tls_session_id(TALLOC_CTX *ctx, request_t *request, SSL *ssl, uint8_t **out,
-						  uint8_t eap_type, char const *prf_label, size_t prf_label_len);
+int			eap_crypto_mppe_keys(request_t *request, SSL *ssl, eap_tls_prf_label_t *prf_label) CC_HINT(nonnull);
+
+int			eap_crypto_tls_session_id(TALLOC_CTX *ctx, request_t *request,
+						  SSL *ssl, eap_tls_prf_label_t *prf_label, uint8_t **out,
+						  uint8_t eap_type);
 
 /* EAP-TLS framework */
 eap_tls_session_t	*eap_tls_session_init(request_t *request, eap_session_t *eap_session,
-					      fr_tls_conf_t *tls_conf, bool client_cert) CC_HINT(nonnull);
+					      SSL_CTX *ssl_ctx, bool client_cert) CC_HINT(nonnull);
 
 
 fr_tls_conf_t		*eap_tls_conf_parse(CONF_SECTION *cs, char const *key) CC_HINT(nonnull);

@@ -61,7 +61,7 @@ typedef struct fr_dict fr_dict_t;
 #endif
 
 #ifdef WITH_VERIFY_PTR
-#  define DA_VERIFY(_x)		fr_dict_verify(__FILE__, __LINE__, _x)
+#  define DA_VERIFY(_x)		fr_dict_attr_verify(__FILE__, __LINE__, _x)
 #else
 #  define DA_VERIFY(_x)		fr_cond_assert(_x)
 #endif
@@ -79,7 +79,8 @@ typedef struct {
 								///< to assign octets values directly.
 								///< See .is_unknown to determine if it is
 								///< ephemeral.
-
+	unsigned int		is_alias : 1;			//!< This isn't a real attribute, it's a reference to
+								///< to one.
 	unsigned int		internal : 1;			//!< Internal attribute, should not be received
 								///< in protocol packets, should not be encoded.
 	unsigned int		array : 1; 			//!< Pack multiples into 1 attr.
@@ -208,9 +209,9 @@ typedef struct {
  */
 typedef struct {
 	uint32_t		pen;				//!< Private enterprise number.
+	bool			continuation;			//!< we only have one flag for now, for WiMAX
 	size_t			type; 				//!< Length of type data
 	size_t			length;				//!< Length of length data
-	size_t			flags;				//!< Vendor flags.
 	char const		*name;				//!< Vendor name.
 } fr_dict_vendor_t;
 
@@ -256,13 +257,15 @@ typedef enum {
 	FR_DICT_ATTR_NOTFOUND		= -1,			//!< Attribute couldn't be found.
 	FR_DICT_ATTR_PROTOCOL_NOTFOUND	= -2,			//!< Protocol couldn't be found.
 	FR_DICT_ATTR_PARSE_ERROR	= -3,			//!< Attribute string couldn't be parsed
-	FR_DICT_ATTR_OOM		= -4,			//!< Memory allocation error.
-	FR_DICT_ATTR_NOT_DESCENDENT	= -5,			//!< Attribute is not a descendent of the parent
+	FR_DICT_ATTR_INTERNAL_ERROR	= -4,			//!< Internal error ocurred.
+	FR_DICT_ATTR_OOM		= -5,			//!< Memory allocation error.
+	FR_DICT_ATTR_NOT_DESCENDENT	= -6,			//!< Attribute is not a descendent of the parent
 								///< attribute.
-	FR_DICT_ATTR_NOT_ANCESTOR	= -6,			//!< Attribute is not an ancestor of the child
+	FR_DICT_ATTR_NOT_ANCESTOR	= -7,			//!< Attribute is not an ancestor of the child
 								///< attribute.
-	FR_DICT_ATTR_NO_CHILDREN	= -7,			//!< Child lookup in attribute with no children.
-	FR_DICT_ATTR_EINVAL		= -8			//!< Invalid arguments.
+	FR_DICT_ATTR_NO_CHILDREN	= -8,			//!< Child lookup in attribute with no children.
+	FR_DICT_ATTR_EINVAL		= -9			//!< Invalid arguments.
+
 } fr_dict_attr_err_t;
 
 typedef bool (*fr_dict_attr_valid_func_t)(fr_dict_t *dict, fr_dict_attr_t const *parent,
@@ -421,6 +424,8 @@ void			fr_dict_namespace_debug(fr_dict_attr_t const *da);
 void			fr_dict_attr_debug(fr_dict_attr_t const *da);
 
 void			fr_dict_debug(fr_dict_t const *dict);
+
+void			fr_dict_export(fr_dict_t const *dict);
 /** @} */
 
 /** @name Attribute lineage
@@ -431,11 +436,11 @@ fr_dict_attr_t const	*fr_dict_attr_common_parent(fr_dict_attr_t const *a, fr_dic
 
 int			fr_dict_oid_component_legacy(unsigned int *out, char const **oid);
 
-ssize_t			fr_dict_print_flags(fr_sbuff_t *out, fr_dict_t const *dict,
-					      fr_type_t type, fr_dict_attr_flags_t const *flags);
+ssize_t			fr_dict_attr_flags_print(fr_sbuff_t *out, fr_dict_t const *dict,
+						 fr_type_t type, fr_dict_attr_flags_t const *flags);
 
 ssize_t			fr_dict_attr_oid_print(fr_sbuff_t *out,
-					       fr_dict_attr_t const *ancestor, fr_dict_attr_t const *da);
+					       fr_dict_attr_t const *ancestor, fr_dict_attr_t const *da, bool numeric);
 #define			FR_DICT_ATTR_OID_PRINT_RETURN(...) FR_SBUFF_RETURN(fr_dict_attr_oid_print, ##__VA_ARGS__)
 
 ssize_t			fr_dict_attr_by_oid_legacy(fr_dict_t const *dict, fr_dict_attr_t const **parent,
@@ -502,29 +507,30 @@ fr_dict_attr_t const	*fr_dict_vendor_da_by_num(fr_dict_attr_t const *vendor_root
 ssize_t			fr_dict_attr_search_by_qualified_name_substr(fr_dict_attr_err_t *err, fr_dict_attr_t const **out,
 								     fr_dict_t const *dict_def,
 								     fr_sbuff_t *name, fr_sbuff_term_t const *tt,
-								     bool fallback)
+								     bool internal, bool foreign)
 								     CC_HINT(nonnull(2, 4));
 
 ssize_t			fr_dict_attr_search_by_name_substr(fr_dict_attr_err_t *err, fr_dict_attr_t const **out,
 					  		   fr_dict_t const *dict_def,
 							   fr_sbuff_t *name, fr_sbuff_term_t const *tt,
-							   bool fallback)
+							   bool internal, bool foreign)
 							   CC_HINT(nonnull(2, 4));
 
 ssize_t			fr_dict_attr_search_by_qualified_oid_substr(fr_dict_attr_err_t *err, fr_dict_attr_t const **out,
 							     	    fr_dict_t const *dict_def,
 								    fr_sbuff_t *in, fr_sbuff_term_t const *tt,
-								    bool fallback)
+								    bool internal, bool foreign)
 								    CC_HINT(nonnull(2, 4));
 
 fr_dict_attr_t const	*fr_dict_attr_search_by_qualified_oid(fr_dict_attr_err_t *err,
-						       	      fr_dict_t const *dict_def, char const *attr, bool fallback)
+						       	      fr_dict_t const *dict_def, char const *attr,
+						       	      bool internal, bool foreign)
 							      CC_HINT(nonnull(3));
 
 ssize_t			fr_dict_attr_search_by_oid_substr(fr_dict_attr_err_t *err, fr_dict_attr_t const **out,
 							  fr_dict_t const *dict_def,
 							  fr_sbuff_t *in, fr_sbuff_term_t const *tt,
-							  bool fallback)
+							  bool internal, bool foreign)
 							  CC_HINT(nonnull(2, 4));
 
 ssize_t			fr_dict_attr_by_name_substr(fr_dict_attr_err_t *err, fr_dict_attr_t const **out,
@@ -535,8 +541,6 @@ ssize_t			fr_dict_attr_by_name_substr(fr_dict_attr_err_t *err, fr_dict_attr_t co
 fr_dict_attr_t const	*fr_dict_attr_by_name(fr_dict_attr_err_t *err, fr_dict_attr_t const *parent,
 					      char const *attr)
 					      CC_HINT(nonnull(2,3));
-
-fr_dict_attr_t const	*fr_dict_attr_child_by_da(fr_dict_attr_t const *parent, fr_dict_attr_t const *child) CC_HINT(nonnull);
 
 fr_dict_attr_t const	*fr_dict_attr_child_by_num(fr_dict_attr_t const *parent, unsigned int attr);
 
@@ -589,7 +593,7 @@ void			fr_dl_dict_autofree(dl_t const *module, void *symbol, void *user_ctx);
  */
 fr_dict_t 		*fr_dict_alloc(char const *proto_name, unsigned int proto_number) CC_HINT(nonnull);
 
-void			fr_dict_dependent_add(fr_dict_t *dict, char const *dependent) CC_HINT(nonnull);
+int			fr_dict_dependent_add(fr_dict_t const *dict, char const *dependent) CC_HINT(nonnull);
 
 int			fr_dict_free(fr_dict_t **dict, char const *dependent) CC_HINT(nonnull);
 
@@ -633,14 +637,13 @@ ssize_t			fr_dict_valid_name(char const *name, ssize_t len);
 
 ssize_t			fr_dict_valid_oid_str(char const *name, ssize_t len);
 
-void			fr_dict_verify(char const *file, int line, fr_dict_attr_t const *da);
-
 fr_dict_attr_t const	*fr_dict_attr_iterate_children(fr_dict_attr_t const *parent, fr_dict_attr_t const **prev);
 
 typedef int		(*fr_dict_walk_t)(fr_dict_attr_t const *da, void *uctx);
 
 int			fr_dict_walk(fr_dict_attr_t const *da, fr_dict_walk_t callback, void *uctx);
 
+void			fr_dict_attr_verify(char const *file, int line, fr_dict_attr_t const *da);
 /** @} */
 
 #undef _CONST

@@ -1,42 +1,29 @@
-server inner-tunnel {
-	namespace = radius
-	listen {
-	       type = Access-Request
-	}
+server eap-tls-test {
+	namespace = tls
 
-	recv Access-Request {
-		update request {
-			&User-Name := &outer.User-Name
+	load session {
+		update control {
+			&control.Cache-Allow-Insert := no
 		}
-		files
-		pap
-		chap
-		mschap
-		eap
+		cache_tls_session
 	}
 
-	authenticate pap {
-		pap
+	store session {
+		cache_tls_session
 	}
 
-	authenticate chap {
-		chap
+	clear session {
+		update control {
+			&control.Cache-Allow-Insert := no
+			&control.Cache-Allow-Merge := no
+			&control.Cache-TTL := 0
+		}
+		cache_tls_session
 	}
 
-	authenticate mschap {
-		mschap
-	}
-
-	authenticate eap {
-		eap
-	}
-
-	send Access-Accept {
-	}
-
-	send Access-Reject {
-	}
-
-	send Access-Challenge {
+	verify certificate {
+		if (&Session-Resumed == true) {
+			reject
+		}
 	}
 }

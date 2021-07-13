@@ -21,6 +21,10 @@
  * @file unlang/function.h
  * @brief Declarations for generic unlang functions.
  *
+ * These are a useful alternative to module methods for library code.
+ * They're more light weight, and don't require instance data lookups
+ * to function.
+ *
  * @copyright 2021 The FreeRADIUS server project
  */
 
@@ -52,10 +56,66 @@ typedef unlang_action_t (*unlang_function_t)(rlm_rcode_t *p_result, int *priorit
  */
 typedef void (*unlang_function_signal_t)(request_t *request, fr_state_signal_t action, void *uctx);
 
-int		unlang_interpret_push_function(request_t *request,
-					       unlang_function_t func, unlang_function_t repeat,
-					       unlang_function_signal_t signal, bool top_frame, void *uctx)
-					       CC_HINT(warn_unused_result);
+int		unlang_function_clear(request_t *request) CC_HINT(warn_unused_result);
+
+/** Set a new signal function for an existing function frame
+ *
+ * The function frame being modified must be at the top of the stack.
+ *
+ * @param[in] request		The current request.
+ * @param[in] signal		The signal function to set.
+ * @param[in] signal_name	Name of the signal function call (for debugging).
+ * @return
+ *	- 0 on success.
+ *      - -1 on failure.
+ */
+#define		unlang_function_signal_set(_request, _signal) \
+		_unlang_function_signal_set(_request, _signal, STRINGIFY(_signal))
+int		_unlang_function_signal_set(request_t *request, unlang_function_signal_t signal, char const *name)
+		CC_HINT(warn_unused_result);
+
+/** Set a new repeat function for an existing function frame
+ *
+ * The function frame being modified must be at the top of the stack.
+ *
+ * @param[in] _request		The current request.
+ * @param[in] _repeat		the repeat function to set.
+ * @return
+ *	- 0 on success.
+ *      - -1 on failure.
+ */
+#define		unlang_function_repeat_set(_request, _repeat) \
+		_unlang_function_repeat_set(_request, _repeat, STRINGIFY(_repeat))
+int		_unlang_function_repeat_set(request_t *request, unlang_function_t repeat, char const *name)
+		CC_HINT(warn_unused_result);
+
+/** Push a generic function onto the unlang stack
+ *
+ * These can be pushed by any other type of unlang op to allow a submodule or function
+ * deeper in the C call stack to establish a new resumption point.
+ *
+ * @param[in] _request		The current request.
+ * @param[in] _func		to call going up the stack.
+ * @param[in] _repeat		function to call going back down the stack (may be NULL).
+ *				This may be the same as func.
+ * @param[in] _signal		function to call if the request is signalled.
+ * @param[in] _uctx		to pass to func(s).
+ * @return
+ *	- 0 on success.
+ *	- -1 on failure.
+ */
+#define		unlang_function_push(_request, _func, _repeat, _signal, _top_frame, _uctx) \
+		_unlang_function_push(_request, \
+				      _func, STRINGIFY(_func), \
+				      _repeat, STRINGIFY(_repeat), \
+				      _signal, STRINGIFY(_signal), \
+				      _top_frame, _uctx)
+unlang_action_t	_unlang_function_push(request_t *request,
+				      unlang_function_t func, char const *func_name,
+				      unlang_function_t repeat, char const *repeat_name,
+				      unlang_function_signal_t signal, char const *signal_name,
+				      bool top_frame, void *uctx)
+				      CC_HINT(warn_unused_result);
 
 #ifdef __cplusplus
 }

@@ -137,6 +137,7 @@ typedef struct {
 #define vp_float64		data.vb_float64
 
 #define vp_date			data.vb_date
+#define vp_time_delta		data.vb_time_delta
 
 #define vp_group		children
 
@@ -229,6 +230,8 @@ static inline fr_pair_t *fr_dcursor_iter_by_ancestor_init(fr_dcursor_t *cursor,
 }
 
 /** @hidecallergraph */
+unsigned int	fr_pair_count_by_da(fr_pair_list_t const *list, fr_dict_attr_t const *da) CC_HINT(nonnull);
+
 fr_pair_t	*fr_pair_find_by_da(fr_pair_list_t const *list, fr_dict_attr_t const *da, unsigned int n);
 
 fr_pair_t	*fr_pair_find_by_ancestor(fr_pair_list_t const *list, fr_dict_attr_t const *ancestor);
@@ -247,7 +250,8 @@ int		fr_pair_append_by_da(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *list
 
 int		fr_pair_prepend_by_da(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *list, fr_dict_attr_t const *da);
 
-int		fr_pair_update_by_da(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *list, fr_dict_attr_t const *da);
+int		fr_pair_update_by_da(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *list,
+				     fr_dict_attr_t const *da, unsigned int n);
 
 int		fr_pair_delete_by_da(fr_pair_list_t *head, fr_dict_attr_t const *da);
 
@@ -285,6 +289,7 @@ int		fr_pair_list_copy_by_ancestor(TALLOC_CTX *ctx, fr_pair_list_t *to,
 					      fr_pair_list_t *from, fr_dict_attr_t const *parent_da, unsigned int count);
 int		fr_pair_sublist_copy(TALLOC_CTX *ctx, fr_pair_list_t *to, fr_pair_list_t const *from, fr_pair_t *item);
 void		fr_pair_list_append(fr_pair_list_t *dst, fr_pair_list_t *src);
+void		fr_pair_list_prepend(fr_pair_list_t *dst, fr_pair_list_t *src);
 
 /** @hidecallergraph */
 void		*fr_pair_list_head(fr_pair_list_t const *list);
@@ -393,8 +398,8 @@ static inline size_t	fr_pair_aprint(TALLOC_CTX *ctx, char **out, fr_pair_t const
 
 void			fr_pair_fprint(FILE *, fr_pair_t const *vp);
 
-#define			fr_pair_list_log(_log, _list) _fr_pair_list_log(_log, 4, _list, __FILE__, __LINE__);
-void			_fr_pair_list_log(fr_log_t const *log, int lvl, fr_pair_list_t const *list, char const *file, int line);
+#define			fr_pair_list_log(_log, _list) _fr_pair_list_log(_log, 4, NULL, _list, __FILE__, __LINE__);
+void			_fr_pair_list_log(fr_log_t const *log, int lvl, fr_pair_t *parent, fr_pair_list_t const *list, char const *file, int line);
 
 void			fr_pair_list_debug(fr_pair_list_t const *list);
 

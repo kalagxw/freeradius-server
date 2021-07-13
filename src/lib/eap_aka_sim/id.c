@@ -167,6 +167,12 @@ int fr_aka_sim_id_type(fr_aka_sim_id_type_t *type, fr_aka_sim_method_hint_t *hin
 {
 	size_t i;
 
+	/*
+	 *	May not fail in the first part of this function
+	 *	so we need to clear any pending messages.
+	 */
+	fr_strerror_clear();
+
 	if (id_len < 1) {
 		if (hint) *hint = AKA_SIM_METHOD_HINT_UNKNOWN;
 		if (type) *type = AKA_SIM_ID_TYPE_UNKNOWN;
@@ -463,7 +469,7 @@ int fr_aka_sim_id_3gpp_pseudonym_encrypt(char out[AKA_SIM_3GPP_PSEUDONYM_LEN + 1
 	 */
 	evp_ctx = aka_sim_crypto_cipher_ctx();
 	if (unlikely(EVP_EncryptInit_ex(evp_ctx, EVP_aes_128_ecb(), NULL, key, NULL) != 1)) {
-		tls_strerror_printf("Failed initialising AES-128-ECB context");
+		fr_tls_log_strerror_printf("Failed initialising AES-128-ECB context");
 	error:
 		return -1;
 	}
@@ -480,13 +486,13 @@ int fr_aka_sim_id_3gpp_pseudonym_encrypt(char out[AKA_SIM_3GPP_PSEUDONYM_LEN + 1
 	 */
 	EVP_CIPHER_CTX_set_padding(evp_ctx, 0);
 	if (unlikely(EVP_EncryptUpdate(evp_ctx, encr, (int *)&len, padded, sizeof(padded)) != 1)) {
-		tls_strerror_printf("Failed encrypting padded IMSI");
+		fr_tls_log_strerror_printf("Failed encrypting padded IMSI");
 		goto error;
 	}
 	encr_len = len;
 
 	if (unlikely(EVP_EncryptFinal_ex(evp_ctx, encr + len, (int *)&len) != 1)) {
-		tls_strerror_printf("Failed finalising encrypted IMSI");
+		fr_tls_log_strerror_printf("Failed finalising encrypted IMSI");
 		goto error;
 	}
 	encr_len += len;
@@ -508,19 +514,19 @@ int fr_aka_sim_id_3gpp_pseudonym_encrypt(char out[AKA_SIM_3GPP_PSEUDONYM_LEN + 1
 	/*
 	 *	Consume tag (6 bits) + key_ind (4 bits) + encr[0] (8 bits) = 18 bits (or 3 bytes of b64)
 	 */
-	*out_p++ = fr_base64_str[tag & 0x3f];							/* 6 bits tag */
-	*out_p++ = fr_base64_str[((key_ind & 0x0f) << 2) | ((u_p[0] & 0xc0) >> 6)];		/* 4 bits key_ind + 2 high bits encr[0] */
-	*out_p++ = fr_base64_str[u_p[0] & 0x3f];						/* 6 low bits of encr[0] */
+	*out_p++ = fr_base64_alphabet_encode[tag & 0x3f];							/* 6 bits tag */
+	*out_p++ = fr_base64_alphabet_encode[((key_ind & 0x0f) << 2) | ((u_p[0] & 0xc0) >> 6)];		/* 4 bits key_ind + 2 high bits encr[0] */
+	*out_p++ = fr_base64_alphabet_encode[u_p[0] & 0x3f];						/* 6 low bits of encr[0] */
 	u_p++;
 
 	/*
 	 *	Consume 3 bytes of input for 4 bytes of b64 (5 iterations)
 	 */
 	while (u_p < u_end) {
-		*out_p++ = fr_base64_str[(u_p[0] & 0xfc) >> 2];					/* 6 high bits of p[0] */
-		*out_p++ = fr_base64_str[((u_p[0] & 0x03) << 4) | ((u_p[1] & 0xf0) >> 4)];	/* 2 low bits of p[0] + 4 high bits of p[1] */
-		*out_p++ = fr_base64_str[((u_p[1] & 0x0f) << 2) | ((u_p[2] & 0xc0) >> 6)];	/* 4 low bits of p[1] + 2 high bits of p[2] */
-		*out_p++ = fr_base64_str[u_p[2] & 0x3f];					/* 6 low bits of p[2] */
+		*out_p++ = fr_base64_alphabet_encode[(u_p[0] & 0xfc) >> 2];					/* 6 high bits of p[0] */
+		*out_p++ = fr_base64_alphabet_encode[((u_p[0] & 0x03) << 4) | ((u_p[1] & 0xf0) >> 4)];	/* 2 low bits of p[0] + 4 high bits of p[1] */
+		*out_p++ = fr_base64_alphabet_encode[((u_p[1] & 0x0f) << 2) | ((u_p[2] & 0xc0) >> 6)];	/* 4 low bits of p[1] + 2 high bits of p[2] */
+		*out_p++ = fr_base64_alphabet_encode[u_p[2] & 0x3f];					/* 6 low bits of p[2] */
 		u_p += 3;
 	}
 	if ((out_p - out) != AKA_SIM_3GPP_PSEUDONYM_LEN) {
@@ -542,7 +548,7 @@ int fr_aka_sim_id_3gpp_pseudonym_encrypt(char out[AKA_SIM_3GPP_PSEUDONYM_LEN + 1
  */
 uint8_t fr_aka_sim_id_3gpp_pseudonym_tag(char const encr_id[AKA_SIM_3GPP_PSEUDONYM_LEN])
 {
-	return fr_base64_sextet[us(encr_id[0])];
+	return fr_base64_alphabet_decode[us(encr_id[0])];
 }
 
 /** Return the key index from a 3gpp pseudonym
@@ -553,7 +559,7 @@ uint8_t fr_aka_sim_id_3gpp_pseudonym_tag(char const encr_id[AKA_SIM_3GPP_PSEUDON
  */
 uint8_t fr_aka_sim_id_3gpp_pseudonym_key_index(char const encr_id[AKA_SIM_3GPP_PSEUDONYM_LEN])
 {
-	return ((fr_base64_sextet[us(encr_id[1])] & 0x3c) >> 2);
+	return ((fr_base64_alphabet_decode[us(encr_id[1])] & 0x3c) >> 2);
 }
 
 /** Decrypt the 3GPP pseudonym
@@ -593,20 +599,20 @@ int fr_aka_sim_id_3gpp_pseudonym_decrypt(char out[AKA_SIM_IMSI_MAX_LEN + 1],
 		}
 	}
 
-	*dec_p++ = (((fr_base64_sextet[us(p[1])] & 0x03) << 6) | fr_base64_sextet[us(p[2])]);
+	*dec_p++ = (((fr_base64_alphabet_decode[us(p[1])] & 0x03) << 6) | fr_base64_alphabet_decode[us(p[2])]);
 	p += 3;
 
 	while (p < end) {
-		*dec_p++ = ((fr_base64_sextet[us(p[0])] << 2) | (fr_base64_sextet[us(p[1])] >> 4));
-		*dec_p++ = ((fr_base64_sextet[us(p[1])] << 4) & 0xf0) | (fr_base64_sextet[us(p[2])] >> 2);
-		*dec_p++ = ((fr_base64_sextet[us(p[2])] << 6) & 0xc0) | fr_base64_sextet[us(p[3])];
+		*dec_p++ = ((fr_base64_alphabet_decode[us(p[0])] << 2) | (fr_base64_alphabet_decode[us(p[1])] >> 4));
+		*dec_p++ = ((fr_base64_alphabet_decode[us(p[1])] << 4) & 0xf0) | (fr_base64_alphabet_decode[us(p[2])] >> 2);
+		*dec_p++ = ((fr_base64_alphabet_decode[us(p[2])] << 6) & 0xc0) | fr_base64_alphabet_decode[us(p[3])];
 
 		p += 4;	/* 32bit input -> 24bit output */
 	}
 
 	evp_ctx = aka_sim_crypto_cipher_ctx();
 	if (unlikely(EVP_DecryptInit_ex(evp_ctx, EVP_aes_128_ecb(), NULL, key, NULL) != 1)) {
-		tls_strerror_printf("Failed initialising AES-128-ECB context");
+		fr_tls_log_strerror_printf("Failed initialising AES-128-ECB context");
 	error:
 		return -1;
 	}
@@ -622,13 +628,13 @@ int fr_aka_sim_id_3gpp_pseudonym_decrypt(char out[AKA_SIM_IMSI_MAX_LEN + 1],
 	 */
 	EVP_CIPHER_CTX_set_padding(evp_ctx, 0);
 	if (unlikely(EVP_DecryptUpdate(evp_ctx, decr, (int *)&len, dec, sizeof(dec)) != 1)) {
-		tls_strerror_printf("Failed decypting IMSI");
+		fr_tls_log_strerror_printf("Failed decypting IMSI");
 		goto error;
 	}
 	decr_len = len;
 
 	if (unlikely(EVP_DecryptFinal_ex(evp_ctx, decr + len, (int *)&len) != 1)) {
-		tls_strerror_printf("Failed finalising decypted IMSI");
+		fr_tls_log_strerror_printf("Failed finalising decypted IMSI");
 		goto error;
 	}
 	decr_len += len;

@@ -77,6 +77,28 @@ filterreply  Password.Cleartext := "testing123"
 filterreply  Password.Cleartext := "testing123"
              Reply-Message !* ANY
 
+overwritereply  Password.Cleartext := "testing123"
+                Reply-Message := "firstpass",
+                Fall-Through = yes
+
+overwritereply  Password.Cleartext := "testing123"
+                Reply-Message := "secondpass"
+
+lessthanreply  Password.Cleartext := "testing123"
+               Reply-Message := "eee",
+               Reply-Message += "aaa",
+               Fall-Through = yes
+
+lessthanreply  Password.Cleartext := "testing123"
+               Reply-Message <= "ddd"
+
+greaterthanreply  Password.Cleartext := "testing123"
+                  Reply-Message := "eee",
+                  Reply-Message += "aaa",
+                  Fall-Through = yes
+
+greaterthanreply  Password.Cleartext := "testing123"
+                  Reply-Message >= "ddd"
 
 #
 #  Addition "+=" to the control list
@@ -90,3 +112,6 @@ addcontrol  Password.Cleartext := "testing123", Reply-Message := "success1"
             Fall-Through = yes
 
 addcontrol  Reply-Message += "success2"
+
+regex	NAS-Identifier =~ /der/, Password.Cleartext := "testing123"
+	Reply-Message := "wonderful"

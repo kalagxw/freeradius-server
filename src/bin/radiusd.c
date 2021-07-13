@@ -39,6 +39,7 @@ RCSID("$Id$")
 #include <freeradius-devel/server/virtual_servers.h>
 
 #include <freeradius-devel/tls/base.h>
+#include <freeradius-devel/tls/log.h>
 
 #include <freeradius-devel/unlang/base.h>
 
@@ -122,7 +123,10 @@ static int thread_instantiate(TALLOC_CTX *ctx, fr_event_list_t *el, UNUSED void 
 {
 	if (modules_thread_instantiate(ctx, el) < 0) return -1;
 	if (xlat_thread_instantiate(ctx) < 0) return -1;
-
+#ifdef WITH_TLS
+	if (fr_openssl_thread_init(main_config->openssl_async_pool_init,
+				   main_config->openssl_async_pool_max) < 0) return -1;
+#endif
 	return 0;
 }
 
@@ -324,7 +328,7 @@ int main(int argc, char *argv[])
 	}
 
 	/*  Process the options.  */
-	while ((c = getopt(argc, argv, "Cd:D:e:fhi:l:Mn:p:PrstTvxX")) != -1) switch (c) {
+	while ((c = getopt(argc, argv, "Cd:D:e:fhi:l:Mmn:p:PrstTvxX")) != -1) switch (c) {
 		case 'C':
 			check_config = true;
 			config->spawn_workers = false;
@@ -368,12 +372,16 @@ int main(int argc, char *argv[])
 			}
 			break;
 
-		case 'n':
-			main_config_name_set_default(config, optarg, true);
+		case 'm':
+			config->allow_multiple_procs = true;
 			break;
 
 		case 'M':
 			config->talloc_memory_report = true;
+			break;
+
+		case 'n':
+			main_config_name_set_default(config, optarg, true);
 			break;
 
 		case 'P':	/* Force the PID to be written, even in -f mode */
@@ -433,6 +441,10 @@ int main(int argc, char *argv[])
 		if (raddb_dir) main_config_raddb_dir_set(config, raddb_dir);
 	}
 
+	/*
+	 *	We've now got enough information to check to see
+	 *	if another process is running with the same config.
+	 */
 	config->debug_level = fr_debug_lvl;
 
 	/*
@@ -533,6 +545,25 @@ int main(int argc, char *argv[])
 	 *  Read the configuration files, BEFORE doing anything else.
 	 */
 	if (main_config_init(config) < 0) EXIT_WITH_FAILURE;
+
+	/*
+	 *  Check we're the only process using this config.
+	 */
+	if (!config->allow_multiple_procs) {
+		switch (main_config_exclusive_proc(config)) {
+		case 0:		/* No other processes running */
+			break;
+
+		case -1:	/* Permissions error - fail open */
+			PWARN("%s - Process concurrency checks disabled", program);
+			break;
+
+		case 1:
+		default:	/* All other errors */
+			fr_perror("%s", program);
+			EXIT_WITH_FAILURE;
+		}
+	}
 
 	if (modules_init() < 0) {
 		fr_perror("%s", program);
@@ -685,6 +716,14 @@ int main(int argc, char *argv[])
 #endif
 
 			goto cleanup;
+		/*
+		 *  The child needs to increment the semaphore as the parent
+		 *  is going to exit, and it will decrement the semaphore.
+		 */
+		} else if (pid == 0) {
+			if (main_config_exclusive_proc_child(main_config) < 0) {
+				PWARN("%s - Failed incrementing exclusive proc semaphore in child", program);
+			}
 		}
 
 		/* so the pipe is correctly widowed if the parent exits?! */
@@ -970,6 +1009,16 @@ int main(int argc, char *argv[])
 		INFO("All threads have exited, sending SIGTERM to remaining children");
 		kill(-radius_pid, SIGTERM);
 	}
+
+	/*
+	 *	Remove the semaphore, allowing other processes
+	 *	to start.  We do this before the cleanup label
+	 *	as the parent process MUST NOT call this
+	 *	function as it exits, otherwise the semaphore
+	 *	is removed and there's no exclusivity.
+	 */
+	main_config_exclusive_proc_done(main_config);
+
 cleanup:
 	/*
 	 *	This may not have been done earlier if we're
@@ -1068,6 +1117,7 @@ static NEVER_RETURNS void usage(main_config_t const *config, int status)
 	fprintf(output, "  -L <size>     When running in memory debug mode, set a hard limit on talloced memory\n");
 #endif
 	fprintf(output, "  -n <name>     Read raddb/name.conf instead of raddb/radiusd.conf.\n");
+	fprintf(output, "  -m            Allow multiple processes reading the same radiusd.conf to exist simultaneously.\n");
 #ifndef NDEBUG
 	fprintf(output, "  -M            Enable talloc memory debugging, and issue a memory report when the server terminates\n");
 #endif
