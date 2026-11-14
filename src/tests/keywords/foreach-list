@@ -1,9 +1,20 @@
-update {
-        &request.Packet-Type !* ANY
+#
+#  PRE: foreach
+#
+string total
+
+#
+#  Loop over children of a list.
+#
+#  Do NOT loop over the grandchildren.
+#
+foreach string value (request.[*]) {
+	total += value
+	total += ', '
 }
 
-foreach &request {
-	update reply {
-		&Called-Station-Id += "%{Foreach-Variable-0}"
-	}
+if (total != "bob, hello, Access-Request, ") {
+	test_fail
 }
+
+success

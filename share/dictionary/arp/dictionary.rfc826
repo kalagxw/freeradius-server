@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2022 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 
@@ -11,7 +11,7 @@
 #
 ##############################################################################
 
-ATTRIBUTE	arp				1	struct
+ATTRIBUTE	arp					1	struct
 MEMBER		hardware-format				uint16
 
 VALUE	hardware-format			Ethernet		1
@@ -24,8 +24,8 @@ MEMBER		hardware-address-length			uint8
 MEMBER		protocol-address-length			uint8
 MEMBER		packet-type				uint16
 
-VALUE	packet-type			Request			1
-VALUE	packet-type			Reply			2
+VALUE	packet-type			ARP-Request		1
+VALUE	packet-type			ARP-Reply		2
 VALUE	packet-type			Reverse-Request		3
 VALUE	packet-type			Reverse-Reply		4
 VALUE	packet-type			DRARP-Request		5

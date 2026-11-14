@@ -1,18 +1,13 @@
 #
-#  Run the "redis" xlat
+#  Test the release method of rlm_redis_ippool
 #
-$INCLUDE cluster_reset.inc
 
-update control {
-	&IP-Pool.Name := 'test_update'
-}
+control.IP-Pool.Name := 'test_release'
 
 #
 #  Add IP addresses
 #
-update request {
-	&Tmp-String-0 := `./build/bin/local/rlm_redis_ippool_tool -a 192.168.0.1/32 $ENV{REDIS_IPPOOL_TEST_SERVER}:30001 %{control.IP-Pool.Name} 192.168.0.0`
-}
+%redis_ippool.subnet.add(control.IP-Pool.Name,'192.168.0.1/32', 32, '192.168.0.0')
 
 #
 #  Check allocation
@@ -20,89 +15,63 @@ update request {
 redis_ippool {
 	invalid = 1
 }
-if (updated) {
-	test_pass
-} else {
+if (!(updated)) {
 	test_fail
 }
 
-if (&reply.Framed-IP-Address == 192.168.0.1) {
-	test_pass
-} else {
+if (!(reply.Framed-IP-Address == 192.168.0.1)) {
 	test_fail
 }
 
 #
 #  Release the IP address
 #
-update {
-	&request.Framed-IP-Address := &reply.Framed-IP-Address
-	&control.IP-Pool.Action := Release
-}
-redis_ippool {
+Framed-IP-Address := reply.Framed-IP-Address
+
+redis_ippool.release {
 	invalid = 1
 }
-if (updated) {
-	test_pass
-} else {
+if (!(updated)) {
 	test_fail
 }
 
 #
 #  Verify the association with the device has been removed
 #
-if ("%{redis:EXISTS '{%{control.IP-Pool.Name}%}:device:%{Calling-Station-ID}'}" == '0') {
-	test_pass
-} else {
+if (!(%redis('EXISTS', "{%{control.IP-Pool.Name}}:device:%{Calling-Station-ID}") == '0')) {
 	test_fail
 }
 
 #
 #  Verify the hash information is retained
 #
-if ("%{redis:HGET '{%{control.IP-Pool.Name}%}:ip:%{reply.Framed-IP-Address}' 'device'}" == '00:11:22:33:44:55') {
-	test_pass
-} else {
+if (!(%redis('HGET', "{%{control.IP-Pool.Name}}:ip:%{reply.Framed-IP-Address}", 'device') == '00:11:22:33:44:55')) {
 	test_fail
 }
 
-if ("%{redis:HGET {%{control.IP-Pool.Name}%}:ip:%{reply.Framed-IP-Address} gateway}" == '127.0.0.1') {
-	test_pass
-} else {
+if (!(%redis('HGET', "{%{control.IP-Pool.Name}}:ip:%{reply.Framed-IP-Address}", 'gateway') == '127.0.0.1')) {
 	test_fail
 }
 
-if ("%{redis:HGET {%{control.IP-Pool.Name}%}:ip:%{reply.Framed-IP-Address} range}" == '192.168.0.0') {
-	test_pass
-} else {
+if (!(%redis('HGET', "{%{control.IP-Pool.Name}}:ip:%{reply.Framed-IP-Address}", 'range') == '192.168.0.0')) {
 	test_fail
 }
 
-# Check the ZSCORE
-update request {
-	&Tmp-Date-0 := "%l"
-}
-
-if ("%{expr:%{redis:ZSCORE '{%{control.IP-Pool.Name}%}:pool' '%{reply.Framed-IP-Address}'} - %(integer:%{Tmp-Date-0})}" > 0) {
-	test_pass
-} else {
+# Check the ZSCORE - releasing an address sets the ZSCORE to now - 1
+if (%redis('ZSCORE', "{%{control.IP-Pool.Name}}:pool", %{reply.Framed-IP-Address}) > %c) {
 	test_fail
 }
 
-if ("%{expr:%{redis:ZSCORE '{%{control.IP-Pool.Name}%}:pool' '%{reply.Framed-IP-Address}'} - %(integer:%{Tmp-Date-0})}" < 10) {
-	test_pass
-} else {
+if ((%c - %redis('ZSCORE', "{%{control.IP-Pool.Name}}:pool", %{reply.Framed-IP-Address}) > 10)) {
 	test_fail
 }
 
 #
 #  Release the IP address again (should still be fine)
 #
-update {
-	&request.Framed-IP-Address := &reply.Framed-IP-Address
-	&control.IP-Pool.Action := Release
-}
-redis_ippool {
+Framed-IP-Address := reply.Framed-IP-Address
+
+redis_ippool.release {
 	invalid = 1
 }
 if (updated) {
@@ -111,6 +80,58 @@ if (updated) {
 	test_fail
 }
 
-update reply {
-	&reply !* ANY
+#
+#  Set the attribute being referenced in association_time
+#
+control.Session-Timeout := 120
+
+#
+#  Now allocate and release the address to create the association.
+#
+redis_ippool {
+	invalid = 1
 }
+if (!(updated)) {
+	test_fail
+}
+
+Framed-IP-Address := reply.Framed-IP-Address
+
+redis_ippool.release {
+	invalid = 1
+}
+if (!(updated)) {
+	test_fail
+}
+
+#
+#  Verify the association with the device remains
+#
+if (%redis('EXISTS', "{%{control.IP-Pool.Name}}:device:%{Calling-Station-ID}") != '1') {
+	test_fail
+}
+
+#
+#  Add an additional address.  Without the device association this would be the next
+#  allocated address.
+#
+%redis_ippool.subnet.add(control.IP-Pool.Name, '192.168.0.2/32')
+
+#
+#  Re-allocate
+#
+request -= Framed-IP-Address[*]
+reply -= Framed-IP-Address[*]
+
+redis_ippool {
+	invalid = 1
+}
+if (!(updated)) {
+	test_fail
+}
+
+if (reply.Framed-IP-Address != 192.168.0.1) {
+	test_fail
+}
+
+reply := {}

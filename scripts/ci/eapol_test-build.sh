@@ -30,15 +30,19 @@
 #  system we use that in preference.  To always build eapol_test, set
 #  FORCE_BUILD=1 in the environment.
 #
+#: ${HOSTAPD_REPO:="git@git.networkradius.com:hostap.git"}
 
 : ${BUILD_DIR:="${HOSTAPD_BUILD_DIR}"}
 TMP_BUILD_DIR="${BUILD_DIR}"
 : ${TMP_BUILD_DIR:="$(mktemp -d -t eapol_test.XXXXX)"}
 : ${HOSTAPD_DIR:="${TMP_BUILD_DIR}/hostapd"}
-: ${HOSTAPD_GIT_TAG:="hostap_2_8"}
+: ${HOSTAPD_REPO:="http://git.w1.fi/hostap.git"}
+: ${HOSTAPD_GIT_TAG:="hostap_2_12"}
 : ${WPA_SUPPLICANT_DIR:="${HOSTAPD_DIR}/wpa_supplicant"}
 
 : ${MAKE:=make}
+#  nproc is coreutils, so macOS and FreeBSD fall through to sysctl.
+: ${JOBS:=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)}
 : ${BUILD_CONF_DIR:="$(dirname "$0")/eapol_test"}
 : ${EAPOL_TEST_PATH:="${BUILD_CONF_DIR}/eapol_test"}
 
@@ -83,15 +87,29 @@ if [ ! -e "${BUILD_CONF_FILE}" ]; then
 fi
 
 # Shallow clone so we don't use all Jouni's bandwidth
-if ! [ -e "${HOSTAPD_DIR}/.git" ] && ! git clone --branch "${HOSTAPD_GIT_TAG}" --depth 1 http://w1.fi/hostap.git 1>&2 "${TMP_BUILD_DIR}/hostapd"; then
-    echo "Failed cloning hostapd" 1>&2
-    if [ -z "${BUILD_DIR}" ]; then rm -rf "$TMP_BUILD_DIR"; fi
-    exit 1
+if ! [ -e "${HOSTAPD_DIR}/.git" ]; then
+    echo "GIT CLONING ${HOSTAPD_GIT_TAG} FROM ${HOSTAPD_REPO}" 1>&2
+    if ! git clone --branch "${HOSTAPD_GIT_TAG}" --depth 1 "${HOSTAPD_REPO}" 1>&2 "${TMP_BUILD_DIR}/hostapd"; then
+        echo "Failed cloning hostapd" 1>&2
+        if [ -z "${BUILD_DIR}" ]; then rm -rf "$TMP_BUILD_DIR"; fi
+        exit 1
+    fi
 fi
 
 cp -n "$BUILD_CONF_FILE" "$WPA_SUPPLICANT_DIR/.config"
 
-if ! ${MAKE} -C "${WPA_SUPPLICANT_DIR}" -j8 eapol_test 1>&2 || [ ! -e "${WPA_SUPPLICANT_DIR}/eapol_test" ]; then
+# Don't crash out on build warnings, some newer GCC versions are quite picky
+sed -i -e 's/-Werror//' "${WPA_SUPPLICANT_DIR}/Makefile"
+
+# There is currently a code path incorrectly identified as a use-after-free by GCC on sid
+# Make that just a warning rather than a compilation failure
+if which lsb_release > /dev/null 2>&1; then
+    if ! [ -z `lsb_release -d | grep sid` ]; then
+        export CFLAGS="-MMD -O2 -Wall -Wno-error=use-after-free -g"
+    fi
+fi
+
+if ! ${MAKE} -C "${WPA_SUPPLICANT_DIR}" -j${JOBS} eapol_test 1>&2 || [ ! -e "${WPA_SUPPLICANT_DIR}/eapol_test" ]; then
     echo "Build error" 1>&2
     if [ -z "${BUILD_DIR}" ]; then rm -rf "$TMP_BUILD_DIR"; fi
     exit 1

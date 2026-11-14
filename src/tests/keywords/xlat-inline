@@ -1,37 +1,32 @@
-#
-# PRE: update
-#
-
 # Set debug to something high, recording the old level
-update request {
-	&Tmp-Integer-0 := "%(debug:4)"
-}
+uint32 test_integer
+
+test_integer := %debug(4)
 
 # Check debug level is now 4
-if ("%(debug:4)" != 4) {
-	fail
+if (!(%debug(4) == 4)) {
+	test_fail
 }
 
 # Set debug back to the original level
-"%(debug:%{Tmp-Integer-0})"
+%debug(%{test_integer})
 
 # Read out the current debug level to verify it changed
-if ("%(debug:%{Tmp-Integer-0})" != "%{Tmp-Integer-0}") {
-	fail
+if (!(%debug(%{test_integer}) == "%{test_integer}")) {
+	test_fail
 }
 
 # Check for 'splosions
-"%{%{control.Password.Cleartext}:-%{control.User-Name}}"
-"%{%{control.User-Name}:-%{control.Password.Cleartext}}"
+"%{control.Password.Cleartext || control.User-Name}"
+"%{control.User-Name || control.Password.Cleartext}"
 
-if (&control.Password.Cleartext =~ /(h)(e)(l)(l)(o)/) {
-	"%{0}"
-	"%{1}"
-	"%{2}"
-	"%{3}"
-	"%{4}"
-	"%{5}"
-	"%{6}"
+if (control.Password.Cleartext =~ /(h)(e)(l)(l)(o)/) {
+	"%regex.match(0)"
+	"%regex.match(1)"
+	"%regex.match(2)"
+	"%regex.match(3)"
+	"%regex.match(4)"
+	"%regex.match(5)"
 }
 
 success

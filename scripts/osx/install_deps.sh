@@ -1,7 +1,7 @@
 #!/bin/sh
 
 #
-#  Licensed under CC-BY-ND 4.0 - http://creativecommons.org/licenses/by-nd/4.0/
+#  Licensed under CC-BY-ND 4.0 - https://creativecommons.org/licenses/by-nd/4.0/
 #
 #  Copyright 2020 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
 #
@@ -25,7 +25,6 @@ hiredis
 isc-dhcp
 json-c
 krb5
-libcouchbase
 libidn
 libmemcached
 libpcap
@@ -34,9 +33,9 @@ llvm
 luajit
 make
 mruby
-mysql-client
+mariadb-connector-c
 openldap
-openssl@1.1
+openssl@3
 pandoc
 pcre2
 perl
@@ -107,7 +106,7 @@ done
 #  and we don't want to allow a partial install of build dependencies, as the
 #  point is to enable the developer to build as many modules as possible.
 #
-#  If they want the dependencies installed they can damn well fix git-lfs support.
+#  If they want the dependencies installed, they need to fix git-lfs support first.
 #
 for i in $packages; do
     if ! brew list "$i" > /dev/null 2>&1; then

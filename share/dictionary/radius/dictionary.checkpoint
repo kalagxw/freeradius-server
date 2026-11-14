@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -11,6 +11,7 @@ VENDOR		CheckPoint			2620
 BEGIN-VENDOR	CheckPoint
 
 ATTRIBUTE	Gaia-User-Role				229	string
-ATTRIBUTE	Gaia-SuperUser-Access			230	integer
+ATTRIBUTE	Gaia-SuperUser-Access			230	uint32
 
 END-VENDOR	CheckPoint
+ALIAS		CheckPoint				Vendor-Specific.CheckPoint

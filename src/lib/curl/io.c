@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -22,9 +22,7 @@
  * @copyright 2020 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
 #include <freeradius-devel/curl/base.h>
-#include <freeradius-devel/server/module.h>
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/unlang/base.h>
 #include <freeradius-devel/util/syserror.h>
 
 /*
@@ -32,9 +30,7 @@
  *
  *  #define curl_easy_setopt(handle,opt,param) curl_easy_setopt(handle,opt,param)
  */
-DIAG_OFF(DIAG_UNKNOWN_PRAGMAS)
-DIAG_OFF(disabled-macro-expansion)
-DIAG_ON(DIAG_UNKNOWN_PRAGMAS)
+DIAG_OFF_OPTIONAL(disabled-macro-expansion)
 #define SET_MOPTION(_mandle, _opt, _val)\
 do {\
 	if ((ret = curl_multi_setopt(mandle, _opt, _val)) != CURLM_OK) {\
@@ -58,7 +54,7 @@ static inline void _fr_curl_io_demux(fr_curl_handle_t *mhandle, CURLM *mandle)
 		case CURLMSG_DONE:
 		{
 			fr_curl_io_request_t	*randle;
-			request_t			*request = NULL;
+			request_t		*request = NULL;
 			CURL			*candle = m->easy_handle;
 			CURLcode		ret;
 
@@ -67,11 +63,22 @@ static inline void _fr_curl_io_demux(fr_curl_handle_t *mhandle, CURLM *mandle)
 			mhandle->transfers--;
 
 			ret = curl_easy_getinfo(candle, CURLINFO_PRIVATE, &randle);
-			if (!fr_cond_assert_msg(ret == CURLE_OK,
+			/*
+			 *	In curl 7.61 we got bad request data returned
+			 *	here after cancellations were processed.
+			 *
+			 *	For debug builds if the value is equal to
+			 *	0xdeadc341, we know the request was cancelled.
+			 *
+			 *	There is no good work around for this other than
+			 *	upgrading to a newer version of curl.
+			 */
+			 if (!fr_cond_assert_msg(ret == CURLE_OK,
 						"Failed retrieving request data from CURL easy handle (candle)")) {
 				curl_multi_remove_handle(mandle, candle);
 				return;
 			}
+			talloc_get_type_abort(randle, fr_curl_io_request_t);
 			request = randle->request;
 
 			REQUEST_VERIFY(request);
@@ -80,14 +87,14 @@ static inline void _fr_curl_io_demux(fr_curl_handle_t *mhandle, CURLM *mandle)
 			 *	If the request failed, say why...
 			 */
 			if (m->data.result != CURLE_OK) {
-				REDEBUG("curl request failed: %s (%i)",
+				REDEBUG("curl request failed: %s (%u)",
 					curl_easy_strerror(m->data.result), m->data.result);
 			}
 			randle->result = m->data.result;
 
 			/*
-			 *	Looks like this needs to be done last,
-			 *	else m->data.result ends up being junk.
+			 *	This needs to be done last, else m->data.result
+			 *	ends up being junk.
 			 */
 			curl_multi_remove_handle(mandle, candle);
 
@@ -97,7 +104,7 @@ static inline void _fr_curl_io_demux(fr_curl_handle_t *mhandle, CURLM *mandle)
 
 		default:
 #ifndef NDEBUG
-			DEBUG4("Got unknown msg (%i) when dequeueing curl responses", msg_queued);
+			DEBUG4("Got unknown msg (%u) when dequeueing curl responses", m->msg);
 #endif
 			break;
 		}
@@ -106,11 +113,11 @@ static inline void _fr_curl_io_demux(fr_curl_handle_t *mhandle, CURLM *mandle)
 
 /** libcurl's timer expired
  *
- * @param[in] el	the timer was inserted into.
+ * @param[in] tl	the timer was inserted into.
  * @param[in] now	The current time according to the event loop.
  * @param[in] uctx	The rlm_fr_curl_thread_t specific to this thread.
  */
-static void _fr_curl_io_timer_expired(UNUSED fr_event_list_t *el, UNUSED fr_time_t now, void *uctx)
+static void _fr_curl_io_timer_expired(UNUSED fr_timer_list_t *tl, UNUSED fr_time_t now, void *uctx)
 {
 	fr_curl_handle_t	*mhandle = talloc_get_type_abort(uctx, fr_curl_handle_t);
 	CURLM			*mandle = mhandle->mandle;
@@ -121,7 +128,7 @@ static void _fr_curl_io_timer_expired(UNUSED fr_event_list_t *el, UNUSED fr_time
 
 	ret = curl_multi_socket_action(mandle, CURL_SOCKET_TIMEOUT, 0, &running);
 	if (ret != CURLM_OK) {
-		ERROR("multi-handle %p - Servicing failed - %s (%i)", mandle, curl_multi_strerror(ret), ret);
+		ERROR("multi-handle %p - Servicing timer failed -%s (%i)", mandle, curl_multi_strerror(ret), ret);
 		return;
 	}
 
@@ -145,7 +152,7 @@ static inline void _fr_curl_io_service(fr_curl_handle_t *mhandle, int fd, int ev
 
 	ret = curl_multi_socket_action(mandle, fd, event, &running);
 	if (ret != CURLM_OK) {
-		ERROR("multi-handle %p - Servicing failed - %s (%i)", mandle, curl_multi_strerror(ret), ret);
+		ERROR("multi-handle %p - Servicing I/O failed - %s (%i)", mandle, curl_multi_strerror(ret), ret);
 		return;
 	}
 
@@ -163,6 +170,10 @@ static inline void _fr_curl_io_service(fr_curl_handle_t *mhandle, int fd, int ev
 
 		case CURL_CSELECT_IN:
 			event_str = "socket-readable";
+			break;
+
+		case 0:
+			event_str = "closed"; /* Not really closed, more do your own eval! */
 			break;
 
 		default:
@@ -187,11 +198,25 @@ static inline void _fr_curl_io_service(fr_curl_handle_t *mhandle, int fd, int ev
  * @param[in] fd_errno	from kevent.
  * @param[in] uctx	The rlm_fr_curl_thread_t specific to this thread.
  */
-static void _fr_curl_io_service_errored(UNUSED fr_event_list_t *el, int fd, UNUSED int flags, int fd_errno, void *uctx)
+static void _fr_curl_io_service_errored(UNUSED fr_event_list_t *el, int fd, int flags, int fd_errno, void *uctx)
 {
 	fr_curl_handle_t	*mhandle = talloc_get_type_abort(uctx, fr_curl_handle_t);
 
 	DEBUG4("multi-handle %p - fd %i errored: %s", mhandle->mandle, fd, fr_syserror(fd_errno));
+
+	/*
+	 *	The remote server closed the socket
+	 *
+	 *	Instead of signalling curl with CURL_CSELECT_ERR
+	 *	which always results in spurious errors being
+	 *	printed, pass in '0', which causes libcurl to do
+	 *	its own evaluation on the socket state, and hopefully
+	 *	run the right code for socket closure.
+	 */
+	if (flags & EV_EOF) {
+		_fr_curl_io_service(mhandle, fd, 0);
+		return;
+	}
 
 	_fr_curl_io_service(mhandle, fd, CURL_CSELECT_ERR);
 }
@@ -248,10 +273,7 @@ static int _fr_curl_io_timer_modify(CURLM *mandle, long timeout_ms, void *ctx)
 	fr_curl_handle_t	*mhandle = talloc_get_type_abort(ctx, fr_curl_handle_t);
 
 	if (timeout_ms < 0) {
-		if (fr_event_timer_delete(&mhandle->ev) < 0) {
-			PERROR("Failed deleting multi-handle timer");
-			return -1;
-		}
+		FR_TIMER_DISARM_RETURN(mhandle->ev);
 		DEBUG3("multi-handle %p - Timer removed", mandle);
 		return 0;
 	}
@@ -266,15 +288,16 @@ static int _fr_curl_io_timer_modify(CURLM *mandle, long timeout_ms, void *ctx)
 	 *  unpleasant recursive behavior that immediately calls another call to the callback
 	 *  with a zero timeout...
 	 *
-	 *  Setting a timeout of zero when calling fr_event_timer_in should result in the event
+	 *  Setting a timeout of zero when calling fr_timer_in should result in the event
 	 *  repeating at most twice during one iteration of the event loop.
 	 *
 	 *  In a previous version of this code we called curl_multi_socket_action immediately
 	 *  if timeout_ms was 0. It was observed that this lead to this callback being called
 	 *  ~665 times per request which is why we no longer do that.
 	 */
-	if (fr_event_timer_in(mhandle, mhandle->el, &mhandle->ev,
-			      fr_time_delta_from_msec(timeout_ms), _fr_curl_io_timer_expired, mhandle) < 0) return -1;
+	if (fr_timer_in(mhandle, mhandle->el->tl, &mhandle->ev,
+			fr_time_delta_from_msec(timeout_ms),
+			false, _fr_curl_io_timer_expired, mhandle) < 0) return -1;
 	return 0;
 }
 
@@ -301,7 +324,7 @@ static int _fr_curl_io_event_modify(UNUSED CURL *easy, curl_socket_t fd, int wha
 
 	switch (what) {
 	case CURL_POLL_IN:
-		if (fr_event_fd_insert(mhandle, mhandle->el, fd,
+		if (fr_event_fd_insert(mhandle, NULL, mhandle->el, fd,
 				       _fr_curl_io_service_readable,
 				       NULL,
 				       _fr_curl_io_service_errored,
@@ -314,7 +337,7 @@ static int _fr_curl_io_event_modify(UNUSED CURL *easy, curl_socket_t fd, int wha
 		break;
 
 	case CURL_POLL_OUT:
-		if (fr_event_fd_insert(mhandle, mhandle->el, fd,
+		if (fr_event_fd_insert(mhandle, NULL, mhandle->el, fd,
 				       NULL,
 				       _fr_curl_io_service_writable,
 				       _fr_curl_io_service_errored,
@@ -327,7 +350,7 @@ static int _fr_curl_io_event_modify(UNUSED CURL *easy, curl_socket_t fd, int wha
 		break;
 
 	case CURL_POLL_INOUT:
-		if (fr_event_fd_insert(mhandle, mhandle->el, fd,
+		if (fr_event_fd_insert(mhandle, NULL, mhandle->el, fd,
 				       _fr_curl_io_service_readable,
 				       _fr_curl_io_service_writable,
 				       _fr_curl_io_service_errored,
@@ -385,7 +408,7 @@ static int curl_debug_log(UNUSED CURL *candle, curl_infotype type, char *data, s
 			q = memchr(p, '\n', end - p);
 			if (!q) q = end;
 
-			RDEBUG3("libcurl - %pV", fr_box_strvalue_len(p, q ? q - p : p - end));
+			RDEBUG3("libcurl - %pV", fr_box_strvalue_len(p, q - p));
 			p = q + 1;
 		}
 
@@ -473,10 +496,15 @@ int fr_curl_io_request_enqueue(fr_curl_handle_t *mhandle, request_t *request, fr
 	 *	Stick the current request in the curl handle's
 	 *	private data.  This makes it simple to resume
 	 *	the request in the demux function later...
+	 *
+	 *	Note: If you get 0xdeadc341 in the private data
+	 *	in the demux function, the result for the easy
+	 *	handle was erroneously delivered after a
+	 *	cancellation.
 	 */
 	ret = curl_easy_setopt(randle->candle, CURLOPT_PRIVATE, randle);
 	if (ret != CURLE_OK) {
-		REDEBUG("Request failed: %i - %s", ret, curl_easy_strerror(ret));
+		REDEBUG("Request failed: %u - %s", ret, curl_easy_strerror(ret));
 		return -1;
 	}
 
@@ -557,7 +585,7 @@ fr_curl_handle_t *fr_curl_io_init(TALLOC_CTX *ctx,
 	CURLMcode		ret;
 	CURLM			*mandle;
 	fr_curl_handle_t	*mhandle;
-	char const		*option = "unknown";
+	char const		*option;
 
 	mandle = curl_multi_init();
 	if (!mandle) {

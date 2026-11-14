@@ -1,0 +1,34 @@
+= %str.concat(<ref:[idx]>, <delim>)
+
+Used to join two or more attributes, separated by an optional
+delimiter.
+
+This expansion is the inverse of xref:xlat/str/split.adoc[split].
+
+.Return: _string_
+
+In most cases, `%str.concat(...)` is only useful inside of a
+dynamically expanded string.  If you need to concatenate strings
+together in a policy, just use `+`.
+
+.Example
+
+[source,unlang]
+----
+Filter-Id := { "aaa", "bb", "c" }
+
+reply += {
+    Reply-Message = %str.concat(%{Filter-Id[*]}, ', ')
+    Reply-Message = %str.concat(%{Filter-Id[*]}, ',')
+}
+----
+
+.Output
+
+----
+aaa, bb, c
+aaa,bb,c
+----
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

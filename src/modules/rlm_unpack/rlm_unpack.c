@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -25,32 +25,16 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
-
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/unlang/xlat_func.h>
 #include <freeradius-devel/util/base16.h>
 
-#include <ctype.h>
-
-static fr_dict_t const *dict_freeradius;
-
-extern fr_dict_autoload_t rlm_unpack_dict[];
-fr_dict_autoload_t rlm_unpack_dict[] = {
-	{ .out = &dict_freeradius, .proto = "freeradius" },
-	{ NULL }
-};
-
-static fr_dict_attr_t const *attr_cast_base;
-
-extern fr_dict_attr_autoload_t rlm_unpack_dict_attr[];
-fr_dict_attr_autoload_t rlm_unpack_dict_attr[] = {
-	{ .out = &attr_cast_base, .name = "Cast-Base", .type = FR_TYPE_UINT8, .dict = &dict_freeradius },
-	{ NULL }
-};
 
 static xlat_arg_parser_t const unpack_xlat_args[] = {
 	{ .required = true, .single = true, .type = FR_TYPE_VOID },
 	{ .required = true, .single = true, .type = FR_TYPE_UINT32 },
 	{ .required = true, .single = true, .type = FR_TYPE_STRING },
+	{ .single = true, .type = FR_TYPE_VOID },
 	XLAT_ARG_PARSER_TERMINATOR
 };
 
@@ -58,24 +42,27 @@ static xlat_arg_parser_t const unpack_xlat_args[] = {
  *
  * Example:
 @verbatim
-%(unpack:%{Class} 0 integer)
+%unpack(%{Class}, 0, integer)
 @endverbatim
  * Expands Class, treating octet at offset 0 (bytes 0-3) as an "integer".
  *
  * @ingroup xlat_functions
  */
-static xlat_action_t unpack_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-				 UNUSED void const *xlat_inst, UNUSED void *xlat_thread_inst,
+static xlat_action_t unpack_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
+				 UNUSED xlat_ctx_t const *xctx, request_t *request,
 				 fr_value_box_list_t *in)
 {
 	size_t		len, input_len, offset;
 	fr_type_t	type;
 	uint8_t const	*input;
 	uint8_t		blob[256];
-	fr_value_box_t	*data_vb = fr_dlist_head(in);
-	fr_value_box_t	*offset_vb = fr_dlist_next(in, data_vb);
-	fr_value_box_t	*type_vb = fr_dlist_next(in, offset_vb);
+	uint32_t	repeat = 1, count = 1;
+	fr_value_box_t	*data_vb = fr_value_box_list_head(in);
+	fr_value_box_t	*offset_vb = fr_value_box_list_next(in, data_vb);
+	fr_value_box_t	*type_vb = fr_value_box_list_next(in, offset_vb);
+	fr_value_box_t	*repeat_vb = fr_value_box_list_next(in, type_vb);
 	fr_value_box_t	*vb;
+	ssize_t		used;
 
 	if ((data_vb->type != FR_TYPE_OCTETS) && (data_vb->type != FR_TYPE_STRING)) {
 		REDEBUG("unpack requires the input attribute to be 'string' or 'octets'");
@@ -84,30 +71,33 @@ static xlat_action_t unpack_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *
 
 	if ((data_vb->type == FR_TYPE_STRING) && (data_vb->vb_length > 1) &&
 	    (data_vb->vb_strvalue[0] == '0') && (data_vb->vb_strvalue[1] == 'x')) {
+		fr_slen_t slen;
+		fr_sbuff_err_t err;
+
 		/*
 		 *	Hex data.
 		 */
 		len = strlen(data_vb->vb_strvalue + 2);
-		if (len > 0) {
-			fr_sbuff_parse_error_t err;
-
-			input = blob;
-			input_len = fr_base16_decode(&err, &FR_DBUFF_TMP(blob, sizeof(blob)),
-					       &FR_SBUFF_IN(data_vb->vb_strvalue + 2, len), true);
-			if (err) {
-				REDEBUG("Invalid hex string in '%s'", data_vb->vb_strvalue);
-				return XLAT_ACTION_FAIL;
-			}
-		} else {
+		if (len <= 0) {
 			REDEBUG("Zero length hex string in '%s'", data_vb->vb_strvalue);
 			return XLAT_ACTION_FAIL;
 		}
+
+		input = blob;
+		slen = fr_base16_decode(&err, &FR_DBUFF_TMP(blob, sizeof(blob)),
+					&FR_SBUFF_IN(data_vb->vb_strvalue + 2, len), true);
+		if ((slen < 0) || err) {
+			REDEBUG("Invalid hex string in '%s'", data_vb->vb_strvalue);
+			return XLAT_ACTION_FAIL;
+		}
+		input_len = slen;
+
 	} else if (data_vb->type == FR_TYPE_STRING) {
 		input = (uint8_t const *)data_vb->vb_strvalue;
-		input_len = data_vb->length;
+		input_len = data_vb->vb_length;
 	} else {
 		input = data_vb->vb_octets;
-		input_len = data_vb->length;
+		input_len = data_vb->vb_length;
 	}
 
 	offset = offset_vb->vb_uint32;
@@ -117,25 +107,47 @@ static xlat_action_t unpack_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *
 		return XLAT_ACTION_FAIL;
 	}
 
-	type = fr_table_value_by_str(fr_value_box_type_table, type_vb->vb_strvalue, FR_TYPE_NULL);
+	type = fr_type_from_str(type_vb->vb_strvalue);
 	if (fr_type_is_null(type)) {
 		REDEBUG("Invalid data type '%s'", type_vb->vb_strvalue);
 		return XLAT_ACTION_FAIL;
 	}
 
-	MEM(vb = fr_value_box_alloc_null(ctx));
-
-	/*
-	 *	Call the generic routines to get data from the
-	 *	"network" buffer.
-	 */
-	if (fr_value_box_from_network(ctx, vb, type, NULL, input + offset, input_len - offset, data_vb->tainted) < 0) {
-		RPEDEBUG("Failed decoding %s", type_vb->vb_strvalue);
-		talloc_free(vb);
-		return XLAT_ACTION_FAIL;
+	if (repeat_vb) {
+		if ((repeat_vb->type == FR_TYPE_STRING) && (strcmp(repeat_vb->vb_strvalue, "*") == 0)) {
+			repeat = UINT32_MAX;
+		} else {
+			if (fr_value_box_cast_in_place(repeat_vb, repeat_vb, FR_TYPE_UINT32, NULL) < 0) {
+				REDEBUG("Invalid value for limit");
+				return XLAT_ACTION_FAIL;
+			}
+			repeat = repeat_vb->vb_uint32;
+		}
 	}
 
-	fr_dcursor_append(out, vb);
+	while (true) {
+		MEM(vb = fr_value_box_alloc_null(ctx));
+
+		/*
+		 *	Call the generic routines to get data from the
+		 *	"network" buffer.
+		 */
+		used = fr_value_box_from_network(ctx, vb, type, NULL,
+						 &FR_DBUFF_TMP(input + offset, input_len - offset),
+						 input_len - offset, data_vb->tainted);
+		if (used < 0) {
+			RPEDEBUG("Failed decoding %s", type_vb->vb_strvalue);
+			talloc_free(vb);
+			return XLAT_ACTION_FAIL;
+		}
+
+		fr_dcursor_append(out, vb);
+		if (count == repeat) break;
+
+		offset += used;
+		if (offset >= input_len) break;
+		count++;
+	}
 
 	return XLAT_ACTION_DONE;
 }
@@ -143,16 +155,20 @@ static xlat_action_t unpack_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *
 /*
  *	Register the xlats
  */
-static int mod_bootstrap(UNUSED void *instance, CONF_SECTION *conf)
+static int mod_load(void)
 {
 	xlat_t	*xlat;
 
-	if (cf_section_name2(conf)) return 0;
-
-	xlat = xlat_register(NULL, "unpack", unpack_xlat, false);
-	xlat_func_args(xlat, unpack_xlat_args);
+	if (unlikely(!(xlat = xlat_func_register(NULL, "unpack", unpack_xlat, FR_TYPE_VOID)))) return -1;
+	xlat_func_args_set(xlat, unpack_xlat_args);
+	xlat_func_flags_set(xlat, XLAT_FUNC_FLAG_PURE);
 
 	return 0;
+}
+
+static void mod_unload(void)
+{
+	xlat_func_unregister("unpack");
 }
 
 /*
@@ -160,14 +176,16 @@ static int mod_bootstrap(UNUSED void *instance, CONF_SECTION *conf)
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern module_t rlm_unpack;
-module_t rlm_unpack = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "unpack",
-	.type		= RLM_TYPE_THREAD_SAFE,
-	.bootstrap	= mod_bootstrap
+extern module_rlm_t rlm_unpack;
+module_rlm_t rlm_unpack = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "unpack",
+		.onload		= mod_load,
+		.unload		= mod_unload
+	}
 };

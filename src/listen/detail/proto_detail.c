@@ -26,15 +26,17 @@
 #include <freeradius-devel/io/listen.h>
 #include <freeradius-devel/io/schedule.h>
 #include <freeradius-devel/radius/radius.h>
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/virtual_servers.h>
-#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/pair_legacy.h>
+
+#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 
 #include "proto_detail.h"
 
 extern fr_app_t proto_detail;
-static int type_parse(TALLOC_CTX *ctx, void *out, UNUSED void *parent, CONF_ITEM *ci, CONF_PARSER const *rule);
-static int transport_parse(TALLOC_CTX *ctx, void *out, UNUSED void *parent, CONF_ITEM *ci, CONF_PARSER const *rule);
+
+static int type_parse(TALLOC_CTX *ctx, void *out, UNUSED void *parent, CONF_ITEM *ci, conf_parser_t const *rule);
+static int transport_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule);
 
 #if 0
 /*
@@ -49,24 +51,26 @@ static int transport_parse(TALLOC_CTX *ctx, void *out, UNUSED void *parent, CONF
 /** How to parse a Detail listen section
  *
  */
-static CONF_PARSER const proto_detail_config[] = {
-	{ FR_CONF_OFFSET("type", FR_TYPE_VOID | FR_TYPE_NOT_EMPTY | FR_TYPE_REQUIRED, proto_detail_t,
+static conf_parser_t const proto_detail_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("type", FR_TYPE_VOID, CONF_FLAG_NOT_EMPTY | CONF_FLAG_REQUIRED, proto_detail_t,
 			  type), .func = type_parse },
-	{ FR_CONF_OFFSET("transport", FR_TYPE_VOID, proto_detail_t, io_submodule),
+	{ FR_CONF_OFFSET_TYPE_FLAGS("transport", FR_TYPE_VOID, 0, proto_detail_t, io_submodule),
 	  .func = transport_parse, .dflt = "file" },
 
 	/*
 	 *	Add this as a synonym so normal humans can understand it.
 	 */
-	{ FR_CONF_OFFSET("max_entry_size", FR_TYPE_UINT32, proto_detail_t, max_packet_size) } ,
+	{ FR_CONF_OFFSET("max_entry_size", proto_detail_t, max_packet_size) } ,
 
 	/*
 	 *	For performance tweaking.  NOT for normal humans.
 	 */
-	{ FR_CONF_OFFSET("max_packet_size", FR_TYPE_UINT32, proto_detail_t, max_packet_size) } ,
-	{ FR_CONF_OFFSET("num_messages", FR_TYPE_UINT32, proto_detail_t, num_messages) } ,
+	{ FR_CONF_OFFSET("max_packet_size", proto_detail_t, max_packet_size) } ,
+	{ FR_CONF_OFFSET("num_messages", proto_detail_t, num_messages) } ,
 
-	{ FR_CONF_OFFSET("priority", FR_TYPE_UINT32, proto_detail_t, priority) },
+	{ FR_CONF_OFFSET("exit_when_done", proto_detail_t, exit_when_done) },
+
+	{ FR_CONF_OFFSET("priority", proto_detail_t, priority) },
 
 	CONF_PARSER_TERMINATOR
 };
@@ -77,36 +81,30 @@ extern fr_dict_autoload_t proto_detail_dict[];
 fr_dict_autoload_t proto_detail_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_packet_dst_ip_address;
-static fr_dict_attr_t const *attr_packet_dst_ipv6_address;
 static fr_dict_attr_t const *attr_packet_dst_port;
 static fr_dict_attr_t const *attr_packet_original_timestamp;
 static fr_dict_attr_t const *attr_packet_src_ip_address;
-static fr_dict_attr_t const *attr_packet_src_ipv6_address;
 static fr_dict_attr_t const *attr_packet_src_port;
-static fr_dict_attr_t const *attr_protocol;
 
 extern fr_dict_attr_autoload_t proto_detail_dict_attr[];
 fr_dict_attr_autoload_t proto_detail_dict_attr[] = {
-	{ .out = &attr_packet_dst_ip_address, .name = "Packet-Dst-IP-Address", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_dst_ipv6_address, .name = "Packet-Dst-IPv6-Address", .type = FR_TYPE_IPV6_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_dst_port, .name = "Packet-Dst-Port", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
+	{ .out = &attr_packet_dst_ip_address, .name = "Net.Dst.IP", .type = FR_TYPE_COMBO_IP_ADDR, .dict = &dict_freeradius },
+	{ .out = &attr_packet_dst_port, .name = "Net.Dst.Port", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
 	{ .out = &attr_packet_original_timestamp, .name = "Packet-Original-Timestamp", .type = FR_TYPE_DATE, .dict = &dict_freeradius },
-	{ .out = &attr_packet_src_ip_address, .name = "Packet-Src-IP-Address", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_src_ipv6_address, .name = "Packet-Src-IPv6-Address", .type = FR_TYPE_IPV6_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_src_port, .name = "Packet-Src-Port", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
-	{ .out = &attr_protocol, .name = "Protocol", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
+	{ .out = &attr_packet_src_ip_address, .name = "Net.Src.IP", .type = FR_TYPE_COMBO_IP_ADDR, .dict = &dict_freeradius },
+	{ .out = &attr_packet_src_port, .name = "Net.Src.Port", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
 
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
-/** Wrapper around dl_instance which translates the packet-type into a submodule name
+/** Translates the packet-type into a submodule name
  *
  * @param[in] ctx	to allocate data in (instance of proto_detail).
- * @param[out] out	Where to write a dl_module_inst_t containing the module handle and instance.
+ * @param[out] out	Where to write a module_instance_t containing the module handle and instance.
  * @param[in] parent	Base structure address.
  * @param[in] ci	#CONF_PAIR specifying the name of the type module.
  * @param[in] rule	unused.
@@ -114,16 +112,14 @@ fr_dict_attr_autoload_t proto_detail_dict_attr[] = {
  *	- 0 on success.
  *	- -1 on failure.
  */
-static int type_parse(UNUSED TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, UNUSED CONF_PARSER const *rule)
+static int type_parse(UNUSED TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, UNUSED conf_parser_t const *rule)
 {
 	proto_detail_t		*inst = talloc_get_type_abort(parent, proto_detail_t);
-	fr_dict_enum_t const	*type_enum;
+	fr_dict_enum_value_t const	*type_enum;
 	CONF_PAIR		*cp = cf_item_to_pair(ci);
 	char const		*value = cf_pair_value(cp);
 
-	*((char const **) out) = value;
-
-	inst->dict = virtual_server_namespace_by_ci(ci);
+	inst->dict = virtual_server_dict_by_child_ci(ci);
 	if (!inst->dict) {
 		cf_log_err(ci, "Please define 'namespace' in this virtual server");
 		return -1;
@@ -147,40 +143,69 @@ static int type_parse(UNUSED TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM
 	}
 
 	inst->code = type_enum->value->vb_uint32;
+	*((char const **) out) = value;
+
 	return 0;
 }
 
-/** Wrapper around dl_instance
- *
- * @param[in] ctx	to allocate data in (instance of proto_detail).
- * @param[out] out	Where to write a dl_module_inst_t containing the module handle and instance.
- * @param[in] parent	Base structure address.
- * @param[in] ci	#CONF_PAIR specifying the name of the type module.
- * @param[in] rule	unused.
- * @return
- *	- 0 on success.
- *	- -1 on failure.
- */
-static int transport_parse(TALLOC_CTX *ctx, void *out, UNUSED void *parent,
-			   CONF_ITEM *ci, UNUSED CONF_PARSER const *rule)
+static int transport_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule)
 {
-	char const	*name = cf_pair_value(cf_item_to_pair(ci));
-	dl_module_inst_t	*parent_inst;
-	CONF_SECTION	*listen_cs = cf_item_to_section(cf_parent(ci));
-	CONF_SECTION	*transport_cs;
+	proto_detail_t *inst = talloc_get_type_abort(parent, proto_detail_t);
 
-	transport_cs = cf_section_find(listen_cs, name, NULL);
+	if (unlikely(virtual_server_listen_transport_parse(ctx, out, parent, ci, rule) < 0)) {
+		return -1;
+	}
 
 	/*
-	 *	Allocate an empty section if one doesn't exist
-	 *	this is so defaults get parsed.
+	 *	If we're not loading the work submodule directly, then try to load it here.
 	 */
-	if (!transport_cs) transport_cs = cf_section_alloc(listen_cs, listen_cs, name, NULL);
+	if (strcmp(inst->io_submodule->module->dl->name, "proto_detail_work") != 0) {
+		CONF_SECTION		*transport_cs;
+		module_instance_t	*mi;
+		char const		*inst_name;
 
-	parent_inst = cf_data_value(cf_data_find(listen_cs, dl_module_inst_t, "proto_detail"));
-	fr_assert(parent_inst);
+		inst->work_submodule = NULL;
 
-	return dl_module_instance(ctx, out, transport_cs, parent_inst, name, DL_MODULE_TYPE_SUBMODULE);
+		mi = virtual_server_listener_by_data(parent);
+		fr_assert(mi);
+
+		transport_cs = cf_section_find(mi->conf, "work", NULL);
+		if (!transport_cs) {
+			transport_cs = cf_section_dup(mi->conf, mi->conf, inst->app_io_conf,
+						      "work", NULL, false);
+			if (!transport_cs) {
+				cf_log_err(mi->conf, "Failed to create configuration for worker");
+				return -1;
+			}
+		}
+
+		if (module_instance_name_from_conf(&inst_name, transport_cs) < 0) return -1;
+
+		/*
+		 *	This *should* get bootstrapped at some point after this module
+		 *	as it's inserted into the three the caller is iterating over.
+		 *
+		 *	We might want to revisit this, and use a linked list of modules
+		 *	to iterate over instead of a tree, so we can add this to the end
+		 *	of that list.
+		 */
+		inst->work_submodule = module_instance_alloc(mi->ml, mi, DL_MODULE_TYPE_SUBMODULE,
+							     "work", inst_name, MODULE_INSTANCE_NONE);
+		if (inst->work_submodule == NULL) {
+		error:
+			cf_log_perr(mi->conf, "Failed to load proto_detail_work");
+			TALLOC_FREE(inst->work_submodule);
+			return -1;
+		}
+
+		if (module_instance_conf_parse(inst->work_submodule, transport_cs) < 0) goto error;
+
+		inst->work_io = (fr_app_io_t const *) inst->work_submodule->exported;
+		inst->work_io_instance = inst->work_submodule->data;
+		inst->work_io_conf = inst->work_submodule->conf;
+	}
+
+	return 0;
 }
 
 /** Decode the packet, and set the request->process function
@@ -195,10 +220,10 @@ static int mod_decode(void const *instance, request_t *request, uint8_t *const d
 	fr_pair_list_t		tmp_list;
 	fr_dcursor_t		cursor;
 	time_t			timestamp = 0;
+	fr_pair_parse_t		root, relative;
 
 	RHEXDUMP3(data, data_len, "proto_detail decode packet");
 
-	request->dict = inst->dict;
 	request->packet->code = inst->code;
 
 	/*
@@ -229,7 +254,7 @@ static int mod_decode(void const *instance, request_t *request, uint8_t *const d
 	}
 
 	lineno = 1;
-	fr_dcursor_init(&cursor, &request->request_pairs);
+	fr_pair_dcursor_init(&cursor, &request->request_pairs);
 	fr_dcursor_tail(&cursor);	/* Ensure we only free what we add on error */
 	fr_pair_list_init(&tmp_list);
 
@@ -237,6 +262,8 @@ static int mod_decode(void const *instance, request_t *request, uint8_t *const d
 	 *	Parse each individual line.
 	 */
 	while (p < end) {
+		fr_slen_t slen;
+
 		/*
 		 *	Each record begins with a zero byte.  If the
 		 *	next byte is also zero, that's the end of
@@ -251,7 +278,6 @@ static int mod_decode(void const *instance, request_t *request, uint8_t *const d
 		 */
 		if ((*p != '\0') && (*p != '\t')) {
 			REDEBUG("Malformed line %d", lineno);
-		error:
 			fr_dcursor_free_list(&cursor);
 			return -1;
 		}
@@ -261,7 +287,7 @@ static int mod_decode(void const *instance, request_t *request, uint8_t *const d
 		MPRINT("LINE   :%s", p);
 
 		/*
-		 *	Skip this for backwards compatability.
+		 *	Skip this for backwards compatibility.
 		 */
 		if (strncasecmp((char const *) p, "Request-Authenticator", 21) == 0) goto next;
 
@@ -277,8 +303,7 @@ static int mod_decode(void const *instance, request_t *request, uint8_t *const d
 
 			vp = fr_pair_afrom_da(request->request_ctx, attr_packet_original_timestamp);
 			if (vp) {
-				vp->vp_date = ((fr_time_t) timestamp) * NSEC;
-				vp->type = VT_DATA;
+				vp->vp_date = fr_unix_time_from_sec(timestamp);
 				fr_dcursor_append(&cursor, vp);
 			}
 			goto next;
@@ -292,37 +317,70 @@ static int mod_decode(void const *instance, request_t *request, uint8_t *const d
 		}
 
 		/*
-		 *	Ensure temporary list is empty before each use
+		 *	Reinitialize every time.
+		 *
+		 *	@todo - maybe we want to keep "relative' around between lines?
+		 *	So that the detail file reader can read:
+		 *
+		 *		foo = {}
+		 *		.bar = baz
+		 *
+		 *	and get
+		 *
+		 *		foo = { bar = baz }
+		 *
+		 *	But doing that would require updating the
+		 *	detail file writer to track parent / child
+		 *	relationships, which we're not yet prepared to
+		 *	do.
+		 *
+		 *	@todo - this also doesn't create nested attributes properly,
+		 *	as the write will write:
+		 *
+		 *		foo.bar = baz
+		 *
+		 *	and then the final pair "foo" is _appended_ to the input list, without paying
+		 *	any attention to what's going on!
+		 *
+		 *	We likely just want to pass in request_pairs the parse function, AND also don't
+		 *	mash "relative" between calls.
 		 */
-		fr_pair_list_free(&tmp_list);
-		if ((fr_pair_list_afrom_str(request->request_ctx, request->dict, (char const *) p, (data + data_len) - p, &tmp_list) > 0) && !fr_pair_list_empty(&tmp_list)) {
-			vp = fr_pair_list_head(&tmp_list);
-			fr_pair_list_append(&request->request_pairs, &tmp_list);
-		} else {
+		root = (fr_pair_parse_t) {
+			.ctx = request->request_ctx,
+			.da = fr_dict_root(request->proto_dict),
+			.list = &tmp_list,
+			.dict = request->proto_dict,
+			.internal = fr_dict_internal(),
+			.allow_zeros = true,
+		};
+		relative = (fr_pair_parse_t) { };
+
+		slen = fr_pair_list_afrom_substr(&root, &relative,
+						 &FR_SBUFF_IN((char const *) p, (data + data_len) - p));
+		if (slen < 0) {
+			RPEDEBUG("Failed reading line");
 			vp = NULL;
-			RWDEBUG("Ignoring line %d - :%s", lineno, p);
+
+		} else if ((slen == 0) || fr_pair_list_empty(&tmp_list)) {
+			vp = NULL;
+			RWDEBUG("Ignoring line %d - %s", lineno, p);
+
+		} else {
+			vp = fr_pair_list_head(&tmp_list);
 		}
 
 		/*
 		 *	Set the original src/dst ip/port
 		 */
 		if (vp) {
-			if ((vp->da == attr_packet_src_ip_address) ||
-			    (vp->da == attr_packet_src_ipv6_address)) {
+			if (vp->da == attr_packet_src_ip_address) {
 				request->packet->socket.inet.src_ipaddr = vp->vp_ip;
-			} else if ((vp->da == attr_packet_dst_ip_address) ||
-				   (vp->da == attr_packet_dst_ipv6_address)) {
+			} else if (vp->da == attr_packet_dst_ip_address) {
 				request->packet->socket.inet.dst_ipaddr = vp->vp_ip;
 			} else if (vp->da == attr_packet_src_port) {
 				request->packet->socket.inet.src_port = vp->vp_uint16;
 			} else if (vp->da == attr_packet_dst_port) {
 				request->packet->socket.inet.dst_port = vp->vp_uint16;
-			} else if (vp->da == attr_protocol) {
-				request->dict = fr_dict_by_protocol_num(vp->vp_uint32);
-				if (!request->dict) {
-					REDEBUG("Invalid protocol: %pP", vp);
-					goto error;
-				}
 			}
 		}
 
@@ -330,6 +388,8 @@ static int mod_decode(void const *instance, request_t *request, uint8_t *const d
 		lineno++;
 		while ((p < end) && (*p)) p++;
 	}
+
+	fr_pair_list_append(&request->request_pairs, &tmp_list);
 
 	/*
 	 *	Let the app_io take care of populating additional fields in the request
@@ -345,54 +405,65 @@ static ssize_t mod_encode(UNUSED void const *instance, request_t *request, uint8
 	return 1;
 }
 
+static int mod_priority_set(void const *instance, UNUSED uint8_t const *buffer, UNUSED size_t buflen)
+{
+	proto_detail_t const *inst = talloc_get_type_abort_const(instance, proto_detail_t);
+
+	/*
+	 *	Return the configured priority.
+	 */
+	return inst->priority;
+}
+
+
 /** Open listen sockets/connect to external event source
  *
  * @param[in] instance	Ctx data for this application.
  * @param[in] sc	to add our file descriptor to.
- * @param[in] conf	Listen section parsed to give us isntance.
+ * @param[in] conf	Listen section parsed to give us instance.
  * @return
  *	- 0 on success.
  *	- -1 on failure.
  */
 static int mod_open(void *instance, fr_schedule_t *sc, CONF_SECTION *conf)
 {
-	fr_listen_t	*li;
-	proto_detail_t 	*inst = talloc_get_type_abort(instance, proto_detail_t);
+	fr_listen_instance_t	*li;
+	fr_listen_t		*listen;
+	proto_detail_t		*inst = talloc_get_type_abort(instance, proto_detail_t);
 
 	/*
-	 *	Build the #fr_listen_t.  This describes the complete
-	 *	path, data takes from the socket to the decoder and
-	 *	back again.
+	 *	Build the listener.  This describes the complete path data
+	 *	takes from the socket to the decoder and back again.
 	 */
-	li = talloc_zero(inst, fr_listen_t);
-	talloc_set_destructor(li, fr_io_listen_free);
-
-	li->app_io = inst->app_io;
-	li->thread_instance = talloc_zero_array(NULL, uint8_t, li->app_io->thread_inst_size);
-	talloc_set_name(li->thread_instance, "proto_%s_thread_t", inst->app_io->name);
-	li->app_io_instance = inst->app_io_instance;
-
-	li->app = &proto_detail;
-	li->app_instance = instance;
-	li->server_cs = inst->server_cs;
+	MEM(listen = fr_listen_alloc(inst, conf, inst->server_cs, &proto_detail, instance,
+				     inst->app_io, inst->app_io_instance));
 
 	/*
 	 *	Set configurable parameters for message ring buffer.
 	 */
-	li->default_message_size = inst->max_packet_size;
-	li->num_messages = inst->num_messages;
+	listen->default_message_size = inst->max_packet_size;
+	listen->num_messages = inst->num_messages;
+
+	/*
+	 *	Then the socket of it we will open.
+	 */
+	MEM(li = fr_listen_instance_alloc(inst, listen));	/* Assigned thread steals the memory */
+	talloc_set_destructor(li, fr_io_listen_free);
+
+	li->thread_instance = talloc_zero_array(li, uint8_t, listen->app_io->common.thread_inst_size);
+	talloc_set_name(li->thread_instance, "proto_%s_thread_t", inst->app_io->common.name);
 
 	/*
 	 *	Open the file.
 	 */
 	if (inst->app_io->open(li) < 0) {
-		cf_log_err(conf, "Failed opening %s file", inst->app_io->name);
+		cf_log_err(conf, "Failed opening %s file", inst->app_io->common.name);
 		talloc_free(li);
 		return -1;
 	}
 
-	fr_assert(li->app_io->get_name);
-	li->name = li->app_io->get_name(li);
+	fr_assert(li->listen->app_io->get_name);
+	li->name = li->listen->app_io->get_name(li);
 
 	/*
 	 *	Testing: allow it to read a "detail.work" file
@@ -408,16 +479,26 @@ static int mod_open(void *instance, fr_schedule_t *sc, CONF_SECTION *conf)
 		return 0;
 	}
 
-	/*
-	 *	Watch the directory for changes.
-	 */
-	if (!fr_schedule_directory_add(sc, li)) {
-		talloc_free(li);
-		return -1;
+	if (li->listen->non_socket_listener) {
+		/*
+		 *	Add listener.  Will insert polling timer.
+		 */
+		if (!fr_schedule_listen_add(sc, li)) {
+			talloc_free(li);
+			return -1;
+		}
+	} else {
+		/*
+		 *	Watch the directory for changes.
+		 */
+		if (!fr_schedule_directory_add(sc, li)) {
+			talloc_free(li);
+			return -1;
+		}
 	}
 
 	DEBUG("Listening on %s bound to virtual server %s",
-	      li->name, cf_section_name2(li->server_cs));
+	      li->name, cf_section_name2(li->listen->server_cs));
 
 	inst->listen = li;	/* Probably won't need it, but doesn't hurt */
 	inst->sc = sc;
@@ -430,26 +511,36 @@ static int mod_open(void *instance, fr_schedule_t *sc, CONF_SECTION *conf)
  *
  * Instantiate I/O and type submodules.
  *
- * @param[in] instance	Ctx data for this application.
- * @param[in] conf	Listen section parsed to give us isntance.
  * @return
  *	- 0 on success.
  *	- -1 on failure.
  */
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	proto_detail_t		*inst = talloc_get_type_abort(instance, proto_detail_t);
+	proto_detail_t		*inst = talloc_get_type_abort(mctx->mi->data, proto_detail_t);
+	CONF_SECTION		*conf = mctx->mi->conf;
 
 	/*
-	 *	Instantiate the I/O module. But DON'T instantiate the
-	 *	work submodule.  We leave that until later.
+	 *	The listener is inside of a virtual server.
 	 */
-	if (inst->app_io->instantiate &&
-	    (inst->app_io->instantiate(inst->app_io_instance,
-				       inst->app_io_conf) < 0)) {
-		cf_log_err(conf, "Instantiation failed for \"%s\"", inst->app_io->name);
+	inst->server_cs = cf_item_to_section(cf_parent(conf));
+	inst->self = &proto_detail;
+
+	/*
+	 *	No IO module, it's an empty listener.  That's not
+	 *	allowed for the detail file reader.
+	 */
+	if (!inst->io_submodule) {
+		cf_log_err(conf, "Virtual server for detail files requires a 'transport' configuration");
 		return -1;
 	}
+
+	/*
+	 *	Bootstrap the I/O module
+	 */
+	inst->app_io = (fr_app_io_t const *) inst->io_submodule->exported;
+	inst->app_io_instance = inst->io_submodule->data;
+	inst->app_io_conf = inst->io_submodule->conf;
 
 	/*
 	 *	These configuration items are not printed by default,
@@ -467,120 +558,20 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 
 	if (!inst->priority) inst->priority = PRIORITY_NORMAL;
 
-	/*
-	 *	If the IO is "file" and not the worker, instantiate the worker now.
-	 */
-	if (strcmp(inst->io_submodule->module->dl->name, "proto_detail_work") != 0) {
-		if (inst->work_io->instantiate && (inst->work_io->instantiate(inst->work_io_instance,
-									      inst->work_io_conf) < 0)) {
-			cf_log_err(inst->work_io_conf, "Instantiation failed for \"%s\"", inst->work_io->name);
-			return -1;
-		}
-	}
-
 	return 0;
 }
-
-/** Bootstrap the application
- *
- * Bootstrap I/O and type submodules.
- *
- * @param[in] instance	Ctx data for this application.
- * @param[in] conf	Listen section parsed to give us instance.
- * @return
- *	- 0 on success.
- *	- -1 on failure.
- */
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
-{
-	proto_detail_t 		*inst = talloc_get_type_abort(instance, proto_detail_t);
-
-	/*
-	 *	The listener is inside of a virtual server.
-	 */
-	inst->server_cs = cf_item_to_section(cf_parent(conf));
-	inst->cs = conf;
-	inst->self = &proto_detail;
-
-	virtual_server_dict_set(inst->server_cs, inst->dict, false);
-
-	/*
-	 *	No IO module, it's an empty listener.  That's not
-	 *	allowed for the detail file reader.
-	 */
-	if (!inst->io_submodule) {
-		cf_log_err(conf, "Virtual server for detail files requires a 'transport' configuration");
-		return -1;
-	}
-
-	/*
-	 *	Bootstrap the I/O module
-	 */
-	inst->app_io = (fr_app_io_t const *) inst->io_submodule->module->common;
-	inst->app_io_instance = inst->io_submodule->data;
-	inst->app_io_conf = inst->io_submodule->conf;
-
-	if (inst->app_io->bootstrap && (inst->app_io->bootstrap(inst->app_io_instance,
-								inst->app_io_conf) < 0)) {
-		cf_log_err(inst->app_io_conf, "Bootstrap failed for \"%s\"", inst->app_io->name);
-		return -1;
-	}
-
-	/*
-	 *	If we're not loading the work submodule directly, then try to load it here.
-	 */
-	if (strcmp(inst->io_submodule->module->dl->name, "proto_detail_work") != 0) {
-		CONF_SECTION *transport_cs;
-		dl_module_inst_t *parent_inst;
-
-		inst->work_submodule = NULL;
-
-		transport_cs = cf_section_find(inst->cs, "work", NULL);
-		parent_inst = cf_data_value(cf_data_find(inst->cs, dl_module_inst_t, "proto_detail"));
-		fr_assert(parent_inst);
-
-		if (!transport_cs) {
-			transport_cs = cf_section_dup(inst->cs, inst->cs, inst->app_io_conf,
-						      "work", NULL, false);
-			if (!transport_cs) {
-				cf_log_err(inst->cs, "Failed to create configuration for worker");
-				return -1;
-			}
-		}
-
-		if (dl_module_instance(inst->cs, &inst->work_submodule, transport_cs,
-				parent_inst, "work", DL_MODULE_TYPE_SUBMODULE) < 0) {
-			cf_log_perr(inst->cs, "Failed to load proto_detail_work");
-			return -1;
-		}
-
-		/*
-		 *	Boot strap the work module.
-		 */
-		inst->work_io = (fr_app_io_t const *) inst->work_submodule->module->common;
-		inst->work_io_instance = inst->work_submodule->data;
-		inst->work_io_conf = inst->work_submodule->conf;
-
-		if (inst->work_io->bootstrap && (inst->work_io->bootstrap(inst->work_io_instance,
-									  inst->work_io_conf) < 0)) {
-			cf_log_err(inst->work_io_conf, "Bootstrap failed for \"%s\"", inst->work_io->name);
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
 
 fr_app_t proto_detail = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "detail",
-	.config			= proto_detail_config,
-	.inst_size		= sizeof(proto_detail_t),
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "detail",
+		.config			= proto_detail_config,
+		.inst_size		= sizeof(proto_detail_t),
 
-	.bootstrap		= mod_bootstrap,
-	.instantiate		= mod_instantiate,
+		.instantiate		= mod_instantiate,
+	},
 	.open			= mod_open,
 	.decode			= mod_decode,
 	.encode			= mod_encode,
+	.priority		= mod_priority_set
 };

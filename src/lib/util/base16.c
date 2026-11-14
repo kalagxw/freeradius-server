@@ -28,7 +28,7 @@ RCSID("$Id$")
 /** lower case encode alphabet for base16
  *
  */
-char const fr_base16_alphabet_encode_lc[UINT8_MAX] = {
+char const fr_base16_alphabet_encode_lc[SBUFF_CHAR_CLASS] = {
 	[0] = '0',
 	[1] = '1',
 	[2] = '2',
@@ -50,7 +50,7 @@ char const fr_base16_alphabet_encode_lc[UINT8_MAX] = {
 /** lower case encode alphabet for base16
  *
  */
-char const fr_base16_alphabet_encode_uc[UINT8_MAX] = {
+char const fr_base16_alphabet_encode_uc[SBUFF_CHAR_CLASS] = {
 	[0] = '0',
 	[1] = '1',
 	[2] = '2',
@@ -72,7 +72,7 @@ char const fr_base16_alphabet_encode_uc[UINT8_MAX] = {
 /** Mixed case decode alphabet for base16
  *
  */
-uint8_t const fr_base16_alphabet_decode_mc[UINT8_MAX] = {
+uint8_t const fr_base16_alphabet_decode_mc[SBUFF_CHAR_CLASS] = {
 	F32(0, UINT8_MAX), F16(32, UINT8_MAX),
 	['0'] = 0,
 	['1'] = 1,
@@ -98,7 +98,7 @@ uint8_t const fr_base16_alphabet_decode_mc[UINT8_MAX] = {
 	['d'] = 13,
 	['e'] = 14,
 	['f'] = 15,
-	F128(103, UINT8_MAX), F16(231, UINT8_MAX), F8(247, UINT8_MAX)
+	F128(103, UINT8_MAX), F16(231, UINT8_MAX), F8(247, UINT8_MAX), F1(255, UINT8_MAX)
 };
 
 /** Convert binary data to a hex string
@@ -112,21 +112,19 @@ uint8_t const fr_base16_alphabet_decode_mc[UINT8_MAX] = {
  *	- >=0 the number of bytes written to out.
  *	- <0 number of bytes we would have needed to print the next hexit.
  */
-ssize_t fr_base16_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in, char const alphabet[static UINT8_MAX])
+fr_slen_t fr_base16_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in, char const alphabet[static SBUFF_CHAR_CLASS])
 {
-	fr_sbuff_t	our_out = FR_SBUFF_NO_ADVANCE(out);
+	fr_sbuff_t	our_out = FR_SBUFF(out);
 	fr_dbuff_t	our_in = FR_DBUFF(in);
 
 	while (fr_dbuff_extend(&our_in)) {
-		uint8_t a = *fr_dbuff_current(&our_in);
-
-		FR_SBUFF_IN_CHAR_RETURN(&our_out, alphabet[us(a >> 4)], (alphabet[us(a & 0x0f)]));
+		FR_SBUFF_RETURN(fr_base16_encode_byte_nstd, &our_out, *fr_dbuff_current(&our_in), alphabet);
 		fr_dbuff_advance(&our_in, 1);
 	}
 
 	fr_sbuff_terminate(&our_out);	/* Ensure this is terminated, even on zero length input */
 	fr_dbuff_set(in, &our_in);
-	return fr_sbuff_set(out, &our_out);
+	FR_SBUFF_SET_RETURN(out, &our_out);
 }
 
 /** Decode base16 encoded input
@@ -138,13 +136,13 @@ ssize_t fr_base16_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in, char const alphab
  *				at the end of the string.
  * @param[in] alphabet		to use for decoding.
  * @return
- *	- <= 0 on failure.  The offset where the decoding error occurred as a negative integer.
+ *	- < 0 on failure.  The offset where the decoding error occurred as a negative integer.
  *	- Length of decoded data.
  */
-ssize_t fr_base16_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_sbuff_t *in,
-			      bool no_trailing, uint8_t const alphabet[static UINT8_MAX])
+fr_slen_t fr_base16_decode_nstd(fr_sbuff_err_t *err, fr_dbuff_t *out, fr_sbuff_t *in,
+				bool no_trailing, uint8_t const alphabet[static SBUFF_CHAR_CLASS])
 {
-	fr_sbuff_t	our_in = FR_SBUFF_NO_ADVANCE(in);
+	fr_sbuff_t	our_in = FR_SBUFF(in);
 	fr_dbuff_t	our_out = FR_DBUFF(out);
 
 	while (fr_sbuff_extend_lowat(NULL, &our_in, 2) >= 2) {
@@ -155,17 +153,18 @@ ssize_t fr_base16_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_s
 		b = fr_is_base16_nstd(p[1], alphabet);
 		if (!a || !b) {
 			if (a && !b && no_trailing) {
-		   		if (err) *err = FR_SBUFF_PARSE_ERROR_TRAILING;
-		   		return -fr_sbuff_used(&our_in);
+		   		if (err) *err = FR_SBUFF_ERR_TRAILING;
+		   		FR_SBUFF_ERROR_RETURN(&our_in);
 		   	}
+		   	break;
 		}
 
 		FR_DBUFF_IN_BYTES_RETURN(&our_out, (alphabet[us(p[0])] << 4) | alphabet[us(p[1])]);
 
 		fr_sbuff_advance(&our_in, 2);
-	};
+	}
 
-	if (err) *err = FR_SBUFF_PARSE_OK;
+	if (err) *err = FR_SBUFF_OK;
 
 	fr_sbuff_set(in, &our_in);
 	return fr_dbuff_set(out, &our_out);

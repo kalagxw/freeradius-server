@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2022 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -8,10 +8,13 @@
 # Version:	$Id$
 #
 
-PROTOCOL	TACACS		5	format=4
-BEGIN-PROTOCOL TACACS
+BEGIN PROTOCOL	TACACS		5	format=string,pool=1MB
 
 $INCLUDE dictionary.freeradius.internal
 $INCLUDE dictionary.tacacs
+$INCLUDE dictionary.rfc8907
+$INCLUDE dictionary.calix
+$INCLUDE dictionary.juniper
+$INCLUDE dictionary.marconi
 
 END-PROTOCOL TACACS

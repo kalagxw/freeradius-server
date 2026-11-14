@@ -30,174 +30,129 @@
 
 #include <freeradius-devel/io/test_point.h>
 #include <freeradius-devel/util/dns.h>
-#include <freeradius-devel/util/pair.h>
 #include <freeradius-devel/util/proto.h>
 #include <freeradius-devel/util/struct.h>
-#include <freeradius-devel/util/talloc.h>
-#include <freeradius-devel/util/types.h>
 
 #include "dhcpv6.h"
 #include "attrs.h"
 
-static ssize_t decode_option(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+/*
+ *    RFC 8415 Section 21.7 defines option codes that MUST NOT appear
+ *    in an Option Request option.  We convert the attributes to a
+ *    64-bit number which can be easily checked.
+ */
+#define DHCPV6_ORO_FORBIDDEN			    \
+	((1ULL << 1)  |	 /* OPTION_CLIENTID */	    \
+	 (1ULL << 2)  |	 /* OPTION_SERVERID */	    \
+	 (1ULL << 3)  |	 /* OPTION_IA_NA */	    \
+	 (1ULL << 4)  |	 /* OPTION_IA_TA */	    \
+	 (1ULL << 5)  |	 /* OPTION_IAADDR */	    \
+	 (1ULL << 6)  |	 /* OPTION_ORO */	    \
+	 (1ULL << 7)  |	 /* OPTION_PREFERENCE */    \
+	 (1ULL << 8)  |	 /* OPTION_ELAPSED_TIME */  \
+	 (1ULL << 9)  |	 /* OPTION_RELAY_MSG */	    \
+	 (1ULL << 11) |	 /* OPTION_AUTH */	    \
+	 (1ULL << 12) |	 /* OPTION_UNICAST */	    \
+	 (1ULL << 13) |	 /* OPTION_STATUS_CODE */   \
+	 (1ULL << 14) |	 /* OPTION_RAPID_COMMIT */  \
+	 (1ULL << 15) |	 /* OPTION_USER_CLASS */    \
+	 (1ULL << 16) |	 /* OPTION_VENDOR_CLASS */  \
+	 (1ULL << 18) |	 /* OPTION_INTERFACE_ID */  \
+	 (1ULL << 19) |	 /* OPTION_RECONF_MSG */    \
+	 (1ULL << 20) |	 /* OPTION_RECONF_ACCEPT */ \
+	 (1ULL << 25) |	 /* OPTION_IA_PD */	    \
+	 (1ULL << 26))	  /* OPTION_IAPREFIX */
+
+static ssize_t decode_option(TALLOC_CTX *ctx, fr_pair_list_t *out,
 			     fr_dict_attr_t const *parent,
 			     uint8_t const *data, size_t const data_len, void *decode_ctx);
-static ssize_t decode_tlvs(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
-			   fr_dict_attr_t const *parent,
-			   uint8_t const *data, size_t const data_len, void *decode_ctx, bool do_raw);
 
-static ssize_t decode_tlv_trampoline(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+static ssize_t decode_tlv_trampoline(TALLOC_CTX *ctx, fr_pair_list_t *out,
 				     fr_dict_attr_t const *parent,
 				     uint8_t const *data, size_t const data_len, void *decode_ctx)
 {
-	return decode_tlvs(ctx, cursor, dict, parent, data, data_len, decode_ctx, true);
+	return fr_pair_tlvs_from_network(ctx, out, parent, data, data_len, decode_ctx, decode_option, NULL, true);
 }
 
-
-static ssize_t decode_raw(TALLOC_CTX *ctx, fr_dcursor_t *cursor, UNUSED fr_dict_t const *dict,
-			  fr_dict_attr_t const *parent,
-			  uint8_t const *data, size_t const data_len, void *decode_ctx)
-{
-	fr_pair_t		*vp;
-	fr_dict_attr_t		*unknown;
-	fr_dict_attr_t const	*da;
-	fr_dhcpv6_decode_ctx_t	*packet_ctx = decode_ctx;
-	ssize_t			slen;
-
-#ifdef __clang_analyzer__
-	if (!packet_ctx || !packet_ctx->tmp_ctx || !parent->parent) return PAIR_DECODE_FATAL_ERROR;
-#endif
-
-	FR_PROTO_HEX_DUMP(data, data_len, "decode_raw");
-
-	/*
-	 *	Re-write the attribute to be "raw".  It is
-	 *	therefore of type "octets", and will be
-	 *	handled below.
-	 */
-	unknown = fr_dict_unknown_attr_afrom_da(packet_ctx->tmp_ctx, parent);
-	if (!unknown) {
-		fr_strerror_printf("%s: Internal sanity check %d", __FUNCTION__, __LINE__);
-		return PAIR_DECODE_OOM;
-	}
-	unknown->flags.is_raw = 1;
-
-	vp = fr_pair_afrom_da(ctx, unknown);
-	if (!vp) return PAIR_DECODE_OOM;
-
-	slen = fr_value_box_from_network(vp, &vp->data, vp->da->type, vp->da, data, data_len, true);
-	if (slen < 0) {
-		talloc_free(vp);
-		da = unknown;
-		fr_dict_unknown_free(&da);
-		return slen;
-	}
-
-	vp->type = VT_DATA;
-	vp->vp_tainted = true;
-	fr_dcursor_append(cursor, vp);
-	return data_len;
-}
-
-static ssize_t decode_value(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+static ssize_t decode_value(TALLOC_CTX *ctx, fr_pair_list_t *out,
 			    fr_dict_attr_t const *parent,
 			    uint8_t const *data, size_t const data_len, void *decode_ctx);
-static ssize_t decode_array(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
-			    fr_dict_attr_t const *parent,
-			    uint8_t const *data, size_t const data_len, void *decode_ctx);
-static ssize_t decode_dns_labels(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
-				 fr_dict_attr_t const *parent,
-				 uint8_t const *data, size_t const data_len, void *decode_ctx);
 
-/** Handle arrays of DNS lavels for fr_struct_from_network()
+/** Handle arrays of DNS labels for fr_struct_from_network()
  *
  */
-static ssize_t decode_value_trampoline(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+static ssize_t decode_value_trampoline(TALLOC_CTX *ctx, fr_pair_list_t *out,
 				       fr_dict_attr_t const *parent,
 				       uint8_t const *data, size_t const data_len, void *decode_ctx)
 {
-	/*
-	 *	@todo - we might need to limit this to only one DNS label.
-	 */
-	if ((parent->type == FR_TYPE_STRING) && !parent->flags.extra && parent->flags.subtype) {
-		return decode_dns_labels(ctx, cursor, dict, parent, data, data_len, decode_ctx);
+	if ((parent->type == FR_TYPE_STRING) && fr_dhcpv6_flag_any_dns_label(parent)) {
+		return fr_pair_dns_labels_from_network(ctx, out, parent, data, data, data_len, NULL, false);
 	}
 
-	if (parent->flags.array) return decode_array(ctx, cursor, dict, parent, data, data_len, decode_ctx);
-
-	return decode_value(ctx, cursor, dict, parent, data, data_len, decode_ctx);
+	return decode_value(ctx, out, parent, data, data_len, decode_ctx);
 }
 
 
-static ssize_t decode_value(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+static ssize_t decode_value(TALLOC_CTX *ctx, fr_pair_list_t *out,
 			    fr_dict_attr_t const *parent,
 			    uint8_t const *data, size_t const data_len, void *decode_ctx)
 {
 	ssize_t			slen;
-	fr_pair_t		*vp;
-	uint8_t			prefix_len;
+	fr_pair_t		*vp = NULL;
+	fr_dict_attr_t const	*ref;
 
 	FR_PROTO_HEX_DUMP(data, data_len, "decode_value");
 
 	switch (parent->type) {
-	/*
-	 *	Address MAY be shorter than 16 bytes.
-	 */
-	case FR_TYPE_IPV6_PREFIX:
-		if ((data_len == 0) || (data_len > (1 + sizeof(vp->vp_ipv6addr)))) {
-		raw:
-			return decode_raw(ctx, cursor, dict, parent, data, data_len, decode_ctx);
-
-		};
+	case FR_TYPE_ATTR:
+		/*
+		 *	Force the length of the data to be two,
+		 *	otherwise the "from network" call complains.
+		 *	Because we pass in the enumv as the _parent_
+		 *	and not the da.  The da is marked as "array",
+		 *	but the parent is not.
+		 */
+		if (data_len < 2) goto raw;
 
 		/*
-		 *	Structs used fixed length fields
+		 *	Run-time checks rather than assertions.
 		 */
-		if (parent->parent->type == FR_TYPE_STRUCT) {
-			if (data_len != (1 + sizeof(vp->vp_ipv6addr))) goto raw;
-
-			vp = fr_pair_afrom_da(ctx, parent);
-			if (!vp) return PAIR_DECODE_OOM;
-
-			vp->vp_ip.af = AF_INET6;
-			vp->vp_ip.scope_id = 0;
-			vp->vp_ip.prefix = data[0];
-			memcpy(&vp->vp_ipv6addr, data + 1, data_len - 1);
-			break;
-		}
-
-		/*
-		 *	No address, the prefix length MUST be zero.
-		 */
-		if (data_len == 1) {
-			if (data[0] != 0) goto raw;
-
-			vp = fr_pair_afrom_da(ctx, parent);
-			if (!vp) return PAIR_DECODE_OOM;
-
-			vp->vp_ip.af = AF_INET6;
-			vp->vp_ip.scope_id = 0;
-			vp->vp_ip.prefix = 0;
-			memset(&vp->vp_ipv6addr, 0, sizeof(vp->vp_ipv6addr));
-			break;
-		}
-
-		prefix_len = data[0];
-
-		/*
-		 *	If we have a /64 prefix but only 7 bytes of
-		 *	address, that's an error.
-		 */
-		if (fr_bytes_from_bits(prefix_len) > (data_len - 1)) goto raw;
+		if (!parent->parent->flags.is_root) return -1;
 
 		vp = fr_pair_afrom_da(ctx, parent);
 		if (!vp) return PAIR_DECODE_OOM;
 
-		vp->vp_ip.af = AF_INET6;
-		vp->vp_ip.scope_id = 0;
-		vp->vp_ip.prefix = prefix_len;
-		memset(&vp->vp_ipv6addr, 0, sizeof(vp->vp_ipv6addr));
-		memcpy(&vp->vp_ipv6addr, data + 1, data_len - 1);
+		slen = fr_value_box_from_network(vp, &vp->data, vp->vp_type, parent->parent,
+						 &FR_DBUFF_TMP(data, 2), 2, true);
+		if (slen <= 0) {
+			TALLOC_FREE(vp);
+			goto raw;
+		}
+
+		vp->vp_tainted = true;
+		FR_PAIR_APPEND(out, vp);
+		return 2;
+
+	/*
+	 *	Address MAY be shorter than 16 bytes.
+	 */
+	case FR_TYPE_IPV6_PREFIX:
+		if (data_len == 0) {
+		raw:
+			return fr_pair_raw_from_network(ctx, out, parent, data, data_len);
+
+		}
+
+		vp = fr_pair_afrom_da(ctx, parent);
+		if (!vp) return PAIR_DECODE_OOM;
+		PAIR_ALLOCED(vp);
+
+		slen = fr_value_box_ipaddr_from_network(&vp->data, parent->type, parent,
+							data[0], data + 1, data_len - 1,
+							(parent->parent->type == FR_TYPE_STRUCT), true);
+		if (slen < 0) goto raw_free;
+
+		slen++;		/* account for the prefix */
 		break;
 
 	/*
@@ -209,7 +164,10 @@ static ssize_t decode_value(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t con
 		if (data_len != 0) goto raw;
 		vp = fr_pair_afrom_da(ctx, parent);
 		if (!vp) return PAIR_DECODE_OOM;
+		PAIR_ALLOCED(vp);
+
 		vp->vp_bool = true;
+		slen = 0;
 		break;
 
 	/*
@@ -222,291 +180,104 @@ static ssize_t decode_value(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t con
 	case FR_TYPE_DATE:
 		vp = fr_pair_afrom_da(ctx, parent);
 		if (!vp) return PAIR_DECODE_OOM;
+		PAIR_ALLOCED(vp);
 
-		if (fr_value_box_from_network(vp, &vp->data, vp->da->type, vp->da, data, data_len, true) < 0) {
-			talloc_free(vp);
-			goto raw;
-		}
-		vp->vp_date += ((fr_time_t) DHCPV6_DATE_OFFSET) * NSEC;
-		break;
-
-	case FR_TYPE_STRUCT:
-		slen = fr_struct_from_network(ctx, cursor, parent, data, data_len,
-					      decode_ctx, decode_value_trampoline, decode_tlv_trampoline);
-		if (slen < 0) return slen;
-		return data_len;
-
-	case FR_TYPE_GROUP:
-	{
-		fr_dcursor_t child_cursor;
-		fr_pair_list_t head;
-		fr_pair_list_init(&head);
-
-		vp = fr_pair_afrom_da(ctx, parent);
-		if (!vp) return PAIR_DECODE_OOM;
-
-		/*
-		 *	Child VPs go into the child group, not in the
-		 *	main parent list.  We start decoding
-		 *	attributes from the dictionary root, not from
-		 *	this parent.  We also don't decode an option
-		 *	header, as we're just decoding the values
-		 *	here.
-		 */
-		fr_dcursor_init(&child_cursor, &head);
-		slen = decode_tlvs(vp, &child_cursor, dict, fr_dict_root(dict_dhcpv6), data, data_len, decode_ctx, false);
+		slen = fr_value_box_from_network(vp, &vp->data, vp->vp_type, vp->da,
+						 &FR_DBUFF_TMP(data, data_len), data_len, true);
 		if (slen < 0) {
 			talloc_free(vp);
 			goto raw;
 		}
-		fr_pair_list_append(&vp->vp_group, &head);
+		vp->vp_date = fr_unix_time_add(vp->vp_date, fr_time_delta_from_sec(DHCPV6_DATE_OFFSET));
 		break;
-	}
+
+	case FR_TYPE_STRUCT:
+		slen = fr_struct_from_network(ctx, out, parent, data, data_len,
+					      decode_ctx, decode_value_trampoline, decode_tlv_trampoline);
+		if (slen < 0) goto raw;
+
+		if (parent->flags.array) return slen;
+		return data_len;
+
+	case FR_TYPE_GROUP:
+		vp = fr_pair_afrom_da(ctx, parent);
+		if (!vp) return PAIR_DECODE_OOM;
+		PAIR_ALLOCED(vp);
+
+		ref = fr_dict_attr_ref(parent);
+		if (ref && (ref->dict != dict_dhcpv6)) {
+			fr_dict_protocol_t const *proto;
+
+			proto = fr_dict_protocol(ref->dict);
+			fr_assert(proto != NULL);
+
+			if (!proto->decode) {
+			raw_free:
+				talloc_free(vp);
+				goto raw;
+			}
+
+			slen = proto->decode(vp, &vp->vp_group, data, data_len);
+			if (slen < 0) goto raw_free;
+
+			vp->vp_tainted = true;
+
+		} else {
+			if (!ref) ref = fr_dict_root(dict_dhcpv6);
+
+			/*
+			 *	Child VPs go into the child group, not in the main parent list.  BUT, we start
+			 *	decoding attributes from the ref, and not from the group parent.
+			 */
+			slen = fr_pair_tlvs_from_network(vp, &vp->vp_group, ref, data, data_len, decode_ctx, decode_option, NULL, false);
+			if (slen < 0) goto raw_free;
+		}
+
+		fr_pair_append(out, vp);
+		return data_len;
+
+	case FR_TYPE_IPV6_ADDR:
+		vp = fr_pair_afrom_da(ctx, parent);
+		if (!vp) return PAIR_DECODE_OOM;
+		PAIR_ALLOCED(vp);
+
+		slen = fr_value_box_ipaddr_from_network(&vp->data, parent->type, parent,
+							128, data, data_len,
+							true, true);
+		if (slen < 0) goto raw_free;
+		break;
 
 	default:
 		vp = fr_pair_afrom_da(ctx, parent);
 		if (!vp) return PAIR_DECODE_OOM;
+		PAIR_ALLOCED(vp);
 
-		if (fr_value_box_from_network(vp, &vp->data, vp->da->type, vp->da, data, data_len, true) < 0) {
-			talloc_free(vp);
-			goto raw;
-		}
+		slen = fr_value_box_from_network(vp, &vp->data, vp->vp_type, vp->da,
+						 &FR_DBUFF_TMP(data, data_len), data_len, true);
+		if (slen < 0) goto raw_free;
 		break;
 	}
 
-	vp->type = VT_DATA;
+	/*
+	 *	The input is larger than the decoded value, re-do it as a raw attribute.
+	 */
+	if (!parent->flags.array && ((size_t) slen < data_len)) {
+		talloc_free(vp);
+		goto raw;
+	}
+
+	fr_assert(vp != NULL);
+
 	vp->vp_tainted = true;
-	fr_dcursor_append(cursor, vp);
-	return data_len;
-}
+	fr_pair_append(out, vp);
 
-
-static ssize_t decode_array(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
-			    fr_dict_attr_t const *parent,
-			    uint8_t const *data, size_t const data_len, void *decode_ctx)
-{
-	uint8_t const  		*p = data, *end = p + data_len;
-	ssize_t			slen;
-	size_t			element_len;
-
-	FR_PROTO_HEX_DUMP(data, data_len, "decode_array");
-
-	if (!fr_cond_assert_msg(parent->flags.array,
-				"%s: Internal sanity check failed, attribute \"%s\" does not have array bit set",
-				__FUNCTION__, parent->name)) return PAIR_DECODE_FATAL_ERROR;
-
-	/*
-	 *	Fixed-size fields get decoded with a simple decoder.
-	 */
-	element_len = fr_dhcpv6_attr_sizes[parent->type][0];
-	if (element_len > 0) {
-		while (p < end) {
-			/*
-			 *	Not enough room for one more element,
-			 *	decode the last bit as raw data.
-			 */
-			if ((size_t) (end - p) < element_len) {
-				slen = decode_raw(ctx, cursor, dict, parent, p, end - p , decode_ctx);
-				if (slen < 0) return slen;
-				break;
-			}
-
-			slen = decode_value(ctx, cursor, dict, parent, p, element_len, decode_ctx);
-			if (slen < 0) return slen;
-			if (!fr_cond_assert((size_t) slen == element_len)) return -(p - data);
-
-			p += slen;
-		}
-
-		/*
-		 *	We MUST have decoded the entire input.  If
-		 *	not, we ignore the extra bits.
-		 */
-		return data_len;
-	}
-
-	/*
-	 *	If the data is variable length i.e. strings or octets
-	 *	there is a length field before each element.
-	 *
-	 *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-...-+-+-+-+-+-+-+
-	 *   |       text-len                |        String                 |
-	 *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-...-+-+-+-+-+-+-+
-	 */
-	while (p < end) {
-		if ((end - p) < 2) {
-		raw:
-			slen = decode_raw(ctx, cursor, dict, parent, p, end - p , decode_ctx);
-			if (slen < 0) return slen;
-			break;
-		}
-
-		element_len = fr_net_to_uint16(p);
-		if ((p + 2 + element_len) > end) {
-			goto raw;
-		}
-
-		p += 2;
-		slen = decode_value(ctx, cursor, dict, parent, p, element_len, decode_ctx);
-		if (slen < 0) return slen;
-		p += slen;
-	}
-
-	return data_len;
-}
-
-static ssize_t decode_dns_labels(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
-				 fr_dict_attr_t const *parent,
-				 uint8_t const *data, size_t const data_len, void *decode_ctx)
-{
-	ssize_t slen;
-	size_t total, labels_len;
-	fr_pair_t *vp;
-	uint8_t const *next = data;
-
-	FR_PROTO_HEX_DUMP(data, data_len, "decode_dns_labels");
-
-	/*
-	 *	This function handles both single-valued and array
-	 *	types.  It's just easier that way.
-	 */
-	if (!parent->flags.array) {
-		slen = fr_dns_label_uncompressed_length(data, data_len, &next);
-		if (slen <= 0) goto raw;
-
-		/*
-		 *	If the DNS label doesn't exactly fill the option, it's an error.
-		 *
-		 *	@todo - we may want to remove this check.
-		 */
-		if (next != (data + data_len)) goto raw;
-
-		labels_len = next - data; /* decode only what we've found */
-	} else {
-		/*
-		 *	Get the length of the entire set of labels, up
-		 *	to (and including) the final 0x00.
-		 *
-		 *	If any of the labels point outside of this
-		 *	area, OR they are otherwise invalid, then that's an error.
-		 */
-		slen = fr_dns_labels_network_verify(data, data_len);
-		if (slen < 0) {
-		raw:
-			return decode_raw(ctx, cursor, dict, parent, data, data_len, decode_ctx);
-		}
-
-		labels_len = slen;
-	}
-
-	/*
-	 *	Loop over the input buffer, decoding the labels one by
-	 *	one.
-	 */
-	for (total = 0; total < labels_len; total += slen) {
-		vp = fr_pair_afrom_da(ctx, parent);
-		if (!vp) return PAIR_DECODE_OOM;
-
-		/*
-		 *	Having verified the input above, this next
-		 *	function should never fail unless there's a
-		 *	bug in the code.
-		 */
-		slen = fr_dns_label_to_value_box(vp, &vp->data, data, labels_len, data + total, true);
-		if (slen <= 0) {
-			talloc_free(vp);
-			goto raw;
-		}
-
-		vp->type = VT_DATA;
-		fr_dcursor_append(cursor, vp);
-	}
-
-	return labels_len;
-}
-
-
-/** Like decode_option(), but decodes *all* of the options.
- *
- */
-static ssize_t decode_tlvs(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
-			   fr_dict_attr_t const *parent,
-			   uint8_t const *data, size_t const data_len, void *decode_ctx, bool do_raw)
-{
-	uint8_t const *p, *end;
-
-	FR_PROTO_HEX_DUMP(data, data_len, "decode_tlvs");
-
-	if (!fr_cond_assert_msg((parent->type == FR_TYPE_TLV || (parent->type == FR_TYPE_VENDOR)),
-				"%s: Internal sanity check failed, attribute \"%s\" is not of type 'tlv'",
-				__FUNCTION__, parent->name)) return PAIR_DECODE_FATAL_ERROR;
-	p = data;
-	end = data + data_len;
-
-	while (p < end) {
-		ssize_t slen;
-
-		slen = decode_option(ctx, cursor, dict, parent, p, (end - p), decode_ctx);
-		if (slen <= 0) {
-			if (!do_raw) return slen;
-
-			slen = decode_raw(ctx, cursor, dict, parent, p, (end - p), decode_ctx);
-			if (slen <= 0) return slen;
-			break;
-		}
-
-		p += slen;
-	}
+	if (parent->flags.array) return slen;
 
 	return data_len;
 }
 
 
-static ssize_t decode_vsa(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
-			  fr_dict_attr_t const *parent,
-			  uint8_t const *data, size_t const data_len, void *decode_ctx)
-{
-	uint32_t		pen;
-	fr_dict_attr_t const	*da;
-	fr_dhcpv6_decode_ctx_t	*packet_ctx = decode_ctx;
-
-	FR_PROTO_HEX_DUMP(data, data_len, "decode_vsa");
-
-	if (!fr_cond_assert_msg(parent->type == FR_TYPE_VSA,
-				"%s: Internal sanity check failed, attribute \"%s\" is not of type 'vsa'",
-				__FUNCTION__, parent->name)) return PAIR_DECODE_FATAL_ERROR;
-
-	/*
-	 *	Enterprise code plus at least one option header
-	 */
-	if (data_len < 8) return decode_raw(ctx, cursor, dict, parent, data, data_len, decode_ctx);
-
-	memcpy(&pen, data, sizeof(pen));
-	pen = htonl(pen);
-
-	/*
-	 *	Verify that the parent (which should be a VSA)
-	 *	contains a fake attribute representing the vendor.
-	 *
-	 *	If it doesn't then this vendor is unknown, but we know
-	 *	vendor attributes have a standard format, so we can
-	 *	decode the data anyway.
-	 */
-	da = fr_dict_attr_child_by_num(parent, pen);
-	if (!da) {
-		fr_dict_attr_t *n;
-
-		n = fr_dict_unknown_vendor_afrom_num(packet_ctx->tmp_ctx, parent, pen);
-		if (!n) return PAIR_DECODE_OOM;
-		da = n;
-	}
-
-	FR_PROTO_TRACE("decode context %s -> %s", parent->name, da->name);
-
-	return decode_tlvs(ctx, cursor, dict, da, data + 4, data_len - 4, decode_ctx, true);
-}
-
-static ssize_t decode_option(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+static ssize_t decode_option(TALLOC_CTX *ctx, fr_pair_list_t *out,
 			      fr_dict_attr_t const *parent,
 			      uint8_t const *data, size_t const data_len, void *decode_ctx)
 {
@@ -516,7 +287,7 @@ static ssize_t decode_option(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t co
 	fr_dict_attr_t const	*da;
 	fr_dhcpv6_decode_ctx_t	*packet_ctx = decode_ctx;
 
-#ifdef __clang_analyzer__
+#ifdef STATIC_ANALYZER
 	if (!packet_ctx || !packet_ctx->tmp_ctx) return PAIR_DECODE_FATAL_ERROR;
 #endif
 
@@ -539,7 +310,7 @@ static ssize_t decode_option(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t co
 
 	da = fr_dict_attr_child_by_num(parent, option);
 	if (!da) {
-		da = fr_dict_unknown_attr_afrom_num(packet_ctx->tmp_ctx, parent, option);
+		da = fr_dict_attr_unknown_raw_afrom_num(packet_ctx->tmp_ctx, parent, option);
 		if (!da) return PAIR_DECODE_FATAL_ERROR;
 	}
 	FR_PROTO_TRACE("decode context changed %s -> %s",da->parent->name, da->name);
@@ -550,45 +321,151 @@ static ssize_t decode_option(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t co
 	 */
 	if (da == attr_relay_message) {
 		fr_pair_t *vp;
-		fr_dcursor_t cursor_group;
 
 		vp = fr_pair_afrom_da(ctx, attr_relay_message);
 		if (!vp) return PAIR_DECODE_FATAL_ERROR;
-
-		fr_dcursor_init(&cursor_group, &vp->vp_group);
-		slen = fr_dhcpv6_decode(vp, data + 4, len, &cursor_group);
-		if (slen < 0) {
-			talloc_free(vp);
-			return slen;
-		}
-
-		fr_dcursor_insert(cursor, vp);
-	} else if ((da->type == FR_TYPE_STRING) && !da->flags.extra && da->flags.subtype) {
-		slen = decode_dns_labels(ctx, cursor, dict, da, data + 4, len, decode_ctx);
-		if (slen < 0) return slen;
+		PAIR_ALLOCED(vp);
 
 		/*
-		 *	The DNS labels may only partially fill the
-		 *	option.  If so, that's an error.  Point to the
-		 *	byte which caused the error, accounting for
-		 *	the option header.
+		 *	Check if the relayed packet is OK.  If not, it's an error.
 		 */
-		if ((size_t) slen != len) return -(4 + slen);
+		if (!fr_dhcpv6_ok(data + 4, len, 200)) return -1;
+
+		slen = fr_dhcpv6_decode(vp, &vp->vp_group, data + 4, len);
+		if (slen < 0) {
+			talloc_free(vp);
+		raw:
+			slen = fr_pair_raw_from_network(ctx, out, da, data + 4, len);
+			if (slen < 0) return slen;
+			return 4 + slen;
+		}
+
+		fr_pair_append(out, vp);
+
+	} else if ((da->type == FR_TYPE_STRING) && fr_dhcpv6_flag_any_dns_label(da)) {
+		slen = fr_pair_dns_labels_from_network(ctx, out, da, data + 4, data + 4, len, NULL, true);
+		if (slen < 0) return slen;
 
 	} else if (da->flags.array) {
-		slen = decode_array(ctx, cursor, dict, da, data + 4, len, decode_ctx);
+		if (da == attr_option_request) {
+			uint8_t const *p;
+
+			if ((len < 2) || ((len & 0x01) != 0)) {
+				fr_strerror_const("Invalid Option-Request, length is not a multiple of 2");
+				return -1;
+			}
+
+			/*
+			 *	Check for the forbidden options.
+			 */
+			for (p = data + 4; p < (data + 4 + len); p += 2) {
+				if (*p) continue;
+
+				if (*p > 26) continue;
+
+				if ((1 << *p) & DHCPV6_ORO_FORBIDDEN) {
+					fr_strerror_printf("Option %u is forbidden inside of Option-Request", *p);
+					return -1;
+				}
+			}
+		}
+
+		slen = fr_pair_array_from_network(ctx, out, da, data + 4, len, decode_ctx, decode_value);
 
 	} else if (da->type == FR_TYPE_VSA) {
-		slen = decode_vsa(ctx, cursor, dict, da, data + 4, len, decode_ctx);
+		bool			append_vsa = false;
+		bool			append_vp = false;
+		uint32_t		pen;
+		fr_dict_attr_t const	*vendor;
+		fr_pair_t		*vsa, *vp;
+		fr_pair_list_t		list;
+
+		/*
+		 *	Insufficient room for a 4-octet enterprise
+		 *	code, plus at least one option header.
+		 */
+		if (len < 8) goto raw;
+
+		pen = fr_nbo_to_uint32(data + 4);
+
+		/*
+		 *	Verify that the VSA contains a vendor.
+		 *
+		 *	If it doesn't then this vendor is unknown, but we know
+		 *	vendor attributes have a standard format, so we can
+		 *	decode the data anyway.
+		 */
+		vendor = fr_dict_attr_child_by_num(da, pen);
+		if (!vendor) {
+			fr_dict_attr_t *n;
+
+			n = fr_dict_attr_unknown_vendor_afrom_num(packet_ctx->tmp_ctx, da, pen);
+			if (!n) return PAIR_DECODE_OOM;
+			vendor = n;
+		}
+
+		vsa = fr_pair_find_by_da(out, NULL, da);
+		if (!vsa) {
+			vsa = fr_pair_afrom_da(ctx, da);
+			if (!vsa) return PAIR_DECODE_FATAL_ERROR;
+			PAIR_ALLOCED(vsa);
+
+			append_vsa = true;
+		}
+
+		vp = NULL;
+		if (!append_vsa) vp = fr_pair_find_by_da(&vsa->vp_group, NULL, vendor);
+
+		if (!vp) {
+			vp = fr_pair_afrom_da(vsa, vendor);
+			if (!vp) return PAIR_DECODE_FATAL_ERROR;
+			PAIR_ALLOCED(vp);
+
+			append_vp = true;
+		}
+
+		fr_pair_list_init(&list);
+		slen = fr_pair_tlvs_from_network(vp, &vp->vp_group, vendor, data + 8, len - 4,
+						 decode_ctx, decode_option, NULL, false);
+
+		if (slen < 0) {
+			fr_pair_list_free(&list);
+			if (append_vp) talloc_free(vp);
+			if (append_vsa) talloc_free(vsa);
+			goto raw;
+		}
+
+		/*
+		 *	The child list contains vendors, and we have to merge the vendors 
+		 */
+		fr_pair_list_append(&vp->vp_group, &list);
+		if (append_vp) fr_pair_append(&vsa->vp_group, vp);
+		if (append_vsa) fr_pair_append(out, vsa);
 
 	} else if (da->type == FR_TYPE_TLV) {
-		slen = decode_tlvs(ctx, cursor, dict, da, data + 4, len, decode_ctx, true);
+		slen = fr_pair_tlvs_from_network(ctx, out, da, data + 4, len, decode_ctx, decode_option, NULL, true);
+
+	} else if (da == attr_auth) {
+		/*
+		 *	See RFC 8415 Section 18 (option format), and Section 20 (functionality).
+		 *
+		 *	The Auth option can be sent from a server to client in a Reply message, and contains a
+		 *	128-bit secret key that is recorded somewhere on the server side.
+		 *
+		 *	The Auth option can be sent from a server to a client in a Reconfigure message, and
+		 *	contains an HMAC-MD5 of the packet and the secret key.
+		 *
+		 *	We are not currently a DHCPv6 client, so we do not support the Auth option, or
+		 *	Reconfigure messages.  See verify_to_client() in base.c.
+		 */
+		fr_strerror_const("The 'Auth' option is not supported");
+		return -1;
 
 	} else {
-		slen = decode_value(ctx, cursor, dict, da, data + 4, len, decode_ctx);
+		slen = decode_value(ctx, out, da, data + 4, len, decode_ctx);
 	}
 
-	if (slen < 0) return slen;
+	if (slen < 0) goto raw;
 
 	return len + 4;
 }
@@ -602,7 +479,7 @@ static ssize_t decode_option(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t co
  *   |          option-code          |           option-len          |
  *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  */
-ssize_t fr_dhcpv6_decode_option(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+ssize_t fr_dhcpv6_decode_option(TALLOC_CTX *ctx, fr_pair_list_t *out,
 				uint8_t const *data, size_t data_len, void *decode_ctx)
 {
 	FR_PROTO_HEX_DUMP(data, data_len, "fr_dhcpv6_decode_pair");
@@ -614,50 +491,81 @@ ssize_t fr_dhcpv6_decode_option(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t
 	 *	All options including VSAs in DHCPv6 MUST follow the
 	 *	standard format.
 	 */
-	return decode_option(ctx, cursor, dict, fr_dict_root(dict), data, data_len, decode_ctx);
+	return decode_option(ctx, out, fr_dict_root(dict_dhcpv6), data, data_len, decode_ctx);
 }
 
-/*
- *	Stub functions to enable test context
- */
-static int _test_ctx_free(UNUSED fr_dhcpv6_decode_ctx_t *ctx)
+ssize_t	fr_dhcpv6_decode_foreign(TALLOC_CTX *ctx, fr_pair_list_t *out,
+				 uint8_t const *data, size_t data_len)
 {
-	fr_dhcpv6_global_free();
+	ssize_t slen;
+	uint8_t const *attr, *end;
 
-	return 0;
+	fr_dhcpv6_decode_ctx_t decode_ctx = {};
+
+	fr_assert(dict_dhcpv6 != NULL);
+
+	decode_ctx.tmp_ctx = talloc(ctx, uint8_t);
+
+	attr = data;
+	end = data + data_len;
+
+	while (attr < end) {
+		slen = fr_dhcpv6_decode_option(ctx, out, attr, (end - attr), &decode_ctx);
+		if (slen < 0) {
+			talloc_free(decode_ctx.tmp_ctx);
+			return slen;
+		}
+
+		/*
+		 *	If slen is larger than the room in the packet,
+		 *	all kinds of bad things happen.
+		 */
+		 if (!fr_cond_assert(slen <= (end - attr))) {
+			talloc_free(decode_ctx.tmp_ctx);
+			 return -slen - (attr - data);
+		 }
+
+		attr += slen;
+		talloc_free_children(decode_ctx.tmp_ctx);
+	}
+
+	talloc_free(decode_ctx.tmp_ctx);
+	return data_len;
 }
 
-static int decode_test_ctx(void **out, TALLOC_CTX *ctx)
+static int decode_test_ctx(void **out, TALLOC_CTX *ctx, UNUSED fr_dict_t const *dict,
+			   UNUSED fr_dict_attr_t const *root_da)
 {
 	fr_dhcpv6_decode_ctx_t	*test_ctx;
-
-	if (fr_dhcpv6_global_init() < 0) return -1;
 
 	test_ctx = talloc_zero(ctx, fr_dhcpv6_decode_ctx_t);
 	if (!test_ctx) return -1;
 
-	test_ctx->tmp_ctx = talloc(ctx, uint8_t);
-	talloc_set_destructor(test_ctx, _test_ctx_free);
+	test_ctx->tmp_ctx = talloc(test_ctx, uint8_t);
 
 	*out = test_ctx;
 
 	return 0;
 }
 
-static ssize_t fr_dhcpv6_decode_proto(TALLOC_CTX *ctx, fr_pair_list_t *list, uint8_t const *data, size_t data_len, UNUSED void *proto_ctx)
+static ssize_t fr_dhcpv6_decode_proto(TALLOC_CTX *ctx, fr_pair_list_t *out, uint8_t const *data, size_t data_len, UNUSED void *proto_ctx)
 {
 	size_t packet_len = data_len;
-	fr_dcursor_t cursor;
 //	fr_dhcpv6_decode_ctx_t	*test_ctx = talloc_get_type_abort(proto_ctx, fr_dhcpv6_decode_ctx_t);
 
 	if (!fr_dhcpv6_ok(data, packet_len, 200)) return -1;
 
-	fr_pair_list_init(list);
-	fr_dcursor_init(&cursor, list);
-
-	return fr_dhcpv6_decode(ctx, data, packet_len, &cursor);
+	return fr_dhcpv6_decode(ctx, out, data, packet_len);
 }
 
+
+static ssize_t decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *out, NDEBUG_UNUSED fr_dict_attr_t const *parent,
+			   uint8_t const *data, size_t data_len, void *decode_ctx)
+{
+	fr_assert(parent == fr_dict_root(dict_dhcpv6));
+
+	return decode_option(ctx, out, fr_dict_root(dict_dhcpv6), data, data_len, decode_ctx);
+}
 
 /*
  *	Test points
@@ -665,7 +573,7 @@ static ssize_t fr_dhcpv6_decode_proto(TALLOC_CTX *ctx, fr_pair_list_t *list, uin
 extern fr_test_point_pair_decode_t dhcpv6_tp_decode_pair;
 fr_test_point_pair_decode_t dhcpv6_tp_decode_pair = {
 	.test_ctx	= decode_test_ctx,
-	.func		= fr_dhcpv6_decode_option
+	.func		= decode_pair,
 };
 
 extern fr_test_point_proto_decode_t dhcpv6_tp_decode_proto;

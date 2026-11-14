@@ -1,3 +1,4 @@
 #
-#  Test the "files" module
+#  Test the "exec" module
 #
+$(eval $(call TEST_PARALLEL))

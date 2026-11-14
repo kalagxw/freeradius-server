@@ -3,18 +3,27 @@
 #
 # Version:      $Id$
 #
-TARGET		:= libfreeradius-util.a
+
+ifeq "$(TARGET_IS_WASM)" "yes"
+TARGET		:= libfreeradius-util.js
+else
+TARGET		:= libfreeradius-util$(L)
+endif
+TGT_CATEGORY	:= lib-util
 
 SOURCES		:= \
 		   atexit.c \
+		   backtrace.c \
 		   base16.c \
 		   base32.c \
 		   base64.c \
+		   calc.c \
 		   cap.c \
-		   cursor.c \
+		   chap.c \
+		   cbor.c \
 		   dbuff.c \
-		   dcursor.c \
 		   debug.c \
+		   decode.c \
 		   dict_ext.c \
 		   dict_fixup.c \
 		   dict_print.c \
@@ -25,7 +34,10 @@ SOURCES		:= \
 		   dict_validate.c \
 		   dl.c \
 		   dns.c \
+		   edit.c \
+		   encode.c \
 		   event.c \
+		   timer.c \
 		   ext.c \
 		   fifo.c \
 		   file.c \
@@ -39,17 +51,20 @@ SOURCES		:= \
 		   htrie.c \
 		   hw.c \
 		   inet.c \
+		   iovec.c \
 		   isaac.c \
 		   log.c \
 		   lst.c \
 		   machine.c \
 		   md4.c \
 		   md5.c \
+		   minmax_heap.c \
 		   misc.c \
 		   missing.c \
 		   net.c \
 		   packet.c \
 		   pair.c \
+		   pair_inline.c \
 		   pair_legacy.c \
 		   pair_print.c \
 		   pair_tokenize.c \
@@ -60,13 +75,18 @@ SOURCES		:= \
 		   proto.c \
 		   rand.c \
 		   rb.c \
+		   rb_expire.c \
 		   regex.c \
 		   retry.c \
 		   sbuff.c \
 		   sem.c \
+		   semaphore.c \
 		   sha1.c \
+		   size.c \
+		   skip.c \
 		   snprintf.c \
 		   socket.c \
+		   stats.c \
 		   strerror.c \
 		   strlcat.c \
 		   strlcpy.c \
@@ -80,17 +100,92 @@ SOURCES		:= \
 		   trie.c \
 		   types.c \
 		   udp.c \
-		   udpfromto.c \
 		   udp_queue.c \
+		   udpfromto.c \
 		   uri.c \
 		   value.c \
 		   version.c
 
+#
+#  Add the fuzzer only if everything was built with the fuzzing flags.
+#
+ifneq "$(findstring fuzzer,${CFLAGS})" ""
+SOURCES		+= fuzzer.c
+endif
+
 HEADERS		:= $(subst src/lib/,,$(wildcard src/lib/util/*.h))
 
-SRC_CFLAGS	:= -D_LIBRADIUS -DNO_ASSERT -I$(top_builddir)/src
+SRC_CFLAGS	:= -DNO_ASSERT -DTOP_SRCDIR=\"${top_srcdir}\" -I$(top_builddir)/src
 
 # System libraries discovered by our top level configure script, links things
 # like pthread and the regexp libraries.
 TGT_LDLIBS	:= $(LIBS) $(PCAP_LIBS)
 TGT_LDFLAGS	:= $(LDFLAGS) $(PCAP_LDFLAGS)
+
+TGT_PREREQS	:= $(TALLOC_EXTENSION_LIBS)
+
+LIBFREERADIUS_UTIL := $(TALLOC_EXTENSION_LIBS) libfreeradius-util$(L)
+
+# libbacktrace is checked out as a submodule and linked statically into libfreeradius-util
+# as it's the only library that uses it.  Other libraries should not use it directly but
+# instead add the functionality they need to libfreeradius-util.
+ifeq "$(WITH_BACKTRACE)" "yes"
+# Path is relative because the install rule does
+# `$(addprefix ${SRC_INCLUDE_DIR}/,$(HEADERS))` and then the pattern
+# rule `${SRC_INCLUDE_DIR}/%.h: src/include/%.h` resolves the prereq
+# under src/include/. The src/include/backtrace -> ../lib/backtrace
+# symlink set up below makes `backtrace/backtrace.h` reach the source.
+# An absolute $(top_srcdir) path here interpolates into
+# `${SRC_INCLUDE_DIR}//abs/path/backtrace.h` (the addprefix output),
+# which the pattern rule still matches but derives a non-existent
+# `src/include//abs/path/backtrace.h` prereq - `make install` then
+# trips with "No rule to make target" in any build where $(top_srcdir)
+# is absolute, e.g. inside docker builds where @abs_top_srcdir@
+# resolves to /usr/local/...
+HEADERS         += backtrace/backtrace.h
+TGT_PREREQS	+= libbacktrace.la
+TGT_LDLIBS	+= '-lbacktrace'
+TGT_LDFLAGS	+= -L$(BUILD_DIR)/lib/local/.libs
+
+#
+#  Our local backtrace.c file needs the soft link to be created.
+#
+src/include/backtrace:
+	cd src/include && ln -s ../lib/backtrace
+
+$(BUILD_DIR)/objs/src/lib/util/backtrace.$(OBJ_EXT): | src/include/backtrace
+
+# Actually call the 'sub'-make to build libbacktrace.
+#
+# Grouped target form (`&:`) is critical: the sub-make produces both
+# the .la and the .a in one invocation, so a regular multi-target rule
+# would let parallel make spawn two concurrent sub-makes (one per
+# target) racing on the same .a / .libs/ directory. That race surfaces
+# under -j>1 as `ranlib: .libs/libbacktrace.a: error reading mmapio.o:
+# file truncated` - ar is mid-write of the .a archive (with mmapio.o
+# as a member) when a concurrent ranlib starts reading it.
+# Requires GNU make >= 4.3.
+src/lib/backtrace/libbacktrace.la src/lib/backtrace/.libs/libbacktrace.a &:
+	$(MAKE) -C $(top_srcdir)/src/lib/backtrace
+
+# We need to do this so jlibtool can find the library.
+$(BUILD_DIR)/lib/.libs/libbacktrace.a: src/lib/backtrace/.libs/libbacktrace.a
+	cp $< $@
+
+# Boilermake needs this target to exist
+$(BUILD_DIR)/lib/libbacktrace.la: src/lib/backtrace/libbacktrace.la $(BUILD_DIR)/lib/.libs/libbacktrace.a
+	cp $< $@
+
+# We need to do this so jlibtool can find the library.
+$(BUILD_DIR)/lib/local/.libs/libbacktrace.a: src/lib/backtrace/.libs/libbacktrace.a
+	cp $< $@
+
+# Boilermake needs this target to exist
+$(BUILD_DIR)/lib/local/libbacktrace.la: src/lib/backtrace/libbacktrace.la $(BUILD_DIR)/lib/local/.libs/libbacktrace.a
+	cp $< $@
+endif
+
+ifeq "$(TARGET_IS_WASM)" "yes"
+SRC_CFLAGS      += -sMAIN_MODULE=1 -sUSE_PTHREADS=1
+TGT_LDFLAGS	+= --no-entry -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 -sEXPORT_ALL=1 -sLINKABLE=1 -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=libfreeradiusUtil -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,setValue,getValue --preload-file=$(top_builddir)/share/dictionary@/share/dictionary
+endif

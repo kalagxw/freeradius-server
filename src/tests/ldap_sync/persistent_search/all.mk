@@ -1,0 +1,95 @@
+#
+#	Tests against Persistent Search implementing LDAP directories
+#
+
+#
+#	Test name
+#
+TEST := test.ldap_sync/persistent_search
+FILES := $(subst $(DIR)/,,$(wildcard $(DIR)/*.ldif))
+
+$(eval $(call TEST_BOOTSTRAP))
+
+#
+#	Generic rules to start /stop the radius service
+#
+include src/tests/radiusd.mk
+$(eval $(call RADIUSD_SERVICE,radiusd,$(OUTPUT)))
+
+$(TEST).trigger_clear:
+	${Q}rm -f $(BUILD_DIR)/tests/ldap_sync/persistent_search/sync_started
+
+#
+#  The server writes sync_started once the sync is running, so the clear has to
+#  finish before the server starts.  Naming the two side by side on a test
+#  output does not order them, because make builds the order-only prerequisites
+#  of one target at the same time under "make -j".
+#
+$(OUTPUT)/radiusd.pid: | $(TEST).trigger_clear
+
+LDAP_SYNC_PERSISTENT_SEARCH_CMD = \
+	ldapmodify \
+	$(ARGV) \
+	-f $(call SHELL_QUOTE,$<)
+
+$(OUTPUT)/%: $(DIR)/% | $(TEST).trigger_clear $(TEST).radiusd_kill $(TEST).radiusd_start
+	$(eval TARGET   := $(notdir $<))
+	$(eval EXPECTED := $(patsubst %.ldif,%.out,$<))
+	$(eval FOUND    := $(patsubst %.ldif,%.out,$@))
+	$(eval ARGV     := $(shell grep "#.*ARGV:" $< | cut -f2 -d ':'))
+	$(eval OUT_DIR  := $(BUILD_DIR)/tests/ldap_sync/persistent_search)
+	$(eval OUT      := $(shell grep "#.*OUT:" $< | cut -f2 -d ':'))
+
+	${Q}echo "LDAPSYNC-TEST persistent_search $(TARGET)"
+	${Q}[ -f $(dir $@)/radiusd.pid ] || exit 1
+	${Q}rm -f $(OUT_DIR)/$(OUT).out
+
+#	Wait for the sync to start before applying changes
+	${Q}i=0; while [ $$i -lt 100 ] ; \
+		do if [ -e $(OUT_DIR)/sync_started ] ;	\
+		then					\
+		break;					\
+		fi;					\
+		sleep .1;				\
+		i=$$((i+1));				\
+	done;
+
+	${Q}$(LDAP_SYNC_PERSISTENT_SEARCH_CMD) > /dev/null
+	${Q}i=0; while [ $$i -lt 600 ] ; \
+		do if [ -e $(OUT_DIR)/$(OUT).out ] ;	\
+		then					\
+		break;					\
+		fi;					\
+		sleep .1;				\
+		i=$$((i+1));				\
+	done ;
+	${Q}sleep .1
+	${Q}if [ ! -e $(OUT_DIR)/$(OUT).out ] ; then	\
+		$(MAKE) --no-print-directory test.ldap_sync/persistent_search.radiusd_kill; \
+		cat $(OUT_DIR)/radiusd.log;					\
+		echo "LDAP_SYNC FAILED $(TARGET) - expected output file not produced";	\
+		echo "# radiusd"; \
+		echo $(call SHELL_QUOTE,$(RADIUSD_CMD.test.ldap_sync/persistent_search)); \
+		echo "# ldapmodify"; \
+		echo $(call SHELL_QUOTE,$(LDAP_SYNC_PERSISTENT_SEARCH_CMD)); \
+		rm -rf $(BUILD_DIR)/tests/test.ldap_sync/persistent_search;	\
+		exit 1;								\
+	fi
+	${Q}mv $(OUT_DIR)/$(OUT).out $(FOUND)
+
+	${Q}if [ -e "$(EXPECTED)" ] && ! cmp -s $(FOUND) $(EXPECTED); then	\
+		$(MAKE) --no-print-directory test.ldap_sync/persistent_search.radiusd_kill; \
+		cat $(OUT_DIR)/radiusd.log;					\
+		echo "LDAP_SYNC FAILED $(TARGET)";				\
+		echo "# radiusd"; \
+		echo $(call SHELL_QUOTE,$(RADIUSD_CMD.test.ldap_sync/persistent_search)); \
+		echo "# ldapmodify"; \
+		echo $(call SHELL_QUOTE,$(LDAP_SYNC_PERSISTENT_SEARCH_CMD)); \
+		rm -rf $(BUILD_DIR)/tests/test.ldap_sync/persistent_search;	\
+		exit 1;								\
+	fi
+	${Q}touch $@
+
+$(TEST):
+	${Q}$(MAKE) --no-print-directory $@.radiusd_stop
+	@touch $(BUILD_DIR)/tests/$@

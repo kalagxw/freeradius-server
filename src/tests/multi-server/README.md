@@ -1,0 +1,204 @@
+# Multi-Server Tests
+
+Integration tests that spin up FreeRADIUS plus its peers (proxies,
+backing stores, kafka, etc.) in Docker containers and exercise them via
+the radenv test framework.
+
+## Prerequisites
+
+Build the `freeradius4-radenv/<image>:<sha>` Docker image before a
+service mode run.  The 'radenv' image holds a developer build of
+FreeRADIUS from the checkout, on top of the 'crossbuild' image:
+
+```bash
+make docker.radenv.ubuntu24
+```
+
+For profiling-mode runs, the `freeradius4-radenv-profiling/<image>:<sha>`
+image is what gets used directly:
+
+```bash
+make freeradius-prof.image
+```
+
+## Running Tests
+
+### All tests, service mode
+
+```bash
+make test.multi-server
+```
+
+### CI subset, service mode
+
+```bash
+make test.multi-server.ci
+```
+
+### Profiling pass (same suites, under a profiler)
+
+```bash
+make test.multi-server.profiling       # all suites
+make test.multi-server.profiling.ci    # CI subset
+make test.multi-server.accept.short_ci MODE=profiling PROFILING_TOOL=gperftools
+```
+
+A profiling run captures with one profiler, named by `PROFILING_TOOL`
+(default `valgrind`). `PROFILING_TOOLS` lists the profilers whose capture
+scripts are mounted into the container, so a run can select any of them
+without an image change.
+
+Profiling results land under
+`prof-results/<branch>/<commit>/<run-index>/<suite>/<test>/<tool>/`, one
+directory per profiler.  Set `PROFILING_RESULT_MODE=dev` to use a flat
+`prof-results/<suite>/<test>/<tool>/` layout that overwrites each run.
+
+Each profiler writes the same set of files into its own result directory:
+
+| file             | contents                                              |
+|------------------|-------------------------------------------------------|
+| `capture.log`    | the capture script's own log                          |
+| `freeradius.log` | server stdout and stderr                              |
+| `profile.out`    | raw profile (callgrind writes `profile.out.<pid>`)    |
+| `report.txt`     | text report (`callgrind_annotate` or `pprof -text`)   |
+| `exit-status`    | 0 when the capture completed                          |
+
+Each profiler also writes one file that the other profiler does not produce.
+callgrind writes `valgrind.log`, valgrind's own engine log.  gperftools
+writes `profile.pb.gz`, a portable profile with the symbols resolved, so pprof
+reads `profile.pb.gz` on any host without the build.
+
+Both captures switch sampling on and off from the `server.start` and
+`server.stop` triggers, callgrind through `%callgrind.start`/`stop` and
+gperftools through `%gperftools.start`/`stop`, so startup and shutdown stay
+out of the profile.  The gperftools capture needs `pprof` in the profiling
+image to convert the raw profile, and fails at startup without it.  The
+header of each `scripts/profiling/start_<tool>_profiling.sh` documents that
+capture.
+
+### A specific test
+
+```bash
+make test.multi-server.proxy-accept.short_ci          # service mode (default)
+make test.multi-server.accept.short_ci MODE=profiling # one test, profiling
+```
+
+### Parallel execution
+
+```bash
+make -j$(nproc) test.multi-server
+```
+
+### Extra flags
+
+Pass debug/verbosity flags to the test framework:
+
+```bash
+make test.multi-server TEST_MULTI_SERVER_FLAGS="-xx -vvv"
+```
+
+## How It Works
+
+A trigger is a line that a container appends to the file that the test
+framework watches.  The first word of the line is the trigger name, and
+the rest of the line is the value that the rules of a state check.
+
+The `verify:` block of a state holds a `timeout` and a `timeout_mode`.
+`timeout_mode` is `bound` by default.  A `bound` state completes as soon
+as every rule that requires a trigger to fire has matched.  The timeout
+is the longest time that a `bound` state waits.  A `window` state runs
+for the whole timeout.
+
+Declare `timeout_mode: window` on a state that has a `never_fire` rule.
+A `never_fire` rule does not match any trigger, so only the whole
+timeout proves that the trigger did not fire.  Also declare
+`timeout_mode: window` on a state that has no rules, such as a load
+generator that runs for the whole timeout.
+
+Each test suite is a directory under `tests/` containing:
+
+- `template.yml.j2` - Jinja2 template for test steps (state machine).
+  `templates/macros.j2` holds macros that write trigger rules and
+  radclient actions.  A template imports the macros with
+  `{% from "macros.j2" import ... %}`.
+- `environment.yml.j2` - Symlink to a Docker Compose template in `environments/`
+- `*.test.yml` - Parameter files (one per test variant)
+
+A parameter file is flat YAML defining topology, load profile, and test
+timeouts.  All `.j2` files in the suite directory are rendered using
+these parameters.  The rendered compose file's `${DATA_PATH}` volume
+mounts are scanned and the corresponding config files are copied or
+rendered into the build directory.
+
+make writes the build outputs to
+`build/tests/multi-server/<mode>/<suite>/<test>/`.  The templates receive
+the mode (`service` or `profiling`) as the variable `mode`, so a suite can
+lengthen the timings of the suite for a server that runs under a profiler.
+
+### Service vs profiling mode
+
+Compose envs reference `${FREERADIUS_IMAGE}` and read `${PROFILING:-no}`.
+The per-test recipe in `all.mk` sets both based on the `MODE` makefile
+variable, exporting the SHA-tagged image name directly:
+
+- `MODE=service` (default) selects `freeradius4-radenv/<image>:<sha>` and
+  leaves `RADIUSD_COMMAND` unset, so the template default (`freeradius -f -l
+  stdout`) runs the server directly.
+- `MODE=profiling` selects `freeradius4-radenv-profiling/<image>:<sha>` and sets
+  `RADIUSD_COMMAND` to `bash /usr/local/bin/start_valgrind_profiling.sh`,
+  which captures the run with callgrind.
+
+Every test template exports the `TEST_LOADGEN_*` variables from the params
+file and then runs `exec ${RADIUSD_COMMAND:-freeradius -f -l stdout}`.
+`configs/compose/freeradius-common.yml.j2`, which every suite's compose file
+extends, carries `RADIUSD_COMMAND` and defaults `TEST_LOADGEN_MAX_REQUESTS`
+to 0, so the test ends when the `max_pps` step finishes unless a suite sets
+an exact count. The makefile copies
+`scripts/profiling/start_<tool>_profiling.sh` into `<test output
+dir>/scripts/` in every mode, and the common compose file bind mounts it into
+`/usr/local/bin`.
+
+The radenv images exist for ubuntu24 only.  The m4 template
+`scripts/docker/m4/radenv.deb.m4` generates the Dockerfile of the
+'radenv' image, and `scripts/docker/m4/radenv-profiling.deb.m4`
+generates the Dockerfile of the 'radenv-profiling' image.  Both image
+builds run configure, make, and make install from
+`scripts/docker/m4/common.radenv-build.m4`.  The 'radenv-profiling' build
+also passes the callgrind `CFLAGS` from
+`scripts/docker/m4/common.radenv-profiling-flags.m4` to configure.
+
+## Adding a New Test
+
+1. Create a parameter file in an existing suite directory, e.g.
+   `tests/proxy-accept/heavy.test.yml`.  Name it `*.ci.test.yml` if
+   it should run in CI.
+
+2. Or create a new suite directory with `template.yml.j2`,
+   `environment.yml.j2` (symlink), and parameter files.
+
+The build framework discovers suites automatically by finding
+directories containing `template.yml.j2`, and discovers tests by
+finding `*.test.yml` files within them.
+
+## File Naming Conventions
+
+- `*.test.yml` - Test parameter file (discovered by `make test.multi-server`)
+- `*.ci.test.yml` - CI test parameter file (also discovered by `make test.multi-server.ci`)
+- `*.yml.j2` - Jinja2 template (rendered, not treated as a test)
+
+## Suites
+
+| Suite | What it exercises |
+| --- | --- |
+| `accept` | Plain RADIUS accept (no external services) |
+| `pap-auth` | PAP authentication against the `files` module |
+| `ldap` | Authentication backed by an LDAP server |
+| `mysql` | Authentication backed by a MySQL database |
+| `proxy-accept` | Five home servers, proxied auth |
+| `proxy-multihop-accept` | Two-hop proxy chain |
+| `kafka-produce` | `rlm_kafka` producer against an Apache Kafka broker |
+| `kafka-produce-reconnect` | Producer reconnection behaviour |
+| `dynamic-clients` | Dynamic client lifecycle: definition, negative cache, expiry, secret rotation, Status-Server, and originating CoA-Request and Disconnect-Request to a dynamic client |
+| `retransmit` | Retransmission of a request whose reply was lost: the server answers from its reply cache without running the request again, then discards the cached reply after `cleanup_delay` and runs the request again |
+| `ldap-timeout` | LDAP server that goes silent after a connection opens, is unreachable from the start, or drops 75% of packets: every request must still be answered |
+| `arp` | ARP listener: a client container on the same bridge asks for an address the server answers for, then one it rejects |

@@ -1,0 +1,7 @@
+TARGET 		:= rbmonkey$(E)
+
+SOURCES 	:= rbmonkey.c
+
+TGT_PREREQS	:= $(LIBFREERADIUS_UTIL)
+TGT_LDLIBS	:= $(LIBS)
+TGT_INSTALLDIR	:=

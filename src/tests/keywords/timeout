@@ -1,0 +1,45 @@
+#
+# PRE: xlat-delay
+#
+float32 a
+bool b
+bool c
+
+#
+#  Set a timeout which will fire, and cause the block to fail.
+#
+redundant {
+	timeout 0.01s {
+		a := %delay_10s(0.1s)
+		test_fail
+	}
+
+	group {
+		ok
+	}
+}
+
+redundant {
+	timeout "0.01" {
+		a := %delay_10s(0.1s)
+		test_fail
+	}
+
+	group {
+		ok
+	}
+}
+
+# Regression test - Only the first child of the timeout block was executed
+redundant {
+	timeout 1s {
+		b = true
+		c = true
+	}
+}
+
+if (!(b && c)) {
+	test_fail
+}
+
+success

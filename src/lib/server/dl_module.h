@@ -40,6 +40,15 @@ RCSIDH(dl_module_h, "$Id$")
 extern "C" {
 #endif
 
+#ifdef _CONST
+#  error _CONST can only be defined in the local header
+#endif
+#ifndef _DL_MODULE_PRIVATE
+#  define _CONST const
+#else
+#  define _CONST
+#endif
+
 #ifdef __APPLE__
 #  define DL_EXTENSION ".dylib"
 #elif defined (WIN32)
@@ -51,9 +60,9 @@ extern "C" {
 /** Stop people using different module/library/server versions together
  *
  */
-#define RLM_MODULE_INIT RADIUSD_MAGIC_NUMBER
+#define MODULE_MAGIC_INIT RADIUSD_MAGIC_NUMBER
 
-typedef enum {
+typedef enum : uint8_t {
 	DL_MODULE_TYPE_MODULE = 0,	//!< Standard loadable module.
 	DL_MODULE_TYPE_PROTO,		//!< Protocol module.
 	DL_MODULE_TYPE_PROCESS,		//!< protocol processor.
@@ -67,30 +76,15 @@ typedef enum {
 #define DL_PRIORITY_DICT	30		//!< Callback priority for dictionary autoloading
 #define DL_PRIORITY_DICT_ATTR	29		//!< Callback priority for attribute resolution
 #define DL_PRIORITY_DICT_ENUM	28		//!< Callback priority for enum resolution
+#define DL_PRIORITY_LIB		20		//!< Callback priority for library config
 #define DL_PRIORITY_BOOTSTRAP	10		//!< Callback priority for bootstrap callback
 
 typedef struct dl_module_loader_s dl_module_loader_t;
-
-/** Module detach callback
- *
- * Is called just before the server exits, and after re-instantiation on HUP,
- * to free the old module instance.
- *
- * Detach should close all handles associated with the module instance, and
- * free any memory allocated during instantiate.
- *
- * @param[in] instance to free.
- * @return
- *	- 0 on success.
- *	- -1 if detach failed.
- */
-typedef int (*module_detach_t)(void *instance);
 
 /** Callback to call when a module is first loaded
  *
  */
 typedef int (*dl_module_onload_t)(void);
-
 
 /** Callback when a module is destroyed
  *
@@ -99,17 +93,14 @@ typedef void (*dl_module_unload_t)(void);
 
 /** Common fields for the interface struct modules export
  *
+ * These are just enough for the loader to be able to load and unload the module.
  */
 #define DL_MODULE_COMMON \
 	struct { \
 		uint64_t 			magic;		\
 		char const			*name;		\
-		size_t				inst_size;	\
-		char const			*inst_type;	\
-		CONF_PARSER const		*config;        \
 		dl_module_onload_t		onload;         \
 		dl_module_unload_t		unload;		\
-		module_detach_t			detach;		\
 	}
 
 /** Fields common to all types of loadable modules
@@ -124,57 +115,46 @@ typedef struct {
  */
 typedef struct dl_module_s dl_module_t;
 struct dl_module_s {
-	dl_t				*dl;		//!< Dynamic loader handle.
+	char const			* _CONST name;		//!< Name of the module. The name passed to dl_module_alloc.
 
-	dl_module_t const		*parent;	//!< of this module.
+	dl_module_loader_t		* _CONST loader;	//!< Loader that owns this dl.
 
-	dl_module_type_t		type;		//!< of this module.
+	dl_t				* _CONST dl;		//!< Dynamic loader handle.
 
-	dl_module_common_t const	*common;	//!< Symbol exported by the module, containing its public
-							//!< functions, name and behaviour control flags.
+	dl_module_t const		* _CONST parent;	//!< of this module.
 
-	CONF_SECTION			*conf;		//!< The module's global configuration
-							///< (as opposed to the instance, configuration).
-							///< May be NULL.
-	bool				in_tree;
-};
+	dl_module_type_t		_CONST type;		//!< of this module.
 
-/** A module/inst tuple
- *
- * Used to pass data back from dl_module_instance_parse_func
- */
-typedef struct dl_module_instance_s dl_module_inst_t;
-struct dl_module_instance_s {
-	char const		*name;			//!< Instance name.
-	dl_module_t const	*module;		//!< Module
-	void			*data;			//!< Module instance's parsed configuration.
-	CONF_SECTION		*conf;			//!< Module's instance configuration.
-	dl_module_inst_t const	*parent;		//!< Parent module's instance (if any).
+	dl_module_common_t		*exported;		//!< Symbol exported by the module, containing its public
+								//!< functions, name and behaviour control flags.
+
+	CONF_SECTION			* _CONST conf;		//!< The module's global configuration
+								///< (as opposed to the instance, configuration).
+								///< May be NULL.
+
+	unsigned int			refs;			//!< Number of references to this module.
+								///< This is maintained as a separate counter
+								///< (instead of using talloc refs) because it needs
+								///< to be thread safe.
+								///< The talloc code accesses the chunk after calling
+								///< the destructor, so we can't lock the loader mutex
+								///< inside the destructor and expect things to work
+								///< correctly.
+	bool				_CONST in_tree;
 };
 
 extern fr_table_num_sorted_t const dl_module_type_prefix[];
 extern size_t dl_module_type_prefix_len;
 
-dl_module_t const	*dl_module(CONF_SECTION *conf, dl_module_t const *parent,
-				   char const *name, dl_module_type_t type);
+int 			dl_module_free(dl_module_t *dl_module);
 
-dl_module_inst_t const	*dl_module_instance_by_data(void const *data);
-
-char const		*dl_module_instance_name_by_data(void const *data);
-
-void			*dl_module_parent_data_by_child_data(void const *data);
-
-void			*dl_module_instance_symbol(dl_module_inst_t const *instance, char const *sym_name);
-
-int			dl_module_instance(TALLOC_CTX *ctx, dl_module_inst_t **out,
-					   CONF_SECTION *conf, dl_module_inst_t const *parent,
-					   char const *name, dl_module_type_t type);
+dl_module_t		*dl_module_alloc(dl_module_t const *parent, char const *name, dl_module_type_t type);
 
 char const		*dl_module_search_path(void);
 
-dl_loader_t		*dl_loader_from_module_loader(dl_module_loader_t *dl_module_loader);
-
 dl_module_loader_t	*dl_module_loader_init(char const *lib_dir);
+
+#undef _CONST
 
 #ifdef __cplusplus
 }

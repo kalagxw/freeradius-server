@@ -39,7 +39,7 @@
 
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_sql_postgresql - "
+#define LOG_PREFIX "sql - postgresql"
 
 #include <freeradius-devel/server/base.h>
 #include <freeradius-devel/util/debug.h>
@@ -51,6 +51,7 @@ RCSID("$Id$")
 
 #include "config.h"
 #include "rlm_sql.h"
+#include "rlm_sql_trunk.h"
 
 #ifndef NAMEDATALEN
 #  define NAMEDATALEN 64
@@ -63,7 +64,7 @@ typedef struct {
 	char const	*db_string;		//!< Text based configuration string.
 	bool		send_application_name;	//!< Whether we send the application name to PostgreSQL.
 	fr_trie_t	*states;		//!< sql state trie.
-} rlm_sql_postgres_t;
+} rlm_sql_postgresql_t;
 
 typedef struct {
 	PGconn		*db;
@@ -72,10 +73,13 @@ typedef struct {
 	int		num_fields;
 	int		affected_rows;
 	char		**row;
+	connection_t	*conn;			//!< Generic connection structure for this connection.
+	int		fd;			//!< fd for this connection's I/O events.
+	fr_sql_query_t	*query_ctx;		//!< Current query running on this connection.
 } rlm_sql_postgres_conn_t;
 
-static CONF_PARSER driver_config[] = {
-	{ FR_CONF_OFFSET("send_application_name", FR_TYPE_BOOL, rlm_sql_postgres_t, send_application_name), .dflt = "yes" },
+static conf_parser_t driver_config[] = {
+	{ FR_CONF_OFFSET("send_application_name", rlm_sql_postgresql_t, send_application_name), .dflt = "yes" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -149,7 +153,7 @@ static void free_result_row(rlm_sql_postgres_conn_t *conn)
 }
 
 #if defined(PG_DIAG_SQLSTATE) && defined(PG_DIAG_MESSAGE_PRIMARY)
-static sql_rcode_t sql_classify_error(rlm_sql_postgres_t *inst, ExecStatusType status, PGresult const *result)
+static sql_rcode_t sql_classify_error(rlm_sql_postgresql_t *inst, ExecStatusType status, PGresult const *result)
 {
 	char const		*error_code;
 	char const		*error_msg;
@@ -165,6 +169,9 @@ static sql_rcode_t sql_classify_error(rlm_sql_postgres_t *inst, ExecStatusType s
 	#ifdef HAVE_PGRES_SINGLE_TUPLE
 		case PGRES_SINGLE_TUPLE:
 	#endif
+	#ifdef HAVE_PGRES_TUPLES_CHUNK
+		case PGRES_TUPLES_CHUNK:
+	#endif
 		case PGRES_TUPLES_OK:
 	#ifdef HAVE_PGRES_COPY_BOTH
 		case PGRES_COPY_BOTH:
@@ -177,6 +184,13 @@ static sql_rcode_t sql_classify_error(rlm_sql_postgres_t *inst, ExecStatusType s
 		case PGRES_EMPTY_QUERY:	/* Shouldn't happen */
 			error_code = "42000";
 			break;
+
+	#ifdef HAVE_PGRES_PIPELINE_SYNC
+		case PGRES_PIPELINE_SYNC:
+		case PGRES_PIPELINE_ABORTED:
+			ERROR("libpq reported aborted pipeline");
+			return RLM_SQL_ERROR;
+	#endif
 
 		case PGRES_BAD_RESPONSE:
 		case PGRES_NONFATAL_ERROR:
@@ -192,7 +206,7 @@ static sql_rcode_t sql_classify_error(rlm_sql_postgres_t *inst, ExecStatusType s
 		return RLM_SQL_ERROR;
 	}
 
-	DEBUG2("sqlstate %s matched %s: %s (%s)", error_code,
+	DEBUG3("sqlstate %s matched %s: %s (%s)", error_code,
 	       entry->sql_state, entry->meaning, fr_table_str_by_value(sql_rcode_table, entry->rcode, "<DEFAULT>"));
 
 	/*
@@ -213,189 +227,364 @@ static sql_rcode_t sql_classify_error(UNUSED PGresult const *result)
 }
 #endif
 
-static int _sql_socket_destructor(rlm_sql_postgres_conn_t *conn)
+static void _sql_connect_io_notify(fr_event_list_t *el, int fd, UNUSED int flags, void *uctx)
 {
-	DEBUG2("Socket destructor called, closing socket");
+	rlm_sql_postgres_conn_t		*c = talloc_get_type_abort(uctx, rlm_sql_postgres_conn_t);
+	PostgresPollingStatusType	status;
 
-	if (!conn->db) return 0;
+	status = PQconnectPoll(c->db);
+
+	/*
+	 *	Documentation says:
+	 *		Caution: do not assume that the socket remains the same across PQconnectPoll calls.
+	 *	So we get the socket again.
+	 */
+	c->fd = PQsocket(c->db);
+	switch (status) {
+	case PGRES_POLLING_OK:
+		DEBUG2("Connected to database '%s' on '%s' server version %i, protocol version %i, backend PID %i ",
+		       PQdb(c->db), PQhost(c->db), PQserverVersion(c->db), PQprotocolVersion(c->db),
+		       PQbackendPID(c->db));
+		fr_event_fd_delete(el, fd, FR_EVENT_FILTER_IO);
+		PQsetnonblocking(c->db, 1);
+		connection_signal_connected(c->conn);
+		return;
+
+	case PGRES_POLLING_FAILED:
+	error:
+		ERROR("Connection failed: %s", PQerrorMessage(c->db));
+		connection_signal_reconnect(c->conn, CONNECTION_FAILED);
+		return;
+
+	case PGRES_POLLING_READING:
+		if (fr_event_fd_insert(c, NULL, c->conn->el, c->fd, _sql_connect_io_notify, NULL, NULL, c) != 0) goto error;
+		return;
+
+	case PGRES_POLLING_WRITING:
+		if (fr_event_fd_insert(c, NULL, c->conn->el, c->fd, NULL, _sql_connect_io_notify, NULL, c) != 0) goto error;
+		return;
+
+	default:
+		goto error;
+
+	}
+}
+
+static void _sql_connect_query_run(connection_t *conn, UNUSED connection_state_t prev,
+				   UNUSED connection_state_t state, void *uctx)
+{
+	rlm_sql_t const			*sql = talloc_get_type_abort_const(uctx, rlm_sql_t);
+	rlm_sql_postgresql_t		*inst = talloc_get_type_abort(sql->driver_submodule->data, rlm_sql_postgresql_t);
+	rlm_sql_postgres_conn_t		*sql_conn = talloc_get_type_abort(conn->h, rlm_sql_postgres_conn_t);
+	int				err;
+	PGresult			*result, *tmp_result;
+	ExecStatusType			status;
+	sql_rcode_t			rcode;
+
+	DEBUG2("Executing \"%s\"", sql->config.connect_query);
+
+	err = PQsendQuery(sql_conn->db, sql->config.connect_query);
+	if (!err) {
+	fail:
+		ERROR("Failed running \"open_query\": %s", PQerrorMessage(sql_conn->db));
+		connection_signal_reconnect(conn, CONNECTION_FAILED);
+		return;
+	}
+
+	result = PQgetResult(sql_conn->db);
+	if (!result) goto fail;
+
+	/*
+	 *  Clear up any additional results returned
+	 */
+	while ((tmp_result = PQgetResult(sql_conn->db))) PQclear(tmp_result);
+
+	status = PQresultStatus(result);
+
+	rcode = sql_classify_error(inst, status, result);
+	PQclear(result);
+
+	if (rcode != RLM_SQL_OK) goto fail;
+}
+
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static connection_state_t _sql_connection_init(void **h, connection_t *conn, void *uctx)
+{
+	rlm_sql_t const			*sql = talloc_get_type_abort_const(uctx, rlm_sql_t);
+	rlm_sql_postgresql_t const	*inst = talloc_get_type_abort(sql->driver_submodule->data, rlm_sql_postgresql_t);
+	rlm_sql_postgres_conn_t		*c;
+	PostgresPollingStatusType	status;
+
+	MEM(c = talloc_zero(conn, rlm_sql_postgres_conn_t));
+	c->conn = conn;
+	c->fd = -1;
+
+	DEBUG2("Starting connection to PostgreSQL server using parameters: %s", inst->db_string);
+
+	c->db = PQconnectStart(inst->db_string);
+	if (!c->db) {
+		ERROR("Connection failed: Out of memory");
+		talloc_free(c);
+		return CONNECTION_STATE_FAILED;
+	}
+
+	switch (PQstatus(c->db)) {
+	case CONNECTION_OK:
+		c->fd = PQsocket(c->db);
+		DEBUG2("Connected to database '%s' on '%s' server version %i, protocol version %i, backend PID %i ",
+		       PQdb(c->db), PQhost(c->db), PQserverVersion(c->db), PQprotocolVersion(c->db),
+		       PQbackendPID(c->db));
+		PQsetnonblocking(c->db, 1);
+
+		*h = c;
+		if (sql->config.connect_query) connection_add_watch_post(conn, CONNECTION_STATE_CONNECTED,
+									 _sql_connect_query_run, true, sql);
+		
+		connection_signal_connected(c->conn);
+		return CONNECTION_STATE_CONNECTING;
+
+	case CONNECTION_BAD:
+		ERROR("Connection failed: %s", PQerrorMessage(c->db));
+	error:
+		PQfinish(c->db);
+		talloc_free(c);
+		return CONNECTION_STATE_FAILED;
+
+	default:
+		break;
+
+	}
+
+	status = PQconnectPoll(c->db);
+	c->fd = PQsocket(c->db);
+	if (fr_event_fd_insert(c, NULL, c->conn->el, c->fd,
+			       status == PGRES_POLLING_READING ? _sql_connect_io_notify : NULL,
+			       status == PGRES_POLLING_WRITING ? _sql_connect_io_notify : NULL, NULL, c) != 0) goto error;
+
+	DEBUG2("Connecting to database '%s' on '%s', fd %d", PQdb(c->db), PQhost(c->db), c->fd);
+
+	*h = c;
+
+	if (sql->config.connect_query) connection_add_watch_post(conn, CONNECTION_STATE_CONNECTED,
+								 _sql_connect_query_run, true, sql);
+
+	return CONNECTION_STATE_CONNECTING;
+}
+
+static void _sql_connection_close(fr_event_list_t *el, void *h, UNUSED void *uctx)
+{
+	rlm_sql_postgres_conn_t	*c = talloc_get_type_abort(h, rlm_sql_postgres_conn_t);
+
+	if (c->fd >= 0) {
+		fr_event_fd_delete(el, c->fd, FR_EVENT_FILTER_IO);
+		c->fd = -1;
+	}
+
+	if (c->result) {
+		PQclear(c->result);
+		c->result = NULL;
+	}
 
 	/* PQfinish also frees the memory used by the PGconn structure */
-	PQfinish(conn->db);
-
-	return 0;
+	PQfinish(c->db);
+	c->query_ctx = NULL;
+	talloc_free(h);
 }
 
-static int CC_HINT(nonnull) sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *config,
-					    UNUSED fr_time_delta_t timeout)
+SQL_TRUNK_CONNECTION_ALLOC
+
+TRUNK_NOTIFY_FUNC(sql_trunk_connection_notify, rlm_sql_postgres_conn_t)
+
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void sql_trunk_request_mux(UNUSED fr_event_list_t *el, trunk_connection_t *tconn,
+				  connection_t *conn, UNUSED void *uctx)
 {
-	rlm_sql_postgres_t *inst = config->driver;
-	rlm_sql_postgres_conn_t *conn;
+	rlm_sql_postgres_conn_t	*sql_conn = talloc_get_type_abort(conn->h, rlm_sql_postgres_conn_t);
+	request_t		*request;
+	trunk_request_t		*treq;
+	fr_sql_query_t		*query_ctx;
+	int			err;
 
-	MEM(conn = handle->conn = talloc_zero(handle, rlm_sql_postgres_conn_t));
-	talloc_set_destructor(conn, _sql_socket_destructor);
+	if (trunk_connection_pop_request(&treq, tconn) != 0) return;
+	if (!treq) return;
 
-	DEBUG2("Connecting using parameters: %s", inst->db_string);
-	conn->db = PQconnectdb(inst->db_string);
-	if (!conn->db) {
-		ERROR("Connection failed: Out of memory");
-		return -1;
+	query_ctx = talloc_get_type_abort(treq->preq, fr_sql_query_t);
+	request = query_ctx->request;
+
+	switch (query_ctx->status) {
+	case SQL_QUERY_PREPARED:
+		ROPTIONAL(RDEBUG2, DEBUG2, "Executing query: %pV", query_ctx->query);
+		err = PQsendQuery(sql_conn->db, query_ctx->query->vb_strvalue);
+		query_ctx->tconn = tconn;
+		if (!err) {
+			ROPTIONAL(RERROR, ERROR, "Failed to send query: %s", PQerrorMessage(sql_conn->db));
+			trunk_request_signal_fail(treq);
+			return;
+		}
+
+		query_ctx->status = SQL_QUERY_SUBMITTED;
+		sql_conn->query_ctx = query_ctx;
+		trunk_request_signal_sent(treq);
+		return;
+
+	default:
+		return;
 	}
-	if (PQstatus(conn->db) != CONNECTION_OK) {
-		ERROR("Connection failed: %s", PQerrorMessage(conn->db));
-		PQfinish(conn->db);
-		conn->db = NULL;
-		return -1;
-	}
-
-	DEBUG2("Connected to database '%s' on '%s' server version %i, protocol version %i, backend PID %i ",
-	       PQdb(conn->db), PQhost(conn->db), PQserverVersion(conn->db), PQprotocolVersion(conn->db),
-	       PQbackendPID(conn->db));
-
-	return 0;
 }
 
-static CC_HINT(nonnull) sql_rcode_t sql_query(rlm_sql_handle_t *handle, rlm_sql_config_t *config,
-					      char const *query)
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void sql_trunk_request_demux(UNUSED fr_event_list_t *el, UNUSED trunk_connection_t *tconn,
+				    connection_t *conn, UNUSED void *uctx)
 {
-	rlm_sql_postgres_conn_t	*conn = handle->conn;
-	rlm_sql_postgres_t	*inst = config->driver;
-	fr_time_delta_t		timeout = fr_time_delta_from_sec(config->query_timeout);
-	fr_time_t		start;
-	int			sockfd;
+	rlm_sql_postgres_conn_t	*sql_conn = talloc_get_type_abort(conn->h, rlm_sql_postgres_conn_t);
+	rlm_sql_postgresql_t	*inst;
+	fr_sql_query_t		*query_ctx;
+	request_t		*request;
 	PGresult		*tmp_result;
-	int			numfields = 0;
 	ExecStatusType		status;
+	int			numfields;
 
-	if (!conn->db) {
-		ERROR("Socket not connected");
-		return RLM_SQL_RECONNECT;
-	}
+	query_ctx = sql_conn->query_ctx;
+	request = query_ctx->request;
+	inst = talloc_get_type_abort(query_ctx->inst->driver_submodule->data, rlm_sql_postgresql_t);
 
-	sockfd = PQsocket(conn->db);
-	if (sockfd < 0) {
-		ERROR("Unable to obtain socket: %s", PQerrorMessage(conn->db));
-		return RLM_SQL_RECONNECT;
-	}
-
-	if (!PQsendQuery(conn->db, query)) {
-		ERROR("Failed to send query: %s", PQerrorMessage(conn->db));
-		return RLM_SQL_RECONNECT;
-	}
-
-	/*
-	 *  We try to avoid blocking by waiting until the driver indicates that
-	 *  the result is ready or our timeout expires
-	 */
-	start = fr_time();
-	while (PQisBusy(conn->db)) {
-		int		r;
-		fd_set		read_fd;
-		fr_time_delta_t	elapsed = 0;
-
-		FD_ZERO(&read_fd);
-		FD_SET(sockfd, &read_fd);
-
-		if (config->query_timeout) {
-			elapsed = fr_time() - start;
-			if (elapsed >= timeout) goto too_long;
+	switch (query_ctx->status) {
+	case SQL_QUERY_SUBMITTED:
+		if (PQconsumeInput(sql_conn->db) == 0) {
+			ROPTIONAL(RERROR, ERROR, "SQL query failed: %s", PQerrorMessage(sql_conn->db));
+			query_ctx->rcode = RLM_SQL_ERROR;
+			break;
 		}
+		if (PQisBusy(sql_conn->db)) return;
 
-		r = select(sockfd + 1, &read_fd, NULL, NULL, config->query_timeout ? &fr_time_delta_to_timeval(timeout - elapsed) : NULL);
-		if (r == 0) {
-		too_long:
-			ERROR("Socket read timeout after %d seconds", config->query_timeout);
-			return RLM_SQL_RECONNECT;
-		}
-		if (r < 0) {
-			if (errno == EINTR) continue;
-			ERROR("Failed in select: %s", fr_syserror(errno));
-			return RLM_SQL_RECONNECT;
-		}
-		if (!PQconsumeInput(conn->db)) {
-			ERROR("Failed reading input: %s", PQerrorMessage(conn->db));
-			return RLM_SQL_RECONNECT;
-		}
-	}
+		query_ctx->status = SQL_QUERY_RETURNED;
 
-	/*
-	 *  Returns a PGresult pointer or possibly a null pointer.
-	 *  A non-null pointer will generally be returned except in
-	 *  out-of-memory conditions or serious errors such as inability
-	 *  to send the command to the server. If a null pointer is
-	 *  returned, it should be treated like a PGRES_FATAL_ERROR
-	 *  result.
-	 */
-	conn->result = PQgetResult(conn->db);
+		sql_conn->result = PQgetResult(sql_conn->db);
 
-	/* Discard results for appended queries */
-	while ((tmp_result = PQgetResult(conn->db)) != NULL)
-		PQclear(tmp_result);
+		/* Discard results for appended queries */
+		while ((tmp_result = PQgetResult(sql_conn->db)) != NULL)
+			PQclear(tmp_result);
 
-	/*
-	 *  As this error COULD be a connection error OR an out-of-memory
-	 *  condition return value WILL be wrong SOME of the time
-	 *  regardless! Pick your poison...
-	 */
-	if (!conn->result) {
-		ERROR("Failed getting query result: %s", PQerrorMessage(conn->db));
-		return RLM_SQL_RECONNECT;
-	}
-
-	status = PQresultStatus(conn->result);
-	switch (status){
-	/*
-	 *  Successful completion of a command returning no data.
-	 */
-	case PGRES_COMMAND_OK:
 		/*
-		 *  Affected_rows function only returns the number of affected rows of a command
-		 *  returning no data...
+		 *  As this error COULD be a connection error OR an out-of-memory
+		 *  condition return value WILL be wrong SOME of the time
+		 *  regardless! Pick your poison...
 		 */
-		conn->affected_rows = affected_rows(conn->result);
-		DEBUG2("query affected rows = %i", conn->affected_rows);
-		break;
-	/*
-	 *  Successful completion of a command returning data (such as a SELECT or SHOW).
-	 */
+		if (!sql_conn->result) {
+			ROPTIONAL(RERROR, ERROR, "Failed getting query result: %s", PQerrorMessage(sql_conn->db));
+			query_ctx->rcode = RLM_SQL_RECONNECT;
+			break;
+		}
+
+		status = PQresultStatus(sql_conn->result);
+		switch (status){
+		/*
+		 *  Successful completion of a command returning no data.
+		 */
+		case PGRES_COMMAND_OK:
+			/*
+			 *  Affected_rows function only returns the number of affected rows of a command
+			 *  returning no data...
+			 */
+			sql_conn->affected_rows = affected_rows(sql_conn->result);
+			ROPTIONAL(RDEBUG2, DEBUG2, "query affected rows = %i", sql_conn->affected_rows);
+			break;
+		/*
+		 *  Successful completion of a command returning data (such as a SELECT or SHOW).
+		 */
 #ifdef HAVE_PGRES_SINGLE_TUPLE
-	case PGRES_SINGLE_TUPLE:
+		case PGRES_SINGLE_TUPLE:
 #endif
-	case PGRES_TUPLES_OK:
-		conn->cur_row = 0;
-		conn->affected_rows = PQntuples(conn->result);
-		numfields = PQnfields(conn->result); /*Check row storing functions..*/
-		DEBUG2("query returned rows = %i, fields = %i", conn->affected_rows, numfields);
-		break;
+#ifdef HAVE_PGRES_TUPLES_CHUNK
+		case PGRES_TUPLES_CHUNK:
+#endif
+		case PGRES_TUPLES_OK:
+			sql_conn->cur_row = 0;
+			sql_conn->affected_rows = PQntuples(sql_conn->result);
+			numfields = PQnfields(sql_conn->result); /*Check row storing functions..*/
+			ROPTIONAL(RDEBUG2, DEBUG2, "query returned rows = %i, fields = %i", sql_conn->affected_rows, numfields);
+			break;
 
 #ifdef HAVE_PGRES_COPY_BOTH
-	case PGRES_COPY_BOTH:
+		case PGRES_COPY_BOTH:
 #endif
-	case PGRES_COPY_OUT:
-	case PGRES_COPY_IN:
-		DEBUG2("Data transfer started");
+		case PGRES_COPY_OUT:
+		case PGRES_COPY_IN:
+			DEBUG2("Data transfer started");
+			break;
+
+		/*
+		 *  Weird.. this shouldn't happen.
+		 */
+		case PGRES_EMPTY_QUERY:
+		case PGRES_BAD_RESPONSE:	/* The server's response was not understood */
+		case PGRES_NONFATAL_ERROR:
+		case PGRES_FATAL_ERROR:
+#ifdef HAVE_PGRES_PIPELINE_SYNC
+		case PGRES_PIPELINE_SYNC:
+		case PGRES_PIPELINE_ABORTED:
+#endif
+			break;
+		}
+
+		query_ctx->rcode = sql_classify_error(inst, status, sql_conn->result);
 		break;
 
-	/*
-	 *  Weird.. this shouldn't happen.
-	 */
-	case PGRES_EMPTY_QUERY:
-	case PGRES_BAD_RESPONSE:	/* The server's response was not understood */
-	case PGRES_NONFATAL_ERROR:
-	case PGRES_FATAL_ERROR:
-		break;
+	default:
+		fr_assert(0);
 	}
 
-	return sql_classify_error(inst, status, conn->result);;
+	if (request) unlang_interpret_mark_runnable(request);
 }
 
-static sql_rcode_t sql_select_query(rlm_sql_handle_t * handle, rlm_sql_config_t *config, char const *query)
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void sql_request_cancel(connection_t *conn, void *preq, trunk_cancel_reason_t reason,
+			       UNUSED void *uctx)
 {
-	return sql_query(handle, config, query);
+	fr_sql_query_t		*query_ctx = talloc_get_type_abort(preq, fr_sql_query_t);
+	rlm_sql_postgres_conn_t	*sql_conn = talloc_get_type_abort(conn->h, rlm_sql_postgres_conn_t);
+
+	if (!query_ctx->treq) return;
+	if (reason != TRUNK_CANCEL_REASON_SIGNAL) return;
+	if (sql_conn->query_ctx == query_ctx) sql_conn->query_ctx = NULL;
 }
 
-static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void sql_request_cancel_mux(UNUSED fr_event_list_t *el, trunk_connection_t *tconn,
+				   connection_t *conn, UNUSED void *uctx)
 {
-	rlm_sql_postgres_conn_t *conn = handle->conn;
+	trunk_request_t		*treq;
+	PGcancel		*cancel;
+	rlm_sql_postgres_conn_t	*sql_conn = talloc_get_type_abort(conn->h, rlm_sql_postgres_conn_t);
+	char			errbuf[256];
+	PGresult		*tmp_result;
+
+	if ((trunk_connection_pop_cancellation(&treq, tconn)) == 0) {
+		cancel = PQgetCancel(sql_conn->db);
+		if (!cancel) goto complete;
+		if (PQcancel(cancel, errbuf, sizeof(errbuf)) == 0) {
+			ERROR("Failed to cancel query: %s", errbuf);
+		}
+		PQfreeCancel(cancel);
+
+		/*
+		 *	The documentation says that regardless of the result of
+		 *	PQcancel, the normal processing of PQgetResult must happen.
+		 */
+		while ((tmp_result = PQgetResult(sql_conn->db)) != NULL)
+			PQclear(tmp_result);
+
+	complete:
+		trunk_request_signal_cancel_complete(treq);
+	}
+}
+
+SQL_QUERY_FAIL
+SQL_QUERY_RESUME
+
+static sql_rcode_t sql_fields(char const **out[], fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
+{
+	rlm_sql_postgres_conn_t *conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_postgres_conn_t);
 
 	int		fields, i;
 	char const	**names;
@@ -403,7 +592,7 @@ static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, UNUS
 	fields = PQnfields(conn->result);
 	if (fields <= 0) return RLM_SQL_ERROR;
 
-	MEM(names = talloc_array(handle, char const *, fields));
+	MEM(names = talloc_array(query_ctx, char const *, fields));
 
 	for (i = 0; i < fields; i++) names[i] = PQfname(conn->result, i);
 	*out = names;
@@ -411,16 +600,16 @@ static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, UNUS
 	return RLM_SQL_OK;
 }
 
-static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+static unlang_action_t sql_fetch_row(unlang_result_t *p_result, UNUSED request_t *request, void *uctx)
 {
+	fr_sql_query_t		*query_ctx = talloc_get_type_abort(uctx, fr_sql_query_t);
+	int			records, i, len;
+	rlm_sql_postgres_conn_t *conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_postgres_conn_t);
 
-	int records, i, len;
-	rlm_sql_postgres_conn_t *conn = handle->conn;
+	query_ctx->row = NULL;
 
-	*out = NULL;
-	handle->row = NULL;
-
-	if (conn->cur_row >= PQntuples(conn->result)) return RLM_SQL_NO_MORE_ROWS;
+	query_ctx->rcode = RLM_SQL_NO_MORE_ROWS;
+	if (conn->cur_row >= PQntuples(conn->result)) RETURN_UNLANG_OK;
 
 	free_result_row(conn);
 
@@ -430,32 +619,32 @@ static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, U
 	if ((PQntuples(conn->result) > 0) && (records > 0)) {
 		conn->row = talloc_zero_array(conn, char *, records + 1);
 		for (i = 0; i < records; i++) {
+			if (PQgetisnull(conn->result, conn->cur_row, i)) continue;
 			len = PQgetlength(conn->result, conn->cur_row, i);
 			conn->row[i] = talloc_array(conn->row, char, len + 1);
 			strlcpy(conn->row[i], PQgetvalue(conn->result, conn->cur_row, i), len + 1);
 		}
 		conn->cur_row++;
-		*out = handle->row = conn->row;
+		query_ctx->row = conn->row;
 
-		return RLM_SQL_OK;
+		query_ctx->rcode = RLM_SQL_OK;
 	}
 
-	return RLM_SQL_NO_MORE_ROWS;
+	RETURN_UNLANG_OK;
 }
 
-static int sql_num_fields(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
+static sql_rcode_t sql_free_result(fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_postgres_conn_t *conn = handle->conn;
+	rlm_sql_postgres_conn_t *conn;
 
-	conn->affected_rows = PQntuples(conn->result);
-	if (conn->result) return PQnfields(conn->result);
+	if (query_ctx->treq && !(query_ctx->treq->state &
+	    (TRUNK_REQUEST_STATE_SENT | TRUNK_REQUEST_STATE_REAPABLE | TRUNK_REQUEST_STATE_COMPLETE))) return RLM_SQL_OK;
 
-	return 0;
-}
+	if (!query_ctx->tconn || !query_ctx->tconn->conn || !query_ctx->tconn->conn->h) return RLM_SQL_ERROR;
 
-static sql_rcode_t sql_free_result(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
-{
-	rlm_sql_postgres_conn_t *conn = handle->conn;
+	if (!(query_ctx->tconn->state & TRUNK_CONN_PROCESSING)) return RLM_SQL_ERROR;
+
+	conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_postgres_conn_t);
 
 	if (conn->result != NULL) {
 		PQclear(conn->result);
@@ -464,24 +653,23 @@ static sql_rcode_t sql_free_result(rlm_sql_handle_t * handle, UNUSED rlm_sql_con
 
 	free_result_row(conn);
 
-	return 0;
+	return RLM_SQL_OK;
 }
 
-/** Retrieves any errors associated with the connection handle
+/** Retrieves any errors associated with the query context
  *
  * @note Caller will free any memory allocated in ctx.
  *
  * @param ctx to allocate temporary error buffers in.
  * @param out Array of sql_log_entrys to fill.
  * @param outlen Length of out array.
- * @param handle rlm_sql connection handle.
- * @param config rlm_sql config.
+ * @param query_ctx Query context to retrieve error for.
  * @return number of errors written to the #sql_log_entry_t array.
  */
 static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen,
-			rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+			fr_sql_query_t *query_ctx)
 {
-	rlm_sql_postgres_conn_t	*conn = handle->conn;
+	rlm_sql_postgres_conn_t *conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_postgres_conn_t);
 	char const		*p, *q;
 	size_t			i = 0;
 
@@ -503,38 +691,54 @@ static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen,
 	return i;
 }
 
-static int sql_affected_rows(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
+static int sql_affected_rows(fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_postgres_conn_t *conn = handle->conn;
+	rlm_sql_postgres_conn_t *conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_postgres_conn_t);
 
 	return conn->affected_rows;
 }
 
-static size_t sql_escape_func(request_t *request, char *out, size_t outlen, char const *in, void *arg)
+static int sql_escape_func(fr_value_box_t *vb, void *arg)
 {
-	size_t			inlen, ret;
-	rlm_sql_handle_t	*handle = talloc_get_type_abort(arg, rlm_sql_handle_t);
-	rlm_sql_postgres_conn_t	*conn = handle->conn;
+	size_t			inlen = vb->vb_length;
+	size_t			real_len;
+	connection_t		*conn = talloc_get_type_abort(arg, connection_t);
+	rlm_sql_postgres_conn_t	*c;
+	char			*out;
 	int			err;
 
-	/* Check for potential buffer overflow */
-	inlen = strlen(in);
-	if ((inlen * 2 + 1) > outlen) return 0;
-	/* Prevent integer overflow */
-	if ((inlen * 2 + 1) <= inlen) return 0;
-
-	ret = PQescapeStringConn(conn->db, out, in, inlen, &err);
-	if (err) {
-		REDEBUG("Error escaping string \"%s\": %s", in, PQerrorMessage(conn->db));
-		return 0;
+	if (!((conn->state == CONNECTION_STATE_CONNECTING) || (conn->state == CONNECTION_STATE_CONNECTED))) {
+		fr_strerror_const("Connection not available for escaping");
+		return -1;
 	}
 
-	return ret;
+	c = talloc_get_type_abort(conn->h, rlm_sql_postgres_conn_t);
+
+	/* Prevent integer overflow on (inlen * 2 + 1) */
+	if (inlen > (SIZE_MAX - 1) / 2) {
+		fr_strerror_const("Input too large to escape");
+		return -1;
+	}
+
+	MEM(out = talloc_array(vb, char, inlen * 2 + 1));
+	real_len = PQescapeStringConn(c->db, out, vb->vb_strvalue, inlen, &err);
+	if (err) {
+		fr_strerror_printf("Error escaping string: %s", PQerrorMessage(c->db));
+		talloc_free(out);
+		return -1;
+	}
+
+	if (real_len + 1 < inlen * 2 + 1) MEM(out = talloc_realloc(vb, out, char, real_len + 1));
+	fr_value_box_strdup_shallow_replace(vb, out, real_len);
+
+	return 0;
 }
 
-static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_sql_postgres_t	*inst = instance;
+	rlm_sql_t const		*parent = talloc_get_type_abort(mctx->mi->parent->data, rlm_sql_t);
+	rlm_sql_config_t const	*config = &parent->config;
+	rlm_sql_postgresql_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_sql_postgresql_t);
 	char 			application_name[NAMEDATALEN];
 	char			*db_string;
 
@@ -545,7 +749,7 @@ static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_
 		CONF_SECTION	*cs;
 		char const	*name;
 
-		cs = cf_item_to_section(cf_parent(conf));
+		cs = cf_item_to_section(cf_parent(mctx->mi->conf));
 
 		name = cf_section_name2(cs);
 		if (!name) name = cf_section_name1(cs);
@@ -567,7 +771,7 @@ static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_
 		}
 
 		if (config->sql_port) {
-			db_string = talloc_asprintf_append(db_string, " port=%i", config->sql_port);
+			db_string = talloc_asprintf_append(db_string, " port=%" PRIu16, config->sql_port);
 		}
 
 		if (config->sql_login[0] != '\0') {
@@ -578,8 +782,8 @@ static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_
 			db_string = talloc_asprintf_append(db_string, " password='%s'", config->sql_password);
 		}
 
-		if (config->query_timeout) {
-			db_string = talloc_asprintf_append(db_string, " connect_timeout=%d", config->query_timeout);
+		if (fr_time_delta_ispos(config->query_timeout)) {
+			db_string = talloc_asprintf_append(db_string, " connect_timeout=%d", (int) fr_time_delta_to_sec(config->query_timeout));
 		}
 
 		if (inst->send_application_name) {
@@ -592,14 +796,14 @@ static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_
 	 *	Only append options when not already present
 	 */
 	} else {
-		db_string = talloc_typed_strdup(inst, config->sql_db);
+		db_string = talloc_strdup(inst, config->sql_db);
 
 		if ((config->sql_server[0] != '\0') && !strstr(db_string, "host=")) {
 			db_string = talloc_asprintf_append(db_string, " host='%s'", config->sql_server);
 		}
 
 		if (config->sql_port && !strstr(db_string, "port=")) {
-			db_string = talloc_asprintf_append(db_string, " port=%i", config->sql_port);
+			db_string = talloc_asprintf_append(db_string, " port=%" PRIu16, config->sql_port);
 		}
 
 		if ((config->sql_login[0] != '\0') && !strstr(db_string, "user=")) {
@@ -610,8 +814,8 @@ static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_
 			db_string = talloc_asprintf_append(db_string, " password='%s'", config->sql_password);
 		}
 
-		if ((config->query_timeout) && !strstr(db_string, "connect_timeout=")) {
-			db_string = talloc_asprintf_append(db_string, " connect_timeout=%d", config->query_timeout);
+		if (fr_time_delta_ispos(config->query_timeout) && !strstr(db_string, "connect_timeout=")) {
+			db_string = talloc_asprintf_append(db_string, " connect_timeout=%d", (int) fr_time_delta_to_sec(config->query_timeout));
 		}
 
 		if (inst->send_application_name && !strstr(db_string, "application_name=")) {
@@ -633,7 +837,7 @@ static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_
 	{
 		CONF_SECTION *cs;
 
-		cs = cf_section_find(conf, "states", NULL);
+		cs = cf_section_find(mctx->mi->conf, "states", NULL);
 		if (cs && (sql_state_entries_from_cs(inst->states, cs) < 0)) return -1;
 	}
 
@@ -642,7 +846,7 @@ static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_
 
 static int mod_load(void)
 {
-#if defined(HAVE_OPENSSL_CRYPTO_H) && (defined(HAVE_PQINITOPENSSL) || defined(HAVE_PQINITSSL))
+#if defined(WITH_TLS) && (defined(HAVE_PQINITOPENSSL) || defined(HAVE_PQINITSSL))
 #  ifdef HAVE_PQINITOPENSSL
 	PQinitOpenSSL(0, 0);
 #  else
@@ -652,25 +856,64 @@ static int mod_load(void)
 	return 0;
 }
 
+static void *sql_escape_arg_alloc(TALLOC_CTX *ctx, fr_event_list_t *el, void *uctx)
+{
+	rlm_sql_t const	*inst = talloc_get_type_abort_const(uctx, rlm_sql_t);
+	connection_t	*conn;
+
+	conn = connection_alloc(ctx, el,
+				&(connection_funcs_t){
+					.init = _sql_connection_init,
+					.close = _sql_connection_close,
+				},
+				inst->config.trunk_conf.conn_conf,
+				inst->name, inst);
+
+	if (!conn) {
+		PERROR("Failed allocating state handler for SQL escape connection");
+		return NULL;
+	}
+
+	connection_signal_init(conn);
+	return conn;
+}
+
+static void sql_escape_arg_free(void *uctx)
+{
+	connection_t	*conn = talloc_get_type_abort(uctx, connection_t);
+	connection_signal_halt(conn);
+}
+
 /* Exported to rlm_sql */
 extern rlm_sql_driver_t rlm_sql_postgresql;
 rlm_sql_driver_t rlm_sql_postgresql = {
-	.name				= "rlm_sql_postgresql",
-	.magic				= RLM_MODULE_INIT,
+	.common = {
+		.magic				= MODULE_MAGIC_INIT,
+		.name				= "sql_postgresql",
+		.inst_size			= sizeof(rlm_sql_postgresql_t),
+		.onload				= mod_load,
+		.config				= driver_config,
+		.instantiate			= mod_instantiate
+	},
 	.flags				= RLM_SQL_RCODE_FLAGS_ALT_QUERY,
-	.inst_size			= sizeof(rlm_sql_postgres_t),
-	.onload				= mod_load,
-	.config				= driver_config,
-	.mod_instantiate		= mod_instantiate,
-	.sql_socket_init		= sql_socket_init,
-	.sql_query			= sql_query,
-	.sql_select_query		= sql_select_query,
-	.sql_num_fields			= sql_num_fields,
+	.sql_query_resume		= sql_query_resume,
+	.sql_select_query_resume	= sql_query_resume,
 	.sql_fields			= sql_fields,
 	.sql_fetch_row			= sql_fetch_row,
 	.sql_error			= sql_error,
 	.sql_finish_query		= sql_free_result,
 	.sql_finish_select_query	= sql_free_result,
 	.sql_affected_rows		= sql_affected_rows,
-	.sql_escape_func		= sql_escape_func
+	.sql_escape_func		= sql_escape_func,
+	.sql_escape_arg_alloc		= sql_escape_arg_alloc,
+	.sql_escape_arg_free		= sql_escape_arg_free,
+	.trunk_io_funcs = {
+		.connection_alloc	= sql_trunk_connection_alloc,
+		.connection_notify	= sql_trunk_connection_notify,
+		.request_mux		= sql_trunk_request_mux,
+		.request_demux		= sql_trunk_request_demux,
+		.request_cancel		= sql_request_cancel,
+		.request_cancel_mux	= sql_request_cancel_mux,
+		.request_fail		= sql_request_fail,
+	}
 };

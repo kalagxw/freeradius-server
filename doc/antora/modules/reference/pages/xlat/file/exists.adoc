@@ -1,0 +1,27 @@
+= Exists
+
+The `file.exists` function is used to check if a file exists on the
+filesystem. This function returns `true` if a file exists, or `false`
+if the file does not exist.
+
+[#syntax]
+== Syntax
+
+`%file.exists(_string_)`
+
+.Return: _bool_
+
+.Checking if a file exists
+====
+[source,unlang]
+----
+if %file.exists("/var/log/radius.log") {
+	# do things...
+}
+----
+====
+
+include::partial$file_limit.adoc[]
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

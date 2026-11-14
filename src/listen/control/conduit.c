@@ -25,26 +25,47 @@
  */
 RCSID("$Id$")
 
-#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/math.h>
+#include <freeradius-devel/util/strerror.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
 #include "conduit.h"
 
 static ssize_t lo_read(int fd, void *out, size_t outlen)
 {
-	size_t total;
+	ssize_t total;
 	ssize_t r;
 	uint8_t *p = out;
 
-	for (total = 0; total < outlen; total += r) {
+	for (total = 0; (size_t)total < outlen; ) {
 		r = read(fd, p + total, outlen - total);
-
-		if (r == 0) return 0;
+		if (r == 0) return total;
 
 		if (r < 0) {
-			if (errno == EINTR) continue;
+			switch (errno) {
+			case EINTR:
+				continue;
+
+#if defined(EWOULDBLOCK) && (EWOULDBLOCK != EAGAIN)
+			case EWOULDBLOCK:
+#endif
+			case EAGAIN:
+				return total;
+
+			default:
+				break;
+			}
 
 			return -1;
-
 		}
+
+		/*
+		 *	The total never exceeds outlen, which is far below
+		 *	SSIZE_MAX.
+		 */
+		if (!fr_cond_assert(fr_add(&total, total, r))) return -1;
 	}
 
 	return total;
@@ -58,7 +79,7 @@ ssize_t fr_conduit_read_async(int fd, fr_conduit_type_t *pconduit,
 			      void *out, size_t outlen, size_t *leftover, bool *want_more)
 {
 	ssize_t r;
-	size_t data_len;
+	uint32_t data_len;
 	uint8_t *buffer = out;
 	fr_conduit_hdr_t hdr;
 	size_t offset = *leftover;
@@ -78,18 +99,7 @@ ssize_t fr_conduit_read_async(int fd, fr_conduit_type_t *pconduit,
 	 */
 	if (offset < sizeof(hdr)) {
 		r = lo_read(fd, buffer + offset, sizeof(hdr) - offset);
-		if (r == 0) return 0; /* closed */
-
-		if (r < 0) {
-#ifdef EWOULDBLOCK
-			if (errno == EWOULDBLOCK) return 0;
-#endif
-#ifdef EAGAIN
-			if (errno == EAGAIN) return 0;
-#endif
-
-			return r;
-		}
+		if (r <= 0) return r;
 
 		*leftover += r;
 		offset += r;
@@ -109,9 +119,12 @@ ssize_t fr_conduit_read_async(int fd, fr_conduit_type_t *pconduit,
 	data_len = ntohl(hdr.length);
 
 	/*
-	 *	The data will overflow the buffer.  Die.
+	 *	The data will overflow the buffer.  Die.  outlen is larger
+	 *	than the header, see above, so the subtraction can't wrap,
+	 *	and data_len from the wire is checked before any arithmetic
+	 *	uses it.
 	 */
-	if ((sizeof(hdr) + data_len) > outlen) {
+	if (data_len > (outlen - sizeof(hdr))) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -127,8 +140,10 @@ ssize_t fr_conduit_read_async(int fd, fr_conduit_type_t *pconduit,
 	offset += r;
 
 	if (offset == outlen) {
+		uint16_t conduit = ntohs(hdr.conduit);
+
 		*want_more = false;
-		*pconduit = ntohs(hdr.conduit);
+		*pconduit = (fr_conduit_type_t) conduit;
 		return outlen;
 	}
 
@@ -142,6 +157,7 @@ ssize_t fr_conduit_read(int fd, fr_conduit_type_t *pconduit, void *out, size_t o
 	size_t data_len;
 	uint8_t *buffer = out;
 	fr_conduit_hdr_t hdr;
+	uint16_t conduit;
 
 	/*
 	 *	Read the header
@@ -152,7 +168,8 @@ ssize_t fr_conduit_read(int fd, fr_conduit_type_t *pconduit, void *out, size_t o
 	/*
 	 *	Read the data into the buffer.
 	 */
-	*pconduit = ntohs(hdr.conduit);
+	conduit = ntohs(hdr.conduit);
+	*pconduit = (fr_conduit_type_t) conduit;
 	data_len = ntohl(hdr.length);
 	if (data_len == 0) return 0;
 	if (data_len > UINT32_MAX) data_len = UINT32_MAX;	/* For Coverity */
@@ -234,8 +251,10 @@ ssize_t fr_conduit_write(int fd, fr_conduit_type_t conduit, void const *out, siz
 	 */
 	if (!outlen) return 0;
 
-	hdr.conduit = htons(conduit);
-	hdr.length = htonl(outlen);
+	hdr = (fr_conduit_hdr_t) {
+		.conduit = htons(conduit),
+		.length = htonl(outlen),
+	};
 
 #if 0
 	fprintf(stderr, "CONDUIT W %zu length %zu\n", conduit, outlen);

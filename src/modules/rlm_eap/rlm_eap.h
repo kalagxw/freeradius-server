@@ -34,7 +34,7 @@ RCSIDH(rlm_eap_h, "$Id$")
 
 /** Different settings for realm issues
  */
-typedef enum {
+typedef enum : uint8_t {
 	REQUIRE_REALM_YES = 0,			//!< Require the EAP-Identity string contain an NAI realm
 						///< or that Stripped-User-Domain is present in the request.
 	REQUIRE_REALM_NO,			//!< Don't require that the identity is qualified.
@@ -45,8 +45,9 @@ typedef enum {
  *
  */
 typedef struct {
-	CONF_SECTION			**submodule_cs;			//!< Configuration sections for the submodules
-									///< we're going to load.
+	char const			*name;				//!< Name of this instance.
+
+	module_instance_t		**type_submodules;		//!< Submodules we loaded.
 	rlm_eap_method_t 		methods[FR_EAP_METHOD_MAX];	//!< Array of loaded (or not), submodules.
 
 	char const			*default_method_name;		//!< Default method to attempt to start.
@@ -65,13 +66,7 @@ typedef struct {
 
 	rlm_eap_require_realm_t		require_realm;			//!< Whether we require the outer identity
 									///< to contain a realm.
-	char const			*name;				//!< Name of this instance.
-	fr_dict_enum_t			*auth_type;
+	fr_dict_enum_value_t const	*auth_type;
 
 	fr_randctx			rand_pool;			//!< Pool of random data.
 } rlm_eap_t;
-
-/*
- *	EAP Method selection
- */
-int      	eap_method_instantiate(rlm_eap_method_t **out, rlm_eap_t *inst, eap_type_t num, CONF_SECTION *cs);

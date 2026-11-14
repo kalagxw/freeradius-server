@@ -29,7 +29,6 @@ RCSIDH(radsniff_h, "$Id$")
 
 #include <sys/types.h>
 
-#include <freeradius-devel/util/base.h>
 #include <freeradius-devel/util/pcap.h>
 #include <freeradius-devel/util/event.h>
 #include <freeradius-devel/radius/radius.h>
@@ -67,7 +66,7 @@ RCSIDH(radsniff_h, "$Id$")
 #define RDEBUG(fmt, ...)	if (conf->print_packet && (fr_debug_lvl > 1)) fprintf(fr_log_fp , "%s (%" PRIu64 ") " fmt "\n", timestr, count, ## __VA_ARGS__)
 #define RDEBUG2(fmt, ...)	if (conf->print_packet && (fr_debug_lvl > 2)) fprintf(fr_log_fp , "%s (%" PRIu64 ") " fmt "\n", timestr, count, ## __VA_ARGS__)
 
-typedef enum {
+typedef enum : uint8_t {
 	RS_NORMAL	= 0x01,
 	RS_UNLINKED	= 0x02,
 	RS_RTX		= 0x04,
@@ -77,9 +76,9 @@ typedef enum {
 } rs_status_t;
 
 typedef void (*rs_packet_logger_t)(uint64_t count, rs_status_t status, fr_pcap_t *handle,
-				   fr_radius_packet_t *packet, fr_pair_list_t *list,
+				   fr_packet_t *packet, fr_pair_list_t *list,
 				   struct timeval *elapsed, struct timeval *latency, bool response, bool body);
-typedef enum {
+typedef enum : uint8_t {
 #ifdef HAVE_COLLECTDC_H
 	RS_STATS_OUT_COLLECTD = 1,
 #endif
@@ -97,14 +96,6 @@ typedef struct rs_stats_value_tmpl rs_stats_value_tmpl_t;
 typedef struct {
 	uint64_t type[FR_RADIUS_CODE_MAX+ 1];
 } rs_counters_t;
-
-typedef struct CC_HINT(__packed__) {
-	uint8_t		code;
-	uint8_t		id;
-	uint8_t		length[2];
-	uint8_t		vector[RADIUS_AUTH_VECTOR_LENGTH];
-	uint8_t		data[];
-} radius_packet_t;
 
 /** Stats for a single interval
  *
@@ -177,25 +168,25 @@ typedef struct {
 	uint8_t			*data;			//!< PCAP packet data.
 } rs_capture_t;
 
-/** Wrapper for fr_radius_packet_t
+/** Wrapper for fr_packet_t
  *
  * Allows an event to be associated with a request packet.  This is required because we need to disarm
  * the event timer when a response is received, so we don't erroneously log the response as lost.
  */
 typedef struct {
 	uint64_t		id;			//!< Monotonically increasing packet counter.
-	fr_event_timer_t const	*event;			//!< Event created when we received the original request.
+	fr_timer_t		*event;			//!< Event created when we received the original request.
 
 	bool			logged;			//!< Whether any messages regarding this request were logged.
 
 	struct timeval		when;			//!< Time when the packet was received, or next time an event
 							//!< is scheduled.
 	fr_pcap_t		*in;			//!< PCAP handle the original request was received on.
-	fr_radius_packet_t	*packet;		//!< The original packet.
+	fr_packet_t		*packet;		//!< The original packet.
 	fr_pair_list_t		packet_vps;
-	fr_radius_packet_t	*expect;		//!< Request/response.
+	fr_packet_t		*expect;		//!< Request/response.
 	fr_pair_list_t		expect_vps;
-	fr_radius_packet_t	*linked;		//!< The subsequent response or forwarded request the packet
+	fr_packet_t		*linked;		//!< The subsequent response or forwarded request the packet
 							//!< was linked against.
 	fr_pair_list_t		link_vps;		//!< fr_pair_ts used to link retransmissions.
 
@@ -264,6 +255,9 @@ struct rs {
 	bool			to_file;		//!< Were writing pcap data to files.
 	bool			to_stdout;		//!< Were writing pcap data to stdout.
 
+	bool			to_output_dir;		//!< Were writing attributes into directory.
+	char const 		*output_dir;		//!< Where we should save the files $PATH/requests.txt and $PATH/reply.txt
+
 	bool			daemonize;		//!< Daemonize and write PID out to file.
 	char const		*pidfile;		//!< File to write PID to.
 
@@ -283,11 +277,11 @@ struct rs {
 
 	char			*list_attributes;	//!< Raw attribute filter string.
 	fr_dict_attr_t const 	*list_da[RS_MAX_ATTRS]; //!< Output CSV with these attribute values.
-	int			list_da_num;
+	size_t			list_da_num;
 
 	char			*link_attributes;	//!< Names of fr_dict_attr_ts to use for rtx.
 	fr_dict_attr_t const	*link_da[RS_MAX_ATTRS];	//!< fr_dict_attr_ts to link on.
-	int			link_da_num;		//!< Number of rtx fr_dict_attr_ts.
+	size_t			link_da_num;		//!< Number of rtx fr_dict_attr_ts.
 
 	char const		*filter_request;	//!< Raw request filter string.
 	char const		*filter_response;	//!< Raw response filter string.

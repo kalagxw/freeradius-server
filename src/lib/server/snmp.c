@@ -23,15 +23,20 @@
  * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  *
  * @copyright 2016 The FreeRADIUS server project
- * @copyright 2016 Network RADIUS SARL
+ * @copyright 2016 Network RADIUS SAS
  */
 RCSID("$Id$")
 
-#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/util/atexit.h>
 #include <freeradius-devel/util/debug.h>
 
 #include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/proto.h>
+#include <freeradius-devel/util/value.h>
+
+#include <freeradius-devel/server/dependency.h>
+#include <freeradius-devel/server/main_loop.h>
+#include <freeradius-devel/server/snmp.h>
 
 #include <freeradius-devel/protocol/snmp/freeradius.h>
 
@@ -40,7 +45,7 @@ static fr_dict_t const *dict_snmp;
 extern fr_dict_autoload_t snmp_dict[];
 fr_dict_autoload_t snmp_dict[] = {
 	{ .out = &dict_snmp, .proto = "snmp" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_snmp_operation;
@@ -54,7 +59,7 @@ fr_dict_attr_autoload_t snmp_dict_attr[] = {
 	{ .out = &attr_snmp_type, .name = "FreeRADIUS-SNMP-Type", .type = FR_TYPE_UINT8, .dict = &dict_snmp },
 	{ .out = &attr_snmp_failure, .name = "FreeRADIUS-SNMP-Failure", .type = FR_TYPE_UINT8, .dict = &dict_snmp },
 	{ .out = &attr_snmp_root, .name = "FreeRADIUS-Iso", .type = FR_TYPE_TLV, .dict = &dict_snmp },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 #define FR_FREERADIUS_SNMP_TYPE_OBJECT 0
@@ -105,7 +110,7 @@ static int snmp_value_serv_ident_get(TALLOC_CTX *ctx, fr_value_box_t *out, NDEBU
 {
 	fr_assert(map->da->type == FR_TYPE_STRING);
 
-	fr_value_box_asprintf(ctx, out, NULL, false, "FreeRADIUS %s", radiusd_version_short);
+	if (fr_value_box_asprintf(ctx, out, NULL, false, "FreeRADIUS %s", radiusd_version_short) < 0) return -1;
 
 	return 0;
 }
@@ -119,12 +124,12 @@ static int snmp_value_uptime_get(UNUSED TALLOC_CTX *ctx, fr_value_box_t *out, ND
 	fr_assert(map->da->type == FR_TYPE_UINT32);
 
 	now = fr_time();
-	delta = now - start_time;
+	delta = fr_time_sub(now, start_time);
 
 	/*
 	 *	ticks are in 1/100's of seconds.
 	 */
-	out->vb_uint32 += delta / 10000000;
+	out->vb_uint32 += fr_time_delta_to_csec(delta);
 
 	return 0;
 }
@@ -138,12 +143,12 @@ static int snmp_config_reset_time_get(UNUSED TALLOC_CTX *ctx, fr_value_box_t *ou
 	fr_assert(map->da->type == FR_TYPE_UINT32);
 
 	now = fr_time();
-	delta = now - reset_time;
+	delta = fr_time_sub(now, reset_time);
 
 	/*
 	 *	ticks are in 1/100's of seconds.
 	 */
-	out->vb_uint32 += delta / 10000000;
+	out->vb_uint32 += fr_time_delta_to_csec(delta);
 
 	return 0;
 }
@@ -188,10 +193,11 @@ static int snmp_client_index(UNUSED TALLOC_CTX *ctx, void **snmp_ctx_out,
 			     UNUSED fr_snmp_map_t const *map,
 			     NDEBUG_UNUSED void const *snmp_ctx_in, uint32_t index_num)
 {
-	RADCLIENT *client;
+	fr_client_t *client;
 
 	fr_assert(!snmp_ctx_in);
 
+	if (index_num == 0) return 1;				/* SNMP indices start from 1; 0 is invalid */
 	client = client_findbynumber(NULL, index_num - 1);	/* Clients indexed from 0 */
 	if (!client) return 1;		/* No more clients */
 
@@ -203,7 +209,7 @@ static int snmp_client_index(UNUSED TALLOC_CTX *ctx, void **snmp_ctx_out,
 static int snmp_client_index_get(UNUSED TALLOC_CTX *ctx, fr_value_box_t *out,
 				 UNUSED fr_snmp_map_t const *map, void *snmp_ctx)
 {
-	RADCLIENT *client = snmp_ctx;
+	fr_client_t *client = snmp_ctx;
 
 	fr_assert(client);
 
@@ -215,7 +221,7 @@ static int snmp_client_index_get(UNUSED TALLOC_CTX *ctx, fr_value_box_t *out,
 static int snmp_client_ipv4addr_get(UNUSED TALLOC_CTX *ctx, fr_value_box_t *out,
 				    NDEBUG_UNUSED fr_snmp_map_t const *map, void *snmp_ctx)
 {
-	RADCLIENT *client = snmp_ctx;
+	fr_client_t *client = snmp_ctx;
 
 	fr_assert(client);
 	fr_assert(map->da->type == FR_TYPE_IPV4_ADDR);
@@ -236,12 +242,12 @@ static int snmp_client_ipv4addr_get(UNUSED TALLOC_CTX *ctx, fr_value_box_t *out,
 static int snmp_client_id_get(TALLOC_CTX *ctx, fr_value_box_t *out,
 			      NDEBUG_UNUSED fr_snmp_map_t const *map, void *snmp_ctx)
 {
-	RADCLIENT *client = snmp_ctx;
+	fr_client_t *client = snmp_ctx;
 
 	fr_assert(client);
 	fr_assert(map->da->type == FR_TYPE_STRING);
 
-	fr_value_box_bstrdup_buffer(ctx, out, NULL, client->longname, false);
+	if (fr_value_box_bstrdup_buffer(ctx, out, NULL, client->longname, false) < 0) return -1;
 
 	return 0;
 }
@@ -249,7 +255,7 @@ static int snmp_client_id_get(TALLOC_CTX *ctx, fr_value_box_t *out,
 static int snmp_auth_client_stats_offset_get(UNUSED TALLOC_CTX *ctx, fr_value_box_t *out,
 				  	     fr_snmp_map_t const *map, void *snmp_ctx)
 {
-	RADCLIENT *client = snmp_ctx;
+	fr_client_t *client = snmp_ctx;
 
 	fr_assert(client);
 	fr_assert(map->da->type == FR_TYPE_UINT32);
@@ -639,7 +645,7 @@ static ssize_t snmp_process_index_attr(fr_dcursor_t *out, request_t *request,
 	if (da_stack->da[depth]->type != FR_TYPE_UINT32) {
 		fr_strerror_printf("Bad index attribute: Index attribute \"%s\" should be a integer, "
 				   "but is a %s", da_stack->da[depth]->name,
-				   fr_table_str_by_value(fr_value_box_type_table, da_stack->da[depth]->type, "?Unknown?"));
+				   fr_type_to_str(da_stack->da[depth]->type));
 		goto error;
 	}
 
@@ -647,6 +653,10 @@ static ssize_t snmp_process_index_attr(fr_dcursor_t *out, request_t *request,
 	 *	Get the index from the index attribute's value.
 	 */
 	vp = fr_dcursor_current(cursor);
+	if (!vp) {
+		fr_strerror_const("Invalid OID: No index attribute in request");
+		goto error;
+	}
 	index_num = vp->vp_uint32;
 
 	/*
@@ -760,7 +770,7 @@ static ssize_t snmp_process_leaf(fr_dcursor_t *out, request_t *request,
 		if (map_p == map[0].last) {
 			return 1;	/* findNext at lower level */
 		}
-		if (map_p->da == vp->da) {		/* Next unless we faked part of the stack */
+		if (vp && (map_p->da == vp->da)) {		/* Next unless we faked part of the stack */
 			map_p++;
 
 			/*
@@ -778,9 +788,7 @@ static ssize_t snmp_process_leaf(fr_dcursor_t *out, request_t *request,
 
 	case FR_FREERADIUS_SNMP_OPERATION_VALUE_GET:
 	{
-		fr_value_box_t data;
-
-		memset(&data, 0, sizeof(data));
+		fr_value_box_t data = (fr_value_box_t) {};
 
 		/*
 		 *	Verify map is a leaf
@@ -827,6 +835,10 @@ static ssize_t snmp_process_leaf(fr_dcursor_t *out, request_t *request,
 		}
 
 		vp = fr_dcursor_current(cursor);
+		if (!vp) {
+			fr_strerror_const("Invalid OID: No value provided for SET operation");
+			goto error;
+		}
 		ret = map_p->set(map_p, snmp_ctx, &vp->data);
 		if (ret < 0) switch (-(ret)) {
 		case FR_FREERADIUS_SNMP_FAILURE_VALUE_NOT_WRITABLE:
@@ -884,9 +896,11 @@ static ssize_t snmp_process(fr_dcursor_t *out, request_t *request,
 	if (!da_stack->da[depth]) {
 		if (snmp_op != FR_FREERADIUS_SNMP_OPERATION_VALUE_GETNEXT) {
 			fr_strerror_const("Invalid OID: Not a leaf");
-			return -(ssize_t)(depth - 1);
+			return -(ssize_t)depth;
 		}
 		snmp_next_leaf(da_stack, depth, &map[1]);
+
+		if (!fr_cond_assert(da_stack->da[depth])) return -1;
 	}
 
 	/*
@@ -925,7 +939,7 @@ int fr_snmp_process(request_t *request)
 	fr_pair_t		*vp;
 
 	char			oid_str[FR_DICT_MAX_TLV_STACK * 4];	/* .<num>{1,3} */
-	size_t			oid_len, len;
+	ssize_t			oid_len, len;
 
 	fr_da_stack_t		da_stack;
 	unsigned int		depth;
@@ -934,10 +948,10 @@ int fr_snmp_process(request_t *request)
 	fr_pair_t		*op;
 
 	fr_pair_list_init(&head);
-	fr_dcursor_init(&request_cursor, &request->request_pairs);
-	fr_dcursor_iter_by_da_init(&op_cursor, &request->request_pairs, attr_snmp_operation);
-	fr_dcursor_init(&reply_cursor, &request->reply_pairs);
-	fr_dcursor_init(&out_cursor, &head);
+	fr_pair_dcursor_init(&request_cursor, &request->request_pairs);
+	fr_pair_dcursor_by_da_init(&op_cursor, &request->request_pairs, attr_snmp_operation);
+	fr_pair_dcursor_init(&reply_cursor, &request->reply_pairs);
+	fr_pair_dcursor_init(&out_cursor, &head);
 
 	RDEBUG2("Processing SNMP stats request");
 
@@ -967,21 +981,15 @@ int fr_snmp_process(request_t *request)
 		/*
 		 *	Clear out any junk values
 		 */
-		if (da->type == FR_TYPE_TLV) {
-			switch (vp->vp_type) {
-			case FR_TYPE_OCTETS:
-			case FR_TYPE_STRING:
-				talloc_free(vp->data.datum.ptr);
+		if (da->type == FR_TYPE_TLV) fr_value_box_clear(&vp->data);
 
-			FALL_THROUGH;
-			default:
-				memset(&vp->data, 0, sizeof(vp->data));
-			}
+		if (fr_pair_reinit_from_da(&request->request_pairs, vp, da) < 0) {
+			RPWARN("Failed converting unknown attribute to known attribute");
+			continue;
 		}
-		vp->da = da;
 	}
 
-	for (vp = fr_dcursor_iter_by_ancestor_init(&request_cursor, &request->request_pairs, attr_snmp_root);
+	for (vp = fr_pair_dcursor_by_ancestor_init(&request_cursor, &request->request_pairs, attr_snmp_root);
 	     vp;
 	     vp = fr_dcursor_next(&request_cursor)) {
 		fr_proto_da_stack_build(&da_stack, vp->da);
@@ -1017,7 +1025,7 @@ int fr_snmp_process(request_t *request)
 			break;
 
 		default:
-			ERROR("Invalid operation %u", vp->vp_uint32);
+			ERROR("Invalid operation %u", op->vp_uint32);
 			return -1;
 		}
 
@@ -1032,14 +1040,16 @@ int fr_snmp_process(request_t *request)
 			fr_sbuff_t	oid_str_sbuff = FR_SBUFF_OUT(oid_str, sizeof(oid_str));
 			fr_pair_list_free(&head);
 
-			fr_sbuff_in_char(&oid_str_sbuff, '.');
+			(void) fr_sbuff_in_char(&oid_str_sbuff, '.');
 
 			/* Get the length of the matching part */
 			oid_len = fr_dict_attr_oid_print(&oid_str_sbuff, attr_snmp_root, da_stack.da[-(ret)], false);
+			fr_assert(oid_len > 0);
 
 			/* Get the last frame in the current stack */
 			len = fr_dict_attr_oid_print(&oid_str_sbuff, attr_snmp_root,
 						     da_stack.da[da_stack.depth - 1], false);
+			fr_assert(len > 0);
 
 			/* Use the difference in OID string length to place the marker */
 			REMARKER(oid_str, oid_len - (len - oid_len), "%s", fr_strerror());
@@ -1057,7 +1067,7 @@ int fr_snmp_process(request_t *request)
 /** Internal SNMP initialisation function (used for recursion)
  *
  */
-static int _fr_snmp_init(fr_snmp_map_t map[], fr_dict_attr_t const *parent)
+static int _fr_snmp_init_r(fr_snmp_map_t map[], fr_dict_attr_t const *parent)
 {
 	unsigned int i;
 
@@ -1073,7 +1083,7 @@ static int _fr_snmp_init(fr_snmp_map_t map[], fr_dict_attr_t const *parent)
 				return -1;
 			}
 
-			ret = _fr_snmp_init(map[i].child, map[i].da);
+			ret = _fr_snmp_init_r(map[i].child, map[i].da);
 			if (ret < 0) return -1;
 
 			continue;
@@ -1100,11 +1110,7 @@ static int _fr_snmp_init(fr_snmp_map_t map[], fr_dict_attr_t const *parent)
 
 	return 0;
 }
-
-/** Initialise the tree of SNMP map structures used to attach callbacks to OIDs
- *
- */
-int fr_snmp_init(void)
+static int _fr_snmp_init(UNUSED void *uctx)
 {
 	start_time = fr_time();
 	reset_time = start_time;
@@ -1119,10 +1125,24 @@ int fr_snmp_init(void)
 		return -1;
 	}
 
-	return _fr_snmp_init(snmp_iso, fr_dict_root(dict_snmp));	/* The SNMP root node */
+	return _fr_snmp_init_r(snmp_iso, fr_dict_root(dict_snmp));	/* The SNMP root node */
 }
 
-void fr_snmp_free(void)
+static int _fr_snmp_free(UNUSED void *uctx)
 {
 	fr_dict_autofree(snmp_dict);
+
+	return 0;
+}
+
+/** Initialise the tree of SNMP map structures used to attach callbacks to OIDs
+ *
+ */
+int fr_snmp_init(void)
+{
+	int ret;
+
+	fr_atexit_global_once_ret(&ret, _fr_snmp_init, _fr_snmp_free, NULL);
+
+	return ret;
 }

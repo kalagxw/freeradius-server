@@ -1,25 +1,21 @@
+string test_string
+
 #
 #  Sync calls should always return a zero length string
 #  because we don't wait for the response.
 #
-update request {
-	&Tmp-String-0 := `/bin/sh -c 'echo hello'`
+test_string := %exec_wait('/bin/sh', '-c', 'echo hello')
+if (test_string != 'hello') {
+	test_fail
 }
-if (&Tmp-String-0 != 'hello') {
+
+#
+#  @todo - list over-rides are not allowed!
+#
+control += %exec_wait('/bin/sh', '-c', "echo Reply-Message := \'hello\'")
+
+if (control.Reply-Message != 'hello') {
 	test_fail
 } else {
 	test_pass
 }
-
-#
-#  Test default list override
-#
-#update request {
-#	control: += `/bin/sh -c "echo reply.Reply-Message = \'hello\'"`
-#}
-
-#if (&reply.Reply-Message != 'hello') {
-#	test_fail
-#} else {
-#	test_pass
-#}

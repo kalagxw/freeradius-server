@@ -2,8 +2,18 @@
 #	Common test values
 #
 
-PORT := 12340
-SECRET := testing123
+#
+#  Ports for the test servers come from the allocator in
+#  scripts/build/make/port.c.  Each server gets a block that nothing else on
+#  the machine holds, so a second "make" running at the same time never lands
+#  on the same ports.
+#
+#  PORT_FILE is where the allocator remembers the port to try next.  Setting
+#  PORT on the command line moves the bottom of the range.
+#
+PORT_FILE := $(BUILD_DIR)/ports
+PORT_FIRST := $(PORT)
+SECRET := $(if $(SECRET),$(SECRET),testing123)
 DICT_PATH := $(top_srcdir)/share/dictionary
 
 #
@@ -14,23 +24,38 @@ GIT_HAS_LFS = $(shell git lfs 1> /dev/null 2>&1 && echo yes || echo no)
 #
 #  To work around OpenSSL issues encountered with old OpenSSL within CI.
 #
+#
+#  Written in one go.  Appending line by line leaves a half-written file for
+#  anything reading it at the same time, and leaves the same behind for the
+#  next build when the write is interrupted.
+#
 raddb/test.conf:
-	${Q}echo 'security {' >> $@
-	${Q}echo '        allow_vulnerable_openssl = yes' >> $@
-	${Q}echo '}' >> $@
-	${Q}echo '$$INCLUDE radiusd.conf' >> $@
+	${Q}printf 'security {\nallow_vulnerable_openssl = yes\n}\n$$INCLUDE radiusd.conf\n' > $@
+
+RADIUSD_CONFIG_CMD = \
+	$(TEST_BIN)/radiusd \
+	-XCM \
+	-d ./raddb \
+	-n debug \
+	-D ./share/dictionary \
+	-n test
 
 #
 #  Run "radiusd -C", looking for errors.
 #
 # Only redirect STDOUT, which should contain details of why the test failed.
 # Don't molest STDERR as this may be used to receive output from a debugger.
-$(BUILD_DIR)/tests/radiusd-c:
+#
+#  The recipe reads raddb/test.conf, so the file has to be finished before the
+#  recipe starts.  Naming both on test.radiusd-c does not do that, because make
+#  builds the prerequisites of one target at the same time under "make -j".
+#
+$(BUILD_DIR)/tests/radiusd-c: | raddb/test.conf
 	@printf "radiusd -C... "
-	${Q}if ! ${TEST_BIN}/radiusd -XCMd ./raddb -n debug -D ./share/dictionary -n test > $(BUILD_DIR)/tests/radiusd.config.log; then \
+	${Q}if ! $(RADIUSD_CONFIG_CMD) > $(BUILD_DIR)/tests/radiusd.config.log; then \
 		cat $(BUILD_DIR)/tests/radiusd.config.log; \
 		echo "fail"; \
-		echo "${TEST_BIN}/radiusd -XCMd ./raddb -n debug -D ./share/dictionary -n test"; \
+		echo $(call SHELL_QUOTE,$(RADIUSD_CONFIG_CMD)); \
 		exit 1; \
 	fi
 	${Q}rm -f raddb/test.conf
@@ -41,31 +66,54 @@ $(BUILD_DIR)/tests/radiusd-c:
 test.radiusd-c: raddb/test.conf $(BUILD_DIR)/tests/radiusd-c ${BUILD_DIR}/bin/radiusd $(GENERATED_CERT_FILES) | $(BUILD_DIR)/tests build.raddb
 
 #
-#  The tests are manually ordered for now, as it's a PITA to fix all
+#  The suites are manually ordered for now, as it's a PITA to fix all
 #  of the dependencies.
 #
-test: \
+TEST_SUITES := \
 		test.bin	\
 		test.trie	\
 		test.dict	\
 		test.unit	\
 		test.keywords	\
 		test.xlat	\
-		test.map	\
 		test.modules	\
+		test.process	\
 		test.radiusd-c	\
 		test.radclient	\
+		test.detail	\
 		test.radsniff	\
 		test.auth	\
 		test.digest	\
 		test.radmin	\
 		test.eap	\
+		test.tls	\
 		test.tacacs	\
 		test.vmps	\
-		| build.raddb
+		test.ldap_sync
+
+#
+#  Suites which mutate shared state, such as the redis cluster and
+#  raddb/test.conf, are not safe to overlap, so "test" runs each suite as its
+#  own sub-make, one after another.
+#
+#  A sub-make inherits the job slots of the make that started it, so "make -j"
+#  still runs the tests inside a suite at the same time as each other.
+#
+.PHONY: test
+test: | build.raddb
+	${Q}for suite in $(TEST_SUITES); do \
+		$(MAKE) --no-print-directory $$suite || exit 1; \
+	done
 
 clean: clean.test
 .PHONY: clean.test
+
+#
+#  Throwing away the names the ports were handed out against makes the next
+#  build allocate again.
+#
+clean.test:
+	${Q}rm -f $(PORT_FILE)
 
 #  Tests specifically for CI. We do a LOT more than just
 #  the above tests
@@ -73,7 +121,7 @@ ci-test: raddb/test.conf test
 	${Q}FR_LIBRARY_PATH=${BUILD_DIR}/lib/local/.libs/ ${BUILD_DIR}/make/jlibtool --mode=execute ${BUILD_DIR}/bin/local/radiusd -xxxv -n test
 	${Q}rm -f raddb/test.conf
 	${Q}$(MAKE) install
-	${Q}perl -p -i -e 's/allow_vulnerable_openssl = no/allow_vulnerable_openssl = yes/' ${raddbdir}/radiusd.conf
+	${Q}perl -p -i -e 's/allow_vulnerable_openssl = no/allow_vulnerable_openssl = yes/' $(confdir)/radiusd.conf
 	${Q}${sbindir}/radiusd -XC
 
 #
@@ -90,19 +138,76 @@ ifneq "$(findstring test,$(MAKECMDGOALS))$(findstring clean,$(MAKECMDGOALS))" ""
 ifneq "$(findstring leak,$(CFLAGS))" ""
 export ASAN_SYMBOLIZER_PATH=$(shell which llvm-symbolizer)
 export ASAN_OPTIONS=malloc_context_size=50 detect_leaks=1 symbolize=1
-ifneq "$(findstring apple,$(AC_HOSTINFO))" ""
-export LSAN_OPTIONS=print_suppressions=0 fast_unwind_on_malloc=0 suppressions=${top_srcdir}/scripts/build/lsan_leaks_osx
-else
 export LSAN_OPTIONS=print_suppressions=0 fast_unwind_on_malloc=0
 endif
-endif
 
-SUBMAKEFILES := rbmonkey.mk $(subst src/tests/,,$(wildcard src/tests/*/all.mk))
+SUBMAKEFILES := $(subst src/tests/,,$(wildcard src/tests/*/all.mk)) depends.mk
 endif
 
 .PHONY: $(BUILD_DIR)/tests
 $(BUILD_DIR)/tests:
 	${Q}mkdir -p $@
+
+.PHONY: test.multi-server.%
+test.multi-server.%:
+	$(MAKE) -f src/tests/multi-server/all.mk $*
+
+######################################################################
+#
+#  Make a test depend on the libraries its configuration loads.
+#
+#  The `radiusd` and `unit_test_module` binaries load libraries via
+#  dlopen().  This includes every proto_*, process_* and rlm_* file.
+#  As a result, `make` cannot see the dependency, as the dependency
+#  isn't captured in the Makefiles.
+#
+#  Unless it is told otherwise, `make` will not rebuild a module
+#  before the test which exercises it: the test then runs against a
+#  stale module, or fails with "Failed to link to module" rather than
+#  make simply building the module first.
+#
+#  The list is read out of the test's configuration files by
+#  `scripts/build/config-libs.sh`, and cached in the `build`
+#  directory.  This means that the `all.mk` file doesn't need to be
+#  manually updated when the dependencies change.  Instead, this
+#  function sees that the relevant `all.mk` file changed, and re-runs
+#  the script to get the dependencies.
+#
+#  For speed, the output is cached into a `libs.mk` file.  This means
+#  that we don't need to run the script many times for each invocation
+#  of `make`.
+#
+#  The candidates are also filtered through ALL_TGTS.  That filtering
+#  drops anything which is not a real target, such as an `unlang`
+#  keyword which looks like a module declaration.  The filtering also
+#  drops a module which is not part of this build.
+#
+#  The src/tests/all.mk file is the last one parsed (see src/all.mk),
+#  so ALL_TGTS is complete by the time we are called here.
+#
+#  Use $(eval $(call TEST_CONFIG_LIBS,<config files>,<target>))
+#
+#  <target> is whatever should depend on the libraries.  For a test which
+#  starts a server, use the start target, so the libraries are built before
+#  the server tries to load them.  Otherwise use the test files.
+#
+######################################################################
+define TEST_CONFIG_LIBS
+ifeq "$(filter clean%,$(MAKECMDGOALS))" ""
+CACHE_DIR.$(TEST) := $$(subst src/,$(BUILD_DIR)/,$(DIR))
+
+-include $$(CACHE_DIR.$(TEST))/libs.mk
+
+$$(CACHE_DIR.$(TEST))/libs.mk: $(DIR)/all.mk src/tests/all.mk scripts/build/config-libs.sh
+	@mkdir -p $$(dir $$@)
+	@echo "CONFIG_LIBS.$(TEST) := $$(filter $$(ALL_TGTS),$$(shell $(top_srcdir)/scripts/build/config-libs.sh ${1}))" > $$@
+
+${2}: $$(addprefix $$(BUILD_DIR)/lib/local/,$$(CONFIG_LIBS.$(TEST)))
+endif
+endef
+
+PROTOCOL_LIBS := $(filter $(ALL_TGTS),$(patsubst %,libfreeradius-%.la,$(notdir $(patsubst %/,%,$(wildcard src/protocols/*/)))))
+$(addprefix $(TEST_BIN_DIR)/,radiusd radict unit_test_attribute unit_test_module): | $(addprefix $(BUILD_DIR)/lib/local/,$(PROTOCOL_LIBS))
 
 ######################################################################
 #
@@ -116,7 +221,7 @@ define TEST_BOOTSTRAP
 #
 #  The test files are files without extensions.
 #
-OUTPUT.$(TEST) := $(patsubst %/,%,$(subst $(top_srcdir)/src,$(BUILD_DIR),$(abspath $(DIR))))
+OUTPUT.$(TEST) := $(patsubst %/,%,$(subst src/,$(BUILD_DIR)/,$(call CANONICAL_PATH,$(DIR))))
 OUTPUT := $$(OUTPUT.$(TEST))
 
 #

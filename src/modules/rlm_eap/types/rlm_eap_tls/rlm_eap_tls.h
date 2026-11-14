@@ -26,7 +26,7 @@ RCSIDH(rlm_eap_tls_h, "$Id$")
 
 #include <freeradius-devel/eap/tls.h>
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 
 /** Cache sections to call on various protocol events
  *
@@ -39,8 +39,7 @@ typedef struct {
 	/*
 	 *	TLS configuration
 	 */
-	char const		*tls_conf_name;		//!< The name of the shared TLS configuration.
-	fr_tls_conf_t		*tls_conf;		//!< Shared TLS configuration structure.
+	fr_tls_conf_t		*tls_conf;		//!< Parsed from the `tls { ... }` subsection.
 
 	bool			include_length;
 
@@ -49,6 +48,4 @@ typedef struct {
 							//!< not mandatory, and there are some situations
 							//!< where it's useful to allow client access without
 							//!< a certificate.
-
-	char const		*virtual_server;	//!< Virtual server used for validating certificates.
 } rlm_eap_tls_t;

@@ -1,0 +1,130 @@
+string test_string1
+string test_string2
+string test_string3
+string empty_string
+
+test_string1 := 'aaa'
+test_string2 := "\n\n\n"
+test_string3 := "the quick brown fox jumped over the lazy dog"
+empty_string := ''
+
+#
+#  Non-regex base substitutions
+#
+
+# Global substitution
+if (!(%str.subst(test_string1, 'a', 'b') == 'bbb')) {
+	test_fail
+}
+
+# No match
+if (!(%str.subst(test_string1, 'c', 'b') == 'aaa')) {
+	test_fail
+}
+
+# Line ending rewrite
+if (!(%str.subst(test_string2, "\n", "\r") == "\r\r\r")) {
+	test_fail
+}
+
+# Removal
+if (!(%str.subst(test_string1, 'a', '') == "")) {
+	test_fail
+}
+
+# Removal of last word only
+if (!(%str.subst(test_string3, 'dog', '') == "the quick brown fox jumped over the lazy ")) {
+	test_fail
+}
+
+# Removal of first and subsequent word
+if (!(%str.subst(test_string3, 'the', '') == " quick brown fox jumped over  lazy dog")) {
+	test_fail
+}
+
+# Removal of middle word
+if (!(%str.subst(test_string3, 'jumped', '') == "the quick brown fox  over the lazy dog")) {
+	test_fail
+}
+
+# Replacement of last word only
+if (!(%str.subst(test_string3, 'dog', 'cat') == "the quick brown fox jumped over the lazy cat")) {
+	test_fail
+}
+
+# Replacement of first and subsequent word
+if (!(%str.subst(test_string3, 'the', 'cat') == "cat quick brown fox jumped over cat lazy dog")) {
+	test_fail
+}
+
+# Replacement of middle word
+if (!(%str.subst(test_string3, 'jumped', 'cat') == "the quick brown fox cat over the lazy dog")) {
+	test_fail
+}
+
+if ("${feature.regex-pcre2}" == 'yes') {
+# Basic substitutions
+if (!(%str.subst(test_string1, '/a/', 'b') == 'baa')) {
+	test_fail
+}
+
+# Global substitution
+if (!(%str.subst(test_string1, '/a/g', 'b') == 'bbb')) {
+	test_fail
+}
+
+# No match
+if (!(%str.subst(test_string1, '/z/', 'b') == 'aaa')) {
+	test_fail
+}
+
+# Basic substitutions - Dynamic
+if (!(%str.subst(test_string1, "/a%{empty_string}/", 'b') == 'baa')) {
+	test_fail
+}
+
+# Global substitution - Dynamic
+if (!(%str.subst(test_string1, "/a%{empty_string}/g", 'b') == 'bbb')) {
+	test_fail
+}
+
+#
+#  Newline manipulation
+#
+
+# Check that newlines really are newlines
+if (!(%length(test_string2) == 3)) {
+	test_fail
+}
+
+# Strip out just the first newline
+if (!(%str.subst(test_string2, '/^./s', '') == "\n\n")) {
+	test_fail
+}
+
+if (!(%str.subst(test_string2, '/\n/', '') == "\n\n")) {
+	test_fail
+}
+
+# Strip out all the newlines
+if (!(%str.subst(test_string2, '/\n/g', '') == '')) {
+	test_fail
+}
+
+# Line ending switch
+if (!(%str.subst(test_string2, '/\n/g', "\r") == "\r\r\r")) {
+	test_fail
+}
+
+# Capture groups
+if (!(%str.subst(test_string3, '/^the (.*) brown (.*) jumped.*/', "$1,$2") == "quick,fox")) {
+	test_fail
+}
+
+if (!(%str.subst(test_string3, "/^%{empty_string}the (.*) brown (.*) jumped.*/", "$1,$2") == "quick,fox")) {
+	test_fail
+}
+
+}
+
+success

@@ -1,5 +1,5 @@
 /*
- * @copyright (c) 2016, Network RADIUS SARL (license@networkradius.com)
+ * @copyright (c) 2016, Network RADIUS SAS (license@networkradius.com)
  *  All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -9,7 +9,7 @@
  *    * Redistributions in binary form must reproduce the above copyright
  *      notice, this list of conditions and the following disclaimer in the
  *      documentation and/or other materials provided with the distribution.
- *    * Neither the name of Network RADIUS SARL nor the
+ *    * Neither the name of Network RADIUS SAS nor the
  *      names of its contributors may be used to endorse or promote products
  *      derived from this software without specific prior written permission.
  *
@@ -32,7 +32,7 @@
  *
  * @author Arran Cudbard-Bell
  *
- * @copyright 2016 Network RADIUS SARL (license@networkradius.com)
+ * @copyright 2016 Network RADIUS SAS (license@networkradius.com)
  */
 #include <osmocom/core/linuxlist.h>
 #include <osmocom/core/timer.h>
@@ -229,17 +229,14 @@ typedef struct sigtran_map_send_auth_info_res {
 } sigtran_map_send_auth_info_res_t;
 
 typedef struct rlm_sigtran {
-	char const		*name;					//!< Instance name.
-
 	sigtran_conn_t const	*conn;					//!< Linkset associated with this instance.
 
 	sigtran_conn_conf_t	conn_conf;				//!< Connection configuration
 
-	tmpl_t		*imsi;					//!< Subscriber identifier.
+	tmpl_t			*imsi;					//!< Subscriber identifier.
 } rlm_sigtran_t;
 
 typedef struct rlm_sigtran_thread {
-        rlm_sigtran_t const     *inst;                                  //!< Instance of rlm_sigtran
         int                     fd;                                     //!< File descriptor
 } rlm_sigtran_thread_t;
 
@@ -260,7 +257,7 @@ int	sigtran_client_link_up(sigtran_conn_t const **out, sigtran_conn_conf_t const
 
 int	sigtran_client_link_down(sigtran_conn_t const **conn);
 
-unlang_action_t sigtran_client_map_send_auth_info(rlm_rcode_t *p_result, rlm_sigtran_t const *inst, request_t *request,
+unlang_action_t sigtran_client_map_send_auth_info(unlang_result_t *p_result, rlm_sigtran_t const *inst, request_t *request,
 				  		  sigtran_conn_t const *conn, int fd);
 
 /*

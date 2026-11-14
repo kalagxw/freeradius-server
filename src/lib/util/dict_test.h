@@ -23,13 +23,16 @@
  */
 RCSIDH(dict_test_h, "$Id$")
 
+#include <freeradius-devel/util/dict.h>
+#include <freeradius-devel/util/value.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /** Test attribute numbers
  */
-typedef enum {
+typedef enum : int8_t {
 	FR_TEST_ATTR_INVALID = -1,
 	FR_TEST_ATTR_STRING = 1,
 	FR_TEST_ATTR_OCTETS,
@@ -76,6 +79,11 @@ typedef enum {
 
 	FR_TEST_ATTR_GROUP,
 
+	FR_TEST_ATTR_NESTED_TOP_TLV,
+	FR_TEST_ATTR_NESTED_CHILD_TLV,
+	FR_TEST_ATTR_NESTED_LEAF_STRING,
+	FR_TEST_ATTR_NESTED_LEAF_INT32,
+
 	FR_TEST_ATTR_ENUM
 } fr_dict_test_attr_number_t;
 
@@ -83,7 +91,7 @@ typedef enum {
  */
 typedef struct value {
 	char const			*key;		//!< Enumeration name.
-	fr_value_box_t			val;		//!< Enumeration value
+	fr_value_box_t			*val;		//!< Enumeration value
 } fr_dict_test_attr_value_t;
 
 /** Test enumeration attributes
@@ -143,6 +151,11 @@ extern fr_dict_attr_t const *fr_dict_attr_test_vendor;
 extern fr_dict_attr_t const *fr_dict_attr_test_vendor_string;
 
 extern fr_dict_attr_t const *fr_dict_attr_test_group;
+
+extern fr_dict_attr_t const *fr_dict_attr_test_nested_top_tlv;
+extern fr_dict_attr_t const *fr_dict_attr_test_nested_child_tlv;
+extern fr_dict_attr_t const *fr_dict_attr_test_nested_leaf_string;
+extern fr_dict_attr_t const *fr_dict_attr_test_nested_leaf_int32;
 
 extern fr_dict_attr_t const *fr_dict_attr_test_enum;
 

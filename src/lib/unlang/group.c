@@ -24,62 +24,50 @@
  */
 RCSID("$Id$")
 
+#include <freeradius-devel/server/rcode.h>
 #include "unlang_priv.h"
 #include "group_priv.h"
 
-unlang_action_t unlang_group(rlm_rcode_t *p_result, request_t *request, unlang_stack_frame_t *frame)
+unlang_action_t unlang_group(UNUSED unlang_result_t *p_result, request_t *request, UNUSED unlang_stack_frame_t *frame)
 {
-	unlang_group_t		*g = unlang_generic_to_group(frame->instruction);
-
-	/*
-	 *	The compiler catches most of these, EXCEPT for the
-	 *	top-level 'recv Access-Request' etc.  Which can exist,
-	 *	and can be empty.
-	 */
-	if (!g->children) {
-		RDEBUG2("<ignoring empty subsection>");
-		return UNLANG_ACTION_EXECUTE_NEXT;
-	}
-
-	if (unlang_interpret_push(request, g->children, frame->result, UNLANG_NEXT_SIBLING, UNLANG_SUB_FRAME) < 0) {
-		*p_result = RLM_MODULE_FAIL;
-		return UNLANG_ACTION_STOP_PROCESSING;
-	}
-
-	return UNLANG_ACTION_PUSHED_CHILD;
+	return unlang_interpret_push_children(NULL, request, RLM_MODULE_NOT_SET, UNLANG_NEXT_SIBLING);
 }
 
-static unlang_action_t unlang_policy(rlm_rcode_t *result, request_t *request, unlang_stack_frame_t *frame)
+static unlang_action_t unlang_policy(unlang_result_t *result, request_t *request, unlang_stack_frame_t *frame)
 {
-	/*
-	 *	Ensure returns stop at the enclosing policy
-	 */
-	return_point_set(frame);
-
 	return unlang_group(result, request, frame);
 }
 
 
+static unlang_t *unlang_compile_group(unlang_t *parent, unlang_compile_ctx_t *unlang_ctx, CONF_ITEM const *ci)
+{
+	if (!cf_item_next(ci, NULL)) return UNLANG_IGNORE;
+
+	return unlang_compile_section(parent, unlang_ctx, cf_item_to_section(ci), UNLANG_TYPE_GROUP);
+}
+
 void unlang_group_init(void)
 {
-	unlang_register(UNLANG_TYPE_GROUP,
-			   &(unlang_op_t){
-				.name = "group",
-				.interpret = unlang_group,
-				.debug_braces = true
-			   });
+	unlang_register(&(unlang_op_t){
+			.name = "group",
+			.type = UNLANG_TYPE_GROUP,
+			.flag = UNLANG_OP_FLAG_DEBUG_BRACES,
 
-	unlang_register(UNLANG_TYPE_REDUNDANT,
-			   &(unlang_op_t){
-				.name = "redundant",
-				.interpret = unlang_group,
-				.debug_braces = true
-			   });
+			.compile = unlang_compile_group,
+			.interpret = unlang_group,
 
-	unlang_register(UNLANG_TYPE_POLICY,
-			   &(unlang_op_t){
-				.name = "policy",
-				.interpret = unlang_policy,
-				.debug_braces = true
-			   });
+			.unlang_size = sizeof(unlang_group_t),
+			.unlang_name = "unlang_group_t",
+		});
+
+	unlang_register(&(unlang_op_t){
+			.name = "policy",
+			.type = UNLANG_TYPE_POLICY,
+			.flag = (unlang_op_flag_t)(UNLANG_OP_FLAG_DEBUG_BRACES | UNLANG_OP_FLAG_RETURN_POINT | UNLANG_OP_FLAG_INTERNAL),
+
+			.interpret = unlang_policy,
+
+			.unlang_size = sizeof(unlang_group_t),
+			.unlang_name = "unlang_group_t",	
+		});
 }

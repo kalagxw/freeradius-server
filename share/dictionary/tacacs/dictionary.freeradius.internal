@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2022 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -15,15 +15,38 @@
 #
 FLAGS	internal
 
-ATTRIBUTE	Packet-Type				65536	uint32
-VALUE	Packet-Type			Authentication-Start	1
-VALUE	Packet-Type			Authentication-Start-Reply	2
-VALUE	Packet-Type			Authentication-Continue	3
-VALUE	Packet-Type			Authentication-Continue-Reply	4
-VALUE	Packet-Type			Authorization-Request	5
-VALUE	Packet-Type			Authorization-Reply	6
-VALUE	Packet-Type			Accounting-Request	7
-VALUE	Packet-Type			Accounting-Reply	8
-VALUE	Packet-Type			Do-Not-Respond		9
+#
+#  Due to TACACS+ insanities, the unlang packet types are a combination
+#  of the TACACS+ type field, and of the status field.
+#
+DEFINE	Packet-Type				uint32
+VALUE	Packet-Type			Authentication-Start		1
+VALUE	Packet-Type			Authentication-Pass		2
+VALUE	Packet-Type			Authentication-Fail		3
+VALUE	Packet-Type			Authentication-GetData		4
+VALUE	Packet-Type			Authentication-GetUser		5
+VALUE	Packet-Type			Authentication-GetPass		6
+VALUE	Packet-Type			Authentication-Restart		7
+VALUE	Packet-Type			Authentication-Error		8
 
-ATTRIBUTE	State				65537	octets
+VALUE	Packet-Type			Authentication-Continue		9
+VALUE	Packet-Type			Authentication-Continue-Abort	10
+
+VALUE	Packet-Type			Authorization-Request		11
+VALUE	Packet-Type			Authorization-Pass-Add		12
+VALUE	Packet-Type			Authorization-Pass-Replace 	13
+VALUE	Packet-Type			Authorization-Fail		14
+VALUE	Packet-Type			Authorization-Error		15
+
+VALUE	Packet-Type			Accounting-Request		16
+VALUE	Packet-Type			Accounting-Success		17
+VALUE	Packet-Type			Accounting-Error		18
+
+DEFINE	State					octets
+
+#
+#  Use v3 names for aliases, so that the mschap module can be used
+#  for both TACACS+ and RADIUS.
+#
+ALIAS	MS-CHAP2-Success		Data
+ALIAS	MS-CHAP-Error			Server-Message

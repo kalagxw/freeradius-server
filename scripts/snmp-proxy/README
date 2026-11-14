@@ -1,5 +1,5 @@
   The files in this directory replace the old FreeRADIUS SNMP
-implementantion with a new one.
+implementation with a new one.
 
 net-radius-freeradius-dictionary.diff
 	Patch to enable the Perl Net::RADIUS module to read the
@@ -22,7 +22,7 @@ make sure snmpd is agentx master (snmpd.conf):
 
 Download the module from
 
-	 http://search.cpan.org/dist/Net-Radius/
+	 https://metacpan.org/dist/Net-Radius
 
 Extract it in this directory:
 

@@ -1,0 +1,18 @@
+name: freeradius-alt-deps
+
+runs:
+  using: composite
+  steps:
+    #
+    #  Build using some alternative libraries
+    #
+    #    PCRE 2       -> PCRE 1
+    #    MIT Kerberos -> HEIMDAL Kerberos
+    #
+
+    - name: Use alternative libraries
+      shell: bash
+      run: |
+        sudo apt-get install -y --no-install-recommends libpcre3-dev  # "PCRE 1"
+        sudo apt-get purge -y libpcre2-dev  # Remove default PCRE 2, leaving only PCRE 1
+        sudo apt-get install -y --no-install-recommends heimdal-dev

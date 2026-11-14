@@ -6,7 +6,7 @@
 #  installed by the distribution packaging.
 #
 #  We want the run-time environment to be lean, typical of a fresh system
-#  installation so that we catch any missing runtime dependancies, assets
+#  installation so that we catch any missing runtime dependencies, assets
 #  missing from the packages, issues with the dynamic loader, etc.
 #
 #  Therefore we skip the usual build framework so that we do not have so
@@ -26,6 +26,7 @@ top_srcdir:=.
 BUILD_DIR:=build
 DIR:=src/tests/eapol_test
 OUTPUT:=$(BUILD_DIR)/tests/eapol_test
+PACKAGE_TEST:=true
 
 ALL_TGTS:=$(addprefix rlm_eap_,$(notdir $(subst -,_,$(patsubst %.conf,%.la,$(wildcard $(DIR)/*.conf)))))
 
@@ -52,3 +53,13 @@ POST_INSTALL_RADIUSD_BIN_ARG:=RADIUSD_BIN=$(RADIUSD_BIN)
 package-test: test.eap
 
 include $(DIR)/all.mk
+
+#
+#  all.mk gates every EAP test on EAPOL_TEST, and the gate closes quietly, so
+#  a missing eapol_test turns into a green run that tested nothing.  all.mk
+#  can also blank EAPOL_TEST after the assignment above, so check the value
+#  here rather than next to the assignment.
+#
+ifeq "$(EAPOL_TEST)" ""
+$(error Aborting the package test, because neither which nor scripts/ci/eapol_test-build.sh found an eapol_test. Install eapol_test before running scripts/ci/package-test.mk)
+endif

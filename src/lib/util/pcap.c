@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License, version 2 of the
  *   License as published by the Free Software Foundation.
  *
@@ -26,21 +26,17 @@
 #include <freeradius-devel/util/net.h>
 #include <freeradius-devel/util/pair.h>
 #include <freeradius-devel/util/pcap.h>
-#include <freeradius-devel/util/print.h>
 #include <freeradius-devel/util/syserror.h>
-#include <freeradius-devel/util/talloc.h>
 
 #include <net/if.h>
 #include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/types.h>
 #include <sys/uio.h>
-#include <unistd.h>
 
 #ifndef SIOCGIFHWADDR
 #  include <ifaddrs.h>
-#  include <net/if_dl.h>
+#  ifdef HAVE_NET_IF_DL_H
+#    include <net/if_dl.h>
+#  endif
 #else
 #  include <net/if.h>
 #endif
@@ -124,7 +120,7 @@ fr_pcap_t *fr_pcap_init(TALLOC_CTX *ctx, char const *name, fr_pcap_type_t type)
 	fr_pcap_t	*this;
 
 	if (!fr_cond_assert(type >= PCAP_INTERFACE_IN && type <= PCAP_INTERFACE_IN_OUT)) {
-		fr_strerror_printf("Invalid PCAP type: %d", type);
+		fr_strerror_printf("Invalid PCAP type: %u", type);
 		return NULL;
 	}
 
@@ -132,7 +128,7 @@ fr_pcap_t *fr_pcap_init(TALLOC_CTX *ctx, char const *name, fr_pcap_type_t type)
 	if (!this) return NULL;
 
 	talloc_set_destructor(this, _free_pcap);
-	this->name = talloc_typed_strdup(this, name);
+	this->name = talloc_strdup(this, name);
 	this->type = type;
 	this->link_layer = -1;
 
@@ -315,7 +311,8 @@ int fr_pcap_open(fr_pcap_t *pcap)
 		pcap->dumper = pcap_dump_open(pcap->handle, pcap->name);
 		if (!pcap->dumper) {
 			fr_strerror_printf("%s", pcap_geterr(pcap->handle));
-
+			pcap_close(pcap->handle);
+			pcap->handle = NULL;
 			return -1;
 		}
 		break;
@@ -340,10 +337,15 @@ int fr_pcap_open(fr_pcap_t *pcap)
 #ifdef HAVE_PCAP_DUMP_FOPEN
 	case PCAP_STDIO_OUT:
 		pcap->handle = pcap_open_dead(DLT_EN10MB, SNAPLEN);
+		if (!pcap->handle) {
+			fr_strerror_const("Unknown error occurred opening dead PCAP handle");
+			return -1;
+		}
 		pcap->dumper = pcap_dump_fopen(pcap->handle, stdout);
 		if (!pcap->dumper) {
 			fr_strerror_printf("%s", pcap_geterr(pcap->handle));
-
+			pcap_close(pcap->handle);
+			pcap->handle = NULL;
 			return -1;
 		}
 		break;
@@ -356,7 +358,7 @@ int fr_pcap_open(fr_pcap_t *pcap)
 	case PCAP_INVALID:
 	default:
 		(void)fr_cond_assert(0);
-		fr_strerror_printf("Bad handle type (%i)", pcap->type);
+		fr_strerror_printf("Bad handle type (%u)", pcap->type);
 		return -1;
 	}
 
@@ -408,8 +410,9 @@ int fr_pcap_apply_filter(fr_pcap_t *pcap, char const *expression)
 	}
 
 	if (pcap_setfilter(pcap->handle, &fp) < 0) {
-		fr_strerror_printf("%s", pcap_geterr(pcap->handle));
+		pcap_freecode(&fp);
 
+		fr_strerror_printf("%s", pcap_geterr(pcap->handle));
 		return -1;
 	}
 
@@ -455,7 +458,7 @@ char *fr_pcap_device_names(TALLOC_CTX *ctx, fr_pcap_t *pcap, char c)
 	for (pcap_p = pcap;
 	     pcap_p;
 	     pcap_p = pcap_p->next) {
-	     	size_t name_len = talloc_array_length(pcap_p->name) - 1;
+	     	size_t name_len = talloc_strlen(pcap_p->name);
 
 		if (!fr_cond_assert(p < end)) {
 			talloc_free(buff);
@@ -488,6 +491,9 @@ bool fr_pcap_link_layer_supported(int link_layer)
 	case DLT_LOOP:
 #ifdef DLT_LINUX_SLL
 	case DLT_LINUX_SLL:
+#endif
+#ifdef DLT_LINUX_SLL2
+	case DLT_LINUX_SLL2:
 #endif
 	case DLT_PFLOG:
 		return true;
@@ -576,6 +582,15 @@ ssize_t fr_pcap_link_layer_offset(uint8_t const *data, size_t len, int link_laye
 #ifdef DLT_LINUX_SLL
 	case DLT_LINUX_SLL:
 		p += 16;
+		if (((size_t)(p - data)) > len) {
+			goto ood;
+		}
+		break;
+#endif
+
+#ifdef DLT_LINUX_SLL2
+	case DLT_LINUX_SLL2:
+		p += 20;
 		if (((size_t)(p - data)) > len) {
 			goto ood;
 		}

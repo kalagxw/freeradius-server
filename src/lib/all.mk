@@ -12,14 +12,14 @@ define LIB_INCLUDE
 #  to evaluate the condition.  Instead, it evaluates the rule
 #  immediately, and decides that nothing is there.
 #
-#  So, we instead depend on a targe which has already been defined.t
+#  So, we instead depend on a target which has already been defined.
 #  - This is a terrible hack
 #
 src/freeradius-devel: | src/include/${1}
 
 src/include/${1}:
 	@echo LN-SF src/lib/${1} $$@
-	$${Q}[ -e $$@ ] || ln -sf $${top_srcdir}/src/lib/${1} $$@
+	$${Q}[ -e $$@ ] || ln -sf ../lib/${1} $$@
 
 install.src.include: $(addprefix ${SRC_INCLUDE_DIR}/,${1}/base.h)
 endef
@@ -29,7 +29,7 @@ src/freeradius-devel: | src/include/${1}
 
 src/include/${1}:
 	@echo LN-SF src/protocols/${1} $$@
-	$${Q}[ -e $$@ ] || ln -sf $${top_srcdir}/src/protocols/${1} $$@
+	$${Q}[ -e $$@ ] || ln -sf ../protocols/${1} $$@
 
 install.src.include: $(addprefix ${SRC_INCLUDE_DIR}/${1}/,$(notdir $(wildcard src/protocols/${1}/*.h)))
 endef
@@ -41,7 +41,7 @@ endef
 #  And then get the rest by wildcard, and ensure unsure that they're
 #  all unique.
 #
-SUBMAKEFILES := $(strip $(call uniq,$(patsubst %,${top_srcdir}/src/lib/%/all.mk,util tls eap eap_aka_sim server unlang io) $(wildcard ${top_srcdir}/src/lib/*/all.mk)))
+SUBMAKEFILES := $(strip $(call uniq,$(patsubst %,${top_srcdir}/src/lib/%/all.mk,$(TALLOC_EXTENSION_DIR) util tls eap eap_aka_sim server unlang io) $(sort $(wildcard ${top_srcdir}/src/lib/*/all.mk))))
 
 #
 #  Add library-specific rules to link include files, etc.
@@ -49,6 +49,14 @@ SUBMAKEFILES := $(strip $(call uniq,$(patsubst %,${top_srcdir}/src/lib/%/all.mk,
 $(foreach x,$(SUBMAKEFILES), \
 	$(eval $(call LIB_INCLUDE,$(subst /all.mk,,$(subst ${top_srcdir}/src/lib/,,$x)))) \
 )
+
+#
+#  Unit tests for libraries that have them.  Added after the include
+#  rules above so no header symlink is created for the test directory.
+#
+SUBMAKEFILES += $(wildcard ${top_srcdir}/src/lib/bio/test/all.mk)
+SUBMAKEFILES += $(wildcard ${top_srcdir}/src/lib/ldap/test/all.mk)
+SUBMAKEFILES += $(wildcard ${top_srcdir}/src/lib/tls/test/all.mk)
 
 
 #

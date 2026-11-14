@@ -31,15 +31,28 @@ RCSIDH(redis_h, "$Id$")
 #include <freeradius-devel/server/base.h>
 #include <freeradius-devel/server/map.h>
 #include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/trunk.h>
 
+#include "config.h"
+
+#ifndef WITH_TLS
+#  undef HAVE_REDIS_SSL
+#endif
+
+#ifdef HAVE_REDIS_SSL
+#  include <freeradius-devel/tls/base.h>
+#endif
+
+//DIAG_OFF(extra-semi-stmt)
 #include <hiredis/hiredis.h>
+//DIAG_ON(extra-semi-stmt)
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define MAX_REDIS_COMMAND_LEN		4096
-#define MAX_REDIS_ARGS			32
+#define MAX_REDIS_ARGS			256
 
 #define REDIS_ERROR_MOVED_STR		"MOVED"
 #define REDIS_ERROR_ASK_STR		"ASK"
@@ -47,27 +60,10 @@ extern "C" {
 #define REDIS_ERROR_NO_SCRIPT_STR	"NOSCRIPT"
 #define REDIS_DEFAULT_PORT		6379
 
-/** Wrap freeReplyObject so we consistently check for NULL pointers
- *
- * Older versions such as 0.10 (which ship with Ubuntu <= 14.10)
- * don't check for NULL pointer before attempting to free, so we
- * get a NULL pointer dereference in some cases.
- *
- * Rather than go back through the many calls to freeReplyObject
- * and attempt to determine code paths that may result in it being
- * called on a NULL pointer, we use this to always check.
- */
-static inline void fr_redis_reply_free(redisReply **reply)
-{
-	if (*reply) freeReplyObject(*reply);
-	*reply = NULL;
-}
+#define REDIS_VERSION(_max, _min, _patch) (uint32_t) (_max << 24) | (_min << 16) | _patch
 
-static inline void fr_redis_pipeline_free(redisReply *reply[], size_t num)
-{
-	size_t i;
-	for (i = 0; i < num; i++) fr_redis_reply_free(&(reply[i]));
-}
+typedef struct fr_redis_cluster_node_s fr_redis_cluster_node_t;
+typedef struct fr_redis_ct_s fr_redis_ct_t;
 
 extern fr_table_num_sorted_t const redis_reply_types[];
 extern size_t redis_reply_types_len;
@@ -80,8 +76,8 @@ extern size_t redis_rcodes_len;
  * the lowest status code, and the reply which accompanies it should
  * be returned to the redis cluster code.
  */
-typedef enum {
-	REDIS_RCODE_SUCCESS = 0,		//!< Operation was successfull.
+typedef enum : int8_t {
+	REDIS_RCODE_SUCCESS = 0,		//!< Operation was successful.
 	REDIS_RCODE_ERROR = -1,			//!< Unrecoverable library/server error.
 	REDIS_RCODE_TRY_AGAIN = -2,		//!< Try the operation again.
 	REDIS_RCODE_RECONNECT = -3,		//!< Transitory error, caller should retry the operation
@@ -91,21 +87,48 @@ typedef enum {
 	REDIS_RCODE_NO_SCRIPT = -6,		//!< Script doesn't exist.
 } fr_redis_rcode_t;
 
+typedef enum : int8_t {
+	REDIS_ASYNC_RCODE_SUCCESS = 0,		//!< Operation was successful.
+	REDIS_ASYNC_RCODE_ERROR = -1,		//!< Unrecoverable error.
+	REDIS_ASYNC_RCODE_BOOTSTRAP = -2,	//!< The caller should issue a request to bootstrap the cluster map.
+	REDIS_ASYNC_RCODE_GETMAP = -3,		//!< The caller should issue a request to update the cluster map.
+
+	REDIS_ASYNC_RCODE_TRY_AGAIN = -4,	//!< Try the operation again
+	REDIS_ASYNC_RCODE_ASK = -5,		//!< Attempt operation on an alternative node.
+	REDIS_ASYNC_RCODE_MOVE = -6,		//!< Attempt operation on an alternative node with remap.
+	REDIS_ASYNC_RCODE_NO_SCRIPT = -7,	//!< Script doesn't exist.
+	REDIS_ASYNC_RCODE_FAIL = -8,		//!< The command set trunk request has been failed.
+} fr_redis_async_rcode_t;
+
 /** Connection handle, holding a redis context
  */
 typedef struct {
 	redisContext		*handle;	//!< Hiredis context used when issuing commands.
+	fr_redis_cluster_node_t	*node;		//!< Node this connection is to.
 } fr_redis_conn_t;
+
+typedef enum : uint8_t {
+	FR_REDIS_INVALID = 0,
+	FR_REDIS_CLUSTER_MAP_BOOTSTRAP,
+	FR_REDIS_CLUSTER_MAP_GET,
+	FR_REDIS_CLUSTER_MAP_UPDATE,
+	FR_REDIS_CLUSTER_MAP_FAIL,
+	FR_REDIS_CODE_MAX,
+	FR_REDIS_DO_NOT_RESPOND = 255
+} fr_redis_packet_code_t;
 
 /** Configuration parameters for a redis connection
  *
- * @note should be passed as instance data to #module_connection_pool_init.
+ * @note should be passed as instance data to #module_rlm_connection_pool_init.
  */
 typedef struct {
 	char const		**hostname;	//!< of Redis server.
 	uint16_t		port;		//!< of Redis daemon.
 	uint32_t		database;	//!< number on Redis server.
+	bool			use_tls;	//!< use TLS.
+	bool			use_cluster_map;//!< use cluster map.
 
+	char const		*username;	//!< for acls.
 	char const		*password;	//!< to authenticate to Redis.
 
 	uint8_t			max_nodes;	//!< Maximum number of cluster nodes to connect to.
@@ -120,44 +143,67 @@ typedef struct {
 	fr_time_delta_t		reconnection_delay;
 
 	char const		*log_prefix;
+
+	char const		*module_name;	//!< Module name for triggers.
+	char const		*inst_name;	//!< Instance name for triggers.
+
+	trunk_conf_t		trunk_conf;	//!< Configuration for trunk connections.
+#ifdef HAVE_REDIS_SSL
+	fr_tls_conf_t		*tls;		//!< Parsed from the `tls { ... }` subsection.  NULL when
+						///< the section is absent.  An absent section is an error
+						///< when `use_tls` is set.
+#endif
 } fr_redis_conf_t;
 
+/*
+ *	`REDIS_TLS_CONFIG` comes first in `REDIS_COMMON_CONFIG`, so
+ *	`REDIS_COMMON_CONFIG` never ends with a comma, whether or not
+ *	`REDIS_TLS_CONFIG` expands to a row.
+ */
+#ifdef HAVE_REDIS_SSL
+#  define REDIS_TLS_CONFIG \
+	{ FR_CONF_SUBSECTION_ALLOC("tls", CONF_FLAG_OK_MISSING, fr_redis_conf_t, tls, fr_tls_client_config), \
+	  .subcs_type = "fr_tls_conf_t" },
+#else
+#  define REDIS_TLS_CONFIG
+#endif
+
 #define REDIS_COMMON_CONFIG \
-	{ FR_CONF_OFFSET("server", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_MULTI, fr_redis_conf_t, hostname) }, \
-	{ FR_CONF_OFFSET("port", FR_TYPE_UINT16, fr_redis_conf_t, port), .dflt = "6379" }, \
-	{ FR_CONF_OFFSET("database", FR_TYPE_UINT32, fr_redis_conf_t, database), .dflt = "0" }, \
-	{ FR_CONF_OFFSET("password", FR_TYPE_STRING | FR_TYPE_SECRET, fr_redis_conf_t, password) }, \
-	{ FR_CONF_OFFSET("max_nodes", FR_TYPE_UINT8, fr_redis_conf_t, max_nodes), .dflt = "20" }, \
-	{ FR_CONF_OFFSET("max_alt", FR_TYPE_UINT32, fr_redis_conf_t, max_alt), .dflt = "3" }, \
-	{ FR_CONF_OFFSET("max_redirects", FR_TYPE_UINT32, fr_redis_conf_t, max_redirects), .dflt = "2" }
+	REDIS_TLS_CONFIG \
+	{ FR_CONF_OFFSET_FLAGS("server", CONF_FLAG_REQUIRED | CONF_FLAG_MULTI, fr_redis_conf_t, hostname) }, \
+	{ FR_CONF_OFFSET("port", fr_redis_conf_t, port), .dflt = "6379" }, \
+	{ FR_CONF_OFFSET("database", fr_redis_conf_t, database), .dflt = "0" }, \
+	{ FR_CONF_OFFSET("use_tls", fr_redis_conf_t, use_tls), .dflt = "no" }, \
+	{ FR_CONF_OFFSET("use_cluster_map", fr_redis_conf_t, use_cluster_map), .dflt = "yes" }, \
+	{ FR_CONF_OFFSET("username", fr_redis_conf_t, username) }, \
+	{ FR_CONF_OFFSET_FLAGS("password", CONF_FLAG_SECRET, fr_redis_conf_t, password) }, \
+	{ FR_CONF_OFFSET("max_nodes", fr_redis_conf_t, max_nodes), .dflt = "20" }, \
+	{ FR_CONF_OFFSET("max_alt", fr_redis_conf_t, max_alt), .dflt = "3" }, \
+	{ FR_CONF_OFFSET("max_redirects", fr_redis_conf_t, max_redirects), .dflt = "2" }, \
+	{ FR_CONF_OFFSET_SUBSECTION("pool", 0, fr_redis_conf_t, trunk_conf, trunk_config) }
 
 void		fr_redis_version_print(void);
+
+int		redis_dict_init(void);
 
 /*
  *	Command and resulting parsing
  */
-fr_redis_rcode_t	fr_redis_command_status(fr_redis_conn_t *conn, redisReply *reply);
-
-void			fr_redis_reply_print(fr_log_lvl_t lvl, redisReply *reply, request_t *request, int idx);
+void			fr_redis_reply_print(fr_log_lvl_t lvl, redisReply *reply, request_t *request, size_t idx,
+					     fr_redis_rcode_t status);
 
 int			fr_redis_reply_to_value_box(TALLOC_CTX *ctx, fr_value_box_t *out, redisReply *reply,
-						    fr_type_t dst_type, fr_dict_attr_t const *dst_enumv);
+						    fr_type_t dst_type, fr_dict_attr_t const *dst_enumv,
+						    bool box_error, bool shallow) CC_HINT(nonnull(2,3));
 
-int			fr_redis_reply_to_map(TALLOC_CTX *ctx, fr_map_list_t *out,
+int			fr_redis_reply_to_map(TALLOC_CTX *ctx, map_list_t *out,
 					      request_t *request, redisReply *key, redisReply *op, redisReply *value);
 
 int			fr_redis_tuple_from_map(TALLOC_CTX *pool, char const *out[], size_t out_len[], map_t *map);
 
-fr_redis_rcode_t	fr_redis_get_version(char *out, size_t out_len, fr_redis_conn_t *conn);
+int			fr_redis_parse_version(char *out, size_t out_len, redisReply *reply);
 
 uint32_t		fr_redis_version_num(char const *version);
-
-/*
- *	Process response from pipelined command.
- */
-fr_redis_rcode_t	fr_redis_pipeline_result(unsigned int *pipelined, fr_redis_rcode_t *rcode,
-						 redisReply *out[], size_t out_len,
-						 fr_redis_conn_t *conn) CC_HINT(nonnull);
 
 #ifdef __cplusplus
 }

@@ -115,7 +115,7 @@ RCSIDH(server_pair_h, "$Id$")
  *	- 0 if we allocated a new attribute.
  *	- -1 on failure.
  */
-#define pair_update_request(_attr, _da) fr_pair_update_by_da(request->request_ctx, _attr, &request->request_pairs, _da, 0)
+#define pair_update_request(_attr, _da) fr_pair_update_by_da_parent(request->request_ctx, _attr, _da)
 
 /** Return or allocate a fr_pair_t in the reply list
  *
@@ -126,7 +126,7 @@ RCSIDH(server_pair_h, "$Id$")
  *	- 0 if we allocated a new attribute.
  *	- -1 on failure.
  */
-#define pair_update_reply(_attr, _da) fr_pair_update_by_da(request->reply_ctx, _attr, &request->reply_pairs, _da, 0)
+#define pair_update_reply(_attr, _da) fr_pair_update_by_da_parent(request->reply_ctx, _attr, _da)
 
 /** Return or allocate a fr_pair_t in the control list
  *
@@ -137,7 +137,7 @@ RCSIDH(server_pair_h, "$Id$")
  *	- 0 if we allocated a new attribute.
  *	- -1 on failure.
  */
-#define pair_update_control(_attr, _da) fr_pair_update_by_da(request->control_ctx, _attr, &request->control_pairs, _da, 0)
+#define pair_update_control(_attr, _da) fr_pair_update_by_da_parent(request->control_ctx, _attr, _da)
 
 /** Return or allocate a fr_pair_t in the session_state list
  *
@@ -148,7 +148,7 @@ RCSIDH(server_pair_h, "$Id$")
  *	- 0 if we allocated a new attribute.
  *	- -1 on failure.
  */
-#define pair_update_session_state(_attr, _da) fr_pair_update_by_da(request->session_state_ctx, _attr, &request->session_state_pairs, _da, 0)
+#define pair_update_session_state(_attr, _da) fr_pair_update_by_da_parent(request->session_state_ctx, _attr, _da)
 
 /** Delete one or move fr_pair_t in a list
  *
@@ -157,8 +157,8 @@ RCSIDH(server_pair_h, "$Id$")
  */
 #define pair_delete(_list, _pair_or_da) \
 	_Generic((_pair_or_da), \
-		 fr_dict_attr_t const *		: fr_pair_delete_by_da(_list, UNCONST(fr_dict_attr_t *, _pair_or_da)),	\
-		 fr_dict_attr_t *		: fr_pair_delete_by_da(_list, UNCONST(fr_dict_attr_t *, _pair_or_da)),	\
+		 fr_dict_attr_t const *		: fr_pair_delete_by_da_nested(_list, UNCONST(fr_dict_attr_t *, _pair_or_da)),	\
+		 fr_dict_attr_t *		: fr_pair_delete_by_da_nested(_list, UNCONST(fr_dict_attr_t *, _pair_or_da)),	\
 		 fr_pair_t *			: fr_pair_delete(_list, UNCONST(fr_pair_t *, _pair_or_da))		\
 	)
 

@@ -1,0 +1,11 @@
+
+= FreeRADIUS Client configuration file - 4.0.0
+
+Don't automatically add a Proxy-State
+
+Does nothing other than proxying.
+
+These cannot be proxied for now
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

@@ -27,9 +27,8 @@ RCSID("$Id$")
 
 #include <freeradius-devel/server/command.h>
 #include <freeradius-devel/server/log.h>
-#include <freeradius-devel/util/debug.h>
 
-#include <freeradius-devel/util/misc.h>
+#include <freeradius-devel/util/skip.h>
 
 /*
  *	Registration hooks for radmin.
@@ -77,7 +76,7 @@ static int split(char **input, char **output, bool syntax_string);
 
 /*
  *	Hacks for simplicity.  These data types aren't allowed as
- *	parameters, so we can re-use them for something else.
+ *	parameters, so we can reuse them for something else.
  */
 
 // our fixed string.  Any data type LESS than this must be a real data type
@@ -101,12 +100,20 @@ static fr_cmd_t *fr_command_find(fr_cmd_t **head, char const *name, fr_cmd_t ***
 {
 	fr_cmd_t *cmd, **where = head;
 
-	if (!head || !name) return NULL;
+	if (!head || !name) {
+		if (insert) *insert = head;
+		return NULL;
+	}
 
 	if (!*head) {
 		if (insert) *insert = head;
 		return NULL;
 	}
+
+	/*
+	 *	Ensure if we exit in the loop insert is initialised
+	 */
+	if (insert) *insert = NULL;
 
 	for (cmd = *head; cmd != NULL; cmd = cmd->next) {
 		int status;
@@ -196,6 +203,7 @@ static bool fr_command_valid_name(char const *name)
 		if (fr_utf8_char(p, -1)) continue;
 
 		fr_strerror_const("Invalid non-UTF8 character in name");
+		return false;
 	}
 
 	return true;
@@ -214,8 +222,8 @@ static bool fr_command_valid_syntax(fr_cmd_argv_t *argv)
 	}
 
 	for (p = argv->name; *p != '\0'; p++) {
-		if (isupper((int) *p)) uppercase = true;
-		if (islower((int) *p)) lowercase = true;
+		if (isupper((uint8_t) *p)) uppercase = true;
+		if (islower((uint8_t) *p)) lowercase = true;
 	}
 
 	/*
@@ -242,7 +250,7 @@ static bool fr_command_valid_syntax(fr_cmd_argv_t *argv)
 	if (uppercase) {
 		fr_type_t type;
 
-		type = fr_table_value_by_str(fr_value_box_type_table, argv->name, FR_TYPE_NULL);
+		type = fr_table_value_by_str(fr_type_table, argv->name, FR_TYPE_NULL);
 		switch (type) {
 		case FR_TYPE_MAX:
 		case FR_TYPE_NULL:
@@ -297,8 +305,9 @@ static int split_alternation(char **input, char **output)
 
 	if ((*str == '[') || (*str == '(')) {
 		char end;
-		quote = *(str++);
 		int count = 0;
+
+		quote = *(str++);
 
 		if (quote == '[') {
 			end = ']';
@@ -469,8 +478,9 @@ static int split(char **input, char **output, bool syntax_string)
 
 	} else if (syntax_string && ((*str == '[') || (*str == '('))) {
 		char end;
-		quote = *(str++);
 		int count = 0;
+
+		quote = *(str++);
 
 		if (quote == '[') {
 			end = ']';
@@ -1194,7 +1204,7 @@ static int fr_command_tab_expand_argv(TALLOC_CTX *ctx, fr_cmd_t *cmd, fr_cmd_inf
 			ret = fr_command_tab_expand_argv(ctx, cmd, info, name, child, max_expansions - count, &expansions[count]);
 			if (!ret) continue;
 
-			count++;
+			count += ret;
 		}
 
 		return count;
@@ -1359,7 +1369,7 @@ int fr_command_tab_expand(TALLOC_CTX *ctx, fr_cmd_t *head, fr_cmd_info_t *info, 
 				p++; \
 				q++; \
 			} } while (0)
-#define MATCHED_NAME	((!*p || isspace((int) *p)) && !*q)
+#define MATCHED_NAME	((!*p || isspace((uint8_t) *p)) && !*q)
 #define TOO_FAR		(*p && (*q > *p))
 #define MATCHED_START	((text + start) >= word) && ((text + start) <= p)
 
@@ -1597,7 +1607,7 @@ static void fr_command_debug_internal(FILE *fp, fr_cmd_t *head, int depth)
 	}
 }
 
-void fr_command_debug(FILE *fp, fr_cmd_t *head)
+void fr_cmd_debug(FILE *fp, fr_cmd_t *head)
 {
 	fr_command_debug_internal(fp, head, 0);
 }
@@ -1835,7 +1845,9 @@ redo:
 	 *	Parse the data to be sure it's well formed.
 	 */
 	if (fr_value_box_from_str(ctx, box, type,
-				  NULL, name, -1, quote, true) < 0) {
+				  NULL,
+				  name, strlen(name),
+				  fr_value_unescape_by_char[(uint8_t)quote]) < 0) {
 		fr_strerror_printf_push("Failed parsing argument '%s'", name);
 		return -1;
 	}
@@ -1902,7 +1914,7 @@ static int syntax_str_to_argv(int start_argc, fr_cmd_argv_t *start, fr_cmd_info_
 {
 	int argc = start_argc;
 	int ret;
-	bool child_done;
+	bool child_done = false;
 	char const *word, *my_word, *p, *q;
 	fr_cmd_argv_t *argv = start;
 	fr_cmd_argv_t *child;
@@ -1920,6 +1932,7 @@ static int syntax_str_to_argv(int start_argc, fr_cmd_argv_t *start, fr_cmd_info_
 		 */
 		if (argv->type < FR_TYPE_FIXED) {
 			size_t len, offset;
+			fr_slen_t slen;
 			char quote, *str;
 			fr_type_t type;
 
@@ -1967,10 +1980,11 @@ static int syntax_str_to_argv(int start_argc, fr_cmd_argv_t *start, fr_cmd_info_
 				info->box[argc] = talloc_zero(info->box, fr_value_box_t);
 			}
 
-			ret = fr_value_box_from_str(info->box[argc], info->box[argc],
-						    type, NULL,
-						    word + offset, len - (offset << 1), quote, false);
-			if (ret < 0) return -1;
+			slen = fr_value_box_from_str(info->box[argc], info->box[argc],
+						     type, NULL,
+						     word + offset, len - (offset << 1),
+						     fr_value_unescape_by_char[(uint8_t)quote]);
+			if (slen < 0) return -1;
 
 			/*
 			 *	Note that argv[i] is the *input* string.
@@ -2094,7 +2108,7 @@ static int syntax_str_to_argv(int start_argc, fr_cmd_argv_t *start, fr_cmd_info_
 		/*
 		 *	Not done yet!
 		 */
-		fr_strerror_const("Internal sanity check failed");
+		fr_strerror_printf("%s: Internal sanity check failed", __FUNCTION__);
 		return -1;
 
 	next:
@@ -2328,7 +2342,7 @@ check_syntax:
 	if (!cmd->syntax_argv) {
 		fr_skip_whitespace(word);
 
-		if (*word > 0) goto too_many;
+		if (*(uint8_t const *)word > 0) goto too_many;
 
 		info->runnable = true;
 		info->argc = argc;
@@ -2423,20 +2437,6 @@ static int expand_all(fr_cmd_t *cmd, fr_cmd_info_t *info, fr_cmd_argv_t *argv, i
 		return count;
 	}
 
-	if (argv->type == FR_TYPE_ALTERNATE) {
-		for (child = argv->child; child != NULL; child = child->next) {
-			fr_cmd_argv_t *sub;
-
-			fr_assert(child->type == FR_TYPE_ALTERNATE_CHOICE);
-			fr_assert(child->child != NULL);
-			sub = child->child;
-
-			count = expand_all(cmd, info, sub, count, max_expansions, expansions);
-		}
-
-		return count;
-	}
-
 	/*
 	 *	@todo - might want to do something smarter here?
 	 */
@@ -2462,7 +2462,7 @@ static int expand_all(fr_cmd_t *cmd, fr_cmd_info_t *info, fr_cmd_argv_t *argv, i
 	return count + 1;
 }
 
-static int expand_syntax(fr_cmd_t *cmd, fr_cmd_info_t *info, fr_cmd_argv_t *argv, char const *text, int start,
+static int expand_syntax(fr_cmd_t *cmd, fr_cmd_info_t *info, fr_cmd_argv_t *argv, char const *text, size_t start,
 			 char const **word_p, int count, int max_expansions, char const **expansions)
 {
 	char const *p, *q;
@@ -2492,7 +2492,7 @@ static int expand_syntax(fr_cmd_t *cmd, fr_cmd_info_t *info, fr_cmd_argv_t *argv
 
 			count = expand_syntax(cmd, info, argv->child, text, start, &my_word, count, max_expansions, expansions);
 
-			if (word != my_word) *word_p = word;
+			if (word != my_word) *word_p = my_word;
 			continue;
 		}
 
@@ -2512,8 +2512,8 @@ static int expand_syntax(fr_cmd_t *cmd, fr_cmd_info_t *info, fr_cmd_argv_t *argv
 				 *	the input.  If so, use it.
 				 */
 				count = expand_syntax(cmd, info, sub, text, start, &my_word, count, max_expansions, expansions);
-				if (my_word != word) {
-					*word_p = word;
+				if (word != my_word) {
+					*word_p = my_word;
 					break;
 				}
 			}
@@ -2527,6 +2527,7 @@ static int expand_syntax(fr_cmd_t *cmd, fr_cmd_info_t *info, fr_cmd_argv_t *argv
 		if (argv->type < FR_TYPE_FIXED) {
 			int ret;
 			size_t len, offset;
+			fr_slen_t slen;
 			char quote, *my_word;
 			fr_type_t type = argv->type;
 
@@ -2541,7 +2542,7 @@ static int expand_syntax(fr_cmd_t *cmd, fr_cmd_info_t *info, fr_cmd_argv_t *argv
 					 *	Tell the caller the
 					 *	full name.
 					 */
-					if (!*p || (isspace((int) *p))) {
+					if (!*p || (isspace((uint8_t) *p))) {
 					expand_name:
 						expansions[count] = strdup(argv->name);
 						count++;
@@ -2585,10 +2586,11 @@ static int expand_syntax(fr_cmd_t *cmd, fr_cmd_info_t *info, fr_cmd_argv_t *argv
 				offset = 0;
 			}
 
-			ret = fr_value_box_from_str(info->box[info->argc], info->box[info->argc],
-						    type, NULL,
-						    word + offset, len - (offset << 1), quote, false);
-			if (ret < 0) return -1;
+			slen = fr_value_box_from_str(info->box[info->argc], info->box[info->argc],
+						     type, NULL,
+						     word + offset, len - (offset << 1),
+						     fr_value_unescape_by_char[(uint8_t)quote]);
+			if (slen < 0) return -1;
 			info->argc++;
 			*word_p = word = p;
 			continue;
@@ -2618,7 +2620,7 @@ static int expand_syntax(fr_cmd_t *cmd, fr_cmd_info_t *info, fr_cmd_argv_t *argv
 		 *	matching all of the name.  The input is a
 		 *	PARTIAL match.  Go fill it in.
 		 */
-		if (!*p || isspace((int) *p)) {
+		if (!*p || isspace((uint8_t) *p)) {
 			goto expand_name;
 		}
 
@@ -2650,7 +2652,7 @@ static int expand_syntax(fr_cmd_t *cmd, fr_cmd_info_t *info, fr_cmd_argv_t *argv
  *	- <0 on error
  *	- >= 0 number of expansions in the array
  */
-int fr_command_complete(fr_cmd_t *head, char const *text, int start,
+int fr_command_complete(fr_cmd_t *head, char const *text, size_t start,
 			int max_expansions, char const **expansions)
 {
 	char const *word, *p, *q;
@@ -2693,7 +2695,7 @@ int fr_command_complete(fr_cmd_t *head, char const *text, int start,
 				 *	Matched all of the input to
 				 *	part of cmd->name.
 				 */
-				if (!*p || isspace((int) *p)) {
+				if (!*p || isspace((uint8_t) *p)) {
 					expansions[count] = strdup(cmd->name);
 					count++;
 				}
@@ -2740,10 +2742,9 @@ int fr_command_complete(fr_cmd_t *head, char const *text, int start,
 		if (cmd->intermediate) {
 			fr_assert(cmd->child != NULL);
 			word = p;
-			cmd = cmd->child;
-
 			info->argv[info->argc] = cmd->name;
 			info->argc++;
+			cmd = cmd->child;
 			continue;
 		}
 

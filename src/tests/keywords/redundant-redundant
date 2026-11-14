@@ -1,68 +1,64 @@
-# PRE: update if foreach redundant redundant-load-balance
+# PRE: redundant redundant-load-balance
 #
 #  Nested redundant blocks.
 #
 #
-update request {
-	&Tmp-Integer-2 := 0
-	&Tmp-Integer-3 := 0
-	&Tmp-Integer-4 := 0
-	&Tmp-Integer-5 := 0
-}
+uint32 count1
+uint32 count2
+uint32 count3
+uint32 count4
+
+count1 = 0
+count2 = 0
+count3 = 0
+count4 = 0
 
 redundant {
 	redundant-load-balance {
 		group {
-			update request {
-				&Tmp-Integer-2 := "%{expr:&Tmp-Integer-2 + 1}"
-			}
+			count1 += 1
 			fail
 		}
 		group {
-			update request {
-				&Tmp-Integer-3 := "%{expr:&Tmp-Integer-3 + 1}"
-			}
+			count2 += 1
 			fail
 		}
 		group {
-			update request {
-				&Tmp-Integer-4 := "%{expr:&Tmp-Integer-4 + 1}"
-			}
+			count3 += 1
 			fail
 		}
 		group {
-			update request {
-				&Tmp-Integer-5 := "%{expr:&Tmp-Integer-5 + 1}"
-			}
+			count4 += 1
 			fail
 		}
 	}
+
+	#
+	#  All of the above fails, so we fail over to "ok".
+	#
 	ok
 }
 
 if (!ok) {
-	update reply {
-		&Filter-Id := "did not return OK"
-	}
-	return
-}
-
-if (&Tmp-Integer-2 != 1) {
 	test_fail
 	return
 }
 
-if (&Tmp-Integer-3 != 1) {
+if (!(count1 == 1)) {
+	test_fail
+}
+
+if (!(count2 == 1)) {
 	test_fail
 	return
 }
 
-if (&Tmp-Integer-4 != 1) {
+if (!(count3 == 1)) {
 	test_fail
 	return
 }
 
-if (&Tmp-Integer-5 != 1) {
+if (!(count4 == 1)) {
 	test_fail
 	return
 }

@@ -3,9 +3,10 @@
 #
 # Version:      $Id$
 #
-TARGET		:= libfreeradius-internal.a
+TARGET		:= libfreeradius-internal$(L)
+TGT_CATEGORY	:= lib-protocol
 
 SOURCES		:= decode.c \
 		   encode.c
 
-TGT_PREREQS	:= libfreeradius-util.a
+TGT_PREREQS	:= $(LIBFREERADIUS_UTIL)

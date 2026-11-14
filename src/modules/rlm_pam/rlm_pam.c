@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -31,7 +31,7 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 
 #include "config.h"
 
@@ -58,8 +58,8 @@ typedef struct {
 	bool		error;		//!< True if pam_conv failed.
 } rlm_pam_data_t;
 
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("pam_auth", FR_TYPE_STRING, rlm_pam_t, pam_auth_name) },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET("pam_auth", rlm_pam_t, pam_auth_name) },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -70,7 +70,7 @@ extern fr_dict_autoload_t rlm_pam_dict[];
 fr_dict_autoload_t rlm_pam_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_pam_auth;
@@ -82,12 +82,12 @@ fr_dict_attr_autoload_t rlm_pam_dict_attr[] = {
 	{ .out = &attr_pam_auth, .name = "Pam-Auth", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 	{ .out = &attr_user_name, .name = "User-Name", .type = FR_TYPE_STRING, .dict = &dict_radius },
 	{ .out = &attr_user_password, .name = "User-Password", .type = FR_TYPE_STRING, .dict = &dict_radius },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
-static int mod_instantiate(void *instance, UNUSED CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_pam_t *inst = instance;
+	rlm_pam_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_pam_t);
 
 	if (!inst->pam_auth_name) inst->pam_auth_name = main_config->name;
 
@@ -211,17 +211,17 @@ static int do_pam(request_t *request, char const *username, char const *passwd, 
 	return 0;
 }
 
-static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_authenticate(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_pam_t const		*data = talloc_get_type_abort_const(mctx->instance, rlm_pam_t);
+	rlm_pam_t const		*data = talloc_get_type_abort_const(mctx->mi->data, rlm_pam_t);
 	int			ret;
 	fr_pair_t		*pair;
 
 	char const		*pam_auth_string = data->pam_auth_name;
 	fr_pair_t		*username, *password;
 
-	username = fr_pair_find_by_da(&request->request_pairs, attr_user_name, 0);
-	password = fr_pair_find_by_da(&request->request_pairs, attr_user_password, 0);
+	username = fr_pair_find_by_da(&request->request_pairs, NULL, attr_user_name);
+	password = fr_pair_find_by_da(&request->request_pairs, NULL, attr_user_password);
 
 	/*
 	 *	We can only authenticate user requests which HAVE
@@ -229,12 +229,12 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	 */
 	if (!username) {
 		REDEBUG("Attribute \"User-Name\" is required for authentication");
-		RETURN_MODULE_INVALID;
+		RETURN_UNLANG_INVALID;
 	}
 
 	if (!password) {
 		REDEBUG("Attribute \"User-Password\" is required for authentication");
-		RETURN_MODULE_INVALID;
+		RETURN_UNLANG_INVALID;
 	}
 
 	/*
@@ -242,7 +242,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	 */
 	if (password->vp_length == 0) {
 		REDEBUG("User-Password must not be empty");
-		RETURN_MODULE_INVALID;
+		RETURN_UNLANG_INVALID;
 	}
 
 	/*
@@ -258,25 +258,29 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	 *	Let control list over-ride the PAM auth name string,
 	 *	for backwards compatibility.
 	 */
-	pair = fr_pair_find_by_da(&request->control_pairs, attr_pam_auth, 0);
+	pair = fr_pair_find_by_da(&request->control_pairs, NULL, attr_pam_auth);
 	if (pair) pam_auth_string = pair->vp_strvalue;
 
 	ret = do_pam(request, username->vp_strvalue, password->vp_strvalue, pam_auth_string);
-	if (ret < 0) RETURN_MODULE_REJECT;
+	if (ret < 0) RETURN_UNLANG_REJECT;
 
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
-extern module_t rlm_pam;
-module_t rlm_pam = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "pam",
-	.type		= RLM_TYPE_THREAD_UNSAFE,	/* The PAM libraries are not thread-safe */
-	.inst_size	= sizeof(rlm_pam_t),
-	.config		= module_config,
-	.instantiate	= mod_instantiate,
-	.methods = {
-		[MOD_AUTHENTICATE]	= mod_authenticate
+extern module_rlm_t rlm_pam;
+module_rlm_t rlm_pam = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "pam",
+		.flags		= MODULE_TYPE_THREAD_UNSAFE,	/* The PAM libraries are not thread-safe */
+		.inst_size	= sizeof(rlm_pam_t),
+		.config		= module_config,
+		.instantiate	= mod_instantiate
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("authenticate", CF_IDENT_ANY), .method = mod_authenticate },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };
-

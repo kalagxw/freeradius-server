@@ -32,8 +32,6 @@ RCSIDH(dhcpv6_h, "$Id$")
 
 #include <freeradius-devel/protocol/dhcpv6/dictionary.h>
 
-extern size_t const fr_dhcpv6_attr_sizes[FR_TYPE_MAX + 1][2];
-
 #define DHCPV6_MSG_TYPE_LEN		1U
 
 #define DHCPV6_TRANSACTION_ID_LEN	3U
@@ -46,10 +44,12 @@ extern size_t const fr_dhcpv6_attr_sizes[FR_TYPE_MAX + 1][2];
 #define DHCPV6_RELAY_HDR_LEN		(DHCPV6_MSG_TYPE_LEN + DHCPV6_HOP_COUNT_LEN + DHCPV6_LINK_ADDRESS_LEN + DHCPV6_PEER_ADDRESS_LEN)
 #define DHCPV6_OPT_HDR_LEN		(sizeof(uint16_t) * 2)
 
-#define DHCPV6_GET_OPTION_NUM(_x)	fr_net_to_uint16(_x)
-#define DHCPV6_GET_OPTION_LEN(_x)	fr_net_to_uint16((_x) + 2)
+#define DHCPV6_GET_OPTION_NUM(_x)	fr_nbo_to_uint16(_x)
+#define DHCPV6_GET_OPTION_LEN(_x)	fr_nbo_to_uint16((_x) + 2)
 
 #define DHCPV6_MAX_RELAY_NESTING	10
+
+#define DHCPV6_MAX_ATTRIBUTES		1024
 
 /*
  *	Defined addresses from RFC 8415 Section 7.1
@@ -63,7 +63,7 @@ extern size_t const fr_dhcpv6_attr_sizes[FR_TYPE_MAX + 1][2];
  *	Copied from src/include/protocols/dhcpv6/freeradius.internal.h
  *	and edited.
  */
-typedef enum {
+typedef enum : uint16_t {
 	FR_DHCPV6_INVALID = 0,
 	FR_DHCPV6_SOLICIT = 1,
 	FR_DHCPV6_ADVERTISE = 2,
@@ -106,17 +106,11 @@ typedef enum {
 
 #define FR_DHCPV6_PACKET_CODE_VALID(_code) (((_code) > 0) && ((_code) < FR_DHCPV6_CODE_MAX))
 
-extern char const		*fr_dhcpv6_packet_types[FR_DHCPV6_CODE_MAX];
+extern char const		*fr_dhcpv6_packet_names[FR_DHCPV6_CODE_MAX];
 
 /** subtype values for DHCPv4 and DHCPv6
  *
  */
-enum {
-	FLAG_ENCODE_NONE = 0,				//!< no particular encoding for DHCPv6 strings
-	FLAG_ENCODE_DNS_LABEL,				//!< encode as DNS label
-	FLAG_ENCODE_PARTIAL_DNS_LABEL, 			//!< encode as a partial DNS label
-};
-
 typedef struct CC_HINT(__packed__) {
 	uint8_t		code;
 	uint8_t		transaction_id[3];
@@ -138,15 +132,61 @@ typedef struct {
 typedef struct {
 	TALLOC_CTX		*tmp_ctx;		//!< for temporary things cleaned up during decoding
 	uint32_t		transaction_id;		//!< previous transaction ID
-	uint8_t			*duid;			//!< the expected DUID, in wire format
+	uint8_t const  		*duid;			//!< the expected DUID, in wire format
 	size_t			duid_len;		//!< length of the expected DUID
 } fr_dhcpv6_decode_ctx_t;
+
+typedef struct {
+	bool			dns_label;
+	bool			partial_dns_label;
+} fr_dhcpv6_attr_flags_t;
+
+extern fr_dict_protocol_t libfreeradius_dhcpv6_dict_protocol;
+
+/** Return DHCPv6-specific flags for a given attribute
+ *
+ * Assert in debug builds when the attribute belongs to another dictionary, as
+ * the flags of one protocol say nothing about an attribute of another.
+ *
+ * If the attribute does not carry the protocol-specific extension, then assert.
+ * Other builds log the error and return zeroed flags instead of NULL.
+ */
+static inline fr_dhcpv6_attr_flags_t const *fr_dhcpv6_attr_flags(fr_dict_attr_t const *da)
+{
+	static fr_dhcpv6_attr_flags_t const	no_flags = {};
+	fr_dhcpv6_attr_flags_t const		*flags;
+
+	fr_assert_msg(fr_dict_protocol(da->dict) == &libfreeradius_dhcpv6_dict_protocol,
+		      "%s is not a DHCPv6 attribute, it is from the \"%s\" dictionary",
+		      da->name, fr_dict_root(da->dict)->name);
+
+	flags = fr_dict_attr_ext(da, FR_DICT_ATTR_EXT_PROTOCOL_SPECIFIC);
+	if (!fr_cond_assert_msg(flags, "%s is not a DHCPv6 attribute, it has no protocol extension",
+				da->name)) return &no_flags;
+
+	return flags;
+}
+
+static inline bool fr_dhcpv6_flag_dns_label(fr_dict_attr_t const *da)
+{
+	return fr_dhcpv6_attr_flags(da)->dns_label;
+}
+
+static inline bool fr_dhcpv6_flag_partial_dns_label(fr_dict_attr_t const *da)
+{
+	return fr_dhcpv6_attr_flags(da)->partial_dns_label;
+}
+
+static inline bool fr_dhcpv6_flag_any_dns_label(fr_dict_attr_t const *da)
+{
+	fr_dhcpv6_attr_flags_t const *flags = fr_dhcpv6_attr_flags(da);
+
+	return flags->dns_label || flags->partial_dns_label;
+}
 
 /*
  *	base.c
  */
-size_t		fr_dhcpv6_option_len(fr_pair_t const *vp);
-
 uint8_t const	*fr_dhcpv6_option_find(uint8_t const *start, uint8_t const *end, unsigned int option);
 
 bool		fr_dhcpv6_ok(uint8_t const *packet, size_t packet_len,
@@ -158,8 +198,7 @@ bool		fr_dhcpv6_verify(uint8_t const *packet, size_t packet_len, fr_dhcpv6_decod
 ssize_t		fr_dhcpv6_encode(fr_dbuff_t *dbuff, uint8_t const *original, size_t length,
 				 int msg_type, fr_pair_list_t *vps);
 
-ssize_t		fr_dhcpv6_decode(TALLOC_CTX *ctx, uint8_t const *packet, size_t packet_len,
-				 fr_dcursor_t *cursor);
+ssize_t		fr_dhcpv6_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, uint8_t const *packet, size_t packet_len);
 
 void		fr_dhcpv6_print_hex(FILE *fp, uint8_t const *packet, size_t packet_len);
 
@@ -170,10 +209,17 @@ void		fr_dhcpv6_global_free(void);
 /*
  *	encode.c
  */
+void		*fr_dhcpv6_next_encodable(fr_dcursor_t *cursor, void *current, void *uctx);
+
 ssize_t		fr_dhcpv6_encode_option(fr_dbuff_t *dbuff, fr_dcursor_t *cursor, void * encode_ctx);
+
+ssize_t		fr_dhcpv6_encode_foreign(fr_dbuff_t *dbuff, fr_pair_list_t const *list);
 
 /*
  *	decode.c
  */
-ssize_t		fr_dhcpv6_decode_option(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+ssize_t		fr_dhcpv6_decode_option(TALLOC_CTX *ctx, fr_pair_list_t *out,
 					uint8_t const *data, size_t data_len, void *decode_ctx);
+
+ssize_t		fr_dhcpv6_decode_foreign(TALLOC_CTX *ctx, fr_pair_list_t *out,
+					 uint8_t const *data, size_t data_len);

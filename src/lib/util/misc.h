@@ -29,13 +29,15 @@ extern "C" {
 
 #include <freeradius-devel/build.h>
 #include <freeradius-devel/missing.h>
+#include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/print.h>
+#include <freeradius-devel/util/strerror.h>
 #include <freeradius-devel/util/talloc.h>
 #include <freeradius-devel/util/time.h>
 
 #include <signal.h>
 
-typedef		int8_t (*fr_cmp_t)(void const *a, void const *b);
+typedef		fr_cmp_ret_t (*fr_cmp_t)(void const *a, void const *b);
 typedef		void (*fr_free_t)(void *);
 
 /*
@@ -52,43 +54,11 @@ void		fr_talloc_verify_cb(const void *ptr, int depth,
 #  define VERIFY_ALL_TALLOC
 #endif
 
-/** Round up - Only works if _mul is a power of 2 but avoids division
- */
-#define ROUND_UP_POW2(_num, _mul)	(((_num) + ((_mul) - 1)) & ~((_mul) - 1))
-
-/** Round up - Works in all cases, but is slower
- */
-#define ROUND_UP(_num, _mul)		(((((_num) + ((_mul) - 1))) / (_mul)) * (_mul))
-
-/** Get the ceiling value of integer division
- *
- */
-#define ROUND_UP_DIV(_x, _y)	(1 + (((_x) - 1) / (_y)))
-
-/** Skip whitespace ('\\t', '\\n', '\\v', '\\f', '\\r', ' ')
- *
- * @param[in,out] _p	string to skip over.
- */
-#define fr_skip_whitespace(_p) while(isspace((int)*(_p))) _p++
-
-/** Skip whitespace, stopping at end ('\\t', '\\n', '\\v', '\\f', '\\r', ' ')
- *
- * @param[in,out] _p	string to skip over.
- * @param[in] _e	pointer to end of string.
- */
-#define fr_bskip_whitespace(_p, _e) while((_p < _e) && isspace((int)*(_p))) _p++
-
-/** Skip everything that's not whitespace ('\\t', '\\n', '\\v', '\\f', '\\r', ' ')
- *
- * @param[in,out] _p	string to skip over.
- */
-#define fr_skip_not_whitespace(_p) while(*_p && !isspace((int)*(_p))) _p++
-
 /** Zero out any whitespace with nul bytes
  *
  * @param[in,out] _p	string to process
  */
-#define fr_zero_whitespace(_p) 	while (isspace((int) *_p)) *(_p++) = '\0'
+#define fr_zero_whitespace(_p) 	while (isspace((uint8_t) *_p)) *(_p++) = '\0'
 
 /** Check whether the string is all whitespace
  *
@@ -98,11 +68,11 @@ void		fr_talloc_verify_cb(const void *ptr, int depth,
  */
 static inline bool is_whitespace(char const *value)
 {
-#ifdef __clang_analyzer__
+#ifdef STATIC_ANALYZER
 	if (*value == '\0') return false;	/* clang analyzer doesn't seem to know what isspace does */
 #endif
 	do {
-		if (!isspace(*value)) return false;
+		if (!isspace((uint8_t) *value)) return false;
 	} while (*++value);
 
 	return true;
@@ -140,11 +110,11 @@ static inline bool is_whitespace(char const *value)
  */
 static inline bool is_integer(char const *value)
 {
-#ifdef __clang_analyzer__
+#ifdef STATIC_ANALYZER
 	if (*value == '\0') return false;	/* clang analyzer doesn't seem to know what isdigit does */
 #endif
 	do {
-		if (!isdigit(*value)) return false;
+		if (!isdigit((uint8_t) *value)) return false;
 	} while (*++value);
 
 	return true;
@@ -165,25 +135,6 @@ static inline bool is_zero(char const *value)
 	return true;
 }
 
-/** Find the highest order bit in an unsigned 64 bit integer
- *
- * @return 0-64 indicating the position of the highest bit,
- *	with 0 indicating no high bits, 1 indicating the 1st
- *	bit and 64 indicating the last bit.
- */
-static inline uint8_t fr_high_bit_pos(uint64_t num)
-{
-	if (num == 0) return 0;	/* num being zero is undefined behaviour for __builtin_clzll */
-
-#ifdef HAVE_BUILTIN_CLZLL
-	return (64 - __builtin_clzll(num));
-#else
-	uint8_t ret = 1;
-	while (num >>= 1) ret++;
-	return ret;
-#endif
-}
-
 int		fr_set_signal(int sig, sig_t func);
 int		fr_unset_signal(int sig);
 int		rad_lockfd(int fd, int lock_len);
@@ -192,22 +143,29 @@ int		rad_unlockfd(int fd, int lock_len);
 int		fr_strtoull(uint64_t *out, char **end, char const *value);
 int		fr_strtoll(int64_t *out, char **end, char const *value);
 char		*fr_trim(char const *str, size_t size);
+char		*fr_tolower(char *str);
 
 int		fr_nonblock(int fd);
 int		fr_blocking(int fd);
+int		fr_cloexec(int fd);
 
-ssize_t		fr_writev(int fd, struct iovec vector[], int iovcnt, fr_time_delta_t timeout);
 ssize_t		fr_utf8_to_ucs2(uint8_t *out, size_t outlen, char const *in, size_t inlen);
 size_t		fr_snprint_uint128(char *out, size_t outlen, uint128_t const num);
-int		fr_unix_time_from_str(fr_unix_time_t *date, char const *date_str, fr_time_res_t hint);
 
-bool		fr_multiply(uint64_t *result, uint64_t lhs, uint64_t rhs);
-uint64_t	fr_multiply_mod(uint64_t lhs, uint64_t rhs, uint64_t mod);
-
-int		fr_size_from_str(size_t *out, char const *str);
-int8_t		fr_pointer_cmp(void const *a, void const *b);
-void		fr_quick_sort(void const *to_sort[], int min_idx, int max_idx, fr_cmp_t cmp);
+fr_cmp_ret_t	fr_pointer_cmp(void const *a, void const *b);
+int		fr_quick_sort(void const *to_sort[], int min_idx, int max_idx, fr_cmp_t cmp);
 int		fr_digest_cmp(uint8_t const *a, uint8_t const *b, size_t length) CC_HINT(nonnull);
+
+/*
+ *	Some libraries need to call suid up/down, except that those are functions in the server, and we don't
+ *	want to link everything to the server library.  As a result, we include trampoline functions which do
+ *	nothing, but which can be over-written by the server when is starts.
+ */
+typedef void (*fr_suid_t)(void);
+
+void		fr_suid_noop(void);
+extern		fr_suid_t fr_suid_up;
+extern		fr_suid_t fr_suid_down;
 
 #ifdef __cplusplus
 }

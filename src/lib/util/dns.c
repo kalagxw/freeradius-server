@@ -19,15 +19,117 @@
  * @file src/lib/util/dns.c
  *
  * @copyright 2019 The FreeRADIUS server project
- * @copyright 2019 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2019 Network RADIUS SAS (legal@networkradius.com)
  */
 RCSID("$Id$")
 
 #include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/strerror.h>
-#include <freeradius-devel/util/talloc.h>
 #include <freeradius-devel/util/value.h>
 #include <freeradius-devel/util/dns.h>
+#include <freeradius-devel/util/proto.h>
+
+#define MAX_OFFSET (1 << 14)
+
+static int dns_label_add(fr_dns_labels_t *lb, uint8_t const *start, uint8_t const *end)
+{
+	size_t offset, size = end - start;
+	fr_dns_block_t *block;
+
+	/*
+	 *	If we don't care about tracking the blocks, then don't
+	 *	do anything.
+	 */
+	if (!lb) return 0;
+
+	fr_assert(start >= lb->start);
+	fr_assert(end >= start);
+
+	offset = start - lb->start;
+
+	/*
+	 *	DNS packets can be up to 64K in size, but the
+	 *	compressed pointers can only be up to 2^14 in size.
+	 *	So we just ignore offsets which are greater than 2^14.
+	 */
+	if ((offset + size) >= MAX_OFFSET) return 0;
+
+	/*
+	 *	We're not tracking labels, so don't do anything.
+	 */
+	if (lb->max == 1) return 0;
+
+	FR_PROTO_TRACE("adding label at offset %zu", offset);
+
+	/*
+	 *	We add blocks append-only.  No adding new blocks in
+	 *	the middle of a packet.
+	 */
+	block = &lb->blocks[lb->num - 1];
+	fr_assert(block->start <= offset);
+	fr_assert(offset);
+
+	FR_PROTO_TRACE("Last block (%d) is %u..%u", lb->num - 1, block->start, block->end);
+
+	/*
+	 *	Fits within an existing block.
+	 */
+	if (block->end == offset) {
+		block->end += size;
+		FR_PROTO_TRACE("Expanding last block (%d) to %u..%u", lb->num - 1, block->start, block->end);
+		return 0;
+	}
+
+	/*
+	 *	It's full, die.
+	 */
+	if (lb->num == lb->max) return -1;
+
+	lb->num++;
+	block++;
+
+	block->start = offset;
+	block->end = offset + size;
+	FR_PROTO_TRACE("Appending block (%d) to %u..%u", lb->num - 1, block->start, block->end);
+
+	return 0;
+}
+
+static void dns_label_mark(fr_dns_labels_t *lb, uint8_t const *p)
+{
+	if (!lb || !lb->mark) return;
+
+	fr_assert(p >= (lb->start + 12)); /* can't point to the packet header */
+	fr_assert(!lb->end || (p < lb->end));
+
+	lb->mark[p - lb->start] = 1;
+}
+
+
+static bool dns_pointer_valid(fr_dns_labels_t *lb, uint16_t offset)
+{
+	int i;
+
+	if (!lb) return true;	/* we have no idea, so allow it */
+
+	if (lb->mark) return (lb->mark[offset] != 0);
+
+	/*
+	 *	Brute-force searching.
+	 *
+	 *	@todo - manually walk through the pointers for the block?
+	 */
+	for (i = 0; i < lb->num; i++) {
+		FR_PROTO_TRACE("Checking block %d %u..%u against %u",
+			       i, lb->blocks[i].start, lb->blocks[i].end, offset);
+
+		if (offset < lb->blocks[i].start) return false;
+
+		if (offset < lb->blocks[i].end) return true;
+	}
+
+	return false;
+}
 
 /** Compare two labels in a case-insensitive fashion.
  *
@@ -49,9 +151,8 @@ static bool labelcmp(uint8_t const *a, uint8_t const *b, size_t len)
 		 *	do case insensitive comparisons of them, so
 		 *	they can't match.
 		 */
-		if ((*a < 'A') || (*b < 'A')) {
-			return false;
-		}
+		if (!(((*a >= 'a') && (*a <= 'z')) || ((*a >= 'A') && (*a <= 'Z')))) return false;
+		if (!(((*b >= 'a') && (*b <= 'z')) || ((*b >= 'A') && (*b <= 'Z')))) return false;
 
 		/*
 		 *	If they're equal but different case, then the
@@ -68,7 +169,7 @@ static bool labelcmp(uint8_t const *a, uint8_t const *b, size_t len)
 	return true;
 }
 
-/** Compress "label" by looking at it recursively.
+/** Compress "label" by looking at the label recursively.
  *
  *  For "ftp.example.com", it searches the input buffer for a matching
  *  "com".  It only does string compares if it finds bytes "03 xx xx
@@ -124,6 +225,9 @@ static bool labelcmp(uint8_t const *a, uint8_t const *b, size_t len)
  *  no existing 3-label name which matches a 3-label name in the
  *  buffer.
  *
+ *  Note that this function does NOT follow pointers in the input
+ *  buffer!
+ *
  *
  *  A different and more straightforward approach is to loop over all
  *  labels in the name from longest to shortest, and comparing them to
@@ -148,6 +252,7 @@ static bool labelcmp(uint8_t const *a, uint8_t const *b, size_t len)
  *  the input buffer.  In contrast, because our algorithm does not do
  *  pointer following, it only compares "com" to "org" once.
  *
+ * @param[in] packet	  where the packet starts
  * @param[in] start	  input buffer holding one or more labels
  * @param[in] end	  end of the input buffer
  * @param[out] new_search Where the parent call to dns_label_compress()
@@ -158,12 +263,13 @@ static bool labelcmp(uint8_t const *a, uint8_t const *b, size_t len)
  *	- false, we didn't compress the input
  *	- true, we did compress the input.
  */
-static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t const **new_search,
+static bool dns_label_compress(uint8_t const *packet, uint8_t const *start, uint8_t const *end, uint8_t const **new_search,
 			       uint8_t *label, uint8_t **label_end)
 {
 	uint8_t *next;
 	uint8_t const *q, *ptr, *suffix, *search;
 	uint16_t offset;
+	bool compressed = false;
 
 	/*
 	 *	Don't compress "end of label" byte or pointers.
@@ -182,7 +288,7 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
 	 *	Note that by design, next > end.  We don't care about
 	 *	the size of the buffer we put "label" into.  We only
 	 *	care that all bytes of "label" are valid, and we don't
-	 *	access memroy after "label".
+	 *	access memory after "label".
 	 */
 
 	/*
@@ -266,7 +372,7 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
 			 *	which matches.
 			 */
 			ptr = q + *q + 1;
-			if (ptr > end) return false;
+			if (ptr >= end) return false;
 
 			/*
 			 *	Label lengths aren't the same, skip
@@ -292,7 +398,7 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
 			 *	point to it.  This check is mainly for
 			 *	static analyzers.
 			 */
-			if ((q - start) > (1 << 14)) return false;
+			if ((q - packet) >= MAX_OFFSET) return false;
 
 			/*
 			 *	Only now do case-insensitive
@@ -312,7 +418,7 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
 			 *	that we managed to compress this
 			 *	label.
 			 */
-			offset = (q - start);
+			offset = (q - packet);
 			label[0] = (offset >> 8) | 0xc0;
 			label[1] = offset & 0xff;
 			*label_end = label + 2;
@@ -327,12 +433,13 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
 	 *	The next label is still uncompressed, so we call
 	 *	ourselves recursively in order to compress it.
 	 */
-	if (*next < 63) {
-		if (!dns_label_compress(start, end, &search, next, label_end)) return false;
+	if (*next <= 63) {
+		if (!dns_label_compress(packet, start, end, &search, next, label_end)) return false;
 
 		/*
 		 *	Else it WAS compressed.
 		 */
+		compressed = true;
 	}
 
 	/*
@@ -341,13 +448,13 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
 	 *	static analysis tools.
 	 */
 	if (*next < 0xc0) {
-		return false;
+		return compressed;
 	}
 
 	/*
 	 *	Remember where our suffix points to.
 	 */
-	suffix = start + ((next[0] & ~0xc0) << 8) + next[1];
+	suffix = packet + ((next[0] & ~0xc0) << 8) + next[1];
 
 	/*
 	 *	Our label now ends with a compressed pointer.  Scan
@@ -399,7 +506,7 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
 		 *	buffer.  Check for a match.
 		 */
 		ptr = q + *q + 1;
-		if (ptr > end) return false;
+		if (ptr >= end) return compressed;
 
 		/*
 		 *	Label lengths aren't the same, skip it.
@@ -413,7 +520,7 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
 		 *	If the NEXT label is uncompressed, then skip
 		 *	it unless it's the suffix we're pointing to.
 		 */
-		if (*ptr < 63) {
+		if (*ptr <= 63) {
 			if (ptr != suffix) {
 				q = ptr;
 				continue;
@@ -447,7 +554,7 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
 		 *	Pointer is too far away.  Don't point
 		 *	to it.
 		 */
-		if ((q - start) > (1 << 14)) return false;
+		if ((q - packet) >= MAX_OFFSET) return compressed;
 
 		/*
 		 *	Only now do case-insensitive
@@ -467,7 +574,7 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
 		 *	that we managed to compress this
 		 *	label.
 		 */
-		offset = (q - start);
+		offset = (q - packet);
 		label[0] = (offset >> 8) | 0xc0;
 		label[1] = offset & 0xff;
 		*label_end = label + 2;
@@ -478,7 +585,7 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
 	/*
 	 *	Who knows what it is, we couldn't compress it.
 	 */
-	return false;
+	return compressed;
 }
 
 
@@ -488,22 +595,20 @@ static bool dns_label_compress(uint8_t const *start, uint8_t const *end, uint8_t
  * @param[in] dbuff	Buffer where labels are written
  * @param[in] compression Whether or not to do DNS label compression.
  * @param[in] value	to encode.
+ * @param[in] lb	label tracking data structure.
  * @return
- *	- >0 the number of bytes written to the dbuff
- *	- 0 could not encode anything, an error has occurred.
- *	- <0 the number of bytes the dbuff should have had, instead of "remaining".
+ *	- >=0 the number of bytes written to the dbuff
+ *	- <0 error
  */
-ssize_t fr_dns_label_from_value_box_dbuff(fr_dbuff_t *dbuff, bool compression, fr_value_box_t const *value)
+ssize_t fr_dns_label_from_value_box_dbuff(fr_dbuff_t *dbuff, bool compression, fr_value_box_t const *value, fr_dns_labels_t *lb)
 {
 	ssize_t			slen;
 	size_t			need = 0;
 
-	slen = fr_dns_label_from_value_box(&need, dbuff->p, fr_dbuff_remaining(dbuff), dbuff->p, compression, value);
-	if (slen < 0) return 0;
+	slen = fr_dns_label_from_value_box(&need, dbuff->p, fr_dbuff_remaining(dbuff), dbuff->p, compression, value, lb);
+	if (slen < 0) return -need;
 
-	if (slen == 0) return -need;
-
-	fr_dbuff_advance(dbuff, (size_t)slen);
+	fr_dbuff_advance(dbuff, (size_t) slen);
 	return slen;
 }
 
@@ -522,23 +627,27 @@ ssize_t fr_dns_label_from_value_box_dbuff(fr_dbuff_t *dbuff, bool compression, f
  * @param[out] where	Where to write this label
  * @param[in] compression Whether or not to do DNS label compression.
  * @param[in] value	to encode.
+ * @param[in] lb	label tracking data structure
  * @return
  *	- 0 no bytes were written, see need value to determine
  *	- >0 the number of bytes written to "where", NOT "buf + where + outlen"
  *	- <0 on error.
  */
 ssize_t fr_dns_label_from_value_box(size_t *need, uint8_t *buf, size_t buf_len, uint8_t *where, bool compression,
-				    fr_value_box_t const *value)
+				    fr_value_box_t const *value, fr_dns_labels_t *lb)
 {
 	uint8_t *label;
-	uint8_t const *end = buf + buf_len;
+	uint8_t const *end;
 	uint8_t const *q, *strend, *last;
 	uint8_t *data;
+	bool underscore = true;
 
 	if (!buf || !buf_len || !where || !value) {
 		fr_strerror_const("Invalid input");
 		return -1;
 	}
+
+	end = buf + buf_len;
 
 	/*
 	 *	Don't allow stupidities
@@ -585,7 +694,19 @@ ssize_t fr_dns_label_from_value_box(size_t *need, uint8_t *buf, size_t buf_len, 
 		return -1;
 	}
 
+	/*
+	 *	Convert it piece by piece.
+	 */
 	while (q < strend) {
+		/*
+		 *	Allow underscore at the start of a label.
+		 */
+		if (underscore) {
+			underscore = false;
+
+			if (*q == '_') goto next;
+		}
+
 		if (*q == '.') {
 			/*
 			 *	Don't count final dot as an
@@ -603,12 +724,19 @@ ssize_t fr_dns_label_from_value_box(size_t *need, uint8_t *buf, size_t buf_len, 
 			}
 			last = q;
 
+			/*
+			 *	We had a dot, allow underscore as the
+			 *	first character of the next label.
+			 */
+			underscore = true;
+
 		} else if (!((*q == '-') || ((*q >= '0') && (*q <= '9')) ||
 			     ((*q >= 'A') && (*q <= 'Z')) || ((*q >= 'a') && (*q <= 'z')))) {
-			fr_strerror_printf("Invalid character %02x in label", *q);
+			fr_strerror_printf("Invalid character 0x%02x in label", *q);
 			return -1;
 		}
 
+	next:
 		q++;
 
 		if ((q - last) > 63) {
@@ -671,17 +799,67 @@ ssize_t fr_dns_label_from_value_box(size_t *need, uint8_t *buf, size_t buf_len, 
 	*(data++) = 0;		/* end of label */
 
 	/*
-	 *	Only one label, don't compress it.  Or, the label is
-	 *	already compressed.
+	 *	If we're compressing it, and we have data to compress,
+	 *	then do it.
 	 */
-	if (!compression || (buf == where) || ((data - where) <= 2)) goto done;
+	if (compression && ((data - where) > 2)) {
+		if (lb) {
+			int i;
 
-	/*
-	 *	Compress it, AND tell us where the new end buffer is located.
-	 */
-	(void) dns_label_compress(buf, where, NULL, where, &data);
+			/*
+			 *	Loop over the parts of the packet which have DNS labels.
+			 *
+			 *	Note that the dns_label_compress() function does NOT follow pointers in the
+			 *	start/end block which it's searching!  It just tries to compress the *input*,
+			 *	and assumes that the input is compressed last label to first label.
+			 *
+			 *	In addition, dns_label_compress() tracks where in the block it started
+			 *	searching.  So it only scans the block once, even if we pass a NULL search
+			 *	parameter to it.
+			 *
+			 *	We could start compression from the *last* block.  When we add
+			 *	"www.example.com" and then "ftp.example.com", we could point "ftp" to the
+			 *	"example.com" portion. which is already in the packet.  However, doing that
+			 *	would require that dns_label_compress() follows pointers in the block it's
+			 *	searching. Which would greatly increase the complexity of the algorithm.
+			 *
+			 *
+			 *	We could still optimize this algorithm a bit, by tracking which parts of the
+			 *	buffer have DNS names of label length 1, 2, etc.  Doing that would mean more
+			 *	complex data structures, but fewer passes over the packet.
+			 */
+			for (i = 0; i < lb->num; i++) {
+				bool compressed;
 
-done:
+				FR_PROTO_TRACE("Trying to compress %s in block %d of %u..%u",
+					       value->vb_strvalue, i,
+					       lb->blocks[i].start, lb->blocks[i].end);
+
+				compressed = dns_label_compress(lb->start, lb->start + lb->blocks[i].start,
+								lb->start + lb->blocks[i].end,
+								NULL, where, &data);
+				if (compressed) {
+					FR_PROTO_TRACE("Compressed label in block %d", i);
+					if (*(where + *where + 1) >= 0xc0) {
+						FR_PROTO_TRACE("Next label is compressed, stopping");
+					}
+				}
+			}
+
+			dns_label_add(lb, where, data);
+
+		} else if (buf != where) {
+			if (dns_label_compress(buf, buf, where, NULL, where, &data)) {
+				FR_PROTO_TRACE("Compressed single label %s to %zu bytes",
+					       value->vb_strvalue, (size_t) (data - where));
+			} else {
+				FR_PROTO_TRACE("Did not compress single label");
+			}
+		}
+	} else {
+		FR_PROTO_TRACE("Not compressing label");
+	}
+
 	fr_assert(data > where);
 	return data - where;
 }
@@ -693,34 +871,42 @@ done:
  *
  *  Note that a bare 0x00 byte has length 1, to account for '.'
  *
+ * @param[in] packet	  where the packet starts
  * @param[in] buf	buffer holding one or more DNS labels
  * @param[in] buf_len	total length of the buffer
  * @param[in,out] next	the DNS label to check, updated to point to the next label
+ * @param[in] lb	label tracking data structure
  * @return
  *	- <=0 on error, offset from buf where the invalid label is located.
  *	- > 0 decoded size of this particular DNS label
  */
-ssize_t fr_dns_label_uncompressed_length(uint8_t const *buf, size_t buf_len, uint8_t const **next)
+ssize_t fr_dns_label_uncompressed_length(uint8_t const *packet, uint8_t const *buf, size_t buf_len, uint8_t const **next, fr_dns_labels_t *lb)
 {
-	uint8_t const *p, *q, *end;
+	uint8_t const *p, *q, *end, *label_end;
 	uint8_t const *current, *start;
 	size_t length;
-	bool at_first_label, set_next;
+	bool at_first_label, already_set_next;
 
-	if (!buf || (buf_len == 0) || !next) return 0;
+	if (!packet || !buf || (buf_len == 0) || !next) {
+		fr_strerror_printf("Invalid argument");
+		return 0;
+	}
 
 	start = *next;
 
 	/*
 	 *	Don't allow stupidities
 	 */
-	if (!((start >= buf) && (start < (buf + buf_len)))) return 0;
+	if (!((start >= packet) && (start < (buf + buf_len)))) {
+		fr_strerror_printf("Label is not within the buffer");
+		return 0;
+	}
 
 	end = buf + buf_len;
 	p = current = start;
 	length = 0;
 	at_first_label = true;
-	set_next = false;
+	already_set_next = false;
 
 	/*
 	 *	We silently accept labels *without* a trailing 0x00,
@@ -745,18 +931,25 @@ ssize_t fr_dns_label_uncompressed_length(uint8_t const *buf, size_t buf_len, uin
 			 */
 			if (current == start) {
 				*next = p;
-				set_next = true;
+				already_set_next = true;
 			}
 
 			break;
 		}
 
 		/*
-		 *	0b10 and 0b10 are forbidden
+		 *	If there's only one byte in the packet, then
+		 *	it MUST be 0x00.  If it's not, then the label
+		 *	overflows the buffer.
+		 */
+		if ((p + 1) >= end) goto overflow;
+
+		/*
+		 *	0b01 and 0b10 are forbidden
 		 */
 		if ((*p > 63) && (*p < 0xc0)) {
 			fr_strerror_const("Data with invalid high bits");
-			return -(p - buf);
+			return -(p - packet);
 		}
 
 		/*
@@ -768,7 +961,7 @@ ssize_t fr_dns_label_uncompressed_length(uint8_t const *buf, size_t buf_len, uin
 			if ((p + 2) > end) {
 			overflow:
 				fr_strerror_const("Label overflows buffer");
-				return -(p - buf);
+				return -(p - packet);
 			}
 
 			offset = p[1];
@@ -777,13 +970,31 @@ ssize_t fr_dns_label_uncompressed_length(uint8_t const *buf, size_t buf_len, uin
 			/*
 			 *	Forward references are forbidden,
 			 *	including self-references.
+			 *
+			 *	This requirement follows RFC 1035
+			 *	Section 4.1.4, which says:
+			 *
+			 *	... an entire domain name or a list of
+			 *	labels at the end of a domain name is
+			 *	replaced with a pointer to a prior
+			 *	occurrence of the same name.
+			 *	...
+			 *
+			 *	Note the key word PRIOR.  If we
+			 *	enforce that the pointer is backwards,
+			 *	and do various other enforcements,
+			 *	then it is very difficult for
+			 *	attackers to create malicious DNS
+			 *	packets which will cause the decoder
+			 *	to do bad things.
 			 */
-			if (offset >= (p - buf)) {
-				fr_strerror_printf("Pointer %04x is an invalid forward reference", offset);
-				return -(p - buf);
+			if (offset >= (p - packet)) {
+				fr_strerror_printf("Pointer %04x at offset %04x is an invalid forward reference",
+						   offset, (unsigned int) (p - packet));
+				return -(p - packet);
 			}
 
-			q = buf + offset;
+			q = packet + offset;
 
 			/*
 			 *	As an additional sanity check, the
@@ -791,25 +1002,45 @@ ssize_t fr_dns_label_uncompressed_length(uint8_t const *buf, size_t buf_len, uin
 			 *	within the label we're parsing.  If
 			 *	that happens, we have a loop.
 			 *
-			 *	i.e. the pointer must be backwards to
-			 *	*before* our current label.  When that
-			 *	limitation is enforced, pointer loops
-			 *	are impossible.
+			 *	i.e. the pointer must point backwards
+			 *	to *before* our current label.  When
+			 *	that limitation is enforced, pointer
+			 *	loops are impossible.
 			 */
 			if (q >= current) {
-				fr_strerror_printf("Pointer %04x creates a loop within a label", offset);
-				return -(p - buf);
+				fr_strerror_printf("Pointer %04x at offset %04x creates a loop within a label",
+						   offset, (unsigned int) (p - packet));
+				return -(p - packet);
 			}
 
+			/*
+			 *	If we're tracking which labels are
+			 *	valid, then check the pointer, too.
+			 */
+			if (!dns_pointer_valid(lb, offset)) {
+				fr_strerror_printf("Pointer %04x at offset %04x does not point to a DNS label",
+						   offset, (unsigned int) (p - packet));
+				return -(p - packet);
+			}
 
 			/*
 			 *	The pointer MUST point to a valid
-			 *	label length, and not to another
+			 *	length field, and not to another
 			 *	pointer.
 			 */
 			if (*q > 63) {
-				fr_strerror_printf("Pointer %04x does not point to the start of a label", offset);
-				return -(p - buf);
+				fr_strerror_printf("Pointer %04x at offset %04x does not point to the start of a label",
+						   offset, (unsigned int) (p - packet));
+				return -(p - packet);
+			}
+
+			/*
+			 *	The pointer MUST NOT point to an end of label field.
+			 */
+			if (!*q) {
+				fr_strerror_printf("Pointer %04x at offset %04x refers to an invalid field", offset,
+						   (unsigned int) (p - packet));
+				return -(p - packet);
 			}
 
 			/*
@@ -820,7 +1051,7 @@ ssize_t fr_dns_label_uncompressed_length(uint8_t const *buf, size_t buf_len, uin
 			 */
 			if (current == start) {
 				*next = p + 2;
-				set_next = true;
+				already_set_next = true;
 			}
 
 			p = current = q;
@@ -831,6 +1062,11 @@ ssize_t fr_dns_label_uncompressed_length(uint8_t const *buf, size_t buf_len, uin
 		 *	Else it's an uncompressed label
 		 */
 		if ((p + *p + 1) > end) goto overflow;
+
+		/*
+		 *	It's a valid label.  Mark it as such.
+		 */
+		dns_label_mark(lb, p);
 
 		/*
 		 *	Account for the '.' on every label after the
@@ -845,18 +1081,29 @@ ssize_t fr_dns_label_uncompressed_length(uint8_t const *buf, size_t buf_len, uin
 		 */
 		if (length > 255) {
 			fr_strerror_const("Total length of labels is > 255");
-			return -(p - buf);
+			return -(p - packet);
 		}
+
+		q = p + 1;
+		label_end = q + *p;
+
+		/*
+		 *	Allow for underscore at the beginning of a
+		 *	label.
+		 */
+		if (*q == '_') q++;
 
 		/*
 		 *	Verify that the contents of the label are OK.
 		 */
-		for (q = p + 1; q < p + *p + 1; q++) {
+		while (q < label_end) {
 			if (!((*q == '-') || ((*q >= '0') && (*q <= '9')) ||
 			      ((*q >= 'A') && (*q <= 'Z')) || ((*q >= 'a') && (*q <= 'z')))) {
-				fr_strerror_printf("Invalid character %02x in label", *q);
-				return -(q - buf);
+				fr_strerror_printf("Invalid character 0x%02x in label", *q);
+				return -(q - packet);
 			}
+
+			q++;
 		}
 
 		p += *p + 1;
@@ -865,43 +1112,53 @@ ssize_t fr_dns_label_uncompressed_length(uint8_t const *buf, size_t buf_len, uin
 	/*
 	 *	Return the length of this label.
 	 */
-	if (!set_next) *next = p; /* should be 'end'< */
+	if (!already_set_next) *next = p; /* should be <='end' */
+
+	/*
+	 *	Add the label, only if we're not using the markup field.
+	 */
+	if (lb && !lb->mark) (void) dns_label_add(lb, start, *next);
 
 	return length;
 }
 
 /** Verify that a network buffer contains valid DNS labels.
  *
+ * @param[in] packet	  where the packet starts
  * @param[in] buf	buffer holding one or more DNS labels
  * @param[in] buf_len	total length of the buffer
+ * @param[in] start	where to start looking
+ * @param[in] lb	label tracking data structure
  * @return
  *	- <=0 on error, where in the buffer the invalid label is located.
  *	- > 0 total size of the encoded label(s).  Will be <= buf_len
  */
-ssize_t fr_dns_labels_network_verify(uint8_t const *buf, size_t buf_len)
+ssize_t fr_dns_labels_network_verify(uint8_t const *packet, uint8_t const *buf, size_t buf_len, uint8_t const *start, fr_dns_labels_t *lb)
 {
 	ssize_t slen;
-	uint8_t const *label;
+	uint8_t const *label = start;
 	uint8_t const *end = buf + buf_len;
 
-	for (label = buf; label < end; /* nothing */) {
+	while (label < end) {
 		if (*label == 0x00) {
 			label++;
 			break;
 		}
 
-		slen = fr_dns_label_uncompressed_length(buf, buf_len, &label);
+		slen = fr_dns_label_uncompressed_length(packet, buf, buf_len, &label, lb);
 		if (slen <= 0) return slen; /* already is offset from 'buf' and not 'label' */
 	}
 
 	return label - buf;
 }
 
-static ssize_t dns_label_decode(uint8_t const *buf, uint8_t const **start, uint8_t const **next)
+static ssize_t dns_label_decode(uint8_t const *packet, uint8_t const *end, uint8_t const **start, uint8_t const **next)
 {
-	uint8_t const *p;
+	uint8_t const *p, *q;
 
 	p = *start;
+
+	if (end == packet) return -1;
 
 	if (*p == 0x00) {
 		*next = p + 1;
@@ -909,16 +1166,32 @@ static ssize_t dns_label_decode(uint8_t const *buf, uint8_t const **start, uint8
 	}
 
 	/*
-	 *	Pointer, which MUST point to a valid label, but we don't
-	 *	check.
+	 *	Pointer, which points somewhere in the packet.
 	 */
-	if (*p > 63) {
+	if (*p >= 0xc0) {
 		uint16_t offset;
+
+		if ((end - p) < 2) {
+			return -(p - packet);
+		}
 
 		offset = p[1];
 		offset += ((*p & ~0xc0) << 8);
 
-		p = buf + offset;
+		q = packet + offset;
+		if (q >= p) {
+			return -(p - packet);
+		}
+		p = q;
+	}
+
+	/*
+	 *	0b01 and 0b10 are forbidden, and pointers can't point to other pointers.
+	 */
+	if (*p > 63) return -(p - packet);
+
+	if ((p + *p + 1) > end) {
+		return -(p - packet);
 	}
 
 	/*
@@ -934,7 +1207,7 @@ static ssize_t dns_label_decode(uint8_t const *buf, uint8_t const **start, uint8
  *
  * The output type is always FR_TYPE_STRING
  *
- * Note that the caller MUST call fr_dns_labels_network_verify(src, len)
+ * Note that the caller MUST call fr_dns_labels_network_verify(src, len, start)
  * before calling this function.  Otherwise bad things will happen.
  *
  * @param[in] ctx	Where to allocate any talloc buffers required.
@@ -943,26 +1216,46 @@ static ssize_t dns_label_decode(uint8_t const *buf, uint8_t const **start, uint8
  * @param[in] len	Length of the buffer to decode
  * @param[in] label	This particular label
  * @param[in] tainted	Whether the value came from a trusted source.
+ * @param[in] lb	label tracking data structure
  * @return
  *	- >= 0 The number of network bytes consumed.
  *	- <0 on error.
  */
 ssize_t fr_dns_label_to_value_box(TALLOC_CTX *ctx, fr_value_box_t *dst,
 				  uint8_t const *src, size_t len, uint8_t const *label,
-				  bool tainted)
+				  bool tainted, fr_dns_labels_t *lb)
 {
 	ssize_t slen;
 	uint8_t const *after = label;
-	uint8_t const *current, *next;
+	uint8_t const *current, *next = NULL;
+	uint8_t const *packet = src;
+	uint8_t const *end = packet + len;
 	uint8_t *p;
 	char *q;
+
+	if (!len) return -1;
+
+	/*
+	 *	The label must be within the current buffer we're
+	 *	passed.
+	 */
+	if ((label < src) || (label >= end)) return -1;
+
+	/*
+	 *	The actual packet might start earlier than the buffer,
+	 *	so reset it if necessary.
+	 */
+	if (lb) packet = lb->start;
 
 	/*
 	 *	Get the uncompressed length of the label, and the
 	 *	label after this one.
 	 */
-	slen = fr_dns_label_uncompressed_length(src, len, &after);
-	if (slen <= 0) return slen;
+	slen = fr_dns_label_uncompressed_length(packet, src, len, &after, lb);
+	if (slen <= 0) {
+		FR_PROTO_TRACE("dns_label_to_value_box - Failed getting length");
+		return slen;
+	}
 
 	fr_value_box_init_null(dst);
 
@@ -985,22 +1278,21 @@ ssize_t fr_dns_label_to_value_box(TALLOC_CTX *ctx, fr_value_box_t *dst,
 	p = (uint8_t *) q;
 	q += slen;
 
-	while ((current < after) && (*current != 0x00)) {
+	while (current && (current < after) && (*current != 0x00)) {
 		/*
 		 *	Get how many bytes this label has, and where
 		 *	we will go to obtain the next label.
-		 *
-		 *	Note that slen > 0 here, as dns_label_decode()
-		 *	only returns 0 when the current byte is 0x00,
-		 *	which it can't be.
 		 */
-		slen = dns_label_decode(src, &current, &next);
+		slen = dns_label_decode(packet, end, &current, &next);
+		if (slen < 0) return slen;
 
 		/*
 		 *	As a sanity check, ensure we don't have a
 		 *	buffer overflow.
 		 */
 		if ((p + slen) > (uint8_t *) q) {
+			FR_PROTO_TRACE("dns_label_to_value_box - length %zd Failed at %d", slen, __LINE__);
+
 		fail:
 			fr_value_box_clear(dst);
 			return -1;
@@ -1032,6 +1324,7 @@ ssize_t fr_dns_label_to_value_box(TALLOC_CTX *ctx, fr_value_box_t *dst,
 	 *	buffer exactly.
 	 */
 	if (p != (uint8_t *) q) {
+		FR_PROTO_TRACE("dns_label_to_value_box - Failed at %d", __LINE__);
 		goto fail;
 	}
 
@@ -1042,48 +1335,4 @@ ssize_t fr_dns_label_to_value_box(TALLOC_CTX *ctx, fr_value_box_t *dst,
 	 *	part of the label.
 	 */
 	return after - label;
-}
-
-/** Get the *network* length of a DNS label in a buffer
- *  i.e. the number of bytes in the encoded representation of the dns label.
- *
- * @param[in] buf	buffer holding one or more DNS labels
- * @param[in] buf_len	total length of the buffer
- * @return
- *	- <=0 on error, offset from buf where the invalid label is located.
- *	- > 0 network length of this particular DNS label
- */
-ssize_t fr_dns_label_network_length(uint8_t const *buf, size_t buf_len)
-{
-	uint8_t const *p = buf;
-	uint8_t const *end = buf + buf_len;
-
-	while (p < end) {
-		if (*p == 0x00) {
-			p++;
-			break;
-		}
-
-		if (*p < 64) {
-			if ((p + *p + 1) > end) {
-				return -(p - buf);
-			}
-
-			p += *p + 1;
-			continue;
-		}
-
-		if (*p < 0xc0) {
-			return -(p - buf);
-		}
-
-		if ((p + 1) > end) {
-			return -(p - buf);
-		}
-
-		p += 2;
-		break;
-	}
-
-	return p - buf;
 }

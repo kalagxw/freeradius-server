@@ -26,41 +26,59 @@
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_krb5 (%s) - "
-#define LOG_PREFIX_ARGS inst->name
+#define LOG_PREFIX inst->name
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
-#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include "krb5.h"
 
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("keytab", FR_TYPE_STRING, rlm_krb5_t, keytabname) },
-	{ FR_CONF_OFFSET("service_principal", FR_TYPE_STRING, rlm_krb5_t, service_princ) },
+#ifdef KRB5_IS_THREAD_SAFE
+static const conf_parser_t reuse_krb5_config[] = {
+	FR_SLAB_CONFIG_CONF_PARSER
+	CONF_PARSER_TERMINATOR
+};
+#endif
+
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET("keytab", rlm_krb5_t, keytabname) },
+	{ FR_CONF_OFFSET("service_principal", rlm_krb5_t, service_princ) },
+#ifdef KRB5_IS_THREAD_SAFE
+	{ FR_CONF_OFFSET_SUBSECTION("reuse", 0, rlm_krb5_t, reuse, reuse_krb5_config) },
+#endif
 	CONF_PARSER_TERMINATOR
 };
 
-static fr_dict_t const *dict_radius;
+typedef struct {
+	fr_value_box_t	username;
+	fr_value_box_t	password;
+} krb5_auth_call_env_t;
 
-extern fr_dict_autoload_t rlm_krb5_dict[];
-fr_dict_autoload_t rlm_krb5_dict[] = {
-	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
-};
-
-static fr_dict_attr_t const *attr_user_name;
-static fr_dict_attr_t const *attr_user_password;
-
-extern fr_dict_attr_autoload_t rlm_krb5_dict_attr[];
-fr_dict_attr_autoload_t rlm_krb5_dict_attr[] = {
-	{ .out = &attr_user_name, .name = "User-Name", .type = FR_TYPE_STRING, .dict = &dict_radius },
-	{ .out = &attr_user_password, .name = "User-Password", .type = FR_TYPE_STRING, .dict = &dict_radius },
-	{ NULL }
-};
-
-static int mod_detach(void *instance)
+#ifdef KRB5_IS_THREAD_SAFE
+static int mod_thread_instantiate(module_thread_inst_ctx_t const *mctx)
 {
-	rlm_krb5_t *inst = instance;
+	rlm_krb5_t 		*inst = talloc_get_type_abort(mctx->mi->data, rlm_krb5_t);
+	rlm_krb5_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_krb5_thread_t);
+
+	t->inst = inst;
+	if (!(t->slab = krb5_slab_list_alloc(t, mctx->el, &inst->reuse, krb5_handle_init, NULL, inst, false, true))) {
+		ERROR("Handle pool instantiation failed");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int mod_thread_detach(module_thread_inst_ctx_t const *mctx)
+{
+	rlm_krb5_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_krb5_thread_t);
+	talloc_free(t->slab);
+	return 0;
+}
+#endif
+
+static int mod_detach(module_detach_ctx_t const *mctx)
+{
+	rlm_krb5_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_krb5_t);
 
 #ifndef HEIMDAL_KRB5
 	talloc_free(inst->vic_options);
@@ -73,16 +91,13 @@ static int mod_detach(void *instance)
 	talloc_free(inst->service);
 
 	if (inst->context) krb5_free_context(inst->context);
-#ifdef KRB5_IS_THREAD_SAFE
-	fr_pool_free(inst->pool);
-#endif
 
 	return 0;
 }
 
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_krb5_t *inst = instance;
+	rlm_krb5_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_krb5_t);
 	krb5_error_code ret;
 #ifndef HEIMDAL_KRB5
 	krb5_keytab keytab;
@@ -109,23 +124,20 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
  *	rlm_krb5 was not built as threadsafe
  */
 #else
+#  ifdef HEIMDAL_KRB5
+#    define KRB5_THREAD_SUPPORT_OPTION "--enable-pthread-support"
+#  else
+#    define KRB5_THREAD_SUPPORT_OPTION "--disable-thread-support=no"
+#  endif
 		fr_log(&default_log, L_WARN, __FILE__, __LINE__,
 		       "libkrb5 is not threadsafe, recompile it with thread support enabled ("
-#  ifdef HEIMDAL_KRB5
-		       "--enable-pthread-support"
-#  else
-		       "--disable-thread-support=no"
-#  endif
-		       ")");
+		       KRB5_THREAD_SUPPORT_OPTION ")");
 		WARN("rlm_krb5 will run in single threaded mode, performance may be degraded");
 	} else {
 		WARN("Build time libkrb5 was not threadsafe, but run time library claims to be");
 		WARN("Reconfigure and recompile rlm_krb5 to enable thread support");
 #endif
 	}
-
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) inst->name = cf_section_name1(conf);
 
 	ret = krb5_init_context(&inst->context);
 	if (ret) {
@@ -220,16 +232,11 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 
 	MEM(inst->vic_options = talloc_zero(inst, krb5_verify_init_creds_opt));
 	krb5_verify_init_creds_opt_init(inst->vic_options);
+	krb5_verify_init_creds_opt_set_ap_req_nofail(inst->vic_options, true);
 #endif
 
-#ifdef KRB5_IS_THREAD_SAFE
-	/*
-	 *	Initialize the socket pool.
-	 */
-	inst->pool = module_connection_pool_init(conf, inst, krb5_mod_conn_create, NULL, NULL, NULL, NULL);
-	if (!inst->pool) return -1;
-#else
-	inst->conn = krb5_mod_conn_create(inst, inst, 0);
+#ifndef KRB5_IS_THREAD_SAFE
+	inst->conn = krb5_mod_conn_create(inst, inst, fr_time_delta_wrap(0));
 	if (!inst->conn) return -1;
 #endif
 	return 0;
@@ -241,39 +248,29 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
  * @param[in] inst of rlm_krb5.
  * @param[in] request Current request.
  * @param[in] context Kerberos context.
+ * @param[in] env call env data containing username.
  */
 static rlm_rcode_t krb5_parse_user(krb5_principal *client, KRB5_UNUSED rlm_krb5_t const *inst, request_t *request,
-				   krb5_context context)
+				   krb5_context context, krb5_auth_call_env_t *env)
 {
 	krb5_error_code ret;
 	char *princ_name;
-	fr_pair_t *username;
 
-	username = fr_pair_find_by_da(&request->request_pairs, attr_user_name, 0);
-
-	/*
-	 *	We can only authenticate user requests which HAVE
-	 *	a User-Name attribute.
-	 */
-	if (!username) {
-		REDEBUG("Attribute \"User-Name\" is required for authentication");
-		return RLM_MODULE_FAIL;
-	}
-
-	ret = krb5_parse_name(context, username->vp_strvalue, client);
+	ret = krb5_parse_name(context, env->username.vb_strvalue, client);
 	if (ret) {
 		REDEBUG("Failed parsing username as principal: %s", rlm_krb5_error(inst, context, ret));
 
 		return RLM_MODULE_FAIL;
 	}
 
-	krb5_unparse_name(context, *client, &princ_name);
-	RDEBUG2("Using client principal \"%s\"", princ_name);
+	if (krb5_unparse_name(context, *client, &princ_name) == 0) {
+		RDEBUG2("Using client principal \"%s\"", princ_name);
 #ifdef HEIMDAL_KRB5
-	free(princ_name);
+		free(princ_name);
 #else
-	krb5_free_unparsed_name(context, princ_name);
+		krb5_free_unparsed_name(context, princ_name);
 #endif
+	}
 	return RLM_MODULE_OK;
 }
 
@@ -290,7 +287,7 @@ static rlm_rcode_t krb5_process_error(rlm_krb5_t const *inst, request_t *request
 	fr_assert(ret != 0);
 
 	if (!fr_cond_assert(inst)) return RLM_MODULE_FAIL;
-	if (!fr_cond_assert(conn)) return RLM_MODULE_FAIL;;	/* Silences warnings */
+	if (!fr_cond_assert(conn)) return RLM_MODULE_FAIL;	/* Silences warnings */
 
 	switch (ret) {
 	case KRB5_LIBOS_BADPWDMATCH:
@@ -319,53 +316,49 @@ static rlm_rcode_t krb5_process_error(rlm_krb5_t const *inst, request_t *request
 /*
  *	Validate user/pass (Heimdal)
  */
-static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_authenticate(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_krb5_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_krb5_t);
+	krb5_auth_call_env_t	*env = talloc_get_type_abort(mctx->env_data, krb5_auth_call_env_t);
+	rlm_krb5_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_krb5_t);
+#  ifdef KRB5_IS_THREAD_SAFE
+	rlm_krb5_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_krb5_thread_t);
+#  endif
 	rlm_rcode_t		rcode;
 	krb5_error_code		ret;
 	rlm_krb5_handle_t	*conn;
 	krb5_principal		client = NULL;
-	fr_pair_t		*password;
-
-	password = fr_pair_find_by_da(&request->request_pairs, attr_user_password, 0);
-
-	if (!password) {
-		REDEBUG("Attribute \"User-Password\" is required for authentication");
-		RETURN_MODULE_INVALID;
-	}
 
 	/*
 	 *	Make sure the supplied password isn't empty
 	 */
-	if (password->vp_length == 0) {
+	if (env->password.vb_length == 0) {
 		REDEBUG("User-Password must not be empty");
-		RETURN_MODULE_INVALID;
+		RETURN_UNLANG_INVALID;
 	}
 
 	/*
 	 *	Log the password
 	 */
 	if (RDEBUG_ENABLED3) {
-		RDEBUG("Login attempt with password \"%pV\"", &password->data);
+		RDEBUG("Login attempt with password \"%pV\"", &env->password);
 	} else {
 		RDEBUG2("Login attempt with password");
 	}
 
 #  ifdef KRB5_IS_THREAD_SAFE
-	conn = fr_pool_connection_get(inst->pool, request);
-	if (!conn) RETURN_MODULE_FAIL;
+	conn = krb5_slab_reserve(t->slab);
+	if (!conn) RETURN_UNLANG_FAIL;
 #  else
 	conn = inst->conn;
 #  endif
 
-	rcode = krb5_parse_user(&client, inst, request, conn->context);
+	rcode = krb5_parse_user(&client, inst, request, conn->context, env);
 	if (rcode != RLM_MODULE_OK) goto cleanup;
 
 	/*
 	 *	Verify the user, using the options we set in instantiate
 	 */
-	ret = krb5_verify_user_opt(conn->context, client, password->vp_strvalue, &conn->options);
+	ret = krb5_verify_user_opt(conn->context, client, env->password.vb_strvalue, &conn->options);
 	if (ret) {
 		rcode = krb5_process_error(inst, request, conn, ret);
 		goto cleanup;
@@ -400,9 +393,9 @@ cleanup:
 	}
 
 #  ifdef KRB5_IS_THREAD_SAFE
-	fr_pool_connection_release(inst->pool, request, conn);
+	krb5_slab_release(conn);
 #  endif
-	RETURN_MODULE_RCODE(rcode);
+	RETURN_UNLANG_RCODE(rcode);
 }
 
 #else  /* HEIMDAL_KRB5 */
@@ -410,9 +403,13 @@ cleanup:
 /*
  *  Validate userid/passwd (MIT)
  */
-static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_authenticate(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_krb5_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_krb5_t);
+	krb5_auth_call_env_t	*env = talloc_get_type_abort(mctx->env_data, krb5_auth_call_env_t);
+	rlm_krb5_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_krb5_t);
+#  ifdef KRB5_IS_THREAD_SAFE
+	rlm_krb5_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_krb5_thread_t);
+#  endif
 	rlm_rcode_t		rcode;
 	krb5_error_code		ret;
 
@@ -420,35 +417,27 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 
 	krb5_principal		client = NULL;	/* actually a pointer value */
 	krb5_creds		init_creds;
-	fr_pair_t		*password;
-
-	password = fr_pair_find_by_da(&request->request_pairs, attr_user_password, 0);
-
-	if (!password) {
-		REDEBUG("Attribute \"User-Password\" is required for authentication");
-		RETURN_MODULE_INVALID;
-	}
 
 	/*
 	 *	Make sure the supplied password isn't empty
 	 */
-	if (password->vp_length == 0) {
+	if (env->password.vb_length == 0) {
 		REDEBUG("User-Password must not be empty");
-		RETURN_MODULE_INVALID;
+		RETURN_UNLANG_INVALID;
 	}
 
 	/*
 	 *	Log the password
 	 */
 	if (RDEBUG_ENABLED3) {
-		RDEBUG("Login attempt with password \"%pV\"", &password->data);
+		RDEBUG("Login attempt with password \"%pV\"", &env->password);
 	} else {
 		RDEBUG2("Login attempt with password");
 	}
 
 #  ifdef KRB5_IS_THREAD_SAFE
-	conn = fr_pool_connection_get(inst->pool, request);
-	if (!conn) RETURN_MODULE_FAIL;
+	conn = krb5_slab_reserve(t->slab);
+	if (!conn) RETURN_UNLANG_FAIL;
 #  else
 	conn = inst->conn;
 #  endif
@@ -462,14 +451,14 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	 *	Check we have all the required VPs, and convert the username
 	 *	into a principal.
 	 */
-	rcode = krb5_parse_user(&client, inst, request, conn->context);
+	rcode = krb5_parse_user(&client, inst, request, conn->context, env);
 	if (rcode != RLM_MODULE_OK) goto cleanup;
 
 	/*
 	 * 	Retrieve the TGT from the TGS/KDC and check we can decrypt it.
 	 */
 	RDEBUG2("Retrieving and decrypting TGT");
-	ret = krb5_get_init_creds_password(conn->context, &init_creds, client, UNCONST(char *, password->vp_strvalue),
+	ret = krb5_get_init_creds_password(conn->context, &init_creds, client, UNCONST(char *, env->password.vb_strvalue),
 					   NULL, NULL, 0, NULL, inst->gic_options);
 	if (ret) {
 		rcode = krb5_process_error(inst, request, conn, ret);
@@ -485,25 +474,48 @@ cleanup:
 	krb5_free_cred_contents(conn->context, &init_creds);
 
 #  ifdef KRB5_IS_THREAD_SAFE
-	fr_pool_connection_release(inst->pool, request, conn);
+	krb5_slab_release(conn);
 #  endif
-	RETURN_MODULE_RCODE(rcode);
+	RETURN_UNLANG_RCODE(rcode);
 }
 
 #endif /* MIT_KRB5 */
 
-extern module_t rlm_krb5;
-module_t rlm_krb5 = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "krb5",
-#ifdef KRB5_IS_THREAD_SAFE
-	.type		= RLM_TYPE_THREAD_SAFE,
+static const call_env_method_t krb5_auth_call_env = {
+	FR_CALL_ENV_METHOD_OUT(krb5_auth_call_env_t),
+	.env = (call_env_parser_t[]) {
+		{ FR_CALL_ENV_OFFSET("username", FR_TYPE_STRING, CALL_ENV_FLAG_REQUIRED| CALL_ENV_FLAG_BARE_WORD_ATTRIBUTE, krb5_auth_call_env_t, username),
+			.pair.dflt = "User-Name", .pair.dflt_quote = T_BARE_WORD },
+		{ FR_CALL_ENV_OFFSET("password", FR_TYPE_STRING, CALL_ENV_FLAG_SECRET | CALL_ENV_FLAG_REQUIRED| CALL_ENV_FLAG_BARE_WORD_ATTRIBUTE, krb5_auth_call_env_t, password),
+			.pair.dflt = "User-Password", .pair.dflt_quote = T_BARE_WORD },
+		CALL_ENV_TERMINATOR
+	}
+};
+
+extern module_rlm_t rlm_krb5;
+module_rlm_t rlm_krb5 = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "krb5",
+		/*
+		 *	FIXME - Probably want a global mutex created on mod_load
+		 */
+#ifndef KRB5_IS_THREAD_SAFE
+		.flags		= MODULE_TYPE_THREAD_UNSAFE,
+#else
+		.thread_inst_size	= sizeof(rlm_krb5_thread_t),
+		.thread_instantiate	= mod_thread_instantiate,
+		.thread_detach		= mod_thread_detach,
 #endif
-	.inst_size	= sizeof(rlm_krb5_t),
-	.config		= module_config,
-	.instantiate	= mod_instantiate,
-	.detach		= mod_detach,
-	.methods = {
-		[MOD_AUTHENTICATE]	= mod_authenticate
+		.inst_size	= sizeof(rlm_krb5_t),
+		.config		= module_config,
+		.instantiate	= mod_instantiate,
+		.detach		= mod_detach
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("authenticate", CF_IDENT_ANY), .method = mod_authenticate, .method_env = &krb5_auth_call_env },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

@@ -37,9 +37,11 @@ extern "C" {
 
 typedef struct pair_list {
 	char const		*name;		//!< Key for matching entry.
-	fr_map_list_t		check;		//!< List of maps for comparison / modifying control list
-	fr_map_list_t		reply;		//!< List of maps for modifying reply list
+	map_list_t		check;		//!< List of maps for comparison / modifying control list
+	map_list_t		reply;		//!< List of maps for modifying reply list
 	int			order;		//!< Sequence of entry in source file
+	bool			fall_through;	//!< go to the next one
+	bool			next_shortest_prefix;  //!< for prefix tries
 	char const		*filename;	//!< Filename entry read from
 	int			lineno;		//!< Line number entry read from
 	fr_dlist_t		entry;		//!< Entry in dlist of PAIR_LIST with matching name
@@ -51,9 +53,7 @@ typedef struct pair_list_list {
 	fr_value_box_t		*box;		//!< parsed version of "name".
 } PAIR_LIST_LIST;
 
-/* users_file.c */
-int		pairlist_read(TALLOC_CTX *ctx, fr_dict_t const *dict, char const *file, PAIR_LIST_LIST *list, int complain);
-void		pairlist_free(PAIR_LIST_LIST *);
+int		pairlist_read(TALLOC_CTX *ctx, fr_dict_t const *dict, char const *file, PAIR_LIST_LIST *list, bool v3_compat);
 
 static inline void pairlist_list_init(PAIR_LIST_LIST *list)
 {

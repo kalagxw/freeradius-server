@@ -25,6 +25,9 @@
 #include <freeradius-devel/server/request.h>
 #include <freeradius-devel/server/request_data.h>
 #include <freeradius-devel/server/module.h>
+#include <freeradius-devel/unlang/interpret.h>
+
+typedef struct eap_session_s eap_session_t;
 
 #include "compose.h"
 #include "types.h"
@@ -32,18 +35,16 @@
 #define REQUEST_DATA_EAP_SESSION	 (1)
 #define REQUEST_DATA_EAP_SESSION_PROXIED (2)
 
-typedef struct eap_session_s eap_session_t;
-
 /** Tracks the progress of a single session of any EAP method
  *
  */
 struct eap_session_s {
 	eap_session_t	*prev, *next;			//!< Next/previous eap session in this doubly linked list.
 
-	eap_session_t	*child;				//!< Session for tunneled EAP method.
+	uint8_t		*child_state;			//!< State value returned by tunneled EAP method.
 
 	request_t	*subrequest;			//!< Current subrequest being executed.
-	rlm_rcode_t	submodule_rcode;		//!< Result of last submodule call.
+	unlang_result_t	submodule_result;		//!< Result of last submodule call.
 
 	void const	*inst;				//!< Instance of the eap module this session was created by.
 	eap_type_t	type;				//!< EAP method number.
@@ -68,8 +69,11 @@ struct eap_session_s {
 	fr_time_t	updated;			//!< The last time we received a packet for this EAP session.
 
 	bool		tls;				//!< Whether EAP method uses TLS.
+	bool		tunnel;				//!< copied from #fr_rlm_eap_submodule_t
 	bool		finished;			//!< Whether we consider this session complete.
 };
+
+void		eap_session_discard(request_t *request);
 
 void		eap_session_destroy(eap_session_t **eap_session);
 
@@ -83,3 +87,5 @@ static inline eap_session_t *eap_session_get(request_t *request)
 {
 	return request_data_reference(request, NULL, REQUEST_DATA_EAP_SESSION);
 }
+
+bool		eap_session_in_tunnel(request_t const *request) CC_HINT(nonnull);

@@ -24,41 +24,41 @@
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_always (%s) - "
-#define LOG_PREFIX_ARGS dl_module_instance_name_by_data(inst)
+#define LOG_PREFIX mctx->mi->name
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/unlang/xlat_func.h>
+
+/*
+ *	Instance data is mprotected for runtime
+ *	this is fine for the majority of module
+ *	instances, but not for rlm_always.
+ *
+ *	This struct is allocated outside of the
+ */
+typedef struct {
+	rlm_rcode_t		rcode;		//!< The integer constant representing rcode_str.
+	bool			force;		//!< If true, we force the rcode.
+} rlm_always_mutable_t;
 
 /*
  *	The instance data for rlm_always is the list of fake values we are
  *	going to return.
  */
 typedef struct {
-	char const	*xlat_name;
-	char const	*rcode_str;	//!< The base value.
-
-	rlm_rcode_t	rcode;		//!< The integer constant representing rcode_str.
-	uint32_t	simulcount;
-	bool		mpp;
+	char const		*rcode_str;	//!< The base value.
+	module_instance_t	*mi;
+	rlm_always_mutable_t	*mutable;
 } rlm_always_t;
 
 /*
  *	A mapping of configuration file names to internal variables.
  */
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("rcode", FR_TYPE_STRING, rlm_always_t, rcode_str), .dflt = "fail" },
-	{ FR_CONF_OFFSET("simulcount", FR_TYPE_UINT32, rlm_always_t, simulcount), .dflt = "0" },
-	{ FR_CONF_OFFSET("mpp", FR_TYPE_BOOL, rlm_always_t, mpp), .dflt = "no" },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET("rcode", rlm_always_t, rcode_str), .dflt = "fail" },
 	CONF_PARSER_TERMINATOR
 };
-
-static int always_xlat_instantiate(void *xlat_inst, UNUSED xlat_exp_t const *exp, void *uctx)
-{
-	*((rlm_always_t **)xlat_inst) = talloc_get_type_abort(uctx, rlm_always_t);
-
-	return 0;
-}
 
 static xlat_arg_parser_t const always_xlat_args[] = {
 	{ .single = true, .type = FR_TYPE_STRING },
@@ -69,32 +69,25 @@ static xlat_arg_parser_t const always_xlat_args[] = {
  *
  * Look ma, no locks...
  *
- * Example: "%{db_status:fail}"
+ * Example: %db_status('fail')
  */
 static xlat_action_t always_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
-				 request_t *request, void const *xlat_inst,
-				 UNUSED void *xlat_thread_inst,
-				 fr_value_box_list_t *in)
+				 xlat_ctx_t const *xctx,
+				 request_t *request, fr_value_box_list_t *in)
 {
-	rlm_always_t const	*inst = talloc_get_type_abort_const(*((void const * const *)xlat_inst),rlm_always_t);
-	module_instance_t	*mi;
+	rlm_always_t		*inst = talloc_get_type_abort(xctx->mctx->mi->data, rlm_always_t);
+	module_instance_t	*mi = inst->mi;
 	char const		*status;
 	char const		*p;
 	fr_value_box_t		*vb;
-	fr_value_box_t		*in_head = fr_dlist_head(in);
-
-	mi = module_by_name(NULL, inst->xlat_name);
-	if (!mi) {
-		RERROR("Can't find the module that registered this xlat: %s", inst->xlat_name);
-		return XLAT_ACTION_FAIL;
-	}
+	fr_value_box_t		*in_head = fr_value_box_list_head(in);
 
 	/*
 	 *      Expand to the existing status
 	 */
 	p = "alive";
 	if (mi->force) {
-		p = fr_table_str_by_value(rcode_table, mi->code, "<invalid>");
+		p = fr_table_str_by_value(rcode_table, mi->rcode, "<invalid>");
 	}
 
 	if (!in_head || in_head->vb_length == 0) goto done;
@@ -114,7 +107,7 @@ static xlat_action_t always_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 			return XLAT_ACTION_FAIL;
 		}
 
-		mi->code = rcode;
+		mi->rcode = rcode;
 		mi->force = true;
 
 	}
@@ -129,63 +122,75 @@ done:
 
 }
 
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
+/*
+ *	Just return the rcode ... this function is autz, auth, acct, and
+ *	preacct!
+ */
+static unlang_action_t CC_HINT(nonnull) mod_always_return(unlang_result_t *p_result, module_ctx_t const *mctx, UNUSED request_t *request)
 {
-	rlm_always_t	*inst = instance;
-	xlat_t		*xlat;
+	rlm_always_t const *inst = talloc_get_type_abort_const(mctx->mi->data, rlm_always_t);
 
-	inst->xlat_name = cf_section_name2(conf);
-	if (!inst->xlat_name) {
-		inst->xlat_name = cf_section_name1(conf);
-	}
+	RETURN_UNLANG_RCODE(inst->mutable->rcode);
+}
 
-	xlat = xlat_register(inst, inst->xlat_name, always_xlat, false);
-	xlat_func_args(xlat, always_xlat_args);
-	xlat_async_instantiate_set(xlat, always_xlat_instantiate, rlm_always_t *, NULL, inst);
+static int mod_detach(module_detach_ctx_t const *mctx)
+{
+	rlm_always_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_always_t);
 
+	talloc_free(inst->mutable);
 	return 0;
 }
 
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_always_t *inst = instance;
+	rlm_always_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_always_t);
+
+	inst->mi = UNCONST(module_instance_t *, mctx->mi);
+
+	/*
+	 *	Allocate this outside of the module instance data,
+	 *	as that gets mprotected
+	 */
+	MEM(inst->mutable = talloc_zero(NULL, rlm_always_mutable_t));
 
 	/*
 	 *	Convert the rcode string to an int
 	 */
-	inst->rcode = fr_table_value_by_str(rcode_table, inst->rcode_str, RLM_MODULE_NOT_SET);
-	if (inst->rcode == RLM_MODULE_NOT_SET) {
-		cf_log_err(conf, "rcode value \"%s\" is invalid", inst->rcode_str);
+	inst->mutable->rcode = fr_table_value_by_str(rcode_table, inst->rcode_str, RLM_MODULE_NOT_SET);
+	if (inst->mutable->rcode == RLM_MODULE_NOT_SET) {
+		cf_log_err(mctx->mi->conf, "rcode value \"%s\" is invalid", inst->rcode_str);
+		talloc_free(inst->mutable);
 		return -1;
 	}
 
 	return 0;
 }
 
-/*
- *	Just return the rcode ... this function is autz, auth, acct, and
- *	preacct!
- */
-static unlang_action_t CC_HINT(nonnull) mod_always_return(rlm_rcode_t *p_result, module_ctx_t const *mctx, UNUSED request_t *request)
+static int mod_bootstrap(module_inst_ctx_t const *mctx)
 {
-	rlm_always_t const *inst = talloc_get_type_abort_const(mctx->instance, rlm_always_t);
+	xlat_t		*xlat;
 
-	RETURN_MODULE_RCODE(inst->rcode);
+	xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, NULL, always_xlat, FR_TYPE_STRING);
+	xlat_func_args_set(xlat, always_xlat_args);
+
+	return 0;
 }
 
-extern module_t rlm_always;
-module_t rlm_always = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "always",
-	.inst_size	= sizeof(rlm_always_t),
-	.config		= module_config,
-	.bootstrap	= mod_bootstrap,
-	.instantiate	= mod_instantiate,
-	.methods = {
-		[MOD_AUTHENTICATE]	= mod_always_return,
-		[MOD_AUTHORIZE]		= mod_always_return,
-		[MOD_PREACCT]		= mod_always_return,
-		[MOD_ACCOUNTING]	= mod_always_return,
-		[MOD_POST_AUTH]		= mod_always_return,
+extern module_rlm_t rlm_always;
+module_rlm_t rlm_always = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "always",
+		.inst_size	= sizeof(rlm_always_t),
+		.config		= module_config,
+		.bootstrap	= mod_bootstrap,
+		.instantiate	= mod_instantiate,
+		.detach		= mod_detach
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME(CF_IDENT_ANY, CF_IDENT_ANY), .method = mod_always_return },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

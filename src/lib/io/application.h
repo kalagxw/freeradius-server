@@ -33,31 +33,6 @@
  */
 typedef struct fr_schedule_s fr_schedule_t;
 
-/** Bootstrap the #fr_app_t
- *
- * Primarily used to allow the #fr_app_t to load its submodules.
- *
- * @param[in] instance	of the #fr_app_t.
- * @param[in] cs	of the listen section that created this #fr_app_t.
- * @return
- *	- 0 on success.
- *	- <0 on failure.
- */
-typedef int (*fr_app_bootstrap_t)( void *instance, CONF_SECTION *cs);
-
-/** Instantiate the #fr_app_t
- *
- * Primarily used to allow the #fr_app_t to validate its config
- * and to allow its submodules to validate their configurations.
- *
- * @param[in] instance	of the #fr_app_t.
- * @param[in] cs	of the listen section that created this #fr_app_t.
- * @return
- *	- 0 on success.
- *	- <0 on failure.
- */
-typedef int (*fr_app_instantiate_t)(void *instance, CONF_SECTION *cs);
-
 /** Open a new socket or other packet source
  *
  * @param[in] instance  of the #fr_app_t.
@@ -83,7 +58,7 @@ typedef int (*fr_app_priority_get_t)(void const *instance, uint8_t const *buffer
 
 /** Called by the network thread to pass an event list for the module to use for timer events
  */
-typedef void (*fr_app_event_list_set_t)(fr_listen_t *li, fr_event_list_t *el, void *nr);
+typedef void (*fr_app_event_list_set_t)(fr_listen_instance_t *li, fr_event_list_t *el, void *nr);
 
 /** Describes a new application (protocol)
  *
@@ -94,17 +69,11 @@ typedef void (*fr_app_event_list_set_t)(fr_listen_t *li, fr_event_list_t *el, vo
  * How the fr_app_t operates is specific to each protocol.
  */
 typedef struct {
-	DL_MODULE_COMMON;				//!< Common fields to all loadable modules.
+	module_t			common;		//!< Common fields provided by all modules.
 
 	fr_dict_t const			**dict;		//!< default dictionary for this application.
 
-	fr_app_bootstrap_t		bootstrap;	//!< Bootstrap function to allow the fr_app_t to load the
-							///< various submodules it requires.
-
-	fr_app_instantiate_t		instantiate;	//!< Instantiate function to perform config validation and
-							///< massaging.
-
-	fr_app_open_t			open;		//!< Callback to allow the #fr_app_t to build an #fr_listen_t
+	fr_app_open_t			open;		//!< Callback to allow the #fr_app_t to open its listeners
 							///< and register it with the scheduler so we can receive
 							///< data.
 
@@ -127,10 +96,7 @@ typedef struct {
  * the packet after its been decoded.
  */
 typedef struct {
-	DL_MODULE_COMMON;				//!< Common fields to all loadable modules.
-
-	fr_app_bootstrap_t		bootstrap;
-	fr_app_instantiate_t		instantiate;
+	module_t			common;		//!< Common fields to all loadable modules.
 	module_method_t			entry_point;	//!< Entry point into the protocol subtype's state machine.
 	virtual_server_compile_t const	*compile_list;	//!< list of processing sections
 } fr_app_worker_t;

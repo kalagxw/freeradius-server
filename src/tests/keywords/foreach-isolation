@@ -1,32 +1,32 @@
 #
-#  PRE: foreach if-multivalue
+#  PRE: foreach
 #
 
-update {
-	&control.Tmp-String-0 := '0'
-	&control.Tmp-String-0 += '1'
-	&control.Tmp-String-0 += '2'
-	&control.Tmp-String-0 += '3'
+control.User-Name := { "0", "1", "2", "3" }
+
+#
+#  We still can't delete the _next_ attribute.
+#
+#  @todo - maybe make this possible?
+#
+foreach thing (control.User-Name) {
+	control -= {
+		User-Name == "%{1 + thing}"
+	}
+	request += {
+		Filter-Id = thing
+	}
 }
 
-foreach &control.Tmp-String-0 {
-	update control {
-		&Tmp-String-0 -= "%{expr:%{Foreach-Variable-0} + 1}"
-	}
-	update request {
-		&Tmp-String-0 += "%{Foreach-Variable-0}"
-	}
-}
-
-if (!&Tmp-String-0[0] || !&Tmp-String-0[1] || !&Tmp-String-0[2] || !&Tmp-String-0[3]) {
+if (!Filter-Id[0] || !Filter-Id[1] || !Filter-Id[2] || !Filter-Id[3]) {
 	test_fail
 }
 
-if ((&Tmp-String-0[0] != '0') || (&Tmp-String-0[1] != '1') || (&Tmp-String-0[2] != '2') || (&Tmp-String-0[3] != '3')) {
+if (!((Filter-Id[0] == '0')) || (!(Filter-Id[1] == '1')) || (!(Filter-Id[2] == '2')) || (!(Filter-Id[3] == '3'))) {
 	test_fail
 }
 
-if (!&control.Tmp-String-0[0] || &control.Tmp-String-0[1] || &control.Tmp-String-0[2] || &control.Tmp-String-0[3]) {
+if (%{control.User-Name[#]} != 4) {
 	test_fail
 }
 

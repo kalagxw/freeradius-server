@@ -79,7 +79,7 @@ int fr_command_walk(fr_cmd_t *head, void **walk_ctx, void *ctx, fr_cmd_walk_t ca
 int fr_command_tab_expand(TALLOC_CTX *ctx, fr_cmd_t *head, fr_cmd_info_t *info, int max_expansions, char const **expansions);
 char const *fr_command_help(fr_cmd_t *head, int argc, char *argv[]);
 int fr_command_run(FILE *fp, FILE *fp_err, fr_cmd_info_t *info, bool read_only);
-void fr_command_debug(FILE *fp, fr_cmd_t *head);
+void fr_cmd_debug(FILE *fp, fr_cmd_t *head);
 int fr_command_str_to_argv(fr_cmd_t *head, fr_cmd_info_t *info, char const *str);
 int fr_command_clear(int new_argc, fr_cmd_info_t *info) CC_HINT(nonnull);
 
@@ -92,7 +92,7 @@ int fr_command_clear(int new_argc, fr_cmd_info_t *info) CC_HINT(nonnull);
 void fr_command_list(FILE *fp, int max_depth, fr_cmd_t *head, int options);
 void fr_command_info_init(TALLOC_CTX *ctx, fr_cmd_info_t *info);
 
-int fr_command_complete(fr_cmd_t *head, char const *text, int start,
+int fr_command_complete(fr_cmd_t *head, char const *text, size_t start,
 			int max_expansions, char const **expansions);
 int fr_command_print_help(FILE *fp, fr_cmd_t *head, char const *text);
 bool fr_command_strncmp(const char *text, const char *name) CC_HINT(nonnull);

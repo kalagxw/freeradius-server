@@ -24,18 +24,19 @@
  */
 RCSID("$Id$")
 
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/unlang/base.h>
+#include <freeradius-devel/server/request.h>
+#include <freeradius-devel/server/request_data.h>
+#include <freeradius-devel/unlang/interpret.h>
 
-static request_init_args_t	default_args;
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/atexit.h>
 
 static fr_dict_t const *dict_freeradius;
 
 extern fr_dict_autoload_t request_dict[];
 fr_dict_autoload_t request_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 fr_dict_attr_t const *request_attr_root;
@@ -43,6 +44,7 @@ fr_dict_attr_t const *request_attr_request;
 fr_dict_attr_t const *request_attr_reply;
 fr_dict_attr_t const *request_attr_control;
 fr_dict_attr_t const *request_attr_state;
+fr_dict_attr_t const *request_attr_local;
 
 extern fr_dict_attr_autoload_t request_dict_attr[];
 fr_dict_attr_autoload_t request_dict_attr[] = {
@@ -51,14 +53,9 @@ fr_dict_attr_autoload_t request_dict_attr[] = {
 	{ .out = &request_attr_reply, .name = "reply", .type = FR_TYPE_GROUP, .dict = &dict_freeradius },
 	{ .out = &request_attr_control, .name = "control", .type = FR_TYPE_GROUP, .dict = &dict_freeradius },
 	{ .out = &request_attr_state, .name = "session-state", .type = FR_TYPE_GROUP, .dict = &dict_freeradius },
-	{ NULL }
+	{ .out = &request_attr_local, .name = "local-variables", .type = FR_TYPE_GROUP, .dict = &dict_freeradius },
+	DICT_AUTOLOAD_TERMINATOR
 };
-
-/** The thread local free list
- *
- * Any entries remaining in the list will be freed when the thread is joined
- */
-static _Thread_local fr_dlist_head_t *request_free_list; /* macro */
 
 #ifndef NDEBUG
 static int _state_ctx_free(fr_pair_t *state)
@@ -82,6 +79,76 @@ static inline void CC_HINT(always_inline) request_log_init_orphan(request_t *req
 	}
 	request->log.dst->func = vlog_request;
 	request->log.dst->uctx = &default_log;
+	request->log.dst->lvl = fr_debug_lvl;
+}
+
+/** Prepend another logging destination to the list.
+ *
+
+ * @param request	the request
+ * @param log_dst	the logging destination
+ * @param lvl		the new request debug lvl
+ */
+void request_log_prepend(request_t *request, fr_log_t *log_dst, fr_log_lvl_t lvl)
+{
+	log_dst_t *dst;
+
+	if (lvl == L_DBG_LVL_DISABLE) {
+		while (request->log.dst) {
+			dst = request->log.dst->next;
+			talloc_free(request->log.dst);
+			request->log.dst = dst;
+		}
+		request->log.lvl = L_DBG_LVL_OFF;
+		return;
+	}
+
+	/*
+	 *	Remove a particular log destination.
+	 */
+	if (lvl == L_DBG_LVL_OFF) {
+		log_dst_t **last;
+
+		last = &request->log.dst;
+		while (*last) {
+			dst = *last;
+			if (((fr_log_t *)dst->uctx)->parent == log_dst) {
+				*last = dst->next;
+				talloc_free(dst);
+				if (!request->log.dst) request->log.lvl = L_DBG_LVL_OFF;
+				return;
+			}
+
+			last = &(dst->next);
+		}
+
+		return;
+	}
+
+	/*
+	 *	Change the debug level of an existing destination.
+	 */
+	for (dst = request->log.dst; dst != NULL; dst = dst->next) {
+		if (((fr_log_t *)dst->uctx)->parent == log_dst) {
+			dst->lvl = lvl;
+			if (lvl > request->log.lvl) request->log.lvl = lvl;
+			return;
+		}
+	}
+
+	/*
+	 *	Not found, add a new log destination.
+	 */
+	MEM(dst = talloc_zero(request, log_dst_t));
+
+	dst->func = vlog_request;
+	dst->uctx = log_dst;
+
+	dst->lvl = lvl;
+	if (lvl > request->log.lvl) request->log.lvl = lvl;
+	dst->next = request->log.dst;
+
+	request->log.dst = dst;
 }
 
 static inline void CC_HINT(always_inline) request_log_init_child(request_t *child, request_t const *parent)
@@ -90,8 +157,8 @@ static inline void CC_HINT(always_inline) request_log_init_child(request_t *chil
 	 *	Copy debug information.
 	 */
 	memcpy(&(child->log), &(parent->log), sizeof(child->log));
-	child->log.unlang_indent = 0;	/* Apart from the indent which we reset */
-	child->log.module_indent = 0;	/* Apart from the indent which we reset */
+	child->log.indent.unlang = 0;	/* Apart from the indent which we reset */
+	child->log.indent.module = 0;	/* Apart from the indent which we reset */
 	child->log.lvl = parent->log.lvl;
 }
 
@@ -103,7 +170,9 @@ static inline void CC_HINT(always_inline) request_log_init_detachable(request_t 
 	 *	Ensure that we use our own version of the logging
 	 *	information, and not the original request one.
 	 */
-	child->log.dst = talloc_zero(child, log_dst_t);
+	if (!parent->log.dst) return;
+
+	MEM(child->log.dst = talloc_zero(child, log_dst_t));
 	memcpy(child->log.dst, parent->log.dst, sizeof(*child->log.dst));
 }
 
@@ -123,7 +192,10 @@ static inline CC_HINT(always_inline) int request_detachable_init(request_t *chil
 static inline CC_HINT(always_inline) int request_child_init(request_t *child, request_t *parent)
 {
 	child->number = parent->child_number++;
-	if (!child->dict) child->dict = parent->dict;
+	if (!child->proto_dict) {
+		child->proto_dict = parent->proto_dict;
+		child->local_dict = parent->proto_dict;
+	}
 
 	if ((parent->seq_start == 0) || (parent->number == parent->seq_start)) {
 		child->name = talloc_typed_asprintf(child, "%s.%" PRIu64, parent->name, child->number);
@@ -141,13 +213,13 @@ static inline CC_HINT(always_inline) int request_child_init(request_t *child, re
 	 *
 	 *	FIXME: Permit different servers for inner && outer sessions?
 	 */
-	child->packet = fr_radius_packet_alloc(child, true);
+	child->packet = fr_packet_alloc(child, true);
 	if (!child->packet) {
 		talloc_free(child);
 		return -1;
 	}
 
-	child->reply = fr_radius_packet_alloc(child, false);
+	child->reply = fr_packet_alloc(child, false);
 	if (!child->reply) {
 		talloc_free(child);
 		return -1;
@@ -164,25 +236,42 @@ static inline CC_HINT(always_inline) int request_child_init(request_t *child, re
  * @param[in] type		of request to initialise.
  * @param[in] args		Other optional arguments.
  */
-static inline CC_HINT(always_inline) int request_init(char const *file, int line,
-						      request_t *request, request_type_t type,
-						      request_init_args_t const *args)
+int _request_init(char const *file, int line,
+		  request_t *request, request_type_t type,
+		  request_init_args_t const *args)
 {
+	fr_dict_t const *dict;
 
 	/*
 	 *	Sanity checks for different requests types
 	 */
 	switch (type) {
 	case REQUEST_TYPE_EXTERNAL:
+		fr_assert(args);
+
 		if (!fr_cond_assert_msg(!args->parent, "External requests must NOT have a parent")) return -1;
+
+		fr_assert(args->namespace);
+
+		dict = args->namespace;
 		break;
 
 	case REQUEST_TYPE_INTERNAL:
+		if (!args || !args->namespace) {
+			dict = fr_dict_internal();
+		} else {
+			dict = args->namespace;
+		}
 		break;
 
 	case REQUEST_TYPE_DETACHED:
 		fr_assert_fail("Detached requests should start as type == REQUEST_TYPE_INTERNAL, "
 			       "args->detachable and be detached later");
+		return -1;
+
+	/* Quiet GCC */
+	default:
+		fr_assert_fail("Invalid request type");
 		return -1;
 	}
 
@@ -192,10 +281,11 @@ static inline CC_HINT(always_inline) int request_init(char const *file, int line
 #endif
 		.type = type,
 		.master_state = REQUEST_ACTIVE,
-		.dict = args->namespace,
+		.proto_dict = fr_dict_proto_dict(dict),
+		.local_dict = dict,
 		.component = "<pre-core>",
 		.flags = {
-			.detachable = args->detachable
+			.detachable = args && args->detachable,
 		},
 		.alloc_file = file,
 		.alloc_line = line
@@ -231,7 +321,7 @@ static inline CC_HINT(always_inline) int request_init(char const *file, int line
 		 *	the any uninitialised lists and
 		 *	create them locally.
 		 */
-		memcpy(&request->pair_list, &args->pair_list, sizeof(request->pair_list));
+		if (args) memcpy(&request->pair_list, &args->pair_list, sizeof(request->pair_list));
 
 #define list_init(_ctx, _list) \
 	do { \
@@ -248,6 +338,7 @@ static inline CC_HINT(always_inline) int request_init(char const *file, int line
 		if (!request->pair_list.request) list_init(request->pair_root, request);
 		if (!request->pair_list.reply) list_init(request->pair_root, reply);
 		if (!request->pair_list.control) list_init(request->pair_root, control);
+		if (!request->pair_list.local) list_init(request->pair_root, local);
 		if (!request->pair_list.state) {
 			list_init(NULL, state);
 #ifndef NDEBUG
@@ -261,7 +352,7 @@ static inline CC_HINT(always_inline) int request_init(char const *file, int line
 	 *	fields if this is going to be a
 	 *	child request.
 	 */
-	if (args->parent) {
+	if (args && args->parent) {
 		if (request_child_init(request, args->parent) < 0) return -1;
 
 		if (args->detachable) {
@@ -273,114 +364,70 @@ static inline CC_HINT(always_inline) int request_init(char const *file, int line
 	} else {
 		request_log_init_orphan(request);
 	}
+
+	/*
+	 *	This is only used by src/lib/io/worker.c
+	 */
+	fr_dlist_entry_init(&request->listen_entry);
+
 	return 0;
 }
 
-/** Callback for freeing a request struct
+/** Check for common things on "request free".
  *
- * @param[in] request		to free or return to the free list.
- * @return
- *	- 0 in the request was freed.
- *	- -1 if the request was inserted into the free list.
  */
-static int _request_free(request_t *request)
+static void request_common_deinit(request_t *request)
 {
-	fr_assert_msg(!fr_heap_entry_inserted(request->time_order_id),
-		      "alloced %s:%i: %s still in the time_order heap ID %i",
+	fr_assert_msg(!fr_timer_armed(request->timeout),
+		      "alloced %s:%i: %s still in the  timeout sublist",
 		      request->alloc_file,
 		      request->alloc_line,
-		      request->name ? request->name : "(null)", request->time_order_id);
-	fr_assert_msg(!fr_heap_entry_inserted(request->runnable_id),
-		      "alloced %s:%i: %s still in the runnable heap ID %i",
+		      request->name ? request->name : "(null)");
+	fr_assert_msg(!fr_heap_entry_inserted(request->runnable),
+		      "alloced %s:%i: %s still in the runnable heap ID %u",
 		      request->alloc_file,
 		      request->alloc_line,
-		      request->name ? request->name : "(null)", request->runnable_id);
+		      request->name ? request->name : "(null)", request->runnable);
 
-	RDEBUG3("Request freed (%p)", request);
+	fr_assert_msg(!fr_dlist_entry_in_list(&request->listen_entry),
+		      "alloced %s:%i: %s still tracked by the listener",
+		      request->alloc_file,
+		      request->alloc_line,
+		      request->name ? request->name : "(null)");
 
-	/*
-	 *	Reinsert into the free list if it's not already
-	 *	in the free list.
-	 *
-	 *	If it *IS* already in the free list, then free it.
-	 */
-	if (unlikely(fr_dlist_entry_in_list(&request->free_entry))) {
-		fr_dlist_entry_unlink(&request->free_entry);	/* Don't trust the list head to be available */
-		goto really_free;
-	}
+	RDEBUG3("Request deinitialising (%p)", request);
 
-	/*
-	 *	We keep a buffer of <active> + N requests per
-	 *	thread, to avoid spurious allocations.
-	 */
-	if (fr_dlist_num_elements(request_free_list) <= 256) {
-		fr_dlist_head_t		*free_list;
-
-		if (request->session_state_ctx) {
-			fr_assert(talloc_parent(request->session_state_ctx) != request);	/* Should never be directly parented */
-			TALLOC_FREE(request->session_state_ctx);				/* Not parented from the request */
-		}
-		free_list = request_free_list;
-
-		/*
-		 *	Reinitialise the request
-		 */
-		talloc_free_children(request);
-
-		memset(request, 0, sizeof(*request));
-		request->component = "free_list";
-#ifndef NDEBUG
-		/*
-		 *	So we don't trip heap asserts
-		 *	if the request is freed out of
-		 *	the free list.
-		 */
-		request->time_order_id = 0;
-		request->runnable_id = 0;
-#endif
-
-		/*
-		 *	Reinsert into the free list
-		 */
-		fr_dlist_insert_head(free_list, request);
-		request_free_list = free_list;
-
-		return -1;	/* Prevent free */
- 	}
-
-
-	/*
-	 *	Ensure anything that might reference the request is
-	 *	freed before it is.
-	 */
-	talloc_free_children(request);
-
-really_free:
 	/*
 	 *	state_ctx is parented separately.
 	 */
 	if (request->session_state_ctx) TALLOC_FREE(request->session_state_ctx);
+}
+
+/** Callback for slabs to deinitialise the request
+ *
+ * Does not need to be called for local requests.
+ *
+ * @param[in] request		deinitialise
+ * @return
+ *	- 0 in the request was deinitialised.
+ *	- -1 if the request is in an unexpected state.
+ */
+int request_slab_deinit(request_t *request)
+{
+	request_common_deinit(request);
+
+	/*
+	 *	Zero out everything.
+	 */
+	memset(request, 0, sizeof(*request));
 
 #ifndef NDEBUG
+	request->component = "free_list";
+	request->runnable = FR_HEAP_INDEX_INVALID;
 	request->magic = 0x01020304;	/* set the request to be nonsense */
 #endif
 
 	return 0;
-}
-
-/** Free any free requests when the thread is joined
- *
- */
-static void _request_free_list_free_on_exit(void *arg)
-{
-	fr_dlist_head_t *list = talloc_get_type_abort(arg, fr_dlist_head_t);
-	request_t		*request;
-
-	/*
-	 *	See the destructor for why this works
-	 */
-	while ((request = fr_dlist_head(list))) talloc_free(request);
-	talloc_free(list);
 }
 
 static inline CC_HINT(always_inline) request_t *request_alloc_pool(TALLOC_CTX *ctx)
@@ -397,96 +444,16 @@ static inline CC_HINT(always_inline) request_t *request_alloc_pool(TALLOC_CTX *c
 	 *	and would have to be freed.
 	 */
 	MEM(request = talloc_pooled_object(ctx, request_t,
-					   1 + 					/* Stack pool */
-					   UNLANG_STACK_MAX + 			/* Stack Frames */
-					   2 + 					/* packets */
-					   10,					/* extra */
-					   (UNLANG_FRAME_PRE_ALLOC * UNLANG_STACK_MAX) +	/* Stack memory */
-					   (sizeof(fr_pair_t) * 5) +		/* pair lists and root*/
-					   (sizeof(fr_radius_packet_t) * 2) +	/* packets */
-					   128					/* extra */
-					   ));
+					   REQUEST_POOL_NUM_OBJECTS,
+					   REQUEST_POOL_SIZE));
 	fr_assert(ctx != request);
-
-	return request;
-}
-
-/** Create a new request_t data structure
- *
- * @param[in] file	where the request was allocated.
- * @param[in] line	where the request was allocated.
- * @param[in] ctx	to bind the request to.
- * @param[in] type	what type of request to alloc.
- * @param[in] args	Optional arguments.
- * @return
- *	- A request on success.
- *	- NULL on error.
- */
-request_t *_request_alloc(char const *file, int line, TALLOC_CTX *ctx,
-			  request_type_t type, request_init_args_t const *args)
-{
-	request_t		*request;
-	fr_dlist_head_t		*free_list;
-
-	if (!args) args = &default_args;
-
-	/*
-	 *	Setup the free list, or return the free
-	 *	list for this thread.
-	 */
-	if (unlikely(!request_free_list)) {
-		MEM(free_list = talloc(NULL, fr_dlist_head_t));
-		fr_dlist_init(free_list, request_t, free_entry);
-		fr_atexit_thread_local(request_free_list, _request_free_list_free_on_exit, free_list);
-	} else {
-		free_list = request_free_list;
-	}
-
-	request = fr_dlist_head(free_list);
-	if (!request) {
-		/*
-		 *	Must be allocated with in the NULL ctx
-		 *	as chunk is returned to the free list.
-		 */
-		request = request_alloc_pool(NULL);
-		talloc_set_destructor(request, _request_free);
-	} else {
-		/*
-		 *	Remove from the free list, as we're
-		 *	about to use it!
-		 */
-		fr_dlist_remove(free_list, request);
-	}
-
-	if (request_init(file, line, request, type, args) < 0) {
-		talloc_free(request);
-		return NULL;
-	}
-
-	/*
-	 *	Initialise entry in free list
-	 */
-	fr_dlist_entry_init(&request->free_entry);	/* Needs to be initialised properly, else bad things happen */
-
-	/*
-	 *	Bind lifetime to a parent.
-	 *
-	 *	If the parent is freed the destructor
-	 *	will fire, and return the request
-	 *	to a "top level" free list.
-	 */
-	if (ctx) talloc_link_ctx(ctx, request);
 
 	return request;
 }
 
 static int _request_local_free(request_t *request)
 {
-	/*
-	 *	Ensure anything that might reference the request is
-	 *	freed before it is.
-	 */
-	talloc_free_children(request);
+	RDEBUG4("Local request freed (%p)", request);
 
 	/*
 	 *	state_ctx is parented separately.
@@ -507,13 +474,21 @@ static int _request_local_free(request_t *request)
 	 */
 	if (request->session_state_ctx) {
 		fr_assert(!request->parent || (request->session_state_ctx != request->parent->session_state_ctx));
-
-		talloc_free(request->session_state_ctx);
 	}
 
-#ifndef NDEBUG
-	request->magic = 0x01020304;	/* set the request to be nonsense */
-#endif
+	/*
+	 *	The log destinations and the request name are talloc
+	 *	children of the request, and request_common_deinit() logs
+	 *	through the log destinations, so the checks run before the
+	 *	children are freed.
+	 */
+	request_common_deinit(request);
+
+	/*
+	 *	Ensure anything that might reference the request is
+	 *	freed before it is.
+	 */
+	talloc_free_children(request);
 
 	return 0;
 }
@@ -529,14 +504,48 @@ request_t *_request_local_alloc(char const *file, int line, TALLOC_CTX *ctx,
 {
 	request_t *request;
 
-	if (!args) args = &default_args;
-
 	request = request_alloc_pool(ctx);
-	if (request_init(file, line, request, type, args) < 0) return NULL;
+	if (_request_init(file, line, request, type, args) < 0) return NULL;
 
 	talloc_set_destructor(request, _request_local_free);
 
 	return request;
+}
+
+/** Replace the session_state_ctx with a new one.
+ *
+ *  NOTHING should rewrite request->session_state_ctx.
+ *
+ *  It's now a pair, and is stored in request->pair_root.
+ *  So it's wrong for anyone other than this function to play games with it.
+ *
+ * @param[in] request	to replace the state of.
+ * @param[in] new_state	state to assign to the request.
+ *			May be NULL in which case a new_state state will
+ *			be alloced and assigned.
+ *
+ * @return the fr_pair_t containing the old state list.
+ */
+fr_pair_t *request_state_replace(request_t *request, fr_pair_t *new_state)
+{
+	fr_pair_t *old = request->session_state_ctx;
+
+	fr_assert(request->session_state_ctx != NULL);
+	fr_assert(request->session_state_ctx != new_state);
+
+	fr_pair_remove(&request->pair_root->children, old);
+
+	/*
+	 *	Save (or delete) the existing state, and re-initialize
+	 *	it with a brand new one.
+	 */
+	if (!new_state) MEM(new_state = fr_pair_afrom_da(NULL, request_attr_state));
+
+	request->session_state_ctx = new_state;
+
+	fr_pair_append(&request->pair_root->children, new_state);
+
+	return old;
 }
 
 /** Unlink a subrequest from its parent
@@ -574,10 +583,21 @@ int request_detach(request_t *child)
 	 */
 	child->type = REQUEST_TYPE_DETACHED;
 
+	/*
+	 *	...and is no longer detachable.
+	 */
+	child->flags.detachable = 0;
+
 	return 0;
 }
 
-int request_global_init(void)
+static int _request_global_free(UNUSED void *uctx)
+{
+	fr_dict_autofree(request_dict);
+	return 0;
+}
+
+static int _request_global_init(UNUSED void *uctx)
 {
 	if (fr_dict_autoload(request_dict) < 0) {
 		PERROR("%s", __FUNCTION__);
@@ -588,13 +608,14 @@ int request_global_init(void)
 		fr_dict_autofree(request_dict);
 		return -1;
 	}
-
 	return 0;
 }
 
-void request_global_free(void)
+int request_global_init(void)
 {
-	fr_dict_autofree(request_dict);
+	int ret;
+	fr_atexit_global_once_ret(&ret, _request_global_init, _request_global_free, NULL);
+	return ret;
 }
 
 #ifdef WITH_VERIFY_PTR
@@ -602,11 +623,11 @@ void request_global_free(void)
  *	Verify a packet.
  */
 static void packet_verify(char const *file, int line,
-			  request_t const *request, fr_radius_packet_t const *packet, char const *type)
+			  request_t const *request, fr_packet_t const *packet, fr_pair_list_t *list, char const *type)
 {
 	TALLOC_CTX *parent;
 
-	fr_fatal_assert_msg(packet, "CONSISTENCY CHECK FAILED %s[%i]: fr_radius_packet_t %s pointer was NULL",
+	fr_fatal_assert_msg(packet, "CONSISTENCY CHECK FAILED %s[%i]: fr_packet_t %s pointer was NULL",
 			    file, line, type);
 
 	parent = talloc_parent(packet);
@@ -615,10 +636,33 @@ static void packet_verify(char const *file, int line,
 		if (parent) fr_log_talloc_report(parent);
 
 
-		fr_fatal_assert_fail("CONSISTENCY CHECK FAILED %s[%i]: Expected fr_radius_packet_t %s to be parented "
+		fr_fatal_assert_fail("CONSISTENCY CHECK FAILED %s[%i]: Expected fr_packet_t %s to be parented "
 				     "by %p (%s), but parented by %p (%s)",
 				     file, line, type, request, talloc_get_name(request),
 				     parent, parent ? talloc_get_name(parent) : "NULL");
+	}
+
+	/*
+	 *	Enforce nesting at the top level.  This catches minor programming bugs in the server core.
+	 *
+	 *	If we care more, we could do these checks recursively.  But the tmpl_tokenize code already
+	 *	enforces parent / child namespaces.  So the end user shouldn't be able to break the parenting.
+	 *
+	 *	This code really only checks for programming bugs where the C code creates a pair, and then
+	 *	adds it to the wrong list.  This was happening during the transition from flat to nested, as
+	 *	the code was in the middle of being fixed.  It should only happen now if the programmer
+	 *	forgets, and uses the wrong APIs.
+	 */
+	fr_pair_list_foreach(list, vp) {
+		if (vp->da->flags.is_raw) continue;
+
+		if (vp->da->flags.internal) continue;
+
+		if (vp->da->depth > 1) {
+			fr_fatal_assert_fail("CONSISTENCY CHECK FAILED %s[%i]: Expected fr_pair_t %s to be parented "
+				     "by (%s), but it is instead at the top-level %s list",
+					     file, line, vp->da->name, vp->da->parent->name, type);
+		}
 	}
 
 	PACKET_VERIFY(packet);
@@ -637,16 +681,12 @@ void request_verify(char const *file, int line, request_t const *request)
 
 	fr_assert(request->magic == REQUEST_MAGIC);
 
-	fr_fatal_assert_msg(talloc_get_size(request) == sizeof(request_t),
-			    "CONSISTENCY CHECK FAILED %s[%i]: expected request_t size of %zu bytes, got %zu bytes",
-			    file, line, sizeof(request_t), talloc_get_size(request));
-
 	(void)talloc_get_type_abort(request->request_ctx, fr_pair_t);
-	fr_pair_list_verify(file, line, request->request_ctx, &request->request_pairs);
+	fr_pair_list_verify(file, line, request->request_ctx, &request->request_pairs, true);
 	(void)talloc_get_type_abort(request->reply_ctx, fr_pair_t);
-	fr_pair_list_verify(file, line, request->reply_ctx, &request->reply_pairs);
+	fr_pair_list_verify(file, line, request->reply_ctx, &request->reply_pairs, true);
 	(void)talloc_get_type_abort(request->control_ctx, fr_pair_t);
-	fr_pair_list_verify(file, line, request->control_ctx, &request->control_pairs);
+	fr_pair_list_verify(file, line, request->control_ctx, &request->control_pairs, true);
 	(void)talloc_get_type_abort(request->session_state_ctx, fr_pair_t);
 
 #ifndef NDEBUG
@@ -659,12 +699,18 @@ void request_verify(char const *file, int line, request_t const *request)
 	}
 #endif
 
-	fr_pair_list_verify(file, line, request->session_state_ctx, &request->session_state_pairs);
+	fr_pair_list_verify(file, line, request->session_state_ctx, &request->session_state_pairs, true);
+	fr_pair_list_verify(file, line, request->local_ctx, &request->local_pairs, true);
+
+	fr_assert(request->proto_dict != NULL);
+	fr_assert(request->local_dict != NULL);
 
 	if (request->packet) {
-		packet_verify(file, line, request, request->packet, "request");
+		packet_verify(file, line, request, request->packet, &request->request_pairs, "request");
 	}
-	if (request->reply) packet_verify(file, line, request, request->reply, "reply");
+	if (request->reply) {
+		packet_verify(file, line, request, request->reply, &request->reply_pairs, "reply");
+	}
 
 	if (request->async) {
 		(void) talloc_get_type_abort(request->async, fr_async_t);

@@ -1,44 +1,82 @@
 #
-# PRE: update if
+# PRE: if
 #
-update {
-	&request.Packet-Type !* ANY
+# this fails, so the next edit is merged in and fails, too.
+string result_string
+
+control -= Password
+
+control += {
+	User-Name = request.User-Name
+	User-Password = request.User-Password
+	Calling-Station-Id = "ab c"
+	Calling-Station-Id = "de fg"
+#	Port-Limit = { 123, 456 }  # @todo - Doesn't work :(
+	Port-Limit = 123
+	NAS-Port = 456
+	NAS-Port = 789
 }
 
-update {
-	&request.Tmp-String-0 := "ab c"
-	&request.Tmp-String-0 += "de fg"
-	&request.Tmp-Integer-0 := 123
-}
-
-update {
-	&request.Tmp-String-1 := "%(concat:%{request[*]} ', ')"
-	&request.Tmp-String-2 := "%(concat:%{Tmp-String-0[*]} ', ')"
-	&request.Tmp-String-3 := "%(concat:%{Tmp-String-0[*]})"
-	&request.Tmp-String-4 := "%(concat:%{Tmp-String-0[*]} ,)"
-	&request.Tmp-String-5 := "%(concat:%{Tmp-String-0[*]} |-)"
-}
-
-if (&request.Tmp-String-1 != "bob, hello, ab c, de fg, 123") {
+#
+#  ref could return a list.
+#  (ref) means "treat the list as one value"
+#  (string) (ref) casts that one value to a string
+#    and returns one string
+#
+result_string := %{(string) (control.NAS-Port[*])}
+if !(result_string == "456789") {
 	test_fail
 }
 
-if (&request.Tmp-String-2 != "ab c, de fg") {
+#
+#  ref could return a list.
+#
+#  Which we then cast individually to the LHS
+#
+Called-Station-Id := control.NAS-Port[*]
+if !(Called-Station-Id[0] == "456") {
+	test_fail
+}
+
+if !(Called-Station-Id[1] == "789") {
+	test_fail
+}
+
+control -= NAS-Port[*]
+ok	# separate updates
+
+
+result_string := %str.concat(%{control.[*]}, ', ')
+
+"%{result_string}"
+if (!(result_string == "bob, hello, ab c, de fg, 123")) {
+	test_fail
+}
+
+result_string := %str.concat(%{control.Calling-Station-Id[*]}, ', ')
+
+if (!(result_string == "ab c, de fg")) {
 	test_fail
 }
 
 # Empty separator
-if (&request.Tmp-String-3 != "ab cde fg") {
+result_string := %str.concat(%{control.Calling-Station-Id[*]})
+
+if (!(result_string == "ab cde fg")) {
 	test_fail
 }
 
 # Single character separator
-if (&request.Tmp-String-4 != "ab c,de fg") {
+result_string := %str.concat(%{control.Calling-Station-Id[*]}, ',')
+
+if (!(result_string == "ab c,de fg")) {
 	test_fail
 }
 
 # Multi character separator not delimited
-if (&request.Tmp-String-5 !="ab c|-de fg") {
+result_string := %str.concat(%{control.Calling-Station-Id[*]}, '|-')
+
+if !(result_string == "ab c|-de fg") {
 	test_fail
 }
 

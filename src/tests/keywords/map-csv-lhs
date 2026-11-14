@@ -2,6 +2,6 @@
 #  PRE: map
 #
 
-map csv "%{tolower:%{User-Name}}" {
-	&reply.Result-Status := 'field3'
+map csv "%str.lower(%{User-Name})" {
+	reply.Result-Status := 'field3'
 }

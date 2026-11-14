@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -19,16 +19,13 @@
  * @file rlm_stats.c
  * @brief Keep RADIUS statistics. Eventually, also non-RADIUS statistics
  *
- * @copyright 2017 Network RADIUS SARL (license@networkradius.com)
+ * @copyright 2017 Network RADIUS SAS (license@networkradius.com)
  */
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/io/listen.h>
-#include <freeradius-devel/util/dlist.h>
-#include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/radius/radius.h>
 
 #include <freeradius-devel/protocol/radius/freeradius.h>
 
@@ -41,19 +38,24 @@ RCSID("$Id$")
 
 #include <pthread.h>
 
+typedef struct {
+	pthread_mutex_t		mutex;
+	fr_dlist_head_t		list;				//!< for threads to know about each other
+	uint64_t		stats[FR_RADIUS_CODE_MAX];
+} rlm_stats_mutable_t;
+
 /*
  *	@todo - MULTI_PROTOCOL - make this protocol agnostic.
- *	Perhaps keep stats in a hash table by (request->dict, request->code) ?
+ *	Perhaps keep stats in a hash table by (request->proto_dict, request->code) ?
  */
 
 typedef struct {
-	pthread_mutex_t		mutex;
+	rlm_stats_mutable_t	*mutable;
 	fr_dict_attr_t const	*type_da;			//!< FreeRADIUS-Stats4-Type
 	fr_dict_attr_t const	*ipv4_da;			//!< FreeRADIUS-Stats4-IPv4-Address
 	fr_dict_attr_t const	*ipv6_da;			//!< FreeRADIUS-Stats4-IPv6-Address
-	fr_dlist_head_t		list;				//!< for threads to know about each other
 
-	uint64_t		stats[FR_RADIUS_CODE_MAX];
+
 } rlm_stats_t;
 
 typedef struct {
@@ -81,7 +83,7 @@ typedef struct {
 	pthread_mutex_t		mutex;
 } rlm_stats_thread_t;
 
-static const CONF_PARSER module_config[] = {
+static const conf_parser_t module_config[] = {
 	CONF_PARSER_TERMINATOR
 };
 
@@ -90,19 +92,21 @@ static fr_dict_t const *dict_radius;
 extern fr_dict_autoload_t rlm_stats_dict[];
 fr_dict_autoload_t rlm_stats_dict[] = {
 	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_freeradius_stats4_ipv4_address;
 static fr_dict_attr_t const *attr_freeradius_stats4_ipv6_address;
 static fr_dict_attr_t const *attr_freeradius_stats4_type;
+static fr_dict_attr_t const *attr_freeradius_stats4_packet_counters;
 
 extern fr_dict_attr_autoload_t rlm_stats_dict_attr[];
 fr_dict_attr_autoload_t rlm_stats_dict_attr[] = {
-	{ .out = &attr_freeradius_stats4_ipv4_address, .name = "Vendor-Specific.FreeRADIUS.Stats4.Stats4-IPv4-Address", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_radius },
-	{ .out = &attr_freeradius_stats4_ipv6_address, .name = "Vendor-Specific.FreeRADIUS.Stats4.Stats4-IPv6-Address", .type = FR_TYPE_IPV6_ADDR, .dict = &dict_radius },
-	{ .out = &attr_freeradius_stats4_type, .name = "Vendor-Specific.FreeRADIUS.Stats4.Stats4-Type", .type = FR_TYPE_UINT32, .dict = &dict_radius },
-	{ NULL }
+	{ .out = &attr_freeradius_stats4_ipv4_address, .name = "Vendor-Specific.FreeRADIUS.Stats4.IPv4-Address", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_radius },
+	{ .out = &attr_freeradius_stats4_ipv6_address, .name = "Vendor-Specific.FreeRADIUS.Stats4.IPv6-Address", .type = FR_TYPE_IPV6_ADDR, .dict = &dict_radius },
+	{ .out = &attr_freeradius_stats4_type, .name = "Vendor-Specific.FreeRADIUS.Stats4.Type", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ .out = &attr_freeradius_stats4_packet_counters, .name = "Vendor-Specific.FreeRADIUS.Stats4.Packet-Counters", .type = FR_TYPE_TLV, .dict = &dict_radius },
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static void coalesce(uint64_t final_stats[FR_RADIUS_CODE_MAX], rlm_stats_thread_t *t,
@@ -119,7 +123,7 @@ static void coalesce(uint64_t final_stats[FR_RADIUS_CODE_MAX], rlm_stats_thread_
 	 *	Bootstrap with my statistics, where we don't need a
 	 *	lock.
 	 */
-	stats = fr_rb_find(*tree, mydata);
+	fr_rb_find((void **)&stats, *tree, mydata);
 	if (!stats) {
 		memset(final_stats, 0, sizeof(uint64_t) * FR_RADIUS_CODE_MAX);
 	} else {
@@ -130,18 +134,20 @@ static void coalesce(uint64_t final_stats[FR_RADIUS_CODE_MAX], rlm_stats_thread_
 	 *	Loop over all of the other thread instances, locking
 	 *	them, and adding their statistics in.
 	 */
-	for (other = fr_dlist_head(&t->inst->list);
+	pthread_mutex_lock(&t->inst->mutable->mutex);
+	for (other = fr_dlist_head(&t->inst->mutable->list);
 	     other != NULL;
-	     other = fr_dlist_next(&t->inst->list, other)) {
+	     other = fr_dlist_next(&t->inst->mutable->list, other)) {
 		int i;
-
-		pthread_mutex_lock(&other->mutex);
 
 		if (other == t) continue;
 
 		tree = (fr_rb_tree_t **) (((uint8_t *) other) + tree_offset);
-		stats = fr_rb_find(*tree, mydata);
+		pthread_mutex_lock(&other->mutex);
+		fr_rb_find((void **)&stats, *tree, mydata);
+
 		if (!stats) {
+			pthread_mutex_unlock(&other->mutex);
 			continue;
 		}
 		memcpy(&local_stats, stats->stats, sizeof(stats->stats));
@@ -152,15 +158,94 @@ static void coalesce(uint64_t final_stats[FR_RADIUS_CODE_MAX], rlm_stats_thread_
 
 		pthread_mutex_unlock(&other->mutex);
 	}
+	pthread_mutex_unlock(&t->inst->mutable->mutex);
 }
 
+
+static unlang_action_t CC_HINT(nonnull) mod_stats_inc(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
+{
+	rlm_stats_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_stats_t);
+	rlm_stats_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_stats_thread_t);
+	int			i, src_code, dst_code;
+	rlm_stats_data_t	*stats;
+	rlm_stats_data_t	mydata;
+
+	if (request->proto_dict != dict_radius) {
+		RWARN("%s can only be called in RADIUS virtual servers", mctx->mi->name);
+		RETURN_UNLANG_NOOP;
+	}
+
+	src_code = request->packet->code;
+	if (src_code >= FR_RADIUS_CODE_MAX) src_code = 0;
+
+	dst_code = request->reply->code;
+	if (dst_code >= FR_RADIUS_CODE_MAX) dst_code = 0;
+
+	pthread_mutex_lock(&t->mutex);
+	t->stats[src_code]++;
+	t->stats[dst_code]++;
+
+	/*
+	 *	Update source statistics
+	 */
+	mydata.ipaddr = request->packet->socket.inet.src_ipaddr;
+	fr_rb_find((void **)&stats, t->src, &mydata);
+	if (!stats) {
+		MEM(stats = talloc_zero(t, rlm_stats_data_t));
+
+		stats->ipaddr = request->packet->socket.inet.src_ipaddr;
+		stats->created = request->async->recv_time;
+
+		(void) fr_rb_insert(t->src, stats);
+	}
+
+	stats->last_packet = request->async->recv_time;
+	stats->stats[src_code]++;
+
+	/*
+	 *	Update destination statistics
+	 */
+	mydata.ipaddr = request->packet->socket.inet.dst_ipaddr;
+	fr_rb_find((void **)&stats, t->dst, &mydata);
+	if (!stats) {
+		MEM(stats = talloc_zero(t, rlm_stats_data_t));
+
+		stats->ipaddr = request->packet->socket.inet.dst_ipaddr;
+		stats->created = request->async->recv_time;
+
+		(void) fr_rb_insert(t->dst, stats);
+	}
+
+	stats->last_packet = request->async->recv_time;
+	stats->stats[dst_code]++;
+	pthread_mutex_unlock(&t->mutex);
+
+	/*
+	 *	@todo - periodically clean up old entries.
+	 */
+
+	if (fr_time_gt(fr_time_add(t->last_global_update, fr_time_delta_wrap(NSEC)), request->async->recv_time)) {
+		RETURN_UNLANG_UPDATED;
+	}
+
+	t->last_global_update = request->async->recv_time;
+
+	pthread_mutex_lock(&inst->mutable->mutex);
+	for (i = 0; i < FR_RADIUS_CODE_MAX; i++) {
+		inst->mutable->stats[i] += t->stats[i];
+		t->stats[i] = 0;
+	}
+	pthread_mutex_unlock(&inst->mutable->mutex);
+
+	RETURN_UNLANG_UPDATED;
+}
 
 /*
  *	Do the statistics
  */
-static unlang_action_t CC_HINT(nonnull) mod_stats(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_stats_read(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_stats_t		*inst = talloc_get_type_abort(mctx->instance, rlm_stats_t);
+	rlm_stats_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_stats_t);
 	rlm_stats_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_stats_thread_t);
 	int			i;
 	uint32_t		stats_type;
@@ -168,99 +253,23 @@ static unlang_action_t CC_HINT(nonnull) mod_stats(rlm_rcode_t *p_result, module_
 
 	fr_pair_t *vp;
 	rlm_stats_data_t mydata;
-	char buffer[64];
-	uint64_t local_stats[NUM_ELEMENTS(inst->stats)];
+	uint64_t local_stats[NUM_ELEMENTS(inst->mutable->stats)];
 
-	/*
-	 *	Increment counters only in "send foo" sections.
-	 *
-	 *	i.e. only when we have a reply to send.
-	 *
-	 *	FIXME - Nothing sets request_state anymore
-	 */
-#if 0
-	if (request->request_state == REQUEST_SEND) {
-		int src_code, dst_code;
-		rlm_stats_data_t *stats;
-
-		src_code = request->packet->code;
-		if (src_code >= FR_RADIUS_CODE_MAX) src_code = 0;
-
-		dst_code = request->reply->code;
-		if (dst_code >= FR_RADIUS_CODE_MAX) dst_code = 0;
-
-		pthread_mutex_lock(&t->mutex);
-		t->stats[src_code]++;
-		t->stats[dst_code]++;
-
-		/*
-		 *	Update source statistics
-		 */
-		mydata.ipaddr = request->packet->socket.inet.src_ipaddr;
-		stats = fr_rb_find(t->src, &mydata);
-		if (!stats) {
-			MEM(stats = talloc_zero(t, rlm_stats_data_t));
-
-			stats->ipaddr = request->packet->socket.inet.src_ipaddr;
-			stats->created = request->async->recv_time;
-
-			(void) fr_rb_insert(t->src, stats);
-		}
-
-		stats->last_packet = request->async->recv_time;
-		stats->stats[src_code]++;
-		stats->stats[dst_code]++;
-
-		/*
-		 *	Update destination statistics
-		 */
-		mydata.ipaddr = request->packet->socket.inet.dst_ipaddr;
-		stats = fr_rb_find(t->dst, &mydata);
-		if (!stats) {
-			MEM(stats = talloc_zero(t, rlm_stats_data_t));
-
-			stats->ipaddr = request->packet->socket.inet.dst_ipaddr;
-			stats->created = request->async->recv_time;
-
-			(void) fr_rb_insert(t->dst, stats);
-		}
-
-		stats->last_packet = request->async->recv_time;
-		stats->stats[src_code]++;
-		stats->stats[dst_code]++;
-		pthread_mutex_unlock(&t->mutex);
-
-		/*
-		 *	@todo - periodically clean up old entries.
-		 */
-
-		if ((t->last_global_update + NSEC) > request->async->recv_time) {
-			RETURN_MODULE_UPDATED;
-		}
-
-		t->last_global_update = request->async->recv_time;
-
-		pthread_mutex_lock(&inst->mutex);
-		for (i = 0; i < FR_RADIUS_CODE_MAX; i++) {
-			inst->stats[i] += t->stats[i];
-			t->stats[i] = 0;
-		}
-		pthread_mutex_unlock(&inst->mutex);
-
-		RETURN_MODULE_UPDATED;
+	if (request->proto_dict != dict_radius) {
+		RWARN("%s can only be called in RADIUS virtual servers", mctx->mi->name);
+		RETURN_UNLANG_NOOP;
 	}
-#endif
 
 	/*
 	 *	Ignore "authenticate" and anything other than Status-Server
 	 */
 	if ((request->packet->code != FR_RADIUS_CODE_STATUS_SERVER)) {
-		RETURN_MODULE_NOOP;
+		RETURN_UNLANG_NOOP;
 	}
 
-	vp = fr_pair_find_by_da(&request->request_pairs, attr_freeradius_stats4_type, 0);
+	vp = fr_pair_find_by_da_nested(&request->request_pairs, attr_freeradius_stats4_type);
 	if (!vp) {
-		stats_type = FR_STATS4_TYPE_VALUE_GLOBAL;
+		stats_type = FR_TYPE_VALUE_GLOBAL;
 	} else {
 		stats_type = vp->vp_uint32;
 	}
@@ -272,44 +281,44 @@ static unlang_action_t CC_HINT(nonnull) mod_stats(rlm_rcode_t *p_result, module_
 	vp->vp_uint32 = stats_type;
 
 	switch (stats_type) {
-	case FR_STATS4_TYPE_VALUE_GLOBAL:			/* global */
+	case FR_TYPE_VALUE_GLOBAL:			/* global */
 		/*
 		 *	Merge our stats with the global stats, and then copy
 		 *	the global stats to a thread-local variable.
 		 *
 		 *	The copy helps minimize mutex contention.
 		 */
-		pthread_mutex_lock(&inst->mutex);
+		pthread_mutex_lock(&inst->mutable->mutex);
 		for (i = 0; i < FR_RADIUS_CODE_MAX; i++) {
-			inst->stats[i] += t->stats[i];
+			inst->mutable->stats[i] += t->stats[i];
 			t->stats[i] = 0;
 		}
-		memcpy(&local_stats, inst->stats, sizeof(inst->stats));
-		pthread_mutex_unlock(&inst->mutex);
+		memcpy(&local_stats, inst->mutable->stats, sizeof(inst->mutable->stats));
+		pthread_mutex_unlock(&inst->mutable->mutex);
 		vp = NULL;
 		break;
 
-	case FR_STATS4_TYPE_VALUE_CLIENT:			/* src */
-		vp = fr_pair_find_by_da(&request->request_pairs, attr_freeradius_stats4_ipv4_address, 0);
-		if (!vp) vp = fr_pair_find_by_da(&request->request_pairs, attr_freeradius_stats4_ipv6_address, 0);
-		if (!vp) RETURN_MODULE_NOOP;
+	case FR_TYPE_VALUE_CLIENT:			/* src */
+		vp = fr_pair_find_by_da_nested(&request->request_pairs, attr_freeradius_stats4_ipv4_address);
+		if (!vp) vp = fr_pair_find_by_da_nested(&request->request_pairs, attr_freeradius_stats4_ipv6_address);
+		if (!vp) RETURN_UNLANG_NOOP;
 
 		mydata.ipaddr = vp->vp_ip;
 		coalesce(local_stats, t, offsetof(rlm_stats_thread_t, src), &mydata);
 		break;
 
-	case FR_STATS4_TYPE_VALUE_LISTENER:			/* dst */
-		vp = fr_pair_find_by_da(&request->request_pairs, attr_freeradius_stats4_ipv4_address, 0);
-		if (!vp) vp = fr_pair_find_by_da(&request->request_pairs, attr_freeradius_stats4_ipv6_address, 0);
-		if (!vp) RETURN_MODULE_NOOP;
+	case FR_TYPE_VALUE_LISTENER:			/* dst */
+		vp = fr_pair_find_by_da_nested(&request->request_pairs, attr_freeradius_stats4_ipv4_address);
+		if (!vp) vp = fr_pair_find_by_da_nested(&request->request_pairs, attr_freeradius_stats4_ipv6_address);
+		if (!vp) RETURN_UNLANG_NOOP;
 
 		mydata.ipaddr = vp->vp_ip;
 		coalesce(local_stats, t, offsetof(rlm_stats_thread_t, dst), &mydata);
 		break;
 
 	default:
-		REDEBUG("Invalid value '%d' for FreeRADIUS-Stats4-type", stats_type);
-		RETURN_MODULE_FAIL;
+		REDEBUG("Invalid value '%" PRIu32 "' for FreeRADIUS-Stats4-type", stats_type);
+		RETURN_UNLANG_FAIL;
 	}
 
 	if (vp ) {
@@ -319,28 +328,23 @@ static unlang_action_t CC_HINT(nonnull) mod_stats(rlm_rcode_t *p_result, module_
 		}
 	}
 
-	strcpy(buffer, "FreeRADIUS-Stats4-");
-
 	for (i = 0; i < FR_RADIUS_CODE_MAX; i++) {
 		fr_dict_attr_t const *da;
 
 		if (!local_stats[i]) continue;
 
-		strlcpy(buffer + 18, fr_packet_codes[i], sizeof(buffer) - 18);
-		da = fr_dict_attr_by_name(NULL, fr_dict_root(dict_radius), buffer);
+		da = fr_dict_attr_by_name(NULL, attr_freeradius_stats4_packet_counters, fr_radius_packet_name[i]);
 		if (!da) continue;
 
-		MEM(vp = fr_pair_afrom_da(request->reply_ctx, da));
+		MEM(vp = fr_pair_afrom_da_nested(request->reply_ctx, &request->reply_pairs, da));
 		vp->vp_uint64 = local_stats[i];
-
-		fr_pair_append(&request->reply_pairs, vp);
 	}
 
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
 
-static int8_t data_cmp(const void *one, const void *two)
+static fr_cmp_ret_t data_cmp(const void *one, const void *two)
 {
 	rlm_stats_data_t const *a = one;
 	rlm_stats_data_t const *b = two;
@@ -351,10 +355,10 @@ static int8_t data_cmp(const void *one, const void *two)
 /** Instantiate thread data for the submodule.
  *
  */
-static int mod_thread_instantiate(UNUSED CONF_SECTION const *cs, void *instance, UNUSED fr_event_list_t *el, void *thread)
+static int mod_thread_instantiate(module_thread_inst_ctx_t const *mctx)
 {
-	rlm_stats_t *inst = talloc_get_type_abort(instance, rlm_stats_t);
-	rlm_stats_thread_t *t = thread;
+	rlm_stats_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_stats_t);
+	rlm_stats_thread_t *t = talloc_get_type_abort(mctx->thread, rlm_stats_thread_t);
 
 	(void) talloc_set_type(t, rlm_stats_thread_t);
 
@@ -368,11 +372,12 @@ static int mod_thread_instantiate(UNUSED CONF_SECTION const *cs, void *instance,
 		TALLOC_FREE(t->src);
 		return -1;
 	}
-	pthread_mutex_init(&t->mutex, 0);
 
-	pthread_mutex_lock(&inst->mutex);
-	fr_dlist_insert_head(&inst->list, t);
-	pthread_mutex_unlock(&inst->mutex);
+	pthread_mutex_init(&t->mutex, NULL);
+
+	pthread_mutex_lock(&inst->mutable->mutex);
+	fr_dlist_insert_head(&inst->mutable->list, t);
+	pthread_mutex_unlock(&inst->mutable->mutex);
 
 	return 0;
 }
@@ -381,29 +386,30 @@ static int mod_thread_instantiate(UNUSED CONF_SECTION const *cs, void *instance,
 /** Destroy thread data for the submodule.
  *
  */
-static int mod_thread_detach(UNUSED fr_event_list_t *el, void *thread)
+static int mod_thread_detach(module_thread_inst_ctx_t const *mctx)
 {
-	rlm_stats_thread_t	*t = talloc_get_type_abort(thread, rlm_stats_thread_t);
+	rlm_stats_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_stats_thread_t);
 	rlm_stats_t		*inst = t->inst;
 	int			i;
 
-	pthread_mutex_lock(&inst->mutex);
+	pthread_mutex_lock(&inst->mutable->mutex);
 	for (i = 0; i < FR_RADIUS_CODE_MAX; i++) {
-		inst->stats[i] += t->stats[i];
+		inst->mutable->stats[i] += t->stats[i];
 	}
-	fr_dlist_remove(&inst->list, t);
-	pthread_mutex_unlock(&inst->mutex);
+	fr_dlist_remove(&inst->mutable->list, t);
+	pthread_mutex_unlock(&inst->mutable->mutex);
 	pthread_mutex_destroy(&t->mutex);
 
 	return 0;
 }
 
-static int mod_instantiate(void *instance, UNUSED CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_stats_t	*inst = instance;
+	rlm_stats_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_stats_t);
 
-	pthread_mutex_init(&inst->mutex, NULL);
-	fr_dlist_init(&inst->list, rlm_stats_thread_t, entry);
+	MEM(inst->mutable = talloc_zero(NULL, rlm_stats_mutable_t));
+	pthread_mutex_init(&inst->mutable->mutex, NULL);
+	fr_dlist_init(&inst->mutable->list, rlm_stats_thread_t, entry);
 
 	return 0;
 }
@@ -412,11 +418,12 @@ static int mod_instantiate(void *instance, UNUSED CONF_SECTION *conf)
  *	Only free memory we allocated.  The strings allocated via
  *	cf_section_parse() do not need to be freed.
  */
-static int mod_detach(void *instance)
+static int mod_detach(module_detach_ctx_t const *mctx)
 {
-	rlm_stats_t *inst = talloc_get_type_abort(instance, rlm_stats_t);
+	rlm_stats_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_stats_t);
 
-	pthread_mutex_destroy(&inst->mutex);
+	pthread_mutex_destroy(&inst->mutable->mutex);
+	talloc_free(inst->mutable);
 
 	/* free things here */
 	return 0;
@@ -427,25 +434,29 @@ static int mod_detach(void *instance)
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern module_t rlm_stats;
+extern module_rlm_t rlm_stats;
 
-module_t rlm_stats = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "stats",
-	.inst_size		= sizeof(rlm_stats_t),
-	.thread_inst_size	= sizeof(rlm_stats_thread_t),
-	.config			= module_config,
-	.instantiate		= mod_instantiate,
-	.detach			= mod_detach,
-	.thread_instantiate	= mod_thread_instantiate,
-	.thread_detach		= mod_thread_detach,
-	.methods = {
-		[MOD_AUTHORIZE]		= mod_stats, /* @mod_stats_query */
-		[MOD_POST_AUTH]		= mod_stats,
-		[MOD_ACCOUNTING]	= mod_stats,
+module_rlm_t rlm_stats = {
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "stats",
+		.inst_size		= sizeof(rlm_stats_t),
+		.thread_inst_size	= sizeof(rlm_stats_thread_t),
+		.config			= module_config,
+		.instantiate		= mod_instantiate,
+		.detach			= mod_detach,
+		.thread_instantiate	= mod_thread_instantiate,
+		.thread_detach		= mod_thread_detach
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("send", CF_IDENT_ANY), .method = mod_stats_inc },
+			{ .section = SECTION_NAME("recv", "Status-Server"), .method = mod_stats_read },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

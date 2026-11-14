@@ -14,7 +14,7 @@ Acct-Output-Octets = 10
 Acct-Session-Id = '00000001'
 Acct-Unique-Session-Id = '00000001'
 Acct-Authentic = RADIUS
-Acct-Session-Time = 30
+Acct-Session-Time = 0
 Acct-Input-Packets = 10
 Acct-Output-Packets = 10
 Acct-Input-Gigawords = 1
@@ -22,7 +22,7 @@ Acct-Output-Gigawords = 1
 Event-Timestamp = 'Feb  1 2015 08:28:28 WIB'
 NAS-Port-Type = Ethernet
 NAS-Port-Id = 'port 001'
-Service-Type = Framed-User
+Service-Type = ::Framed-User
 Framed-Protocol = PPP
 Acct-Link-Count = 0
 Idle-Timeout = 0
@@ -36,3 +36,4 @@ Proxy-State = 0x323531
 #  There's not an Accounting-Failed packet type in RADIUS...
 #
 Packet-Type == Access-Accept
+Proxy-State == 0x323531

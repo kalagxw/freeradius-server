@@ -21,15 +21,16 @@
  * @file src/bin/radsnmp.c
  *
  * @copyright 2015-2016 The FreeRADIUS server project
- * @copyright 2015-2016 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2015-2016 Network RADIUS SAS (legal@networkradius.com)
  *
  * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
 RCSID("$Id$")
 
 #include <freeradius-devel/util/conf.h>
-#include <freeradius-devel/util/base.h>
 #include <freeradius-devel/util/udp.h>
+#include <freeradius-devel/util/syserror.h>
+#include <freeradius-devel/util/atexit.h>
 #include <freeradius-devel/radius/radius.h>
 #include <freeradius-devel/radius/list.h>
 
@@ -43,7 +44,7 @@ RCSID("$Id$")
 
 #include <assert.h>
 
-static char const *radsnmp_version = RADIUSD_VERSION_STRING_BUILD("radsnmp");
+static char const *radsnmp_version = RADIUSD_VERSION_BUILD("radsnmp");
 
 static bool stop;
 
@@ -54,7 +55,7 @@ static bool stop;
 
 #define ERROR(fmt, ...)		fr_log(&default_log, L_DBG,  __FILE__, __LINE__, "radsnmp (error): " fmt, ## __VA_ARGS__)
 
-typedef enum {
+typedef enum : int8_t {
 	RADSNMP_UNKNOWN = -1,				//!< Unknown command.
 	RADSNMP_PING = 0,				//!< Check server is alive.
 	RADSNMP_GET,					//!< Get an SNMP leaf value.
@@ -65,9 +66,9 @@ typedef enum {
 
 static fr_table_num_sorted_t const radsnmp_command_str[] = {
 	{ L(""),		RADSNMP_EXIT },			//!< Terminate radsnmp.
-	{ L("PING"), 	RADSNMP_PING },			//!< Liveness command from Net-SNMP
 	{ L("get"),	RADSNMP_GET },			//!< Get the value of an OID.
 	{ L("getnext"), 	RADSNMP_GETNEXT },		//!< Get the next OID in the tree.
+	{ L("PING"), 	RADSNMP_PING },			//!< Liveness command from Net-SNMP
 	{ L("set"),	RADSNMP_SET },			//!< Set the value of an OID.
 };
 static size_t radsnmp_command_str_len = NUM_ELEMENTS(radsnmp_command_str);
@@ -79,7 +80,7 @@ typedef struct {
 	fr_dict_attr_t const	*snmp_op;		//!< SNMP operation.
 	fr_dict_attr_t const	*snmp_type;		//!< SNMP type attribute.
 	fr_dict_attr_t const	*snmp_failure;		//!< SNMP set error attribute.
-	char const		*raddb_dir;		//!< Radius dictionary directory.
+	char const		*confdir;		//!< Radius dictionary directory.
 	char const		*dict_dir;		//!< Dictionary director.
 	unsigned int		code;			//!< Request type.
 	int			proto;			//!< Protocol TCP/UDP.
@@ -90,18 +91,20 @@ typedef struct {
 	uint16_t		server_port;		//!< Port to send requests to.
 
 	unsigned int		retries;		//!< Number of retries.
-	fr_time_t		timeout;
+	fr_time_delta_t		timeout;
 	char			*secret;		//!< Shared secret.
 } radsnmp_conf_t;
 
 static fr_dict_t const *dict_freeradius;
 static fr_dict_t const *dict_radius;
+static fr_dict_t const *dict_snmp;
 
 extern fr_dict_autoload_t radsnmp_dict[];
 fr_dict_autoload_t radsnmp_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
+	{ .out = &dict_snmp, .proto = "snmp" },
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_extended_attribute_1;
@@ -114,12 +117,12 @@ static fr_dict_attr_t const *attr_vendor_specific;
 extern fr_dict_attr_autoload_t radsnmp_dict_attr[];
 fr_dict_attr_autoload_t radsnmp_dict_attr[] = {
 	{ .out = &attr_extended_attribute_1, .name = "Extended-Attribute-1", .type = FR_TYPE_TLV, .dict = &dict_radius },
-	{ .out = &attr_freeradius_snmp_failure, .name = "FreeRADIUS-SNMP-Failure", .type = FR_TYPE_UINT8, .dict = &dict_radius },
-	{ .out = &attr_freeradius_snmp_operation, .name = "FreeRADIUS-SNMP-Operation", .type = FR_TYPE_UINT8, .dict = &dict_radius },
-	{ .out = &attr_freeradius_snmp_type, .name = "FreeRADIUS-SNMP-Type", .type = FR_TYPE_UINT8, .dict = &dict_radius },
+	{ .out = &attr_freeradius_snmp_failure, .name = "FreeRADIUS-SNMP-Failure", .type = FR_TYPE_UINT8, .dict = &dict_snmp },
+	{ .out = &attr_freeradius_snmp_operation, .name = "FreeRADIUS-SNMP-Operation", .type = FR_TYPE_UINT8, .dict = &dict_snmp },
+	{ .out = &attr_freeradius_snmp_type, .name = "FreeRADIUS-SNMP-Type", .type = FR_TYPE_UINT8, .dict = &dict_snmp },
 	{ .out = &attr_message_authenticator, .name = "Message-Authenticator", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_vendor_specific, .name = "Vendor-Specific", .type = FR_TYPE_VSA, .dict = &dict_radius },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static NEVER_RETURNS void usage(void)
@@ -129,7 +132,7 @@ static NEVER_RETURNS void usage(void)
 	fprintf(stderr, "  <command>              One of auth, acct, status, coa, disconnect or auto.\n");
 	fprintf(stderr, "  -4                     Use IPv4 address of server\n");
 	fprintf(stderr, "  -6                     Use IPv6 address of server.\n");
-	fprintf(stderr, "  -d <raddb>             Set user dictionary directory (defaults to " RADDBDIR ").\n");
+	fprintf(stderr, "  -d <confdir>           Set user dictionary directory (defaults to " CONFDIR ").\n");
 	fprintf(stderr, "  -D <dictdir>           Set main dictionary directory (defaults to " DICTDIR ").\n");
 	fprintf(stderr, "  -h                     Print usage help information.\n");
 	fprintf(stderr, "  -l <file>              Log output to file.\n");
@@ -161,11 +164,11 @@ static void rs_signal_stop(UNUSED int sig)
  * @param fd the request will be sent on.
  * @return new request.
  */
-static fr_radius_packet_t *radsnmp_alloc(radsnmp_conf_t *conf, int fd)
+static fr_packet_t *radsnmp_alloc(radsnmp_conf_t *conf, int fd)
 {
-	fr_radius_packet_t *packet;
+	fr_packet_t *packet;
 
-	packet = fr_radius_packet_alloc(conf, true);
+	packet = fr_packet_alloc(conf, true);
 
 	packet->code = conf->code;
 
@@ -235,7 +238,7 @@ static ssize_t radsnmp_pair_from_oid(TALLOC_CTX *ctx, radsnmp_conf_t *conf, fr_d
 	for (;;) {
 		unsigned int num = 0;
 
-		slen = fr_dict_attr_by_oid_legacy(conf->dict, &parent, &attr, p);
+		slen = fr_dict_attr_by_oid_legacy(&parent, &attr, p);
 		if (slen > 0) break;
 		p += -(slen);
 
@@ -301,11 +304,21 @@ static ssize_t radsnmp_pair_from_oid(TALLOC_CTX *ctx, radsnmp_conf_t *conf, fr_d
 	if (attr != 0) {
 		da = fr_dict_attr_child_by_num(parent, attr);
 		if (!da) {
-			fr_strerror_printf("Unknown leaf attribute %i", attr);
+			fr_strerror_printf("Unknown leaf attribute %u", attr);
 			return -(slen);
 		}
 	} else {
 		da = parent;
+	}
+
+	/*
+	 *	TLVs are special, they cannot hold values.  The caller should know this!
+	 */
+	if (da->type == FR_TYPE_TLV) {
+		if (!value) return slen;
+
+		fr_strerror_const("TLVs cannot hold values");
+		return -(slen);
 	}
 
 	MEM(vp = fr_pair_afrom_da(ctx, da));
@@ -314,18 +327,7 @@ static ssize_t radsnmp_pair_from_oid(TALLOC_CTX *ctx, radsnmp_conf_t *conf, fr_d
 	 *	fr_pair_ts with no value need a 1 byte value buffer.
 	 */
 	if (!value) {
-		switch (da->type) {
-		/*
-		 *	We can blame the authors of RFC 6929 for
-		 *	this hack.  Apparently the presence or absence
-		 *	of an attribute isn't considered a useful means
-		 *	of conveying information, so empty TLVs are
-		 *	disallowed.
-		 */
-		case FR_TYPE_TLV:
-			fr_pair_to_unknown(vp);
-			FALL_THROUGH;
-
+		switch (vp->vp_type) {
 		case FR_TYPE_OCTETS:
 			fr_pair_value_memdup(vp, (uint8_t const *)"\0", 1, true);
 			break;
@@ -345,12 +347,7 @@ static ssize_t radsnmp_pair_from_oid(TALLOC_CTX *ctx, radsnmp_conf_t *conf, fr_d
 		return slen;
 	}
 
-	if (da->type == FR_TYPE_TLV) {
-		fr_strerror_const("TLVs cannot hold values");
-		return -(slen);
-	}
-
-	ret = fr_pair_value_from_str(vp, value, -1, '\0', true);
+	ret = fr_pair_value_from_str(vp, value, strlen(value), NULL, true);
 	if (ret < 0) {
 		slen = -(slen);
 		goto error;
@@ -426,10 +423,12 @@ static int radsnmp_get_response(int fd,
 	 *	attribute grouping to coalesce all related index
 	 *	attributes under a single request OID.
 	 */
-	 for (vp = fr_dcursor_init(&cursor, head);
+	 for (vp = fr_pair_dcursor_init(&cursor, head);
 	      vp;
 	      vp = fr_dcursor_next(&cursor)) {
 	      	fr_dict_attr_t const *common;
+		fr_value_box_t copy;
+
 	      	/*
 	      	 *	We only care about TLV attributes beneath our root
 	      	 */
@@ -469,7 +468,7 @@ static int radsnmp_get_response(int fd,
 			 *	Add the value of the index attribute as the next
 			 *	OID component.
 			 */
-			len = snprintf(p, end - p, ".%i.", vp->vp_uint32);
+			len = snprintf(p, end - p, ".%" PRIu32 ".", vp->vp_uint32);
 			if (is_truncated(len, end - p)) goto oob;
 
 			p += len;
@@ -526,13 +525,21 @@ static int radsnmp_get_response(int fd,
 			io_vector[4].iov_len = vp->vp_length;
 			break;
 
+		case FR_TYPE_STRUCTURAL:
+			fr_assert(0);
+			return -1;
+
 		default:
 			/*
-			 *	We call fr_value_box_print with a NULL da pointer
-			 *	because we always need return integer values not
-			 *	value aliases.
+			 *	We need the integer values, not the
+			 *	enum names.  So we copy the box, and
+			 *	nuke the enum ptr.
 			 */
-			slen = fr_value_box_print(&FR_SBUFF_OUT(value_buff, sizeof(value_buff)), &vp->data, NULL);
+			fr_value_box_copy_shallow(NULL, &copy, &vp->data);
+			copy.enumv = NULL;
+
+			slen = fr_value_box_print(&FR_SBUFF_OUT(value_buff, sizeof(value_buff)), &copy, NULL);
+
 			if (slen < 0) {
 				fr_strerror_const("Insufficient fixed value buffer");
 				return -1;
@@ -590,7 +597,7 @@ static int radsnmp_set_response(int fd, fr_dict_attr_t const *error, fr_pair_lis
 	struct iovec	io_vector[2];
 	char		newline[] = "\n";
 
-	vp = fr_pair_find_by_da(head, error, 0);
+	vp = fr_pair_find_by_da(head, NULL, error);
 	if (!vp) {
 		if (write(fd, "DONE\n", 5) < 0) {
 			fr_strerror_printf("Failed writing set response: %s", fr_syserror(errno));
@@ -625,17 +632,17 @@ static int radsnmp_send_recv(radsnmp_conf_t *conf, int fd)
 	fr_strerror_clear();
 
 #define NEXT_LINE(_line, _buffer) \
-{ \
+do { \
 	size_t _len; \
 	if (stop) return 0; \
 	errno = 0;\
 	_line = fgets(_buffer, sizeof(_buffer), stdin); \
-	if (_line) { \
-		_len = strlen(_line); \
-		if ((_len > 0) && (_line[_len - 1] == '\n')) _line[_len - 1] = '\0'; \
-		DEBUG2("read: %s", _line); \
-	} \
-}
+	if (!_line) return 0; \
+	_len = strlen(_line); \
+	if ((_len > 0) && (_line[_len - 1] == '\n')) _line[_len - 1] = '\0'; \
+	DEBUG2("read: %s", _line); \
+} while (0)
+
 	/*
 	 *	Read commands from pass_persist
 	 */
@@ -648,7 +655,7 @@ static int radsnmp_send_recv(radsnmp_conf_t *conf, int fd)
 
 		fr_dcursor_t		cursor;
 		fr_pair_t		*vp;
-		fr_radius_packet_t	*packet;
+		fr_packet_t	*packet;
 		fr_pair_list_t		request_vps;
 
 		/*
@@ -661,7 +668,7 @@ static int radsnmp_send_recv(radsnmp_conf_t *conf, int fd)
 			return EXIT_FAILURE;
 		}
 		fr_pair_list_init(&request_vps);
-		fr_dcursor_init(&cursor, &request_vps);
+		fr_pair_dcursor_init(&cursor, &request_vps);
 
 		NEXT_LINE(line, buffer);
 
@@ -680,11 +687,11 @@ static int radsnmp_send_recv(radsnmp_conf_t *conf, int fd)
 
 		case RADSNMP_SET:
 		{
-			char		value_buff[254];	/* RADIUS attribute length + 1 */
-			char		*value;
-			char		type_str[64];
-			char		*p;
-			fr_dict_enum_t	*type;
+			char				value_buff[254];	/* RADIUS attribute length + 1 */
+			char				*value;
+			char				type_str[64];
+			char				*p;
+			fr_dict_enum_value_t const	*type;
 
 			NEXT_LINE(line, buffer);	/* Should be the OID */
 			NEXT_LINE(value, value_buff);	/* Should be the value */
@@ -767,7 +774,7 @@ static int radsnmp_send_recv(radsnmp_conf_t *conf, int fd)
 		 *	Send the packet
 		 */
 		{
-			fr_radius_packet_t	*reply = NULL;
+			fr_packet_t	*reply = NULL;
 			fr_pair_list_t		reply_vps;
 			ssize_t			rcode;
 
@@ -777,20 +784,10 @@ static int radsnmp_send_recv(radsnmp_conf_t *conf, int fd)
 			unsigned int		i;
 
 			fr_pair_list_init(&reply_vps);
-
-			if (fr_radius_packet_encode(packet, &request_vps, NULL, conf->secret) < 0) {
-				fr_perror("Failed encoding packet");
-				return EXIT_FAILURE;
-			}
-			if (fr_radius_packet_sign(packet, NULL, conf->secret) < 0) {
-				fr_perror("Failed signing packet");
-				return EXIT_FAILURE;
-			}
-
 			/*
 			 *	Print the attributes we're about to send
 			 */
-			fr_packet_log(&default_log, packet, &reply_vps, false);
+			fr_radius_packet_log(&default_log, packet, &reply_vps, false);
 
 			FD_ZERO(&set); /* clear the set */
 			FD_SET(fd, &set);
@@ -801,7 +798,7 @@ static int radsnmp_send_recv(radsnmp_conf_t *conf, int fd)
 			 *	next call.
 			 */
 			for (i = 0; i < conf->retries; i++) {
-				rcode = write(packet->socket.fd, packet->data, packet->data_len);
+				rcode = fr_radius_packet_send(packet, &request_vps, NULL, conf->secret);
 				if (rcode < 0) {
 					ERROR("Failed sending: %s", fr_syserror(errno));
 					return EXIT_FAILURE;
@@ -814,11 +811,11 @@ static int radsnmp_send_recv(radsnmp_conf_t *conf, int fd)
 					return EXIT_FAILURE;
 
 				case 0:
-					DEBUG("Response timeout.  Retrying %d/%u...", i + 1, conf->retries);
+					DEBUG("Response timeout.  Retrying %u/%u...", i + 1, conf->retries);
 					continue;	/* Timeout */
 
 				case 1:
-					reply = fr_radius_packet_recv(packet, packet->socket.fd, UDP_FLAGS_NONE,
+					reply = fr_packet_recv(packet, packet->socket.fd, UDP_FLAGS_NONE,
 								      RADIUS_MAX_ATTRIBUTES, false);
 					if (!reply) {
 						fr_perror("Failed receiving reply");
@@ -827,9 +824,12 @@ static int radsnmp_send_recv(radsnmp_conf_t *conf, int fd)
 						talloc_free(packet);
 						continue;
 					}
-					if (fr_radius_packet_decode(reply, &reply_vps, packet,
-								    RADIUS_MAX_ATTRIBUTES, false, conf->secret) < 0) {
+					if (fr_radius_decode_simple(reply, &reply_vps,
+								    reply->data, reply->data_len,
+								    packet->vector,
+								    conf->secret) < 0) {
 						fr_perror("Failed decoding reply");
+						talloc_free(reply);
 						goto recv_error;
 					}
 					break;
@@ -849,7 +849,7 @@ static int radsnmp_send_recv(radsnmp_conf_t *conf, int fd)
 			/*
 			 *	Print the attributes we received in response
 			 */
-			fr_packet_log(&default_log, reply, &reply_vps, true);
+			fr_radius_packet_log(&default_log, reply, &reply_vps, true);
 
 			switch (command) {
 			case RADSNMP_GET:
@@ -915,17 +915,15 @@ int main(int argc, char **argv)
 	conf = talloc_zero(autofree, radsnmp_conf_t);
 	conf->proto = IPPROTO_UDP;
 	conf->dict_dir = DICTDIR;
-	conf->raddb_dir = RADDBDIR;
+	conf->confdir = CONFDIR;
 	conf->secret = talloc_strdup(conf, "testing123");
 	conf->timeout = fr_time_delta_from_sec(3);
 	conf->retries = 5;
 
-#ifndef NDEBUG
-	if (fr_fault_setup(autofree, getenv("PANIC_ACTION"), argv[0]) < 0) {
+	if (fr_fault_setup(autofree, getenv("PANIC_ACTION"), argv[0], PANIC_ACTION_SIGNALS) < 0) {
 		fr_perror("radsnmp");
 		fr_exit_now(EXIT_FAILURE);
 	}
-#endif
 
 	/*
 	 *	Need to log to stderr because net-snmp will interpret stdout
@@ -947,7 +945,7 @@ int main(int argc, char **argv)
 			break;
 
 		case 'd':
-			conf->raddb_dir = optarg;
+			conf->confdir = optarg;
 			break;
 
 		case 'l':
@@ -975,7 +973,7 @@ int main(int argc, char **argv)
 			break;
 
 		case 'r':
-			if (!isdigit((int) *optarg)) usage();
+			if (!isdigit((uint8_t) *optarg)) usage();
 			conf->retries = atoi(optarg);
 			if ((conf->retries == 0) || (conf->retries > 1000)) usage();
 			break;
@@ -1012,7 +1010,7 @@ int main(int argc, char **argv)
 		       break;
 
 		case 't':
-			if (fr_time_delta_from_str(&conf->timeout, optarg, FR_TIME_RES_SEC) < 0) {
+			if (fr_time_delta_from_str(&conf->timeout, optarg, strlen(optarg), FR_TIME_RES_SEC) < 0) {
 				fr_perror("Failed parsing timeout value");
 				fr_exit_now(EXIT_FAILURE);
 			}
@@ -1045,6 +1043,11 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
+	if (!fr_dict_global_ctx_init(NULL, true, conf->dict_dir)) {
+		fr_perror("radsnmp");
+		fr_exit_now(EXIT_FAILURE);
+	}
+
 	if (fr_dict_autoload(radsnmp_dict) < 0) {
 		fr_perror("radsnmp");
 		fr_exit_now(EXIT_FAILURE);
@@ -1055,19 +1058,25 @@ int main(int argc, char **argv)
 		fr_exit_now(EXIT_FAILURE);
 	}
 
-	if (fr_dict_read(fr_dict_unconst(dict_freeradius), conf->raddb_dir, FR_DICTIONARY_FILE) == -1) {
+	if (fr_dict_read(fr_dict_unconst(dict_freeradius), conf->confdir, FR_DICTIONARY_FILE) == -1) {
 		fr_perror("radsnmp");
 		fr_exit_now(EXIT_FAILURE);
 	}
+
+	if (fr_radius_global_init() < 0) {
+		fr_perror("radsnmp");
+		fr_exit_now(EXIT_FAILURE);
+	}
+
 	fr_strerror_clear();	/* Clear the error buffer */
 
 	/*
 	 *	Get the request type
 	 */
-	if (!isdigit((int) argv[2][0])) {
+	if (!isdigit((uint8_t) argv[2][0])) {
 		int code;
 
-		code = fr_table_value_by_str(fr_request_types, argv[2], -1);
+		code = fr_table_value_by_str(fr_radius_request_name_table, argv[2], -1);
 		if (code < 0) {
 			ERROR("Unrecognised request type \"%s\"", argv[2]);
 			usage();
@@ -1095,8 +1104,8 @@ int main(int argc, char **argv)
 
 	conf->snmp_root = fr_dict_attr_child_by_num(attr_vendor_specific, VENDORPEC_FREERADIUS);
 	if (!conf->snmp_root) {
-		ERROR("Incomplete dictionary: Missing definition for Extended-Attribute-1(%i)."
-		      "Vendor-Specific(%i).FreeRADIUS(%i)",
+		ERROR("Incomplete dictionary: Missing definition for Extended-Attribute-1(%u)."
+		      "Vendor-Specific(%u).FreeRADIUS(%i)",
 		      attr_extended_attribute_1->attr,
 		      attr_vendor_specific->attr,
 		      VENDORPEC_FREERADIUS);
@@ -1107,8 +1116,8 @@ int main(int argc, char **argv)
 
 	conf->snmp_oid_root = fr_dict_attr_child_by_num(conf->snmp_root, 1);
 	if (!conf->snmp_oid_root) {
-		ERROR("Incomplete dictionary: Missing definition for 1.Extended-Attribute-1(%i)."
-		      "Vendor-Specific(%i).FreeRADIUS(%i).FreeRADIUS-Iso(%i)",
+		ERROR("Incomplete dictionary: Missing definition for 1.Extended-Attribute-1(%u)."
+		      "Vendor-Specific(%u).FreeRADIUS(%i).FreeRADIUS-Iso(%i)",
 		      attr_extended_attribute_1->attr,
 		      attr_vendor_specific->attr,
 		      VENDORPEC_FREERADIUS, 1);
@@ -1117,12 +1126,12 @@ int main(int argc, char **argv)
 
 	switch (conf->proto) {
 	case IPPROTO_TCP:
-		sockfd = fr_socket_client_tcp(NULL, &conf->server_ipaddr, conf->server_port, true);
+		sockfd = fr_socket_client_tcp(NULL, NULL, &conf->server_ipaddr, conf->server_port, true);
 		break;
 
 	default:
 	case IPPROTO_UDP:
-		sockfd = fr_socket_client_udp(NULL, NULL, &conf->server_ipaddr, conf->server_port, true);
+		sockfd = fr_socket_client_udp(NULL, NULL, NULL, &conf->server_ipaddr, conf->server_port, true);
 		break;
 	}
 	if (sockfd < 0) {
@@ -1152,6 +1161,12 @@ finish:
 	 *	...except the dictionaries
 	 */
 	fr_dict_autofree(radsnmp_dict);
+
+	/*
+	 *	Ensure our atexit handlers run before any other
+	 *	atexit handlers registered by third party libraries.
+	 */
+	fr_atexit_global_trigger_all();
 
 	return ret;
 }

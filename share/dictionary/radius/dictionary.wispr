@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -28,12 +28,28 @@ ATTRIBUTE	Location-ID				1	string
 ATTRIBUTE	Location-Name				2	string
 ATTRIBUTE	Logoff-URL				3	string
 ATTRIBUTE	Redirection-URL				4	string
-ATTRIBUTE	Bandwidth-Min-Up			5	integer
-ATTRIBUTE	Bandwidth-Min-Down			6	integer
-ATTRIBUTE	Bandwidth-Max-Up			7	integer
-ATTRIBUTE	Bandwidth-Max-Down			8	integer
+ATTRIBUTE	Bandwidth-Min-Up			5	uint32
+ATTRIBUTE	Bandwidth-Min-Down			6	uint32
+ATTRIBUTE	Bandwidth-Max-Up			7	uint32
+ATTRIBUTE	Bandwidth-Max-Down			8	uint32
 ATTRIBUTE	Session-Terminate-Time			9	string
 ATTRIBUTE	Session-Terminate-End-Of-Day		10	string
 ATTRIBUTE	Billing-Class-Of-Service		11	string
 
+#
+# Wireless Broadband Alliance "WBA-" attributes also use vendor ID 14122
+#
+# https://github.com/wireless-broadband-alliance/RADIUS-VSA
+#
+ATTRIBUTE	Offered-Service				12	string
+ATTRIBUTE	Financial-Clearing-Provider		13	string
+ATTRIBUTE	Data-Clearing-Provider			14	string
+ATTRIBUTE	Linear-Volume-Rate			15	octets
+ATTRIBUTE	Identity-Provider			16	string
+ATTRIBUTE	Custom-SLA				17	string
+
+
 END-VENDOR	WISPr
+ALIAS		WISPr					Vendor-Specific.WISPr
+ALIAS		WBA					Vendor-Specific.WISPr
+

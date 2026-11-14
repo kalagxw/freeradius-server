@@ -2,11 +2,12 @@
 
 ifneq "${TARGETNAME}" ""
   TARGETNAME	:= rlm_sqlcounter
-  TARGET	:= $(TARGETNAME).a
+  TARGET	:= $(TARGETNAME)$(L)
 
   # Be sure to NOT include the rlm_sql drivers
   SUBMAKEFILES	:= 
 endif
+TGT_CATEGORY	:=
 
 SOURCES		:= $(TARGETNAME).c
 

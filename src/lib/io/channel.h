@@ -44,13 +44,15 @@ typedef struct fr_channel_s fr_channel_t;
  *	Forward declaration until such time as we fix the code so that
  *	the network threads can push transports to worker threads.
  */
-typedef struct fr_listen fr_listen_t;
+typedef struct fr_listen_s fr_listen_t;
+typedef struct fr_listen_instance_s fr_listen_instance_t;
 
 #ifdef __cplusplus
 }
 #endif
 
 #include <freeradius-devel/io/base.h>
+#include <freeradius-devel/io/atomic_queue.h>
 #include <freeradius-devel/io/control.h>
 #include <freeradius-devel/io/message.h>
 #include <freeradius-devel/util/dlist.h>
@@ -64,16 +66,20 @@ typedef struct fr_listen fr_listen_t;
 extern "C" {
 #endif
 
-typedef enum fr_channel_event_t {
-	FR_CHANNEL_ERROR = 0,
-	FR_CHANNEL_DATA_READY_RESPONDER,
-	FR_CHANNEL_DATA_READY_REQUESTOR,
-	FR_CHANNEL_OPEN,
-	FR_CHANNEL_CLOSE,
-
-	FR_CHANNEL_NOOP,
-	FR_CHANNEL_EMPTY,
-} fr_channel_event_t;
+/** Events channels send, in the FR_CONTROL_EVENTSET_CHANNEL event set
+ *
+ *  The control plane dispatches each to its own callback, see
+ *  fr_channel_callbacks_add().
+ */
+typedef enum fr_channel_control_event_t : uint16_t {
+	FR_CHANNEL_CONTROL_DATA_TO_RESPONDER = 0,	//!< Requests are queued for the responder.
+	FR_CHANNEL_CONTROL_DATA_TO_REQUESTOR,		//!< Replies are queued for the requestor.
+	FR_CHANNEL_CONTROL_DATA_DONE_RESPONDER,		//!< The responder has serviced its requests, and says
+							///< how many it has seen.  Replies may be waiting.
+	FR_CHANNEL_CONTROL_OPEN,			//!< A requestor has opened a channel to the responder.
+	FR_CHANNEL_CONTROL_CLOSE,			//!< The requestor is closing the channel.
+	FR_CHANNEL_CONTROL_CLOSE_ACK			//!< The responder has finished closing it.
+} fr_channel_control_event_t;
 
 /** Statistics for the channel
  *
@@ -82,6 +88,7 @@ typedef struct {
 	uint64_t       		outstanding; 	//!< Number of outstanding requests with no reply.
 	uint64_t		signals;	//!< Number of kevent signals we've sent.
 	uint64_t		resignals;	//!< Number of signals resent.
+	uint64_t		spurious;	//!< Number of signals we received which found no data waiting.
 
 	uint64_t		packets;	//!< Number of actual data packets.
 
@@ -128,13 +135,12 @@ typedef struct {
 	union {
 		struct {
 			fr_time_t		recv_time;	//!< time original request was received (network -> worker)
-			bool			is_dup;		//!< dup, new, etc.
 		} request;
 
 		struct {
-			fr_time_delta_t		cpu_time;	//!<  total CPU time, including predicted work, (only worker -> network)
-			fr_time_delta_t		processing_time;  //!< actual processing time for this packet (only worker -> network)
-			fr_time_t		request_time;	//!< timestamp of the request packet
+			fr_time_delta_t		cpu_time;		//!< Total CPU time, including predicted work, (only worker -> network).
+			fr_time_delta_t		processing_time; 	//!< Actual processing time for this packet (only worker -> network).
+			fr_time_t		request_time;		//!< Timestamp of the request packet.
 	        } reply;
 	};
 
@@ -144,7 +150,7 @@ typedef struct {
 								//!< information, and other proto_* specific information
 								//!< that needs to be passed to the request.
 
-	fr_listen_t	*listen;				//!< for tracking packet transport, etc.
+	fr_listen_instance_t	*inst;				//!< for tracking packet transport, etc.
 } fr_channel_data_t;
 
 #define PRIORITY_NOW    (1 << 16)
@@ -167,26 +173,73 @@ int	fr_channel_null_reply(fr_channel_t *ch) CC_HINT(nonnull);
 
 bool	fr_channel_recv_reply(fr_channel_t *ch) CC_HINT(nonnull);
 
-typedef void (*fr_channel_recv_callback_t)(void *ctx, fr_channel_t *ch, fr_channel_data_t *cd);
-int	fr_channel_set_recv_reply(fr_channel_t *ch, void *ctx, fr_channel_recv_callback_t recv_reply) CC_HINT(nonnull(1,3));
-int	fr_channel_set_recv_request(fr_channel_t *ch, void *ctx, fr_channel_recv_callback_t recv_reply) CC_HINT(nonnull(1,3));
-
-int	fr_channel_responder_sleeping(fr_channel_t *ch) CC_HINT(nonnull);
+typedef void (*fr_channel_recv_callback_t)(fr_channel_t *ch, fr_channel_data_t *cd, void *uctx);
+int	fr_channel_set_recv_reply(fr_channel_t *ch, fr_channel_recv_callback_t recv_reply, void *uctx) CC_HINT(nonnull(1,2));
+int	fr_channel_set_recv_request(fr_channel_t *ch, fr_channel_recv_callback_t recv_request, void *uctx) CC_HINT(nonnull(1,2));
 
 int	fr_channel_service_kevent(fr_channel_t *ch, fr_control_t *c, struct kevent const *kev) CC_HINT(nonnull);
-fr_channel_event_t	fr_channel_service_message(fr_time_t when, fr_channel_t **p_channel, void const *data, size_t data_size) CC_HINT(nonnull);
+
+/** Called on a responder when a requestor opens a channel to it
+ *
+ * @param[in] ch	the new channel.
+ * @param[in] reply_ms	the message set the responder allocates replies from.
+ * @param[in] now	the current time.
+ * @param[in] uctx	registered with the callbacks.
+ */
+typedef void (*fr_channel_open_t)(fr_channel_t *ch, fr_message_set_t *reply_ms, fr_time_t now, void *uctx);
+
+/** Called on a responder when the requestor closes a channel
+ *
+ * The responder calls fr_channel_responder_ack_close() once it has
+ * finished with the channel.
+ *
+ * @param[in] ch	the channel.
+ * @param[in] now	the current time.
+ * @param[in] uctx	registered with the callbacks.
+ */
+typedef void (*fr_channel_close_t)(fr_channel_t *ch, fr_time_t now, void *uctx);
+
+/** Called on a requestor when the responder has finished closing a channel
+ *
+ * @param[in] ch	the channel.
+ * @param[in] now	the current time.
+ * @param[in] uctx	registered with the callbacks.
+ */
+typedef void (*fr_channel_closed_t)(fr_channel_t *ch, fr_time_t now, void *uctx);
+
+/** What the owner of a control plane does with channel lifecycle events
+ *
+ *  Data arriving on a channel is drained by the channel code itself,
+ *  through the callbacks set with fr_channel_set_recv_request() and
+ *  fr_channel_set_recv_reply().  Only the lifecycle events reach the
+ *  owner.  A responder gets open and close, a requestor gets closed.
+ *  Leave the others NULL.
+ */
+typedef struct {
+	fr_channel_open_t	open;
+	fr_channel_close_t	close;
+	fr_channel_closed_t	closed;
+} fr_channel_callbacks_t;
+
+int	fr_channel_callbacks_add(fr_control_t *c, fr_channel_callbacks_t const *callbacks,
+				 void *uctx) CC_HINT(nonnull);
 
 bool	fr_channel_active(fr_channel_t *ch) CC_HINT(nonnull);
 
-int	fr_channel_signal_open(fr_channel_t *ch) CC_HINT(nonnull);
+int	fr_channel_signal_open(fr_channel_t *ch, fr_message_set_t *reply_ms) CC_HINT(nonnull);
 
 int	fr_channel_signal_responder_close(fr_channel_t *ch) CC_HINT(nonnull);
+unsigned int fr_channel_responder_discard(fr_channel_t *ch) CC_HINT(nonnull);
+
 int	fr_channel_responder_ack_close(fr_channel_t *ch) CC_HINT(nonnull);
 
 void	fr_channel_responder_uctx_add(fr_channel_t *ch, void *ctx) CC_HINT(nonnull);
 void	*fr_channel_responder_uctx_get(fr_channel_t *ch) CC_HINT(nonnull);
 void	fr_channel_requestor_uctx_add(fr_channel_t *ch, void *ctx) CC_HINT(nonnull);
 void	*fr_channel_requestor_uctx_get(fr_channel_t *ch) CC_HINT(nonnull);
+
+fr_channel_stats_t const *fr_channel_requestor_stats(fr_channel_t const *ch) CC_HINT(nonnull);
+fr_channel_stats_t const *fr_channel_responder_stats(fr_channel_t const *ch) CC_HINT(nonnull);
 
 
 void	fr_channel_stats_log(fr_channel_t const *ch, fr_log_t const *log, char const *file, int line);

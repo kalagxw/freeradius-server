@@ -1,5 +1,6 @@
-TARGET		:= libfreeradius-control.a
+TARGET		:= libfreeradius-control$(L)
+TGT_CATEGORY	:= lib-util
 
 SOURCES		:= conduit.c
 
-SRC_CFLAGS	:= 
+SRC_CFLAGS	:=

@@ -29,11 +29,9 @@ extern "C" {
 
 #include <freeradius-devel/util/misc.h>
 
-#include <stdbool.h>
-#include <stdint.h>
 
 /* Red-Black tree description */
-typedef enum {
+typedef enum : uint8_t {
 	BLACK,
 	RED
 } fr_rb_colour_t;
@@ -107,7 +105,6 @@ struct fr_rb_tree_s {
  *				If ctx is freed, tree will free any nodes, calling the
  *				free function if set.
  * @param[in] _type		of item being stored in the tree, e.g. fr_value_box_t.
- * @param[in] _field		Containing the #fr_rb_node_t within item being stored.
  * @param[in] _data_cmp		Callback to compare node data.
  * @param[in] _data_free	Optional function used to free data if tree nodes are
  *				deleted or replaced.
@@ -120,7 +117,7 @@ struct fr_rb_tree_s {
 
 /** Initialises a red black tree
  *
- * This variant initates an #fr_rb_node_t on the heap.  This allows the data structure
+ * This variant initiates an #fr_rb_node_t on the heap.  This allows the data structure
  * to be inserted into multiple trees.
  *
  * @param[out] _tree		to initialise.
@@ -140,7 +137,7 @@ struct fr_rb_tree_s {
 /** Initialises a red black that verifies elements are of a specific talloc type
  *
  * This variant stores #fr_rb_node_t data inline with the data structure to avoid
- * initating #fr_rb_node_t on the heap.
+ * initiating #fr_rb_node_t on the heap.
  *
  * It is suitable for use where the data structure will only be inserted into a
  * fixed set of trees.
@@ -163,7 +160,7 @@ struct fr_rb_tree_s {
 /** Initialises a red black tree
  *
  * This variant stores #fr_rb_node_t data inline with the data structure to avoid
- * initating #fr_rb_node_t on the heap.
+ * initiating #fr_rb_node_t on the heap.
  *
  * It is suitable for use where the data structure will only be inserted into a
  * fixed set of trees.
@@ -175,8 +172,8 @@ struct fr_rb_tree_s {
  * @param[in] _data_free	Optional function used to free data if tree nodes are
  *				deleted or replaced.
  * @return
- *	- A new rbtree on success.
- *	- NULL on failure.
+ *	- 0 on success.
+ *	- -1 on failure.
  */
 #define		fr_rb_inline_init(_tree, _type, _field, _data_cmp, _data_free) \
 		_Generic((((_type *)0)->_field), \
@@ -196,7 +193,6 @@ int _fr_rb_init(fr_rb_tree_t *tree, TALLOC_CTX *node_ctx,
  *				If ctx is freed, tree will free any nodes, calling the
  *				free function if set.
  * @param[in] _type		of item being stored in the tree, e.g. fr_value_box_t.
- * @param[in] _field		Containing the #fr_rb_node_t within item being stored.
  * @param[in] _data_cmp		Callback to compare node data.
  * @param[in] _data_free	Optional function used to free data if tree nodes are
  *				deleted or replaced.
@@ -279,19 +275,27 @@ fr_rb_tree_t	*_fr_rb_alloc(TALLOC_CTX *ctx, ssize_t offset, char const *type,
 			      fr_cmp_t data_cmp, fr_free_t data_free) CC_HINT(warn_unused_result);
 
 /** @hidecallergraph */
-void		*fr_rb_find(fr_rb_tree_t const *tree, void const *data) CC_HINT(nonnull);
+int		fr_rb_find(void **found, fr_rb_tree_t const *tree, void const *data) CC_HINT(nonnull);
 
 int		fr_rb_find_or_insert(void **found, fr_rb_tree_t *tree, void const *data) CC_HINT(nonnull(2,3));
 
-bool		fr_rb_insert(fr_rb_tree_t *tree, void const *data) CC_HINT(nonnull);
+int		fr_rb_insert(fr_rb_tree_t *tree, void const *data) CC_HINT(nonnull);
 
 int		fr_rb_replace(void **old, fr_rb_tree_t *tree, void const *data) CC_HINT(nonnull(2,3));
 
-void		*fr_rb_remove(fr_rb_tree_t *tree, void const *data) CC_HINT(nonnull);
+int		fr_rb_remove(void **removed, fr_rb_tree_t *tree, void const *data) CC_HINT(nonnull(2,3));
 
-bool		fr_rb_delete(fr_rb_tree_t *tree, void const *data) CC_HINT(nonnull);
+void		*fr_rb_remove_by_inline_node(fr_rb_tree_t *tree, fr_rb_node_t *node) CC_HINT(nonnull);
+
+int		fr_rb_delete(fr_rb_tree_t *tree, void const *data) CC_HINT(nonnull);
+
+bool 		fr_rb_delete_by_inline_node(fr_rb_tree_t *tree, fr_rb_node_t *node) CC_HINT(nonnull);
 
 uint32_t	fr_rb_num_elements(fr_rb_tree_t *tree) CC_HINT(nonnull);
+
+void		*fr_rb_first(fr_rb_tree_t *tree) CC_HINT(nonnull);
+
+void		*fr_rb_last(fr_rb_tree_t *tree) CC_HINT(nonnull);
 
 /** Check to see if an item is in a tree by examining its inline #fr_rb_node_t
  *
@@ -310,60 +314,53 @@ static inline bool fr_rb_node_inline_in_tree(fr_rb_node_t const *node)
 	return (node->left && node->right && node->parent && !node->being_freed);
 }
 
-/** Check to see if nodes are equivalent and if they are, replace one with the other
- *
- * @param[in] tree		Used to access the comparitor.
- * @param[in] to_replace	Node to replace in the tree.
- * @param[in] replacement	Replacement.
- * @return
- *      - true on success.
- *      - false if nodes were not equivalent.
- */
-static inline bool fr_rb_node_inline_replace(fr_rb_tree_t *tree, fr_rb_node_t *to_replace, fr_rb_node_t *replacement)
-{
-	if (tree->data_cmp(to_replace->data, replacement->data) != 0) return false;
-
-	memcpy(replacement, to_replace, sizeof(*replacement));
-	memset(to_replace, 0, sizeof(*to_replace));
-
-	return true;
-}
-
 /** Iterator structure for in-order traversal of an rbtree
  */
 typedef struct {
-	fr_rb_tree_t	*tree;			//!< Tree being iterated over.
 	fr_rb_node_t	*node;			///< current node--set to NULL (not NIL) by fr_rb_iter_delete()
 	fr_rb_node_t	*next;			///< if non-NULL, next node cached by fr_rb_iter_delete()
 } fr_rb_iter_inorder_t;
 
-void		*fr_rb_iter_init_inorder(fr_rb_iter_inorder_t *iter, fr_rb_tree_t *tree) CC_HINT(nonnull);
+void		*fr_rb_iter_init_inorder(fr_rb_tree_t *tree, fr_rb_iter_inorder_t *iter) CC_HINT(nonnull);
 
-void		*fr_rb_iter_next_inorder(fr_rb_iter_inorder_t *iter) CC_HINT(nonnull);
+void		*fr_rb_iter_next_inorder(fr_rb_tree_t *tree, fr_rb_iter_inorder_t *iter) CC_HINT(nonnull);
 
-void		fr_rb_iter_delete_inorder(fr_rb_iter_inorder_t *iter) CC_HINT(nonnull);
+void		fr_rb_iter_delete_inorder(fr_rb_tree_t *tree, fr_rb_iter_inorder_t *iter) CC_HINT(nonnull);
+
+#define fr_rb_inorder_foreach(_tree, _type, _iter) \
+{ \
+	fr_rb_iter_inorder_t _state; \
+	for (_type *_iter = fr_rb_iter_init_inorder(_tree, &_state); _iter; _iter = fr_rb_iter_next_inorder(_tree, &_state))
 
 /** Iterator structure for pre-order traversal of an rbtree
  */
 typedef struct {
-	fr_rb_tree_t	*tree;			//!< Tree being iterated over.
 	fr_rb_node_t	*node;			///< current node
 } fr_rb_iter_preorder_t;
 
-void		*fr_rb_iter_init_preorder(fr_rb_iter_preorder_t *iter, fr_rb_tree_t *tree) CC_HINT(nonnull);
+void		*fr_rb_iter_init_preorder(fr_rb_tree_t *tree, fr_rb_iter_preorder_t *iter) CC_HINT(nonnull);
 
-void		*fr_rb_iter_next_preorder(fr_rb_iter_preorder_t *iter) CC_HINT(nonnull);
+void		*fr_rb_iter_next_preorder(fr_rb_tree_t *tree, fr_rb_iter_preorder_t *iter) CC_HINT(nonnull);
+
+#define fr_rb_preorder_foreach(_tree, _type, _iter) \
+{ \
+	fr_rb_iter_preorder_t _state; \
+	for (_type *_iter = fr_rb_iter_init_preorder(_tree, &_state); _iter; _iter = fr_rb_iter_next_preorder(_tree, &_state))
 
 /** Iterator structure for post-order traversal of an rbtree
  */
 typedef struct {
-	fr_rb_tree_t	*tree;			//!< Tree being iterated over.
 	fr_rb_node_t	*node;			///< current node
 } fr_rb_iter_postorder_t;
 
-void		*fr_rb_iter_init_postorder(fr_rb_iter_postorder_t *iter, fr_rb_tree_t *tree) CC_HINT(nonnull);
+void		*fr_rb_iter_init_postorder(fr_rb_tree_t *tree, fr_rb_iter_postorder_t *iter) CC_HINT(nonnull);
 
-void		*fr_rb_iter_next_postorder(fr_rb_iter_postorder_t *iter) CC_HINT(nonnull);
+void		*fr_rb_iter_next_postorder(fr_rb_tree_t *tree, fr_rb_iter_postorder_t *iter) CC_HINT(nonnull);
+
+#define fr_rb_postorder_foreach(_tree, _type, _iter) \
+{ \
+	fr_rb_iter_postorder_t _state; \
+	for (_type *_iter = fr_rb_iter_init_postorder(_tree, &_state); _iter; _iter = fr_rb_iter_next_postorder(_tree, &_state))
 
 int		fr_rb_flatten_inorder(TALLOC_CTX *ctx, void **out[], fr_rb_tree_t *tree);
 

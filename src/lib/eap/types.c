@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -21,6 +21,8 @@
  *
  * @copyright 2019 The FreeRADIUS server project
  */
+#include <freeradius-devel/util/value.h>
+
 #include "attrs.h"
 #include "types.h"
 
@@ -35,7 +37,7 @@
  */
 eap_type_t eap_name2type(char const *name)
 {
-	fr_dict_enum_t	*dv;
+	fr_dict_enum_value_t const	*dv;
 
 	dv = fr_dict_enum_by_name(attr_eap_type, name, -1);
 	if (!dv) return FR_EAP_METHOD_INVALID;
@@ -51,7 +53,7 @@ eap_type_t eap_name2type(char const *name)
  */
 char const *eap_type2name(eap_type_t method)
 {
-	fr_dict_enum_t	*dv;
+	fr_dict_enum_value_t const	*dv;
 
 	dv = fr_dict_enum_by_value(attr_eap_type, fr_box_uint32(method));
 	if (dv) return dv->name;

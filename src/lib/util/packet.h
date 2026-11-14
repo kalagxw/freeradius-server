@@ -37,7 +37,7 @@ extern "C" {
 #include <freeradius-devel/util/time.h>
 
 #ifdef WITH_VERIFY_PTR
-#  define PACKET_VERIFY(_x)	(void) talloc_get_type_abort_const(_x, fr_radius_packet_t)
+#  define PACKET_VERIFY(_x)	(void) talloc_get_type_abort_const(_x, fr_packet_t)
 #else
 #  define PACKET_VERIFY(_x)	fr_cond_assert(_x)
 #endif
@@ -47,38 +47,41 @@ extern "C" {
 /*
  *	vector:		Request authenticator from access-request packet
  *			Put in there by rad_decode, and must be put in the
- *			response fr_radius_packet_t as well before calling fr_radius_packet_send
+ *			response fr_packet_t as well before calling fr_radius_packet_send
  *
  *	verified:	Filled in by rad_decode for accounting-request packets
  *
  *	data,data_len:	Used between fr_radius_recv and fr_radius_decode.
  */
 typedef struct {
-	fr_rb_node_t		node;			//!< Allows insertion into the list.c
-							///< rbtree, may be removed in future.
-
 	fr_socket_t		socket;			//!< This packet was received on.
+	fr_time_t		timestamp;		//!< When we received the packet.
 
 	int			id;			//!< Packet ID (used to link requests/responses).
 	unsigned int		code;			//!< Packet code (type).
 
-	uint8_t			vector[RADIUS_AUTH_VECTOR_LENGTH];//!< RADIUS authentication vector.
-
-	uint32_t       		count;			//!< Number of times we've seen this packet
-	fr_time_t		timestamp;		//!< When we received the packet.
 	uint8_t			*data;			//!< Packet data (body).
 	size_t			data_len;		//!< Length of packet data.
 
-	uint32_t       		rounds;			//!< for State[0]
+	/*
+	 *	The vector should go away soon
+	 */
+	uint8_t			vector[RADIUS_AUTH_VECTOR_LENGTH];//!< RADIUS authentication vector.
+
+	/*
+	 *	The following fields are deprecated, and only used by old code.
+	 */
+	fr_rb_node_t		node;			//!< Allows insertion into the list.c
+							///< rbtree, may be removed in future.
 
 	size_t			partial;
 
 	void			*uctx;
-} fr_radius_packet_t;
+} fr_packet_t;
 
-fr_radius_packet_t	*fr_radius_packet_alloc(TALLOC_CTX *ctx, bool new_vector);
-fr_radius_packet_t	*fr_radius_packet_alloc_reply(TALLOC_CTX *ctx, fr_radius_packet_t *);
-void		fr_radius_packet_free(fr_radius_packet_t **);
+fr_packet_t	*fr_packet_alloc(TALLOC_CTX *ctx, bool new_vector);
+fr_packet_t	*fr_packet_alloc_reply(TALLOC_CTX *ctx, fr_packet_t *);
+void		fr_packet_free(fr_packet_t **);
 
 #ifdef __cplusplus
 }

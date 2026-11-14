@@ -26,14 +26,12 @@ RCSID("$Id$")
 #include <freeradius-devel/io/schedule.h>
 #include <freeradius-devel/radius/defs.h>
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/util/base.h>
 #include <freeradius-devel/util/inet.h>
 #include <freeradius-devel/util/md5.h>
 #include <freeradius-devel/util/syserror.h>
 
 #include <sys/event.h>
 #include <stdio.h>
-#include <string.h>
 #include <pthread.h>
 
 #ifdef HAVE_GETOPT_H
@@ -64,7 +62,7 @@ static fr_test_packet_ctx_t	tpc;
 static rlm_rcode_t test_process(UNUSED void const *instance, request_t *request, fr_io_action_t action)
 {
 	MPRINT1("\t\tPROCESS --- request %"PRIu64" action %d\n", request->number, action);
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
 static int test_decode(void const *instance, request_t *request, uint8_t *const data, size_t data_len)
@@ -94,11 +92,11 @@ static ssize_t test_encode(void const *instance, request_t *request, uint8_t *bu
 
 	memcpy(buffer + 4, tpc.vector, 16);
 
-	md5_ctx = fr_md5_ctx_alloc(true);
+	md5_ctx = fr_md5_ctx_alloc_from_list();
 	fr_md5_update(md5_ctx, buffer, 20);
 	fr_md5_update(md5_ctx, (uint8_t const *) secret, strlen(secret));
 	fr_md5_final(buffer + 4, md5_ctx);
-	fr_md5_ctx_free(&md5_ctx);
+	fr_md5_ctx_free_from_list(&md5_ctx);
 
 	return 20;
 }
@@ -120,7 +118,7 @@ static int test_open(void *ctx, UNUSED void const *master_ctx)
 		fr_exit_now(EXIT_FAILURE);
 	}
 
-	if (fr_socket_bind(io_ctx->sockfd, &io_ctx->ipaddr, &io_ctx->port, NULL) < 0) {
+	if (fr_socket_bind(io_ctx->sockfd, NULL, &io_ctx->ipaddr, &io_ctx->port) < 0) {
 		fr_perror("radius_test: Failed binding to socket");
 		fr_exit_now(EXIT_FAILURE);
 	}
@@ -228,7 +226,7 @@ int main(int argc, char *argv[])
 
 	fr_time_start();
 
-	fr_log_init(&default_log, false);
+	fr_log_init_legacy(&default_log, false);
 	default_log.colourise = true;
 
 	memset(&my_ipaddr, 0, sizeof(my_ipaddr));
@@ -278,7 +276,7 @@ int main(int argc, char *argv[])
 	app_io_inst->ipaddr = my_ipaddr;
 	app_io_inst->port = my_port;
 
-	sched = fr_schedule_create(autofree, NULL, &default_log, debug_lvl, num_networks, num_workers, NULL, NULL);
+	sched = fr_schedule_create(autofree, false, NULL, &default_log, debug_lvl, num_networks, num_workers, NULL, NULL);
 	if (!sched) {
 		fprintf(stderr, "schedule_test: Failed to create scheduler\n");
 		fr_exit_now(EXIT_FAILURE);
@@ -297,7 +295,7 @@ int main(int argc, char *argv[])
 	}
 #endif
 
-	(void) fr_fault_setup(autofree, NULL, argv[0]);
+	(void) fr_fault_setup(autofree, NULL, argv[0], PANIC_ACTION_SIGNALS);
 	(void) fr_schedule_listen_add(sched, &listen);
 
 	sleep(10);

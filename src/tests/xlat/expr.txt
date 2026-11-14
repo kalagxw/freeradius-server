@@ -1,23 +1,172 @@
-xlat %{expr: 1 + 2 + 3 + 4}
-data 10
+#
+#  1 argument
+#
+#
+#  @todo - this offset is way wrong
+#
+xlat_expr %file.exists()
+match ERROR offset 13 'Missing required arg 1'
 
-xlat %{expr: 1 & ~1}
-data 0
+#
+#  Only one argument
+#
+xlat_expr %file.exists("foo", "bar")
+match ERROR offset 19 'Too many arguments, expected 1, got 2'
 
-xlat %{expr: 2 - -1}
-data 3
 
-xlat %{expr: -1 * 2}
-data -2
+#-- we don't have a cast to string, and we don't have a tmpl where the cast
+# can be stored...
+# add a cast, and update the cast function to print (type)....
+xlat_expr (string) "foo%bin('000000')"
+match foo\000\000\000
 
-xlat %{expr: 1 << 2 | 1}
-data 5
+xlat_expr 1 && 2
+match 2
 
-xlat %{expr: 6 + -(1 + 3)}
-data 2
+xlat_expr 1 < 2
+match true
 
-xlat %{tolower:\%{ FOO}
-data \%{ foo
+xlat_expr 1 + 2
+match 3
 
-xlat \%D
-data %D
+xlat_expr (ipv4prefix) 192.168.0.0/16 + 4
+match 192.168.0.4
+
+# @todo - quotes?
+xlat_expr "foo"
+match foo
+
+# @todo - quotes?
+xlat_expr "foo" + "bar"
+match foobar
+
+xlat_expr 0xabcdef + 0x1234
+match 0xabcdef1234
+
+xlat_expr 2 ^ 4
+match 6
+
+xlat_expr (uint32) 8 >> 2
+match 2
+
+xlat_expr (uint32) 1 << 31
+match 2147483648
+
+xlat_expr %n
+match 0
+
+xlat_expr &Net.Src.IP =~ /^127.0/
+match true
+
+xlat_expr &Net.Src.IP =~ /^128.0/
+match false
+
+xlat_expr &Net.Src.IP =~ /foo %{Net.Dst.IP} foo/
+match false
+
+xlat_expr &Net.Src.IP =~ /%{Net.Dst.IP}/
+match true
+
+# Auto upcast
+xlat_expr (uint32) 1 << 32
+match 4294967296
+
+#
+#  The error message is currently "eaten" by a call to RPEDEBUG
+#  in xlat_eval.c.  Oh well.
+#
+xlat_expr (uint32)((uint32) 1 << 32)
+match ERROR expanding xlat: no error provided
+
+#
+#  This shifts it 8, and then tries to cast it to uint8?
+#
+xlat_expr (uint8) 1 << 8
+match 256
+
+# Cannot perform any operations for destination type ether
+#
+#  Except the error is printed out via RPEDEBUG, and is thus unavailable
+#  to the unit tests
+#
+xlat_expr 00:01:02:03:04:05 ^ 11:22:33:44:55:66
+match ERROR expanding xlat: no error provided
+
+#
+#  NAS-IP-Address doesn't exist.
+#
+xlat_expr -&NAS-IP-Address
+match ERROR expanding xlat: Input is empty
+
+xlat_expr "foo" + (string)&Net.Src.IP
+match foo127.0.0.1
+
+xlat_expr "foo%{Net.Src.IP}"
+match foo127.0.0.1
+
+xlat_expr "foo" + (octets)&Net.Src.IP
+match 0x666f6f7f000001
+
+#
+#  @todo - fix escaping of "match" results?
+#  This just casts the octets to 'string', without
+#  any escaping.
+#
+xlat_expr "foo" + (string)%bin('0x0001020304')
+match foo\000\001\002\003\004
+
+
+# string + octets gets promoted to octets
+xlat_expr "foo" + %bin('0x0001020304')
+match 0x666f6f0001020304
+
+# no escaping!
+xlat_expr 'foo%{Packet-Authentication-Vector}'
+match foo%{Packet-Authentication-Vector}
+
+# Ad-hoc packing of TLVs!
+xlat_expr (octets)((uint16) 258) + (octets)((uint16) 4) + (octets)((ipv4addr) 127.0.0.1)
+match 0x010200047f000001
+
+xlat_expr (uint16) ((uint32) 1 + (uint8) 2)
+match 3
+
+xlat_expr (&Framed-IP-Address || &Net.Src.IP) == (ipaddr) 127.0.0.1
+match true
+
+xlat_expr "foo " + "baz" + " bar"
+match foo baz bar
+
+#xlat_expr "foo " + &User-Name + " bar"
+#match foo bob bar
+
+#
+#  The User-Name has to exist
+#
+xlat_expr %{User-Name}
+match bob
+
+#
+#  We're not hashing the string value of the attribute reference
+#
+xlat_expr (octets) %hash.md5('&User-Name')
+match 0x14d23a6ed8e7d19fcb3a38dc86c1fc0b
+
+#
+#  We're hashing the string contained by the User-Name
+#
+xlat_expr (octets) %hash.md5('bob')
+match 0x9f9d51bc70ef21ca5c14f307980a29d8
+
+#
+#  And if we take it from the &User-Name ref, we get the same thing
+#  as hashing the bare string.
+#
+xlat_expr (octets) %hash.md5(%{User-Name})
+match 0x9f9d51bc70ef21ca5c14f307980a29d8
+
+xlat_expr &Service-Type
+match Framed-User
+
+xlat_expr (uint32) (&Service-Type)
+match 2

@@ -37,7 +37,6 @@ RCSID("$Id$")
 #include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/syserror.h>
 
-#include <signal.h>
 #include <fcntl.h>
 
 #ifdef HAVE_SYS_WAIT_H
@@ -52,22 +51,22 @@ static int			self_pipe[2] = { -1, -1 };
 #include <systemd/sd-daemon.h>
 
 static fr_time_delta_t		sd_watchdog_interval;
-static fr_event_timer_t	const	*sd_watchdog_ev;
+static fr_timer_t		*sd_watchdog_ev;
 
 /** Reoccurring watchdog event to inform systemd we're still alive
  *
- * Note actually a very good indicator of aliveness as the main event
+ * Not actually a very good indicator of aliveness as the main event
  * loop doesn't actually do any packet processing.
  */
-static void sd_watchdog_event(fr_event_list_t *our_el, UNUSED fr_time_t now, void *ctx)
+static void sd_watchdog_event(fr_timer_list_t *tl, UNUSED fr_time_t now, void *ctx)
 {
 	DEBUG("Emitting systemd watchdog notification");
 
 	sd_notify(0, "WATCHDOG=1");
 
-	if (fr_event_timer_in(NULL, our_el, &sd_watchdog_ev,
-			      sd_watchdog_interval,
-			      sd_watchdog_event, ctx) < 0) {
+	if (fr_timer_in(NULL, tl, &sd_watchdog_ev,
+			sd_watchdog_interval,
+			true, sd_watchdog_event, ctx) < 0) {
 		ERROR("Failed to insert watchdog event");
 	}
 }
@@ -80,6 +79,13 @@ void main_loop_signal_raise(int flag)
 {
 	ssize_t rcode;
 	uint8_t buffer[16];
+
+	/*
+	 *	The main loop is exiting, don't read from the self
+	 *	pipe, which avoids a fault below when that pipe
+	 *	doesn't exist.
+	 */
+	if (self_pipe[1] < 0) return;
 
 	/*
 	 *	The read MUST be non-blocking for this to work.
@@ -97,7 +103,10 @@ void main_loop_signal_raise(int flag)
 
 	buffer[0] |= flag;
 
-	if (write(self_pipe[1], buffer, 1) < 0) fr_exit(0);
+	if (write(self_pipe[1], buffer, 1) < 0) {
+		FR_FAULT_LOG("Failed to write to self-pipe: %s", fr_syserror(errno));
+		fr_exit(0);
+	}
 }
 
 static void main_loop_signal_process(int flag)
@@ -111,6 +120,8 @@ static void main_loop_signal_process(int flag)
 			fr_event_loop_exit(event_list, 2);
 		}
 
+		close(self_pipe[1]);
+		self_pipe[1] = -1;
 		return;
 	} /* else exit/term flags weren't set */
 
@@ -119,10 +130,10 @@ static void main_loop_signal_process(int flag)
 	 */
 	if ((flag & RADIUS_SIGNAL_SELF_HUP) != 0) {
 		fr_time_t when;
-		static fr_time_t last_hup = 0;
+		static fr_time_t last_hup = fr_time_wrap(0);
 
 		when = fr_time();
-		if (when - last_hup <  fr_time_delta_from_sec(5)) {
+		if (fr_time_delta_lt(fr_time_sub(when, last_hup), fr_time_delta_from_sec(5))) {
 			INFO("Ignoring HUP (less than 5s since last one)");
 			return;
 		}
@@ -131,7 +142,7 @@ static void main_loop_signal_process(int flag)
 
 		last_hup = when;
 
-		trigger_exec(unlang_interpret_get_thread_default(), NULL, NULL, "server.signal.hup", true, NULL);
+		trigger(unlang_interpret_get_thread_default(), NULL, NULL, "server.signal.hup", true, NULL, NULL);
 		fr_event_loop_exit(event_list, 0x80);
 	}
 }
@@ -175,7 +186,7 @@ void main_loop_set_sd_watchdog_interval(void)
 		 *	and set the interval to be half what
 		 *	systemd uses as its timeout value.
 		 */
-		sd_watchdog_interval = ((interval_usec * 1000) / 2);
+		sd_watchdog_interval = fr_time_delta_wrap((interval_usec * 1000) / 2);
 
 		INFO("systemd watchdog interval is %pVs", fr_box_time_delta(sd_watchdog_interval));
 	} else {
@@ -208,7 +219,7 @@ int main_loop_start(void)
 	/*
 	 *	Start placating the watchdog (if told to do so).
 	 */
-	if (sd_watchdog_interval > 0) sd_watchdog_event(event_list, 0, NULL);
+	if (fr_time_delta_ispos(sd_watchdog_interval)) sd_watchdog_event(event_list->tl, fr_time_wrap(0), NULL);
 #endif
 
 	ret = fr_event_loop(event_list);
@@ -217,7 +228,7 @@ int main_loop_start(void)
 		if (under_systemd) {
 			INFO("Informing systemd we're stopping");
 			sd_notify(0, "STOPPING=1");
-			fr_event_timer_delete(&sd_watchdog_ev);
+			FR_TIMER_DELETE(&sd_watchdog_ev);
 		}
 	}
 #endif
@@ -232,9 +243,9 @@ int main_loop_start(void)
 	return ret;
 }
 
-static int _loop_status(fr_time_t wake, UNUSED void *ctx)
+static int _loop_status(UNUSED fr_time_t now, fr_time_delta_t wake, UNUSED void *ctx)
 {
-	if (wake > (NSEC / 10)) DEBUG3("Main loop waking up in %pV seconds", fr_box_time_delta(wake));
+	if (fr_time_delta_unwrap(wake) > (NSEC / 10)) DEBUG4("Main loop waking up in %pV seconds", fr_box_time_delta(wake));
 
 	return 0;
 }
@@ -266,27 +277,25 @@ int main_loop_init(void)
 		ERROR("Error opening self-signal pipe: %s", fr_syserror(errno));
 		return -1;
 	}
-	if ((fcntl(self_pipe[0], F_SETFL, O_NONBLOCK) < 0) ||
-	    (fcntl(self_pipe[0], F_SETFD, FD_CLOEXEC) < 0)) {
+	if ((fr_cloexec(self_pipe[0]) < 0) || (fr_cloexec(self_pipe[1]) < 0) ||
+	    (fr_nonblock(self_pipe[0]) < 0) || (fr_nonblock(self_pipe[1]) < 0)) {
 		ERROR("Error setting self-signal pipe flags: %s", fr_syserror(errno));
-		return -1;
-	}
-	if ((fcntl(self_pipe[1], F_SETFL, O_NONBLOCK) < 0) ||
-	    (fcntl(self_pipe[1], F_SETFD, FD_CLOEXEC) < 0)) {
-		ERROR("Error setting self-signal pipe flags: %s", fr_syserror(errno));
+	close_pipe:
+		close(self_pipe[0]);
+		close(self_pipe[1]);
+		self_pipe[0] = self_pipe[1] = -1;
 		return -1;
 	}
 	DEBUG4("Created self-signal pipe.  Read end FD %i, write end FD %i", self_pipe[0], self_pipe[1]);
 
-	if (fr_event_fd_insert(NULL, event_list, self_pipe[0],
+	if (fr_event_fd_insert(NULL, NULL, event_list, self_pipe[0],
 			       main_loop_signal_recv,
 			       NULL,
 			       NULL,
 			       event_list) < 0) {
 		PERROR("Failed creating self-signal pipe handler");
-		return -1;
+		goto close_pipe;
 	}
 
 	return 0;
 }
-

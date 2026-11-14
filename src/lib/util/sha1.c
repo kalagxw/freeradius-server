@@ -10,7 +10,6 @@ RCSID("$Id$")
 
 #include <freeradius-devel/util/sha1.h>
 
-#include <arpa/inet.h>
 
 #ifndef WITH_OPENSSL_SHA1
 #  define rol(value, bits) (((value) << (bits)) | ((value) >> (32 - (bits))))
@@ -24,11 +23,11 @@ RCSID("$Id$")
     ^block->l[(i+2)&15]^block->l[i&15],1))
 
 /* (R0+R1), R2, R3, R4 are the different operations used in SHA1 */
-#  define R0(v,w,x,y,z,i) z+=((w&(x^y))^y)+blk0(i)+0x5A827999+rol(v,5);w=rol(w,30);
-#  define R1(v,w,x,y,z,i) z+=((w&(x^y))^y)+blk(i)+0x5A827999+rol(v,5);w=rol(w,30);
-#  define R2(v,w,x,y,z,i) z+=(w^x^y)+blk(i)+0x6ED9EBA1+rol(v,5);w=rol(w,30);
-#  define R3(v,w,x,y,z,i) z+=(((w|x)&y)|(w&x))+blk(i)+0x8F1BBCDC+rol(v,5);w=rol(w,30);
-#  define R4(v,w,x,y,z,i) z+=(w^x^y)+blk(i)+0xCA62C1D6+rol(v,5);w=rol(w,30);
+#  define R0(v,w,x,y,z,i) do { z+=((w&(x^y))^y)+blk0(i)+0x5A827999+rol(v,5);w=rol(w,30); } while (0)
+#  define R1(v,w,x,y,z,i) do { z+=((w&(x^y))^y)+blk(i)+0x5A827999+rol(v,5);w=rol(w,30); } while (0)
+#  define R2(v,w,x,y,z,i) do { z+=(w^x^y)+blk(i)+0x6ED9EBA1+rol(v,5);w=rol(w,30); } while (0)
+#  define R3(v,w,x,y,z,i) do { z+=(((w|x)&y)|(w&x))+blk(i)+0x8F1BBCDC+rol(v,5);w=rol(w,30); } while (0)
+#  define R4(v,w,x,y,z,i) do { z+=(w^x^y)+blk(i)+0xCA62C1D6+rol(v,5);w=rol(w,30); } while (0)
 
 
 /* Hash a single 512-bit block. This is the core of the algorithm. */
@@ -41,7 +40,7 @@ void fr_sha1_transform(uint32_t state[static 5], uint8_t const buffer[static 64]
 		uint32_t l[16];
 	} CHAR64LONG16;
 	CHAR64LONG16 *block;
-	uint8_t workspace[64];
+	uint64_t workspace[8];
 
 	block = (CHAR64LONG16*)workspace;
 	memcpy(block, buffer, 64);
@@ -82,7 +81,7 @@ void fr_sha1_transform(uint32_t state[static 5], uint8_t const buffer[static 64]
 	state[3] += d;
 	state[4] += e;
 
-#  ifndef __clang_analyzer__
+#  ifndef STATIC_ANALYZER
 	/* Wipe variables */
 	a = b = c = d = e = 0;
 #  endif
@@ -108,12 +107,14 @@ void fr_sha1_update(fr_sha1_ctx *context, uint8_t const *in, size_t len)
 	unsigned int i, j;
 
 	/*
-	 *	Needed so we can calculate the zero
-	 *	length sha1 hash correctly.
-	 *	ubsan doesn't like arithmetic on
-	 *	NULL pointers.
+	 *	If len == 0, there's nothing to do:
+	 *	First, len == 0 impolies len * 8 == 0, so the contents of
+	 *	context->count wouldn't change.
+	 *	j by construction is <= 63, so if len == 0, j + len == j <= 63, and
+	 *	i would be set to 0 and the final memcpy() would "copy" 0
+	 *	bytes, so the contents of context->buffer wouldn't change either.
 	 */
-	if (!in) in = (uint8_t[]){ 0x00 };
+	if (len == 0) return;
 
 	j = (context->count[0] >> 3) & 63;
 	if ((context->count[0] += len << 3) < (len << 3)) {
@@ -156,7 +157,7 @@ void fr_sha1_final(uint8_t digest[static SHA1_DIGEST_LENGTH], fr_sha1_ctx *conte
 		digest[i] = (uint8_t)((context->state[i>>2] >> ((3-(i & 3)) * 8) ) & 255);
 	}
 
-#  ifndef __clang_analyzer__
+#  ifndef STATIC_ANALYZER
 	/* Wipe variables */
 	i = j = 0;
 	memset(context->buffer, 0, 64);
@@ -178,7 +179,7 @@ void fr_sha1_final_no_len(uint8_t digest[static SHA1_DIGEST_LENGTH], fr_sha1_ctx
 		digest[i] = (uint8_t)((context->state[i>>2] >> ((3-(i & 3)) * 8) ) & 255);
 	}
 
-#  ifndef __clang_analyzer__
+#  ifndef STATIC_ANALYZER
 	/* Wipe variables */
 	i = j = 0;
 	memset(context->buffer, 0, 64);

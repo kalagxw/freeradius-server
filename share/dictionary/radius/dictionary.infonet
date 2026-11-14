@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -42,7 +42,7 @@ ATTRIBUTE	Type					248	string
 #       auth packets.
 #
 ATTRIBUTE	Pool-Request				252	string
-ATTRIBUTE	Surcharge-Type				254	integer
+ATTRIBUTE	Surcharge-Type				254	uint32
 ATTRIBUTE	NAS-Location				255	string
 ATTRIBUTE	Random-IP-Pool				246	string
 #
@@ -51,3 +51,4 @@ ATTRIBUTE	LoginHost-Dest				250	string
 ATTRIBUTE	Tunnel-Decision-IP			251	string
 
 END-VENDOR	infonet
+ALIAS		infonet					Vendor-Specific.infonet

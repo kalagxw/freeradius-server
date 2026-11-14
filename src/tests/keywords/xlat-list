@@ -1,47 +1,45 @@
+control := {
+	Framed-IP-Address = 192.0.2.1
+	Framed-IP-Address = 192.0.2.2
+}
+
+if (control.[#] != 2) {
+	test_fail
+}
+
+if (control.[0] != 192.0.2.1) {
+	test_fail
+}
+
+if (control.[1] != 192.0.2.2) {
+	test_fail
+}
+
+if (control.[n] != 192.0.2.2) {
+	test_fail
+}
+
 #
-# PRE: update
+#  Cast this to a string!
 #
-update {
-	&control !* ANY
-}
-
-update control {
-	&Tmp-IP-Address-0 := 192.0.2.1
-	&Tmp-IP-Address-0 += 192.0.2.2
-}
-
-if ("%{control[#]}" != 2) {
-	test_fail
-}
-
-debug_control
-
-if (("%{control[0]}" != 192.0.2.1) || ("%{control[1]}" != 192.0.2.2)) {
-	test_fail
-}
-
-if (("%{control[n]}" != 192.0.2.2)) {
-	test_fail
-}
-
-if ("%{control[*]}" != '192.0.2.1,192.0.2.2') {
+if ("%{control.[*]}" != '192.0.2.1192.0.2.2') {
 	test_fail
 }
 
 # Try calling these xlats in mapping too, they may get optimised to VPTs which is a
 # different code path.
-update request {
-	&Tmp-IP-Address-1 += "%{control[1]}"
-	&Tmp-IP-Address-1 += "%{control[0]}"
-	&Tmp-String-0 = "%(concat:%{control[*]} ,)"
-	&Tmp-Integer-0 = "%{control[#]}"
+request += {
+	NAS-IP-Address = %{control.[1]}
+	NAS-IP-Address = %{control.[0]}
+	Filter-Id	= %str.concat(%{control.[*]}, ',')
+	NAS-Port = %{control.[#]}
 }
 
-if (&Tmp-String-0 != '192.0.2.1,192.0.2.2') {
+if (Filter-Id != '192.0.2.1,192.0.2.2') {
 	test_fail
 }
 
-if (&Tmp-Integer-0 != 2) {
+if (NAS-Port != 2) {
 	test_fail
 }
 

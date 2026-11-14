@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -29,9 +29,9 @@ ATTRIBUTE	Aniii					9	string
 ATTRIBUTE	Lastapp					10	string
 ATTRIBUTE	Lastdata				11	string
 ATTRIBUTE	Disposition				12	string
-ATTRIBUTE	Hangupcause				13	integer
-ATTRIBUTE	Billusec				15	integer
-ATTRIBUTE	AMAFlags				16	integer
+ATTRIBUTE	Hangupcause				13	uint32
+ATTRIBUTE	Billusec				15	uint32
+ATTRIBUTE	AMAFlags				16	uint32
 ATTRIBUTE	RDNIS					17	string
 ATTRIBUTE	Context					18	string
 ATTRIBUTE	Source					19	string
@@ -113,3 +113,4 @@ VALUE	Hangupcause			User-Not-Registered	606
 #
 
 END-VENDOR	NetBorder
+ALIAS		NetBorder				Vendor-Specific.NetBorder

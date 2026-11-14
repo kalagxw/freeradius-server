@@ -1,0 +1,128 @@
+
+= The redis Virtual Server
+
+The `redis` virtual server handles the fetching of Redis cluster maps
+
+It is called from the rlm_redis module when a cluster map is needed
+either when connections are first established or in response to a
+Redis MOVED reply.
+
+This virtual server has no process sections.
+
+== The Virtual Server
+
+This is the `redis` virtual server.
+
+----
+server redis {
+	namespace = redis
+
+	redis {
+----
+
+timeout:: Timeout when fetching cluster map
+
+----
+#		timeout = 5s
+
+----
+
+retry_interval:: Time between retrying a failed map fetch
+
+----
+#		retry_interval = 30s
+
+----
+
+refresh_interval:: Time between refreshing the cluster map
+
+Defaults to not set.  When not set, cluster maps will only be
+refreshed following a request from a worker.
+
+----
+#		refresh_interval = 600s
+
+----
+
+pool:: Connection pool settings
+
+The `redis` virtual server uses pool configuration with the same
+options as the rlm_redis module.
+
+The default values are reasonable for most settings thought the
+connection_timeout / reconnect_delay may need to be amended.
+----
+		pool {
+			connection {
+----
+
+connection_timeout:: How long to wait before giving up on a connection
+which is being opened.
+
+----
+#				connection_timeout = 3.0
+
+----
+
+reconnect_delay:: If opening a connection fails, or an open connection
+fails, we wait `reconnect_delay` seconds before attempting to open
+another connection.
+
+----
+#				reconnect_delay = 5
+			}
+		}
+
+----
+
+trigger:: Cluster state triggers
+
+The standard trunk connection triggers can be used with Redis, either
+with a trigger section inside `pool` or global triggers.  See
+`trigger.conf` for details.  with a Redis cluster, such triggers will
+apply to the individual node connections.
+
+Separately, triggers can be enabled from cluster state changes.
+
+These triggers use the IP address and port of the first bootstrap
+server for the value of `Connection-Pool-Server` and
+`Connection-Pool-Port`.
+
+----
+		trigger {
+
+----
+
+cluster_bootstrap:: The coordinator is fetching the cluster map for
+the first time.
+
+----
+#			cluster_bootstrap = ...
+
+----
+
+cluster_get:: The coordinator is fetching the latest cluster map.
+
+----
+#			cluster_get = ...
+
+----
+
+cluster_update:: The coordinator has fetched a valid cluster map.
+
+----
+#			cluster_update = ...
+
+----
+
+cluster_fail:: The coordinator could not fetch a valid cluster map.
+
+----
+#			cluster_fail = ...
+		}
+	}
+}
+----
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

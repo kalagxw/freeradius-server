@@ -1,0 +1,235 @@
+#pragma once
+/*
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+#ifdef WITH_TLS
+/**
+ * $Id$
+ *
+ * @file lib/tls/connection.h
+ * @brief Run one TLS connection from the first policy section to the last.
+ *
+ * A TLS session is the handshake.  A TLS connection is the handshake, the
+ * policy which runs before and after the handshake, and the cache operations
+ * the handshake queues.  fr_tls_session_t holds the handshake.
+ * fr_tls_connection_t holds the connection, and drives fr_tls_session_t.
+ *
+ * @copyright 2026 Network RADIUS SAS (legal@networkradius.com)
+ */
+RCSIDH(tls_connection_h, "$Id$")
+
+#include "openssl_user_macros.h"
+
+#include <freeradius-devel/unlang/action.h>
+#include <freeradius-devel/unlang/function.h>
+#include <freeradius-devel/util/timer.h>
+
+#include "conf.h"
+#include "session.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/** The state of the TLS connection.
+ *
+ * The connection state goes from new, to "doing handshakes", to
+ * "doing ticket callbacks", to "connected".
+ *
+ * TICKET is not the same as CONNECTED, because TLS 1.3 sends tickets
+ * after the handshake, but before the application data.  In TLS 1.2,
+ * the state goes from HANDSHAKE directly to CONNECTED.
+ *
+ * There is no substantial difference between HANDSHAKE and TICKET,
+ * except to give more visibility into the state of the connection.
+ */
+typedef enum : uint8_t {
+	TLS_CONNECTION_NEW_SESSION = 0,			//!< Run `new session { ... }`.
+	TLS_CONNECTION_HANDSHAKE,			//!< Run handshake rounds until the handshake ends.
+	TLS_CONNECTION_TICKET,				//!< Run the ticket and cache operations which the
+							///< handshake queued.
+	TLS_CONNECTION_CONNECTED			//!< Every ticket section has finished.  The
+							///< connection can carry application data.
+} fr_tls_connection_state_t;
+
+/** Give the reason why the connection failed
+ *
+ */
+typedef enum : uint8_t {
+	TLS_CONNECTION_FAIL_NONE = 0,			//!< no failure as of yet
+	TLS_CONNECTION_FAIL_TLS,			//!< failure inside of TLS
+	TLS_CONNECTION_FAIL_SYSCALL,			//!< system call, usually IO layer
+	TLS_CONNECTION_FAIL_APPLICATION,		//!< other application error
+} fr_tls_connection_fail_t;
+
+/** IO state.  Did the read / write succeed, etc?
+ *
+ * An application does IO, as the TLS library should not do any IO.
+ *
+ * The application still needs to inform the TLS library as to the state
+ * of the underlying connection.  This enum does that.
+ *
+ * The values here should be the same for all applications.  If
+ * they're not, we can add new values.
+ *
+ * New connections start off with state 0 (FR_TLS_CONNECTION_IO_OK).
+ */
+typedef enum : uint8_t {
+	FR_TLS_CONNECTION_IO_OK = 0,			//!< The call succeeded, or no call has been
+							///< made yet.
+	FR_TLS_CONNECTION_IO_RETRY,			//!< A signal interrupted the call.  Run the
+							///< call again.
+	FR_TLS_CONNECTION_IO_BLOCKED,			//!< The call would block.  Wait for the socket
+							///< to become ready.
+	FR_TLS_CONNECTION_IO_EOF,			//!< The peer closed the connection.  On a stream
+							///< a read() which returns zero means the same
+							///< thing.
+	FR_TLS_CONNECTION_IO_FATAL,			//!< The connection cannot continue.
+} fr_tls_connection_io_state_t;
+
+/** Tables which map enumeration values to names.
+ *
+ @verbatim
+   DEBUG("%s - connection failed: %s", conn->name,
+	 fr_table_str_by_value(fr_tls_connection_fail_table, conn->failed, "<INVALID>"));
+ @endverbatim
+ */
+extern fr_table_num_indexed_t const	fr_tls_connection_state_table[];
+extern size_t				fr_tls_connection_state_table_len;
+
+extern fr_table_num_indexed_t const	fr_tls_connection_fail_table[];
+extern size_t				fr_tls_connection_fail_table_len;
+
+extern fr_table_num_indexed_t const	fr_tls_connection_io_state_table[];
+extern size_t				fr_tls_connection_io_state_table_len;
+
+/** Everything the TLS connection state machine needs
+ *
+ * The state machine is the set of functions in src/lib/tls/connection.c.
+ * Every field the state machine reads or writes lives in fr_tls_connection_t,
+ * and the state machine reads no other structure.
+ *
+ * fr_tls_connection_t must be talloc'd, and must not be embedded in another
+ * structure.  `name` is allocated from the connection, so the connection has
+ * to be a talloc chunk of its own.
+ *
+ * The state machine performs two actions which are outside of TLS state
+ * management:
+ *
+ * - telling the calling application that the TLS connection has finished,
+ *   whether the connection succeeded or failed
+ * - writing the data OpenSSL produced out to the peer
+ *
+ * Both actions belong to the application which owns the connection, so the
+ * state machine calls the `finished` and `write` callbacks rather than
+ * performing either action itself.
+ */
+typedef struct fr_tls_connection_s fr_tls_connection_t;
+
+struct fr_tls_connection_s {
+	char const		*name;			//!< What to call this connection in log messages,
+
+	fr_tls_session_t	*tls_session;		//!< State of the handshake.
+	request_t		*request;		//!< Request the handshake runs under.
+							///< MUST be set, and MUST live longer than the connection.
+
+	fr_tls_connection_state_t state;       		//!< Which part of the connection is running.
+
+	bool			in_frame;		//!< tls_connection_frame_process() is running.
+							///< A wake raised while the frame runs cannot go
+							///< to the interpreter, because the request has
+							///< not yielded yet, so the frame takes it.
+	bool			wake_pending;		//!< A wake was raised while `in_frame` was set.
+
+	unlang_function_no_result_t process;		//!< The connection runs its own state machine
+							///< inside one unlang frame, and this is the
+							///< function that machine runs next.  The
+							///< interpreter does not know about it:
+							///< tls_connection_frame_process() is the only
+							///< thing the interpreter sees, and that function
+							///< calls this one.  NULL means the connection's
+							///< state machine has finished.
+
+	fr_tls_connection_fail_t failed;	       	//!< why the connection failed
+	int			error;			//!< for system call errors
+
+	fr_timer_list_t		*tl;			//!< DTLS retransmission timer list
+	fr_timer_t		*post_handshake_ev;	//!< Bounds the wait for whatever the peer still owes
+							///< once OpenSSL has finished.  A TLS 1.3 peer is
+							///< owed a session ticket, and nothing else times
+							///< that wait.
+	fr_timer_t		*timer_ev;		//!< DTLS retransmission timer event
+							///< can be re-used by the application for application data
+
+	fr_tls_connection_io_state_t io_state;		//!< IO state, set by the application
+
+	bool			client;			//!< Act as the client and connect to a server,
+							///< rather than accept a connection.
+	bool			idle;			//!< The connection frame has yielded, and waits
+							///< for a record.
+	bool			pending;		//!< A record is waiting for OpenSSL.
+	bool			fail_pending;		//!< fr_tls_connection_failed() was called while a
+							///< record was still waiting for OpenSSL.  The
+							///< connection ends later, once OpenSSL has processed
+							///< any pending TLS alerts.
+	bool			eof;			//!< The peer closed the connection.  A record the peer
+							///< sent before closing may still be pending, and may
+							///< complete the handshake.  The connection fails only
+							///< if the handshake reads that record and then
+							///< determines it needs another record.
+
+	void			*uctx;			//!< Context for the callback functions below.
+							///< The callbacks read `conn->uctx` rather than
+							///< taking the context as an argument, so that
+							///< adding a callback does not mean repeating
+							///< the same first parameter again.
+
+	void			(*connected)(fr_tls_connection_t *conn);
+							//!< TLS is connected, and the application can send data
+	void			(*close)(fr_tls_connection_t *conn);
+							//!< TLS is closing the connection
+	ssize_t			(*write)(fr_tls_connection_t *conn,
+					 uint8_t const *data, size_t size);
+							//!< Write `size` octets at `data` to the
+							///< peer.  Returns <0 on failure, or the
+							///< amount of data written >=0.
+};
+
+fr_tls_connection_t *fr_tls_connection_alloc(TALLOC_CTX *ctx, fr_timer_list_t *tl,
+					     ssize_t (*write)(fr_tls_connection_t *conn,
+							      uint8_t const *data, size_t size),
+					     void (*connected)(fr_tls_connection_t *conn),
+					     void (*close)(fr_tls_connection_t *conn));
+
+int		fr_tls_connection_push(fr_tls_connection_t *conn);
+
+void		fr_tls_connection_wake(fr_tls_connection_t *conn);
+
+void		fr_tls_connection_failed(fr_tls_connection_t *conn, fr_tls_connection_fail_t reason);
+
+void		fr_tls_connection_eof(fr_tls_connection_t *conn);
+
+fr_tls_connection_io_state_t fr_tls_connection_io_error(fr_tls_connection_t *conn, ssize_t slen);
+
+void		fr_tls_connection_recv(fr_tls_connection_t *conn, uint8_t const *data, size_t data_len);
+
+int		fr_tls_connection_write(fr_tls_connection_t *conn);
+
+void		fr_tls_connection_process(fr_tls_connection_t *conn);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* WITH_TLS */

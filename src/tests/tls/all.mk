@@ -1,0 +1,199 @@
+#
+#  Tests for unit_test_tls: one script per test, each running TLS handshakes
+#  against the program.
+#
+#  The same scripts then run a second time against unit_test_bio, which is
+#  unit_test_tls reworked to use the TLS bio in src/lib/bio/tls.c.
+#
+
+#
+#  Test name
+#
+TEST := test.tls
+
+#
+#  TEST is a global which the next test directory overwrites.  Recipe bodies
+#  are expanded long after that has happened, so a copy is kept here.
+#
+TLS_TEST := test.tls
+
+#
+#  unit_test_tls is only built when the server has OpenSSL, see
+#  src/bin/unit_test_tls.mk.  With no program there is nothing to test, so
+#  everything below is skipped, and the test says why.
+#
+ifeq "$(filter unit_test_tls,$(ALL_TGTS))" ""
+
+.PHONY: $(TEST) $(TEST).help clean.$(TEST)
+$(TEST):
+	@echo "$(TLS_TEST) - skipped, unit_test_tls was not built"
+
+$(TEST).help:
+	@echo make $(TLS_TEST)
+
+clean.$(TEST):
+
+clean.test: clean.$(TEST)
+
+else
+
+#
+#  The tests are the scripts listed below, so there are no per-file tests
+#  here.
+#
+FILES :=
+
+$(eval $(call TEST_BOOTSTRAP))
+
+#
+#  DIR and OUTPUT are globals which the next test directory overwrites, so
+#  TLS_DIR and TLS_OUTPUT copy the two globals here, while the globals still
+#  name this directory.
+#
+TLS_DIR     := $(DIR)
+TLS_OUTPUT  := $(OUTPUT)
+TLS_CONF    := $(DIR)/unit_test_tls.conf
+TLS_COMMON  := $(DIR)/common.conf
+
+#
+#  Every script in this directory is a test.  The comment at the top of the
+#  script says what the test covers.  The script writes a receipt named
+#  after the script when the test passes, so alpn.sh writes alpn.receipt.
+#  A test with a configuration file named after the script uses that
+#  configuration file, so psk.sh uses psk.conf.  Every other test uses
+#  unit_test_tls.conf.
+#
+TLS_TESTS := $(patsubst $(DIR)/%.sh,%,$(wildcard $(DIR)/*.sh))
+
+#
+#  A few tests run a Python home server, because neither unit_test_tls nor
+#  unit_test_bio can behave like the home server in those tests.  The test
+#  names are in TLS_PYTHON_TESTS.  They run when a Python 3 interpreter can
+#  import the modules which the Python programs use, and they do not run
+#  otherwise.  The Python tests run once, as the tests do not use
+#  unit_test_tls or unit_test_bio.
+#
+TLS_PYTHON_TESTS := rlm_radius_blocked rlm_radius_blocked_tcp rlm_radius_dtls_dynamic rlm_radius_tls_dynamic
+
+#
+#  The Python tests share the Python programs, so every Python test depends on
+#  every Python program.
+#
+TLS_PYTHON_FILES := $(wildcard $(DIR)/*.py)
+TLS_PYTHON := $(shell python3 -c 'import signal, socket, ssl, struct' 2>/dev/null && command -v python3)
+
+TLS_TESTS := $(filter-out $(TLS_PYTHON_TESTS),$(TLS_TESTS))
+ifneq "$(TLS_PYTHON)" ""
+TLS_TESTS += $(TLS_PYTHON_TESTS)
+endif
+
+#
+#  The suite takes one block of ports from the allocator in
+#  scripts/build/make/port.c.  Each test takes the port at the position of
+#  the test in TLS_TESTS.  The tests can therefore run at the same time, and
+#  a second build tree can run the suite at the same time.  Each test script
+#  passes PORT to the client, and the configuration file reads the server
+#  port from $ENV{PORT}.
+#
+#  The block has to be at least as large as the number of tests.  A test
+#  beyond the end of the block is given an empty port, and fails in a way
+#  which says nothing about ports, so the count is checked below rather than
+#  left to be discovered.
+#
+TLS_PORT_COUNT := 64
+TLS_PORT_FIRST := $(unique-port $(PORT_FILE),$(TLS_TEST),$(TLS_PORT_COUNT),$(PORT_FIRST))
+TLS_PORTS := $(shell seq $(TLS_PORT_FIRST) $$(($(TLS_PORT_FIRST) + $(TLS_PORT_COUNT) - 1)))
+
+#
+#  TLS_TEST_RULE defines the rule for one test.  ${1} is the test name.
+#
+#
+define TLS_TEST_RULE
+TLS_PORT.${1} := $(word $(words $(TLS_RECEIPTS) ${1}),$(TLS_PORTS))
+TLS_CMD.${1} := \
+	OUTPUT=$(call SHELL_QUOTE,$(TLS_OUTPUT)) \
+	CONFDIR=$(call SHELL_QUOTE,$(top_srcdir)/$(TLS_DIR)) \
+	CERTDIR=$(call SHELL_QUOTE,$(top_srcdir)/raddb/certs/rsa) \
+	DICT_PATH=$(call SHELL_QUOTE,$(DICT_PATH)) \
+	PORT=$$(TLS_PORT.${1}) \
+	LPORT=$$(TLS_PORT.${1}) \
+	PYTHON=$(call SHELL_QUOTE,$(TLS_PYTHON)) \
+	UNIT_TEST_TLS=$(call SHELL_QUOTE,$(TEST_BIN)/unit_test_tls) \
+	RADIUSD=$(call SHELL_QUOTE,$(TEST_BIN)/radiusd) \
+	$(SHELL) \
+	$(TLS_DIR)/${1}.sh
+
+$(TLS_OUTPUT)/${1}.receipt: $(or $(wildcard $(TLS_DIR)/${1}.conf),$(TLS_CONF)) $(TLS_COMMON) $(TLS_DIR)/${1}.sh $(if $(filter ${1},$(TLS_PYTHON_TESTS)),$(TLS_PYTHON_FILES)) $(TEST_BIN_DIR)/unit_test_tls $(TEST_BIN_DIR)/radiusd $(GENERATED_CERT_FILES) | $(TLS_OUTPUT)
+	@echo "TLS-TEST ${1}"
+	$${Q}if ! $$(TLS_CMD.${1}) > $$@.log 2>&1 || ! test -f $$@; then \
+		cat $$@.log; \
+		echo "# $$@.log"; \
+		echo $$(call SHELL_QUOTE,$$(TLS_CMD.${1})); \
+		rm -f $(BUILD_DIR)/tests/$(TLS_TEST); \
+		exit 1; \
+	fi
+
+TLS_RECEIPTS += $(TLS_OUTPUT)/${1}.receipt
+endef
+
+TLS_RECEIPTS :=
+$(foreach x,$(TLS_TESTS),$(eval $(call TLS_TEST_RULE,$x)))
+
+#
+#  The same scripts, run against unit_test_bio.  unit_test_bio reads the same
+#  configuration files, but the program name picks the default configuration
+#  file, so `-n unit_test_tls` restores the default.  A script which passes
+#  its own -n wins, as the later -n is the one which counts.
+#
+#  dtls_loss is left out, because the TLS bio has no place to drop a
+#  datagram, so unit_test_bio refuses `drop_datagram`.
+#
+#  Each test writes to the bio subdirectory, so the receipts and the logs of
+#  the two programs do not overwrite each other.
+#
+TLS_BIO_TESTS := $(filter-out dtls_loss $(TLS_PYTHON_TESTS),$(TLS_TESTS))
+
+define TLS_BIO_TEST_RULE
+TLS_PORT.bio.${1} := $(word $(words $(TLS_RECEIPTS) ${1}),$(TLS_PORTS))
+TLS_CMD.bio.${1} := OUTPUT="$(TLS_OUTPUT)/bio" CONFDIR="$(top_srcdir)/$(TLS_DIR)" CERTDIR="$(top_srcdir)/raddb/certs/rsa" DICT_PATH="$(DICT_PATH)" PORT="$$(TLS_PORT.bio.${1})" UNIT_TEST_TLS="$(TEST_BIN)/unit_test_bio -n unit_test_tls" RADIUSD="$(TEST_BIN)/radiusd" $(SHELL) $(TLS_DIR)/${1}.sh
+
+$(TLS_OUTPUT)/bio/${1}.receipt: $(or $(wildcard $(TLS_DIR)/${1}.conf),$(TLS_CONF)) $(TLS_COMMON) $(TLS_DIR)/${1}.sh $(TEST_BIN_DIR)/unit_test_bio $(TEST_BIN_DIR)/radiusd $(GENERATED_CERT_FILES) | $(TLS_OUTPUT)
+	@echo "TLS-BIO-TEST ${1}"
+	$${Q}mkdir -p $(TLS_OUTPUT)/bio
+	$${Q}if ! $$(TLS_CMD.bio.${1}) > $$@.log 2>&1 || ! test -f $$@; then \
+		cat $$@.log; \
+		echo "# $$@.log"; \
+		echo $$(TLS_CMD.bio.${1}); \
+		rm -f $(BUILD_DIR)/tests/$(TLS_TEST); \
+		exit 1; \
+	fi
+
+TLS_RECEIPTS += $(TLS_OUTPUT)/bio/${1}.receipt
+endef
+
+ifneq "$(filter unit_test_bio,$(ALL_TGTS))" ""
+$(foreach x,$(TLS_BIO_TESTS),$(eval $(call TLS_BIO_TEST_RULE,$x)))
+endif
+
+#
+#  Every test, and every unit_test_bio run of a test, takes one port from the
+#  block.
+#
+ifeq "$(shell test $(words $(TLS_RECEIPTS)) -gt $(TLS_PORT_COUNT) && echo overflow)" "overflow"
+$(error src/tests/tls has $(words $(TLS_RECEIPTS)) tests and only $(TLS_PORT_COUNT) ports.  Raise TLS_PORT_COUNT)
+endif
+
+#
+#  unit_test_tls loads a process module and rlm_* modules at run time, so
+#  make cannot see the dependency on those libraries.  TEST_CONFIG_LIBS in
+#  src/tests/all.mk reads the module list from common.conf, which holds the
+#  modules section.
+#
+$(eval $(call TEST_CONFIG_LIBS,$(TLS_COMMON) $(TLS_DIR)/radiusd.conf,$(TLS_RECEIPTS)))
+
+$(BUILD_DIR)/tests/$(TEST): $(TLS_RECEIPTS)
+
+$(TEST).help:
+	@echo make $(TLS_TEST)
+
+endif

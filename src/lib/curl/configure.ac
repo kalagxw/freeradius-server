@@ -1,17 +1,11 @@
-AC_PREREQ([2.53])
-AC_INIT(base.c)
+AC_PREREQ([2.73])
+AC_INIT
+AC_CONFIG_SRCDIR([base.c])
 AC_REVISION($Revision$)
-AC_DEFUN(modname,[libfreeradius-curl])
-AC_DEFUN(modname_useropt,[m4_bpatsubst([]modname,[[-+.]],[_])])
+FR_INIT_LIBRARY([libfreeradius-curl], [libcurl support])
+AC_CONFIG_HEADERS([config.h])
 
-AC_CONFIG_HEADER(config.h)
-m4_include([m4/libcurl_check_config.m4])
-
-AC_ARG_WITH([]modname,
-[AS_HELP_STRING([--without-[]modname],[build without libcurl support])]
-)
-
-if test x$with_[]modname_useropt != xno; then
+FR_LIBRARY_START_TESTS
 
 	AC_PROG_CC
 	AC_PROG_CPP
@@ -45,33 +39,16 @@ if test x$with_[]modname_useropt != xno; then
 		fi
 	fi
 
-	targetname=modname
 	version="$libcurl_cv_lib_curl_version"
 
-else
-	targetname=
-	echo \*\*\* module modname is disabled.
-fi
-
-dnl  Don't change this section.
-if test x"$fail" != x""; then
-	if test x"${enable_strict_dependencies}" = x"yes"; then
-		AC_MSG_ERROR([set --without-]modname[ to disable it explicitly.])
-	else
-		AC_MSG_WARN([silently not building ]modname[.])
-		AC_MSG_WARN([FAILURE: ]modname[ requires: $fail.]);
-		targetname=""
-	fi
-fi
+FR_LIBRARY_END_TESTS
 
 mod_ldflags="$LIBCURL"
 mod_cflags="$LIBCURL_CPPFLAGS"
 
 AC_SUBST(mod_cflags)
 AC_SUBST(mod_ldflags)
-
 AC_SUBST(version)
 
-AC_SUBST(targetname)
-AC_OUTPUT(all.mk)
-
+AC_CONFIG_FILES([all.mk])
+AC_OUTPUT

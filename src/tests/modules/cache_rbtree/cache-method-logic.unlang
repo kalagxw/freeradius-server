@@ -1,0 +1,189 @@
+#
+#  PRE:
+#
+Filter-Id := 'testkey1'
+
+#
+# 0.  Basic update and retrieve
+#
+control.Callback-Id := 'cache me'
+
+cache.update
+if (!updated) {
+	test_fail
+}
+
+# 1. Check the module didn't perform a merge
+if (Callback-Id) {
+	test_fail
+}
+
+# 2. Check status-only works correctly (should return ok and consume attribute)
+cache.status
+if (!ok) {
+	test_fail
+}
+
+# 3. Retrieve the entry (should be copied to request list)
+cache.load
+if (!updated) {
+	test_fail
+}
+
+# 4.
+if (Callback-Id != control.Callback-Id) {
+	test_fail
+}
+
+# 5. Retrieving the entry should not expire it
+request -= Callback-Id[*]
+
+cache.load
+if (!updated) {
+	test_fail
+}
+
+# 6.
+if (Callback-Id != control.Callback-Id) {
+	test_fail
+}
+
+# 8. Remove the entry
+cache.clear
+if (!ok) {
+	test_fail
+}
+
+# 8. Check status-only works correctly (should return notfound and consume attribute)
+cache.status
+if (!notfound) {
+	test_fail
+}
+
+# 14. This should still allow the creation of a new entry
+control.Cache-TTL := -2
+
+cache.update
+if (!updated) {
+	test_fail
+}
+
+# 12. We have nothing to do if it is ready added.
+cache.update
+if (!updated) {
+	test_fail
+}
+
+# 13.
+if (Cache-TTL) {
+	test_fail
+}
+
+# 14.
+if (Callback-Id != control.Callback-Id) {
+	test_fail
+}
+
+control.Callback-Id := 'cache me2'
+
+# 18. Updating the Cache-TTL shouldn't make things go boom (we can't really check if it works)
+control.Cache-TTL := 666
+
+cache.ttl
+if (!updated) {
+	test_fail
+}
+
+# 19. Request Callback-Id shouldn't have been updated yet
+if (Callback-Id == control.Callback-Id) {
+	test_fail
+}
+
+# 20. Check that a new entry is created
+control.Cache-TTL := -2
+
+cache.update
+if (!updated) {
+	test_fail
+}
+
+# 21. Request Callback-Id still shouldn't have been updated yet
+if (Callback-Id == control.Callback-Id) {
+	test_fail
+}
+
+# 22.
+cache.load
+if (!updated) {
+	test_fail
+}
+
+# 23. Request Callback-Id should now have been updated
+if (Callback-Id != control.Callback-Id) {
+	test_fail
+}
+
+# 24. Check Cache-Merge = yes works as expected (should update current request)
+control.Callback-Id := 'cache me3'
+control.Cache-TTL := -2
+control.Cache-Merge-New := yes
+
+cache.update
+if (!updated) {
+	test_fail
+}
+
+# 25. Request Callback-Id should now have been updated
+if (Callback-Id != control.Callback-Id) {
+	test_fail
+}
+
+# 26. Check Cache-Entry-Hits is updated as we expect
+if (Cache-Entry-Hits != 0) {
+	test_fail
+}
+
+cache.load
+if (Cache-Entry-Hits != 1) {
+	test_fail
+}
+
+# 27. Try and store an existing entry, should do nothing
+cache.store
+if (!noop) {
+	test_fail
+}
+
+# 28. But with the entry removed, we can now create a new entry
+cache.clear
+if (!ok) {
+	test_fail
+}
+
+cache.store
+if (!updated) {
+	test_fail
+}
+
+# 29. Check the behaviour of cache_empty_update
+cache_empty_update.store
+if (!updated) {
+	test_fail
+}
+
+cache_empty_update.status
+if (!ok) {
+	test_fail
+}
+
+cache_empty_update.clear
+if (!ok) {
+	test_fail
+}
+
+cache_empty_update.status
+if (!notfound) {
+	test_fail
+}
+
+test_pass

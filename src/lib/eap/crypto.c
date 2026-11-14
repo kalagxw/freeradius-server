@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -32,8 +32,6 @@ USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 #define __STDC_WANT_LIB_EXT1__ 1
 #include <string.h>
 
-#include <openssl/hmac.h>
-
 #include <freeradius-devel/util/sha1.h>
 #include <freeradius-devel/tls/base.h>
 #include <freeradius-devel/tls/log.h>
@@ -42,18 +40,19 @@ USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 #include "base.h"
 #include "attrs.h"
 
+#include <openssl/hmac.h>
+
 /** Initialize the PRF label fields
  *
  */
 void eap_crypto_prf_label_init(eap_tls_prf_label_t *prf_label, eap_session_t *eap_session,
 			      char const *keying_prf_label, size_t keying_prf_label_len)
 {
-#ifdef TLS1_3_VERSION
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
 
-	if (eap_tls_session->tls_session->info.version == TLS1_3_VERSION) {
+	if (SSL_version(eap_tls_session->tls_session->ssl) == TLS1_3_VERSION) {
 		prf_label->keying_prf_label = "EXPORTER_EAP_TLS_Key_Material";
-		prf_label->keying_prf_label_len = sizeof("EXPORTER_EAP_TLS_Key_Material") -1;
+		prf_label->keying_prf_label_len = sizeof("EXPORTER_EAP_TLS_Key_Material") - 1;
 
 		prf_label->sessid_prf_label = "EXPORTER_EAP_TLS_Method-Id";
 		prf_label->sessid_prf_label_len = sizeof("EXPORTER_EAP_TLS_Method-Id") - 1;
@@ -63,7 +62,6 @@ void eap_crypto_prf_label_init(eap_tls_prf_label_t *prf_label, eap_session_t *ea
 		prf_label->use_context = 1;
 		return;
 	}
-#endif
 
 	prf_label->keying_prf_label = keying_prf_label;
 	prf_label->keying_prf_label_len = keying_prf_label_len;
@@ -95,7 +93,7 @@ int eap_crypto_mppe_keys(request_t *request, SSL *ssl, eap_tls_prf_label_t *prf_
 				       prf_label->context,
 				       prf_label->context_len,
 				       prf_label->use_context) != 1) {
-		fr_tls_log_error(request, "Failed generating MPPE keys");
+		fr_tls_log_perror(request, "Failed generating MPPE keys");
 		return -1;
 	}
 
@@ -130,9 +128,6 @@ int eap_crypto_mppe_keys(request_t *request, SSL *ssl, eap_tls_prf_label_t *prf_
 }
 
 int eap_crypto_tls_session_id(TALLOC_CTX *ctx,
-#if OPENSSL_VERSION_NUMBER < 0x10101000L
-			      UNUSED
-#endif
 			      request_t *request, SSL *ssl, eap_tls_prf_label_t *prf_label,
 			      uint8_t **out, uint8_t eap_type)
 {
@@ -157,7 +152,6 @@ int eap_crypto_tls_session_id(TALLOC_CTX *ctx,
 		SSL_get_client_random(ssl, p, SSL3_RANDOM_SIZE);
 		p += SSL3_RANDOM_SIZE;
 		SSL_get_server_random(ssl, p, SSL3_RANDOM_SIZE);
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
 		break;
 
 	/*
@@ -175,12 +169,12 @@ int eap_crypto_tls_session_id(TALLOC_CTX *ctx,
 					       prf_label->context,
 					       prf_label->context_len,
 					       prf_label->use_context) != 1) {
-			fr_tls_log_error(request, "Failed generating TLS session ID");
+			talloc_free(buff);
+			fr_tls_log_perror(request, "Failed generating TLS session ID");
 			return -1;
 		}
 	}
 		break;
-#endif
 	}
 	*out = buff;
 

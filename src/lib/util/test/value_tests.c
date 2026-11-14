@@ -1,0 +1,1625 @@
+/*
+ *   This library is free software; you can redistribute it and/or
+ *   modify it under the terms of the GNU Lesser General Public
+ *   License as published by the Free Software Foundation; either
+ *   version 2.1 of the License, or (at your option) any later version.
+ *
+ *   This library is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ *   Lesser General Public License for more details.
+ *
+ *   You should have received a copy of the GNU Lesser General Public
+ *   License along with this library; if not, write to the Free Software
+ *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+/** Tests for value box functions
+ *
+ * @file src/lib/util/test/value_tests.c
+ * @copyright 2026 Network RADIUS SAS ("legal@networkradius.com")
+ */
+
+static void test_init(void);
+#define TEST_GLOBAL_INIT test_init()
+
+#include "acutest_common_init.h"
+#include "acutest_helpers.h"
+
+#include <freeradius-devel/util/value.h>
+
+static TALLOC_CTX *autofree;
+
+static void test_init(void)
+{
+	autofree = talloc_autofree_context();
+	if (!autofree) {
+		fr_perror("value_tests");
+		fr_exit_now(EXIT_FAILURE);
+	}
+
+	if (fr_check_lib_magic(RADIUSD_MAGIC_NUMBER) < 0) {
+		fr_perror("value_tests");
+		fr_exit_now(EXIT_FAILURE);
+	}
+}
+
+/*
+ *	Comparison tests (fr_value_box_cmp)
+ */
+static void test_cmp_uint32_equal(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (uint32_t) 42, false);
+	fr_value_box(&b, (uint32_t) 42, false);
+
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == 0);
+}
+
+static void test_cmp_uint32_less(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (uint32_t) 10, false);
+	fr_value_box(&b, (uint32_t) 20, false);
+
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == -1);
+	TEST_CHECK(fr_value_box_cmp(&b, &a) == 1);
+}
+
+static void test_cmp_int32(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (int32_t) -10, false);
+	fr_value_box(&b, (int32_t) 10, false);
+
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == -1);
+	TEST_CHECK(fr_value_box_cmp(&b, &a) == 1);
+
+	fr_value_box(&b, (int32_t) -10, false);
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == 0);
+}
+
+static void test_cmp_float64(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (double) 3.14, false);
+	fr_value_box(&b, (double) 2.71, false);
+
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == 1);
+	TEST_CHECK(fr_value_box_cmp(&b, &a) == -1);
+
+	fr_value_box(&b, (double) 3.14, false);
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == 0);
+}
+
+static void test_cmp_string(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box_strdup(autofree, &a, NULL, "apple", false);
+	fr_value_box_strdup(autofree, &b, NULL, "banana", false);
+
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == -1);
+	TEST_CHECK(fr_value_box_cmp(&b, &a) == 1);
+
+	fr_value_box_clear(&b);
+	fr_value_box_strdup(autofree, &b, NULL, "apple", false);
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == 0);
+
+	fr_value_box_clear(&a);
+	fr_value_box_clear(&b);
+}
+
+static void test_cmp_octets(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box_memdup(autofree, &a, NULL, (uint8_t const *)"\x01\x02", 2, false);
+	fr_value_box_memdup(autofree, &b, NULL, (uint8_t const *)"\x01\x03", 2, false);
+
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == -1);
+	TEST_CHECK(fr_value_box_cmp(&b, &a) == 1);
+
+	fr_value_box_clear(&a);
+	fr_value_box_clear(&b);
+}
+
+static void test_cmp_octets_length(void)
+{
+	fr_value_box_t a, b;
+
+	/* Same prefix but different length: shorter is "less" */
+	fr_value_box_memdup(autofree, &a, NULL, (uint8_t const *)"\x01", 1, false);
+	fr_value_box_memdup(autofree, &b, NULL, (uint8_t const *)"\x01\x02", 2, false);
+
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == -1);
+	TEST_CHECK(fr_value_box_cmp(&b, &a) == 1);
+
+	fr_value_box_clear(&a);
+	fr_value_box_clear(&b);
+}
+
+static void test_cmp_bool(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (bool) true, false);
+	fr_value_box(&b, (bool) false, false);
+
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == 1);
+	TEST_CHECK(fr_value_box_cmp(&b, &a) == -1);
+
+	fr_value_box(&b, (bool) true, false);
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == 0);
+}
+
+static void test_cmp_different_types(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (uint32_t) 42, false);
+	fr_value_box(&b, (uint64_t) 42, false);
+
+	/* Different types are incomparable, both directions return CMP_ERR exactly */
+	TEST_CHECK(fr_value_box_cmp(&a, &b) == CMP_ERR);
+	TEST_CHECK(fr_value_box_cmp(&b, &a) == CMP_ERR);
+}
+
+/*
+ *	Comparison operator tests (fr_value_box_cmp_op)
+ */
+static void test_cmp_op_eq(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (uint32_t) 42, false);
+	fr_value_box(&b, (uint32_t) 42, false);
+
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_CMP_EQ, &a, &b) == 1);
+
+	fr_value_box(&b, (uint32_t) 43, false);
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_CMP_EQ, &a, &b) == 0);
+}
+
+static void test_cmp_op_ne(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (uint32_t) 42, false);
+	fr_value_box(&b, (uint32_t) 43, false);
+
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_NE, &a, &b) == 1);
+
+	fr_value_box(&b, (uint32_t) 42, false);
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_NE, &a, &b) == 0);
+}
+
+static void test_cmp_op_lt(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (uint32_t) 10, false);
+	fr_value_box(&b, (uint32_t) 20, false);
+
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_LT, &a, &b) == 1);
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_LT, &b, &a) == 0);
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_LT, &a, &a) == 0);
+}
+
+static void test_cmp_op_gt(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (uint32_t) 20, false);
+	fr_value_box(&b, (uint32_t) 10, false);
+
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_GT, &a, &b) == 1);
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_GT, &b, &a) == 0);
+}
+
+static void test_cmp_op_le(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (uint32_t) 10, false);
+	fr_value_box(&b, (uint32_t) 20, false);
+
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_LE, &a, &b) == 1);
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_LE, &b, &a) == 0);
+
+	fr_value_box(&b, (uint32_t) 10, false);
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_LE, &a, &b) == 1);
+}
+
+static void test_cmp_op_ge(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (uint32_t) 20, false);
+	fr_value_box(&b, (uint32_t) 10, false);
+
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_GE, &a, &b) == 1);
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_GE, &b, &a) == 0);
+
+	fr_value_box(&b, (uint32_t) 20, false);
+	TEST_CHECK(fr_value_box_cmp_op(T_OP_GE, &a, &b) == 1);
+}
+
+/*
+ *	Cast tests (fr_value_box_cast)
+ */
+static void test_cast_uint32_to_uint64(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box(&src, (uint32_t) 42, false);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_UINT64, NULL, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_UINT64);
+	TEST_CHECK(dst.vb_uint64 == 42);
+}
+
+/** A float at or past the top of a 64-bit integer must fail the cast, not convert
+ *
+ *  UINT64_MAX and INT64_MAX are not representable as a double, and round up to 2^64 and
+ *  2^63.  A source of exactly 2^64 or 2^63 passed a "greater than the maximum" check, and
+ *  the conversion to the integer type was undefined.
+ */
+static void test_cast_float_to_int64_bounds(void)
+{
+	fr_value_box_t src, dst;
+
+	TEST_CASE("float64 2^64 to uint64 overflows");
+	fr_value_box(&src, (double) 0x1p64, false);
+	fr_value_box_init_null(&dst);
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_UINT64, NULL, &src) < 0);
+
+	TEST_CASE("float32 2^64 to uint64 overflows");
+	fr_value_box(&src, (float) 0x1p64, false);
+	fr_value_box_init_null(&dst);
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_UINT64, NULL, &src) < 0);
+
+	TEST_CASE("float64 2^63 to int64 overflows");
+	fr_value_box(&src, (double) 0x1p63, false);
+	fr_value_box_init_null(&dst);
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_INT64, NULL, &src) < 0);
+
+	TEST_CASE("the largest float64 below 2^64 converts to uint64");
+	fr_value_box(&src, (double) 0x1.fffffffffffffp63, false);
+	fr_value_box_init_null(&dst);
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_UINT64, NULL, &src) == 0);
+	TEST_CHECK(dst.vb_uint64 == UINT64_C(18446744073709549568));
+
+	TEST_CASE("float64 -2^63 converts to int64");
+	fr_value_box(&src, (double) -0x1p63, false);
+	fr_value_box_init_null(&dst);
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_INT64, NULL, &src) == 0);
+	TEST_CHECK(dst.vb_int64 == INT64_MIN);
+}
+
+/** A float cast to a date must fail when the date does not fit in int64_t nanoseconds
+ *
+ *  A date is a signed 64-bit count of nanoseconds, which holds about 9.2e9 seconds.  The float
+ *  branches converted the seconds to int64_t and multiplied by NSEC.  The float32 branch had
+ *  no check, the float64 branch checked after a conversion that was already undefined above
+ *  2^63, and a value in the last second before the bound overflowed when the fraction was
+ *  added.
+ */
+static void test_cast_float_to_date_bounds(void)
+{
+	fr_value_box_t src, dst;
+
+	TEST_CASE("float32 1e10 seconds overflows");
+	fr_value_box(&src, (float) 1e10, false);
+	fr_value_box_init_null(&dst);
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_DATE, NULL, &src) < 0);
+
+	TEST_CASE("float64 1e19 seconds overflows");
+	fr_value_box(&src, (double) 1e19, false);
+	fr_value_box_init_null(&dst);
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_DATE, NULL, &src) < 0);
+
+	TEST_CASE("float64 in the last second before the bound overflows");
+	fr_value_box(&src, (double) 9223372036.5, false);
+	fr_value_box_init_null(&dst);
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_DATE, NULL, &src) < 0);
+
+	TEST_CASE("float64 1.5 seconds converts, keeping the fraction");
+	fr_value_box(&src, (double) 1.5, false);
+	fr_value_box_init_null(&dst);
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_DATE, NULL, &src) == 0);
+	TEST_CHECK(fr_unix_time_unwrap(dst.vb_date) == UINT64_C(1500000000));
+	TEST_MSG("got %" PRIu64 " ns", fr_unix_time_unwrap(dst.vb_date));
+}
+
+static void test_cast_uint32_to_string(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box(&src, (uint32_t) 12345, false);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_STRING, NULL, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_STRING);
+	TEST_CHECK_STRCMP(dst.vb_strvalue, "12345");
+
+	fr_value_box_clear(&dst);
+}
+
+static void test_cast_string_to_uint32(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box_strdup(autofree, &src, NULL, "12345", false);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_UINT32, NULL, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_UINT32);
+	TEST_CHECK(dst.vb_uint32 == 12345);
+	TEST_MSG("Expected 12345, got %u", dst.vb_uint32);
+
+	fr_value_box_clear(&src);
+}
+
+/*
+ *	fr_value_box_cast() returns 0 on success.  A cast from a string
+ *	parses the string, and must not return the length it parsed.
+ */
+static void test_cast_string_returns_zero(void)
+{
+	static struct {
+		char const	*in;
+		fr_type_t	type;
+	} const cast[] = {
+		{ "192.0.2.1",		FR_TYPE_IPV4_ADDR },
+		{ "192.0.2.0/24",	FR_TYPE_IPV4_PREFIX },
+		{ "2001:db8::1",	FR_TYPE_IPV6_ADDR },
+		{ "2001:db8::/32",	FR_TYPE_IPV6_PREFIX },
+		{ "aa:bb:cc:dd:ee:ff",	FR_TYPE_ETHERNET },
+		{ "yes",		FR_TYPE_BOOL },
+		{ "12345",		FR_TYPE_UINT64 },
+		{ "0x0102",		FR_TYPE_OCTETS },
+	};
+	fr_value_box_t	src, dst;
+	size_t		i;
+	int		ret;
+
+	for (i = 0; i < NUM_ELEMENTS(cast); i++) {
+		fr_value_box_strdup(autofree, &src, NULL, cast[i].in, false);
+		fr_value_box_init_null(&dst);
+
+		ret = fr_value_box_cast(autofree, &dst, cast[i].type, NULL, &src);
+		TEST_CHECK(ret == 0);
+		TEST_MSG("Casting \"%s\" to %s returned %d, expected 0",
+			 cast[i].in, fr_type_to_str(cast[i].type), ret);
+
+		fr_value_box_clear(&dst);
+		fr_value_box_clear(&src);
+	}
+}
+
+static void test_cast_int32_to_int64(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box(&src, (int32_t) -42, false);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_INT64, NULL, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_INT64);
+	TEST_CHECK(dst.vb_int64 == -42);
+}
+
+static void test_cast_uint8_to_uint32(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box(&src, (uint8_t) 255, false);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_UINT32, NULL, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_UINT32);
+	TEST_CHECK(dst.vb_uint32 == 255);
+}
+
+static void test_cast_same_type(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box(&src, (uint32_t) 42, false);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_UINT32, NULL, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_UINT32);
+	TEST_CHECK(dst.vb_uint32 == 42);
+}
+
+static void test_cast_bool_to_uint32(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box(&src, (bool) true, false);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_UINT32, NULL, &src) == 0);
+	TEST_CHECK(dst.vb_uint32 == 1);
+
+	fr_value_box(&src, (bool) false, false);
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_UINT32, NULL, &src) == 0);
+	TEST_CHECK(dst.vb_uint32 == 0);
+}
+
+static void test_cast_uint32_to_bool(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box(&src, (uint32_t) 1, false);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_BOOL, NULL, &src) == 0);
+	TEST_CHECK(dst.vb_bool == true);
+
+	fr_value_box(&src, (uint32_t) 0, false);
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_BOOL, NULL, &src) == 0);
+	TEST_CHECK(dst.vb_bool == false);
+}
+
+/*
+ *	Cast in place tests
+ */
+static void test_cast_in_place_uint32_to_uint64(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box(&vb, (uint32_t) 42, false);
+
+	TEST_CHECK(fr_value_box_cast_in_place(autofree, &vb, FR_TYPE_UINT64, NULL) == 0);
+	TEST_CHECK(vb.type == FR_TYPE_UINT64);
+	TEST_CHECK(vb.vb_uint64 == 42);
+}
+
+static void test_cast_in_place_uint32_to_string(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box(&vb, (uint32_t) 12345, false);
+
+	TEST_CHECK(fr_value_box_cast_in_place(autofree, &vb, FR_TYPE_STRING, NULL) == 0);
+	TEST_CHECK(vb.type == FR_TYPE_STRING);
+	TEST_CHECK_STRCMP(vb.vb_strvalue, "12345");
+
+	fr_value_box_clear(&vb);
+}
+
+/*
+ *	Copy tests
+ */
+static void test_copy_uint32(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box(&src, (uint32_t) 42, false);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_copy(autofree, &dst, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_UINT32);
+	TEST_CHECK(dst.vb_uint32 == 42);
+}
+
+static void test_copy_string(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box_strdup(autofree, &src, NULL, "hello", false);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_copy(autofree, &dst, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_STRING);
+	TEST_CHECK_STRCMP(dst.vb_strvalue, "hello");
+
+	/* Deep copy: different pointer */
+	TEST_CHECK(dst.vb_strvalue != src.vb_strvalue);
+
+	fr_value_box_clear(&src);
+	fr_value_box_clear(&dst);
+}
+
+static void test_copy_octets(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box_memdup(autofree, &src, NULL, (uint8_t const *)"\x01\x02\x03", 3, false);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_copy(autofree, &dst, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_OCTETS);
+	TEST_CHECK(dst.vb_length == 3);
+	TEST_CHECK(memcmp(dst.vb_octets, "\x01\x02\x03", 3) == 0);
+
+	/* Deep copy */
+	TEST_CHECK(dst.vb_octets != src.vb_octets);
+
+	fr_value_box_clear(&src);
+	fr_value_box_clear(&dst);
+}
+
+static void test_copy_preserves_tainted(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box(&src, (uint32_t) 42, true);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_copy(autofree, &dst, &src) == 0);
+	TEST_CHECK(dst.tainted == true);
+}
+
+/*
+ *	Safety (safe_for) propagation tests
+ *
+ *	Tokens standing in for two different consumers.  Any two distinct values other
+ *	than FR_VALUE_BOX_SAFE_FOR_NONE and FR_VALUE_BOX_SAFE_FOR_ANY will do.
+ */
+#define SAFE_FOR_X	((fr_value_box_safe_for_t) 0x1000)
+#define SAFE_FOR_Y	((fr_value_box_safe_for_t) 0x2000)
+
+static void test_copy_preserves_safe_for(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box_strdup(autofree, &src, NULL, "copy me", false);
+	fr_value_box_mark_safe_for(&src, SAFE_FOR_X);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_copy(autofree, &dst, &src) == 0);
+	TEST_CHECK(fr_value_box_is_safe_for_only(&dst, SAFE_FOR_X));
+
+	fr_value_box_clear(&src);
+	fr_value_box_clear(&dst);
+}
+
+static void test_cast_octets_to_string_preserves_safe_for(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box_memdup(autofree, &src, NULL, (uint8_t const *) "abc", 3, false);
+	fr_value_box_mark_safe_for(&src, SAFE_FOR_X);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_STRING, NULL, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_STRING);
+	TEST_CHECK(fr_value_box_is_safe_for_only(&dst, SAFE_FOR_X));
+	TEST_MSG("Expected safe_for %#lx, got %#lx", (unsigned long) SAFE_FOR_X, (unsigned long) dst.vb_safefor);
+
+	fr_value_box_clear(&src);
+	fr_value_box_clear(&dst);
+}
+
+static void test_cast_string_to_octets_preserves_safe_for(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box_strdup(autofree, &src, NULL, "abc", false);
+	fr_value_box_mark_safe_for(&src, SAFE_FOR_X);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_OCTETS, NULL, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_OCTETS);
+	TEST_CHECK(fr_value_box_is_safe_for_only(&dst, SAFE_FOR_X));
+	TEST_MSG("Expected safe_for %#lx, got %#lx", (unsigned long) SAFE_FOR_X, (unsigned long) dst.vb_safefor);
+
+	fr_value_box_clear(&src);
+	fr_value_box_clear(&dst);
+}
+
+static void test_cast_uint32_to_string_clears_safe_for(void)
+{
+	fr_value_box_t src, dst;
+
+	fr_value_box(&src, (uint32_t) 12345, false);
+	fr_value_box_mark_safe_for(&src, SAFE_FOR_X);
+	fr_value_box_init_null(&dst);
+
+	TEST_CHECK(fr_value_box_cast(autofree, &dst, FR_TYPE_STRING, NULL, &src) == 0);
+	TEST_CHECK(dst.type == FR_TYPE_STRING);
+	TEST_CHECK(dst.vb_safefor == FR_VALUE_BOX_SAFE_FOR_NONE);
+	TEST_MSG("Expected safe_for NONE, got %#lx", (unsigned long) dst.vb_safefor);
+
+	fr_value_box_clear(&dst);
+}
+
+/** Build a list of single character string boxes, each marked with the matching token
+ */
+static void safe_for_list_build(fr_value_box_list_t *list, fr_value_box_safe_for_t const tokens[], size_t num)
+{
+	size_t i;
+
+	fr_value_box_list_init(list);
+	for (i = 0; i < num; i++) {
+		fr_value_box_t *vb;
+
+		vb = fr_value_box_alloc(autofree, FR_TYPE_STRING, NULL);
+		TEST_ASSERT(vb != NULL);
+		TEST_ASSERT(fr_value_box_strdup(vb, vb, NULL, "x", false) == 0);
+		fr_value_box_mark_safe_for(vb, tokens[i]);
+		fr_value_box_list_insert_tail(list, vb);
+	}
+}
+
+/** Concatenate a list into a separate output box and check the resulting safe_for
+ */
+static void safe_for_concat_check(fr_type_t type, fr_value_box_safe_for_t const tokens[], size_t num,
+				  fr_value_box_safe_for_t expect)
+{
+	fr_value_box_list_t	list;
+	fr_value_box_t		out;
+
+	safe_for_list_build(&list, tokens, num);
+	fr_value_box_init_null(&out);
+
+	TEST_CHECK(fr_value_box_list_concat_in_place(autofree, &out, &list, type,
+						     FR_VALUE_BOX_LIST_FREE, true, SIZE_MAX) == 0);
+	TEST_CHECK(out.type == type);
+	TEST_CHECK(out.vb_length == num);
+	TEST_CHECK(out.vb_safefor == expect);
+	TEST_MSG("Expected safe_for %#lx, got %#lx", (unsigned long) expect, (unsigned long) out.vb_safefor);
+
+	fr_value_box_clear(&out);
+}
+
+static void test_concat_any_any_is_any(void)
+{
+	fr_value_box_safe_for_t const tokens[] = { FR_VALUE_BOX_SAFE_FOR_ANY, FR_VALUE_BOX_SAFE_FOR_ANY };
+
+	safe_for_concat_check(FR_TYPE_STRING, tokens, NUM_ELEMENTS(tokens), FR_VALUE_BOX_SAFE_FOR_ANY);
+}
+
+static void test_concat_x_x_is_x(void)
+{
+	fr_value_box_safe_for_t const tokens[] = { SAFE_FOR_X, SAFE_FOR_X };
+
+	safe_for_concat_check(FR_TYPE_STRING, tokens, NUM_ELEMENTS(tokens), SAFE_FOR_X);
+}
+
+static void test_concat_x_any_is_x(void)
+{
+	fr_value_box_safe_for_t const tokens[] = { SAFE_FOR_X, FR_VALUE_BOX_SAFE_FOR_ANY };
+
+	safe_for_concat_check(FR_TYPE_STRING, tokens, NUM_ELEMENTS(tokens), SAFE_FOR_X);
+}
+
+static void test_concat_any_x_is_x(void)
+{
+	fr_value_box_safe_for_t const tokens[] = { FR_VALUE_BOX_SAFE_FOR_ANY, SAFE_FOR_X };
+
+	safe_for_concat_check(FR_TYPE_STRING, tokens, NUM_ELEMENTS(tokens), SAFE_FOR_X);
+}
+
+static void test_concat_x_y_is_none(void)
+{
+	fr_value_box_safe_for_t const tokens[] = { SAFE_FOR_X, SAFE_FOR_Y };
+
+	safe_for_concat_check(FR_TYPE_STRING, tokens, NUM_ELEMENTS(tokens), FR_VALUE_BOX_SAFE_FOR_NONE);
+}
+
+static void test_concat_x_none_is_none(void)
+{
+	fr_value_box_safe_for_t const tokens[] = { SAFE_FOR_X, FR_VALUE_BOX_SAFE_FOR_NONE };
+
+	safe_for_concat_check(FR_TYPE_STRING, tokens, NUM_ELEMENTS(tokens), FR_VALUE_BOX_SAFE_FOR_NONE);
+}
+
+static void test_concat_octets_x_x_is_x(void)
+{
+	fr_value_box_safe_for_t const tokens[] = { SAFE_FOR_X, SAFE_FOR_X };
+
+	safe_for_concat_check(FR_TYPE_OCTETS, tokens, NUM_ELEMENTS(tokens), SAFE_FOR_X);
+}
+
+/** The list head doubles as the output box
+ */
+static void test_concat_into_head_x_x_is_x(void)
+{
+	fr_value_box_safe_for_t const	tokens[] = { SAFE_FOR_X, SAFE_FOR_X };
+	fr_value_box_list_t		list;
+	fr_value_box_t			*head;
+
+	safe_for_list_build(&list, tokens, NUM_ELEMENTS(tokens));
+	head = fr_value_box_list_head(&list);
+
+	TEST_CHECK(fr_value_box_list_concat_in_place(autofree, head, &list, FR_TYPE_STRING,
+						     FR_VALUE_BOX_LIST_FREE, true, SIZE_MAX) == 0);
+	TEST_CHECK(head->vb_length == 2);
+	TEST_CHECK(fr_value_box_is_safe_for_only(head, SAFE_FOR_X));
+	TEST_MSG("Expected safe_for %#lx, got %#lx", (unsigned long) SAFE_FOR_X, (unsigned long) head->vb_safefor);
+
+	fr_value_box_list_talloc_free(&list);
+}
+
+static void test_list_safety_merge(void)
+{
+	fr_value_box_safe_for_t const	x_any[] = { SAFE_FOR_X, FR_VALUE_BOX_SAFE_FOR_ANY };
+	fr_value_box_safe_for_t const	x_y[] = { SAFE_FOR_X, SAFE_FOR_Y };
+	fr_value_box_safe_for_t const	x_only[] = { SAFE_FOR_X };
+	fr_value_box_list_t		list;
+	fr_value_box_t			out, *group;
+
+	TEST_CASE("X and ANY merge to X");
+	safe_for_list_build(&list, x_any, NUM_ELEMENTS(x_any));
+	fr_value_box_init_null(&out);
+	fr_value_box_list_safety_merge(&out, &list);
+	TEST_CHECK(fr_value_box_is_safe_for_only(&out, SAFE_FOR_X));
+	fr_value_box_list_talloc_free(&list);
+
+	TEST_CASE("X and Y merge to NONE");
+	safe_for_list_build(&list, x_y, NUM_ELEMENTS(x_y));
+	fr_value_box_init_null(&out);
+	fr_value_box_list_safety_merge(&out, &list);
+	TEST_CHECK(out.vb_safefor == FR_VALUE_BOX_SAFE_FOR_NONE);
+	fr_value_box_list_talloc_free(&list);
+
+	TEST_CASE("Group children are merged, the group box itself is not");
+	fr_value_box_list_init(&list);
+	group = fr_value_box_alloc(autofree, FR_TYPE_GROUP, NULL);
+	TEST_ASSERT(group != NULL);
+	safe_for_list_build(&group->vb_group, x_only, NUM_ELEMENTS(x_only));
+	fr_value_box_list_insert_tail(&list, group);
+	fr_value_box_init_null(&out);
+	fr_value_box_list_safety_merge(&out, &list);
+	TEST_CHECK(fr_value_box_is_safe_for_only(&out, SAFE_FOR_X));
+	fr_value_box_list_talloc_free(&list);
+}
+
+/*
+ *	String operations
+ */
+static void test_strdup(void)
+{
+	fr_value_box_t vb;
+
+	TEST_CHECK(fr_value_box_strdup(autofree, &vb, NULL, "hello world", false) == 0);
+	TEST_CHECK(vb.type == FR_TYPE_STRING);
+	TEST_CHECK_STRCMP(vb.vb_strvalue, "hello world");
+	TEST_CHECK(vb.vb_length == 11);
+
+	fr_value_box_clear(&vb);
+}
+
+static void test_asprintf(void)
+{
+	fr_value_box_t vb;
+
+	TEST_CHECK(fr_value_box_asprintf(autofree, &vb, NULL, false, "value=%d", 42) == 0);
+	TEST_CHECK(vb.type == FR_TYPE_STRING);
+	TEST_CHECK_STRCMP(vb.vb_strvalue, "value=42");
+
+	fr_value_box_clear(&vb);
+}
+
+static void test_bstrndup(void)
+{
+	fr_value_box_t vb;
+
+	/* bstrndup copies exactly len bytes */
+	TEST_CHECK(fr_value_box_bstrndup(autofree, &vb, NULL, "hello\0world", 11, false) == 0);
+	TEST_CHECK(vb.type == FR_TYPE_STRING);
+	TEST_CHECK(vb.vb_length == 11);
+	TEST_CHECK(memcmp(vb.vb_strvalue, "hello\0world", 11) == 0);
+
+	fr_value_box_clear(&vb);
+}
+
+/*
+ *	Memory operations
+ */
+static void test_memdup(void)
+{
+	fr_value_box_t vb;
+	uint8_t data[] = { 0xde, 0xad, 0xbe, 0xef };
+
+	TEST_CHECK(fr_value_box_memdup(autofree, &vb, NULL, data, sizeof(data), false) == 0);
+	TEST_CHECK(vb.type == FR_TYPE_OCTETS);
+	TEST_CHECK(vb.vb_length == 4);
+	TEST_CHECK(memcmp(vb.vb_octets, data, 4) == 0);
+
+	fr_value_box_clear(&vb);
+}
+
+/*
+ *	Hash tests
+ */
+static void test_hash_same_values(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (uint32_t) 42, false);
+	fr_value_box(&b, (uint32_t) 42, false);
+
+	TEST_CHECK(fr_value_box_hash(&a) == fr_value_box_hash(&b));
+}
+
+static void test_hash_different_values(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box(&a, (uint32_t) 42, false);
+	fr_value_box(&b, (uint32_t) 43, false);
+
+	TEST_CHECK(fr_value_box_hash(&a) != fr_value_box_hash(&b));
+}
+
+static void test_hash_string(void)
+{
+	fr_value_box_t a, b;
+
+	fr_value_box_strdup(autofree, &a, NULL, "hello", false);
+	fr_value_box_strdup(autofree, &b, NULL, "hello", false);
+
+	TEST_CHECK(fr_value_box_hash(&a) == fr_value_box_hash(&b));
+
+	fr_value_box_clear(&a);
+	fr_value_box_clear(&b);
+}
+
+/*
+ *	Truthiness tests (fr_value_box_is_truthy)
+ */
+static void test_truthy_bool(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box(&vb, (bool) true, false);
+	TEST_CHECK(fr_value_box_is_truthy(&vb) == true);
+
+	fr_value_box(&vb, (bool) false, false);
+	TEST_CHECK(fr_value_box_is_truthy(&vb) == false);
+}
+
+static void test_truthy_uint32(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box(&vb, (uint32_t) 42, false);
+	TEST_CHECK(fr_value_box_is_truthy(&vb) == true);
+
+	fr_value_box(&vb, (uint32_t) 0, false);
+	TEST_CHECK(fr_value_box_is_truthy(&vb) == false);
+}
+
+static void test_truthy_string(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box_strdup(autofree, &vb, NULL, "hello", false);
+	TEST_CHECK(fr_value_box_is_truthy(&vb) == true);
+	fr_value_box_clear(&vb);
+
+	fr_value_box_strdup(autofree, &vb, NULL, "", false);
+	TEST_CHECK(fr_value_box_is_truthy(&vb) == false);
+	fr_value_box_clear(&vb);
+}
+
+static void test_truthy_octets(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box_memdup(autofree, &vb, NULL, (uint8_t const *)"\x01", 1, false);
+	TEST_CHECK(fr_value_box_is_truthy(&vb) == true);
+	fr_value_box_clear(&vb);
+
+	fr_value_box_memdup(autofree, &vb, NULL, (uint8_t const *)"", 0, false);
+	TEST_CHECK(fr_value_box_is_truthy(&vb) == false);
+	fr_value_box_clear(&vb);
+}
+
+/*
+ *	Increment tests (fr_value_box_increment)
+ */
+static void test_increment_uint32(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box(&vb, (uint32_t) 41, false);
+	fr_value_box_increment(&vb);
+	TEST_CHECK(vb.vb_uint32 == 42);
+	TEST_MSG("Expected 42, got %u", vb.vb_uint32);
+}
+
+static void test_increment_uint8_overflow(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box(&vb, (uint8_t) UINT8_MAX, false);
+	fr_value_box_increment(&vb);
+	TEST_CHECK(vb.vb_uint8 == 0);
+	TEST_MSG("Expected 0 (wrap), got %u", vb.vb_uint8);
+}
+
+static void test_increment_int32(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box(&vb, (int32_t) -1, false);
+	fr_value_box_increment(&vb);
+	TEST_CHECK(vb.vb_int32 == 0);
+	TEST_MSG("Expected 0, got %d", vb.vb_int32);
+}
+
+/*
+ *	as_uint64 extraction tests
+ */
+static void test_as_uint64(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box(&vb, (uint8_t) 255, false);
+	TEST_CHECK(fr_value_box_as_uint64(&vb) == 255);
+
+	fr_value_box(&vb, (uint16_t) 1000, false);
+	TEST_CHECK(fr_value_box_as_uint64(&vb) == 1000);
+
+	fr_value_box(&vb, (uint32_t) 100000, false);
+	TEST_CHECK(fr_value_box_as_uint64(&vb) == 100000);
+
+	fr_value_box(&vb, (uint64_t) UINT64_MAX, false);
+	TEST_CHECK(fr_value_box_as_uint64(&vb) == UINT64_MAX);
+
+	fr_value_box(&vb, (bool) true, false);
+	TEST_CHECK(fr_value_box_as_uint64(&vb) == 1);
+}
+
+/*
+ *	Clear tests
+ */
+static void test_clear(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box(&vb, (uint32_t) 42, false);
+	TEST_CHECK(vb.type == FR_TYPE_UINT32);
+
+	fr_value_box_clear(&vb);
+	TEST_CHECK(vb.type == FR_TYPE_NULL);
+}
+
+static void test_clear_string(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box_strdup(autofree, &vb, NULL, "hello", false);
+	TEST_CHECK(vb.type == FR_TYPE_STRING);
+
+	fr_value_box_clear(&vb);
+	TEST_CHECK(vb.type == FR_TYPE_NULL);
+}
+
+/*
+ *	Tainted flag tests
+ */
+static void test_tainted_flag(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box(&vb, (uint32_t) 42, true);
+	TEST_CHECK(vb.tainted == true);
+
+	fr_value_box(&vb, (uint32_t) 42, false);
+	TEST_CHECK(vb.tainted == false);
+}
+
+/*
+ *	Network encode/decode round-trip tests
+ */
+static void test_network_uint32(void)
+{
+	fr_value_box_t src, dst;
+	uint8_t buffer[256] = {};
+	fr_dbuff_t dbuff;
+	ssize_t enc_len, dec_len;
+
+	fr_value_box(&src, (uint32_t) 0x12345678, false);
+
+	/* Encode to network format */
+	dbuff = FR_DBUFF_TMP(buffer, sizeof(buffer));
+	enc_len = fr_value_box_to_network(&dbuff, &src);
+	TEST_CHECK(enc_len == 4);
+
+	/* Verify network byte order (big endian) */
+	TEST_CHECK(buffer[0] == 0x12);
+	TEST_CHECK(buffer[1] == 0x34);
+	TEST_CHECK(buffer[2] == 0x56);
+	TEST_CHECK(buffer[3] == 0x78);
+
+	/* Decode back */
+	fr_value_box_init_null(&dst);
+	dbuff = FR_DBUFF_TMP(buffer, (size_t)enc_len);
+	dec_len = fr_value_box_from_network(NULL, &dst, FR_TYPE_UINT32, NULL, &dbuff, enc_len, false);
+	TEST_CHECK(dec_len == 4);
+	TEST_CHECK(dst.vb_uint32 == 0x12345678);
+	TEST_MSG("Expected 0x12345678, got 0x%08x", dst.vb_uint32);
+}
+
+/** The scope_id of an IPv6 address is one byte on the wire, not the four bytes of fr_ipaddr_t.scope_id
+ *
+ */
+static void test_network_ipv6addr_scope_id(void)
+{
+	fr_value_box_t src, dst;
+	uint8_t buffer[256] = {};
+	fr_dbuff_t dbuff;
+	ssize_t enc_len, dec_len;
+
+	fr_value_box_init(&src, FR_TYPE_IPV6_ADDR, NULL, false);
+	src.vb_ip = (fr_ipaddr_t) {
+		.af = AF_INET6,
+		.prefix = 128,
+		.scope_id = 1,
+		.addr.v6.s6_addr = { 0xfe, 0x80, [15] = 0x01 }
+	};
+
+	dbuff = FR_DBUFF_TMP(buffer, sizeof(buffer));
+	enc_len = fr_value_box_to_network(&dbuff, &src);
+	TEST_CHECK(enc_len == 17);
+	TEST_MSG("Expected 17, got %zd", enc_len);
+	TEST_CHECK(buffer[0] == 1);
+	TEST_CHECK(buffer[1] == 0xfe);
+
+	fr_value_box_init_null(&dst);
+	dbuff = FR_DBUFF_TMP(buffer, (size_t)enc_len);
+	dec_len = fr_value_box_from_network(NULL, &dst, FR_TYPE_IPV6_ADDR, NULL, &dbuff, enc_len, false);
+	TEST_CHECK(dec_len == 17);
+	TEST_CHECK(dst.vb_ip.scope_id == 1);
+	TEST_CHECK(memcmp(&dst.vb_ip.addr.v6, &src.vb_ip.addr.v6, sizeof(src.vb_ip.addr.v6)) == 0);
+
+	src.vb_ip.scope_id = 256;
+	dbuff = FR_DBUFF_TMP(buffer, sizeof(buffer));
+	enc_len = fr_value_box_to_network(&dbuff, &src);
+	TEST_CHECK(enc_len < 0);
+	TEST_MSG("Expected an error, got %zd", enc_len);
+}
+
+static void test_network_uint64(void)
+{
+	fr_value_box_t src, dst;
+	uint8_t buffer[256] = {};
+	fr_dbuff_t dbuff;
+	ssize_t enc_len, dec_len;
+
+	fr_value_box(&src, (uint64_t) 0x0102030405060708ULL, false);
+
+	dbuff = FR_DBUFF_TMP(buffer, sizeof(buffer));
+	enc_len = fr_value_box_to_network(&dbuff, &src);
+	TEST_CHECK(enc_len == 8);
+
+	/* Verify big endian */
+	TEST_CHECK(buffer[0] == 0x01);
+	TEST_CHECK(buffer[7] == 0x08);
+
+	/* Decode back */
+	fr_value_box_init_null(&dst);
+	dbuff = FR_DBUFF_TMP(buffer, (size_t)enc_len);
+	dec_len = fr_value_box_from_network(NULL, &dst, FR_TYPE_UINT64, NULL, &dbuff, enc_len, false);
+	TEST_CHECK(dec_len == 8);
+	TEST_CHECK(dst.vb_uint64 == 0x0102030405060708ULL);
+}
+
+static void test_network_int32(void)
+{
+	fr_value_box_t src, dst;
+	uint8_t buffer[256] = {};
+	fr_dbuff_t dbuff;
+	ssize_t enc_len, dec_len;
+
+	fr_value_box(&src, (int32_t) -1, false);
+
+	dbuff = FR_DBUFF_TMP(buffer, sizeof(buffer));
+	enc_len = fr_value_box_to_network(&dbuff, &src);
+	TEST_CHECK(enc_len == 4);
+
+	/* -1 in two's complement big endian is 0xffffffff */
+	TEST_CHECK(buffer[0] == 0xff);
+	TEST_CHECK(buffer[1] == 0xff);
+	TEST_CHECK(buffer[2] == 0xff);
+	TEST_CHECK(buffer[3] == 0xff);
+
+	/* Decode back */
+	fr_value_box_init_null(&dst);
+	dbuff = FR_DBUFF_TMP(buffer, (size_t)enc_len);
+	dec_len = fr_value_box_from_network(NULL, &dst, FR_TYPE_INT32, NULL, &dbuff, enc_len, false);
+	TEST_CHECK(dec_len == 4);
+	TEST_CHECK(dst.vb_int32 == -1);
+}
+
+static void test_network_bool(void)
+{
+	fr_value_box_t src, dst;
+	uint8_t buffer[256] = {};
+	fr_dbuff_t dbuff;
+	ssize_t enc_len, dec_len;
+
+	fr_value_box(&src, (bool) true, false);
+
+	dbuff = FR_DBUFF_TMP(buffer, sizeof(buffer));
+	enc_len = fr_value_box_to_network(&dbuff, &src);
+	TEST_CHECK(enc_len == 1);
+	TEST_CHECK(buffer[0] == 1);
+
+	fr_value_box_init_null(&dst);
+	dbuff = FR_DBUFF_TMP(buffer, (size_t)enc_len);
+	dec_len = fr_value_box_from_network(NULL, &dst, FR_TYPE_BOOL, NULL, &dbuff, enc_len, false);
+	TEST_CHECK(dec_len == 1);
+	TEST_CHECK(dst.vb_bool == true);
+}
+
+static void test_network_length(void)
+{
+	fr_value_box_t vb;
+
+	fr_value_box(&vb, (uint8_t) 0, false);
+	TEST_CHECK(fr_value_box_network_length(&vb) == 1);
+
+	fr_value_box(&vb, (uint16_t) 0, false);
+	TEST_CHECK(fr_value_box_network_length(&vb) == 2);
+
+	fr_value_box(&vb, (uint32_t) 0, false);
+	TEST_CHECK(fr_value_box_network_length(&vb) == 4);
+
+	fr_value_box(&vb, (uint64_t) 0, false);
+	TEST_CHECK(fr_value_box_network_length(&vb) == 8);
+}
+
+/*
+ *	Print tests (fr_value_box_print)
+ */
+static void test_print_uint32(void)
+{
+	fr_value_box_t vb;
+	char buffer[256] = {};
+	fr_sbuff_t sbuff = FR_SBUFF_OUT(buffer, sizeof(buffer));
+
+	fr_value_box(&vb, (uint32_t) 42, false);
+
+	TEST_CHECK(fr_value_box_print(&sbuff, &vb, NULL) > 0);
+	fr_sbuff_terminate(&sbuff);
+	TEST_CHECK_STRCMP(buffer, "42");
+}
+
+static void test_print_int32_negative(void)
+{
+	fr_value_box_t vb;
+	char buffer[256] = {};
+	fr_sbuff_t sbuff = FR_SBUFF_OUT(buffer, sizeof(buffer));
+
+	fr_value_box(&vb, (int32_t) -42, false);
+
+	TEST_CHECK(fr_value_box_print(&sbuff, &vb, NULL) > 0);
+	fr_sbuff_terminate(&sbuff);
+	TEST_CHECK_STRCMP(buffer, "-42");
+}
+
+static void test_print_string(void)
+{
+	fr_value_box_t vb;
+	char buffer[256] = {};
+	fr_sbuff_t sbuff = FR_SBUFF_OUT(buffer, sizeof(buffer));
+
+	fr_value_box_strdup(autofree, &vb, NULL, "hello", false);
+
+	TEST_CHECK(fr_value_box_print(&sbuff, &vb, NULL) > 0);
+	fr_sbuff_terminate(&sbuff);
+	TEST_CHECK_STRCMP(buffer, "hello");
+
+	fr_value_box_clear(&vb);
+}
+
+static void test_print_bool(void)
+{
+	fr_value_box_t vb;
+	char buffer[256] = {};
+	fr_sbuff_t sbuff;
+
+	fr_value_box(&vb, (bool) true, false);
+	sbuff = FR_SBUFF_OUT(buffer, sizeof(buffer));
+	TEST_CHECK(fr_value_box_print(&sbuff, &vb, NULL) > 0);
+	fr_sbuff_terminate(&sbuff);
+	TEST_CHECK_STRCMP(buffer, "yes");
+
+	fr_value_box(&vb, (bool) false, false);
+	sbuff = FR_SBUFF_OUT(buffer, sizeof(buffer));
+	TEST_CHECK(fr_value_box_print(&sbuff, &vb, NULL) > 0);
+	fr_sbuff_terminate(&sbuff);
+	TEST_CHECK_STRCMP(buffer, "no");
+}
+
+static void test_print_octets(void)
+{
+	fr_value_box_t vb;
+	char buffer[256] = {};
+	fr_sbuff_t sbuff = FR_SBUFF_OUT(buffer, sizeof(buffer));
+
+	fr_value_box_memdup(autofree, &vb, NULL, (uint8_t const *)"\xde\xad\xbe\xef", 4, false);
+
+	TEST_CHECK(fr_value_box_print(&sbuff, &vb, NULL) > 0);
+	fr_sbuff_terminate(&sbuff);
+	TEST_CHECK_STRCMP(buffer, "0xdeadbeef");
+
+	fr_value_box_clear(&vb);
+}
+
+/*
+ *	From string parsing tests (fr_value_box_from_str)
+ */
+static void test_from_str_uint32(void)
+{
+	fr_value_box_t vb;
+
+	TEST_CHECK(fr_value_box_from_str(autofree, &vb, FR_TYPE_UINT32, NULL,
+					 "12345", strlen("12345"), NULL) > 0);
+	TEST_CHECK(vb.type == FR_TYPE_UINT32);
+	TEST_CHECK(vb.vb_uint32 == 12345);
+	TEST_MSG("Expected 12345, got %u", vb.vb_uint32);
+}
+
+static void test_from_str_int32(void)
+{
+	fr_value_box_t vb;
+
+	TEST_CHECK(fr_value_box_from_str(autofree, &vb, FR_TYPE_INT32, NULL,
+					 "-42", strlen("-42"), NULL) > 0);
+	TEST_CHECK(vb.type == FR_TYPE_INT32);
+	TEST_CHECK(vb.vb_int32 == -42);
+	TEST_MSG("Expected -42, got %d", vb.vb_int32);
+}
+
+static void test_from_str_bool(void)
+{
+	fr_value_box_t vb;
+
+	TEST_CHECK(fr_value_box_from_str(autofree, &vb, FR_TYPE_BOOL, NULL,
+					 "yes", strlen("yes"), NULL) > 0);
+	TEST_CHECK(vb.type == FR_TYPE_BOOL);
+	TEST_CHECK(vb.vb_bool == true);
+}
+
+static void test_from_str_float64(void)
+{
+	fr_value_box_t vb;
+
+	TEST_CHECK(fr_value_box_from_str(autofree, &vb, FR_TYPE_FLOAT64, NULL,
+					 "3.14", strlen("3.14"), NULL) > 0);
+	TEST_CHECK(vb.type == FR_TYPE_FLOAT64);
+	TEST_CHECK((vb.vb_float64 > 3.13) && (vb.vb_float64 < 3.15));
+	TEST_MSG("Expected ~3.14, got %f", vb.vb_float64);
+}
+
+static void test_from_str_octets(void)
+{
+	fr_value_box_t vb;
+
+	TEST_CHECK(fr_value_box_from_str(autofree, &vb, FR_TYPE_OCTETS, NULL,
+					 "0xdeadbeef", strlen("0xdeadbeef"), NULL) > 0);
+	TEST_CHECK(vb.type == FR_TYPE_OCTETS);
+	TEST_CHECK(vb.vb_length == 4);
+	TEST_CHECK(memcmp(vb.vb_octets, "\xde\xad\xbe\xef", 4) == 0);
+
+	fr_value_box_clear(&vb);
+}
+
+static void test_from_str_string(void)
+{
+	fr_value_box_t vb;
+
+	TEST_CHECK(fr_value_box_from_str(autofree, &vb, FR_TYPE_STRING, NULL,
+					 "hello world", strlen("hello world"), NULL) > 0);
+	TEST_CHECK(vb.type == FR_TYPE_STRING);
+	TEST_CHECK_STRCMP(vb.vb_strvalue, "hello world");
+
+	fr_value_box_clear(&vb);
+}
+
+/*
+ *	Print/parse round-trip tests
+ */
+static void test_round_trip_uint32(void)
+{
+	fr_value_box_t src, dst;
+	char buffer[256] = {};
+	fr_sbuff_t sbuff = FR_SBUFF_OUT(buffer, sizeof(buffer));
+
+	fr_value_box(&src, (uint32_t) 42, false);
+
+	TEST_CHECK(fr_value_box_print(&sbuff, &src, NULL) > 0);
+	fr_sbuff_terminate(&sbuff);
+
+	TEST_CHECK(fr_value_box_from_str(autofree, &dst, FR_TYPE_UINT32, NULL,
+					 buffer, strlen(buffer), NULL) > 0);
+	TEST_CHECK(dst.vb_uint32 == 42);
+}
+
+static void test_round_trip_int64(void)
+{
+	fr_value_box_t src, dst;
+	char buffer[256] = {};
+	fr_sbuff_t sbuff = FR_SBUFF_OUT(buffer, sizeof(buffer));
+
+	fr_value_box(&src, (int64_t) -9999999, false);
+
+	TEST_CHECK(fr_value_box_print(&sbuff, &src, NULL) > 0);
+	fr_sbuff_terminate(&sbuff);
+
+	TEST_CHECK(fr_value_box_from_str(autofree, &dst, FR_TYPE_INT64, NULL,
+					 buffer, strlen(buffer), NULL) > 0);
+	TEST_CHECK(dst.vb_int64 == -9999999);
+}
+
+static void test_round_trip_bool(void)
+{
+	fr_value_box_t src, dst;
+	char buffer[256] = {};
+	fr_sbuff_t sbuff;
+
+	fr_value_box(&src, (bool) true, false);
+	sbuff = FR_SBUFF_OUT(buffer, sizeof(buffer));
+	TEST_CHECK(fr_value_box_print(&sbuff, &src, NULL) > 0);
+	fr_sbuff_terminate(&sbuff);
+
+	TEST_CHECK(fr_value_box_from_str(autofree, &dst, FR_TYPE_BOOL, NULL,
+					 buffer, strlen(buffer), NULL) > 0);
+	TEST_CHECK(dst.vb_bool == true);
+}
+
+static void test_round_trip_network_uint32(void)
+{
+	fr_value_box_t src, dst;
+	uint8_t buffer[256] = {};
+	fr_dbuff_t dbuff;
+	ssize_t enc_len;
+
+	fr_value_box(&src, (uint32_t) 0xdeadbeef, false);
+
+	/* Encode */
+	dbuff = FR_DBUFF_TMP(buffer, sizeof(buffer));
+	enc_len = fr_value_box_to_network(&dbuff, &src);
+	TEST_CHECK(enc_len == 4);
+
+	/* Decode */
+	fr_value_box_init_null(&dst);
+	dbuff = FR_DBUFF_TMP(buffer, (size_t)enc_len);
+	TEST_CHECK(fr_value_box_from_network(NULL, &dst, FR_TYPE_UINT32, NULL, &dbuff, enc_len, false) == 4);
+	TEST_CHECK(dst.vb_uint32 == 0xdeadbeef);
+}
+
+/** Escape function for the in-place escape tests, writes '%' as "%25"
+ */
+static fr_slen_t test_percent_escape(fr_sbuff_t *out, fr_sbuff_t *in)
+{
+	fr_sbuff_t	our_out = FR_SBUFF(out);
+	fr_sbuff_t	our_in = FR_SBUFF(in);
+
+	while (fr_sbuff_extend(&our_in)) {
+		char c = *fr_sbuff_current(&our_in);
+
+		if (c == '%') {
+			FR_SBUFF_IN_STRCPY_LITERAL_RETURN(&our_out, "%25");
+		} else {
+			FR_SBUFF_IN_CHAR_RETURN(&our_out, c);
+		}
+		fr_sbuff_advance(&our_in, 1);
+	}
+
+	fr_sbuff_set(in, &our_in);
+	FR_SBUFF_SET_RETURN(out, &our_out);
+}
+
+static void test_bstrndup_replace(void)
+{
+	fr_value_box_t	*vb;
+	char const	*old;
+
+	TEST_CASE("Replacing a string value copies the new bytes and keeps the flags");
+	vb = fr_value_box_alloc(NULL, FR_TYPE_STRING, NULL);
+	TEST_ASSERT(vb != NULL);
+	TEST_ASSERT(fr_value_box_bstrndup(vb, vb, NULL, "before", 6, true) == 0);
+	fr_value_box_mark_safe_for(vb, (fr_value_box_safe_for_t)test_bstrndup_replace);
+	old = vb->vb_strvalue;
+
+	TEST_CHECK_RET(fr_value_box_bstrndup_replace(vb, vb, "af\0ter", 6), 0);
+	TEST_CHECK(vb->vb_strvalue != old);
+	TEST_CHECK_LEN(vb->vb_length, 6);
+	TEST_CHECK(memcmp(vb->vb_strvalue, "af\0ter", 6) == 0);
+	TEST_CHECK(vb->vb_strvalue[6] == '\0');
+	TEST_CHECK(vb->tainted == true);
+	TEST_CHECK(fr_value_box_is_safe_for_only(vb, test_bstrndup_replace));
+
+	TEST_CASE("Replacing from an aliased source copies before freeing");
+	TEST_CHECK_RET(fr_value_box_bstrndup_replace(vb, vb, vb->vb_strvalue + 2, 4), 0);
+	TEST_CHECK_LEN(vb->vb_length, 4);
+	TEST_CHECK(memcmp(vb->vb_strvalue, "\0ter", 4) == 0);
+
+	talloc_free(vb);
+}
+
+static void test_escape_in_place_func_string(void)
+{
+	fr_value_box_t *vb;
+
+	TEST_CASE("String with escapable characters and an embedded NUL");
+	vb = fr_value_box_alloc(NULL, FR_TYPE_STRING, NULL);
+	TEST_ASSERT(vb != NULL);
+	TEST_ASSERT(fr_value_box_bstrndup(vb, vb, NULL, "a%b\0c", 5, true) == 0);
+
+	TEST_CHECK_RET(fr_value_box_escape_in_place_func(vb, vb, test_percent_escape), 0);
+	TEST_CHECK_LEN(vb->vb_length, 7);
+	TEST_CHECK(memcmp(vb->vb_strvalue, "a%25b\0c", 7) == 0);
+	TEST_CHECK(vb->vb_strvalue[7] == '\0');
+	TEST_CHECK(vb->tainted == true);
+
+	talloc_free(vb);
+}
+
+static void test_escape_in_place_func_unchanged(void)
+{
+	fr_value_box_t *vb;
+
+	TEST_CASE("String with nothing to escape is copied as is");
+	vb = fr_value_box_alloc(NULL, FR_TYPE_STRING, NULL);
+	TEST_ASSERT(vb != NULL);
+	TEST_ASSERT(fr_value_box_strdup(vb, vb, NULL, "plain", false) == 0);
+
+	TEST_CHECK_RET(fr_value_box_escape_in_place_func(vb, vb, test_percent_escape), 0);
+	TEST_CHECK_STRCMP(vb->vb_strvalue, "plain");
+	TEST_CHECK_LEN(vb->vb_length, 5);
+
+	talloc_free(vb);
+}
+
+static void test_escape_in_place_func_cast(void)
+{
+	fr_value_box_t *vb;
+
+	TEST_CASE("Non-string input is cast to a string before escaping");
+	vb = fr_value_box_alloc(NULL, FR_TYPE_UINT32, NULL);
+	TEST_ASSERT(vb != NULL);
+	vb->vb_uint32 = 100;
+
+	TEST_CHECK_RET(fr_value_box_escape_in_place_func(vb, vb, test_percent_escape), 0);
+	TEST_CHECK(vb->type == FR_TYPE_STRING);
+	TEST_CHECK_STRCMP(vb->vb_strvalue, "100");
+
+	talloc_free(vb);
+}
+
+TEST_LIST = {
+	/* Value replacement and in place escaping */
+	{ "bstrndup_replace",			test_bstrndup_replace },
+	{ "escape_in_place_func_string",	test_escape_in_place_func_string },
+	{ "escape_in_place_func_unchanged",	test_escape_in_place_func_unchanged },
+	{ "escape_in_place_func_cast",		test_escape_in_place_func_cast },
+
+	/* Comparison tests */
+	{ "cmp_uint32_equal",			test_cmp_uint32_equal },
+	{ "cmp_uint32_less",			test_cmp_uint32_less },
+	{ "cmp_int32",				test_cmp_int32 },
+	{ "cmp_float64",			test_cmp_float64 },
+	{ "cmp_string",				test_cmp_string },
+	{ "cmp_octets",				test_cmp_octets },
+	{ "cmp_octets_length",			test_cmp_octets_length },
+	{ "cmp_bool",				test_cmp_bool },
+	{ "cmp_different_types",		test_cmp_different_types },
+
+	/* Comparison operator tests */
+	{ "cmp_op_eq",				test_cmp_op_eq },
+	{ "cmp_op_ne",				test_cmp_op_ne },
+	{ "cmp_op_lt",				test_cmp_op_lt },
+	{ "cmp_op_gt",				test_cmp_op_gt },
+	{ "cmp_op_le",				test_cmp_op_le },
+	{ "cmp_op_ge",				test_cmp_op_ge },
+
+	/* Cast tests */
+	{ "cast_uint32_to_uint64",		test_cast_uint32_to_uint64 },
+	{ "cast_float_to_int64_bounds",		test_cast_float_to_int64_bounds },
+	{ "cast_float_to_date_bounds",		test_cast_float_to_date_bounds },
+	{ "cast_uint32_to_string",		test_cast_uint32_to_string },
+	{ "cast_string_to_uint32",		test_cast_string_to_uint32 },
+	{ "cast_string_returns_zero",		test_cast_string_returns_zero },
+	{ "cast_int32_to_int64",		test_cast_int32_to_int64 },
+	{ "cast_uint8_to_uint32",		test_cast_uint8_to_uint32 },
+	{ "cast_same_type",			test_cast_same_type },
+	{ "cast_bool_to_uint32",		test_cast_bool_to_uint32 },
+	{ "cast_uint32_to_bool",		test_cast_uint32_to_bool },
+
+	/* Cast in place */
+	{ "cast_in_place_uint32_to_uint64",	test_cast_in_place_uint32_to_uint64 },
+	{ "cast_in_place_uint32_to_string",	test_cast_in_place_uint32_to_string },
+
+	/* Copy tests */
+	{ "copy_uint32",			test_copy_uint32 },
+	{ "copy_string",			test_copy_string },
+	{ "copy_octets",			test_copy_octets },
+	{ "copy_preserves_tainted",		test_copy_preserves_tainted },
+
+	/* Safety propagation */
+	{ "copy_preserves_safe_for",		test_copy_preserves_safe_for },
+	{ "cast_octets_to_string_preserves_safe_for",	test_cast_octets_to_string_preserves_safe_for },
+	{ "cast_string_to_octets_preserves_safe_for",	test_cast_string_to_octets_preserves_safe_for },
+	{ "cast_uint32_to_string_clears_safe_for",	test_cast_uint32_to_string_clears_safe_for },
+	{ "concat_any_any_is_any",		test_concat_any_any_is_any },
+	{ "concat_x_x_is_x",			test_concat_x_x_is_x },
+	{ "concat_x_any_is_x",			test_concat_x_any_is_x },
+	{ "concat_any_x_is_x",			test_concat_any_x_is_x },
+	{ "concat_x_y_is_none",			test_concat_x_y_is_none },
+	{ "concat_x_none_is_none",		test_concat_x_none_is_none },
+	{ "concat_octets_x_x_is_x",		test_concat_octets_x_x_is_x },
+	{ "concat_into_head_x_x_is_x",		test_concat_into_head_x_x_is_x },
+	{ "list_safety_merge",			test_list_safety_merge },
+
+	/* String operations */
+	{ "strdup",				test_strdup },
+	{ "asprintf",				test_asprintf },
+	{ "bstrndup",				test_bstrndup },
+
+	/* Memory operations */
+	{ "memdup",				test_memdup },
+
+	/* Hash tests */
+	{ "hash_same_values",			test_hash_same_values },
+	{ "hash_different_values",		test_hash_different_values },
+	{ "hash_string",			test_hash_string },
+
+	/* Truthiness tests */
+	{ "truthy_bool",			test_truthy_bool },
+	{ "truthy_uint32",			test_truthy_uint32 },
+	{ "truthy_string",			test_truthy_string },
+	{ "truthy_octets",			test_truthy_octets },
+
+	/* Increment tests */
+	{ "increment_uint32",			test_increment_uint32 },
+	{ "increment_uint8_overflow",		test_increment_uint8_overflow },
+	{ "increment_int32",			test_increment_int32 },
+
+	/* as_uint64 */
+	{ "as_uint64",				test_as_uint64 },
+
+	/* Clear tests */
+	{ "clear",				test_clear },
+	{ "clear_string",			test_clear_string },
+
+	/* Tainted flag */
+	{ "tainted_flag",			test_tainted_flag },
+
+	/* Network encode/decode */
+	{ "network_uint32",			test_network_uint32 },
+	{ "network_uint64",			test_network_uint64 },
+	{ "network_int32",			test_network_int32 },
+	{ "network_bool",			test_network_bool },
+	{ "network_length",			test_network_length },
+
+	/* Print tests */
+	{ "print_uint32",			test_print_uint32 },
+	{ "print_int32_negative",		test_print_int32_negative },
+	{ "print_string",			test_print_string },
+	{ "print_bool",				test_print_bool },
+	{ "print_octets",			test_print_octets },
+
+	/* From string parsing */
+	{ "from_str_uint32",			test_from_str_uint32 },
+	{ "from_str_int32",			test_from_str_int32 },
+	{ "from_str_bool",			test_from_str_bool },
+	{ "from_str_float64",			test_from_str_float64 },
+	{ "from_str_octets",			test_from_str_octets },
+	{ "from_str_string",			test_from_str_string },
+
+	/* Round-trip tests */
+	{ "round_trip_uint32",			test_round_trip_uint32 },
+	{ "round_trip_int64",			test_round_trip_int64 },
+	{ "round_trip_bool",			test_round_trip_bool },
+	{ "round_trip_network_uint32",		test_round_trip_network_uint32 },
+	{ "network_ipv6addr_scope_id",		test_network_ipv6addr_scope_id },
+
+	TEST_TERMINATOR
+};

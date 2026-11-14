@@ -1,0 +1,13 @@
+Filter-Id := 'test0'
+Callback-Id := 'test1'
+
+compound_key
+if (!ok) {
+	test_fail
+}
+debug_all
+if (!(control.Realm == 'matched')) {
+	test_fail
+}
+
+test_pass

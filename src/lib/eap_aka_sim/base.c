@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -27,7 +27,6 @@
 
 RCSID("$Id$")
 
-#include <freeradius-devel/util/base.h>
 #include <freeradius-devel/util/sha1.h>
 
 #include <freeradius-devel/util/debug.h>
@@ -54,7 +53,7 @@ fr_dict_autoload_t libfreeradius_aka_sim_dict[] = {
 	{ .out = &dict_radius, .proto = "radius" },
 	{ .out = &dict_eap_aka_sim, .base_dir = "eap/aka-sim", .proto = "eap-aka-sim" },
 
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 fr_dict_attr_t const *attr_eap_aka_sim_ak;
@@ -64,6 +63,7 @@ fr_dict_attr_t const *attr_eap_aka_sim_auts;
 fr_dict_attr_t const *attr_eap_aka_sim_bidding;
 fr_dict_attr_t const *attr_eap_aka_sim_checkcode;
 fr_dict_attr_t const *attr_eap_aka_sim_ck;
+fr_dict_attr_t const *attr_eap_aka_sim_ck_prime;
 fr_dict_attr_t const *attr_eap_aka_sim_client_error_code;
 fr_dict_attr_t const *attr_eap_aka_sim_counter;
 fr_dict_attr_t const *attr_eap_aka_sim_counter_too_small;
@@ -74,6 +74,7 @@ fr_dict_attr_t const *attr_eap_aka_sim_hmac_extra_response;
 fr_dict_attr_t const *attr_eap_aka_sim_identity;
 fr_dict_attr_t const *attr_eap_aka_sim_identity_type;
 fr_dict_attr_t const *attr_eap_aka_sim_ik;
+fr_dict_attr_t const *attr_eap_aka_sim_ik_prime;
 fr_dict_attr_t const *attr_eap_aka_sim_iv;
 fr_dict_attr_t const *attr_eap_aka_sim_k_aut;
 fr_dict_attr_t const *attr_eap_aka_sim_k_encr;
@@ -90,7 +91,6 @@ fr_dict_attr_t const *attr_eap_aka_sim_next_reauth_id;
 fr_dict_attr_t const *attr_eap_aka_sim_nonce_mt;
 fr_dict_attr_t const *attr_eap_aka_sim_nonce_s;
 fr_dict_attr_t const *attr_eap_aka_sim_notification;
-fr_dict_attr_t const *attr_eap_aka_sim_padding;
 fr_dict_attr_t const *attr_eap_aka_sim_permanent_id_req;
 fr_dict_attr_t const *attr_eap_aka_sim_permanent_identity;
 fr_dict_attr_t const *attr_eap_aka_sim_rand;
@@ -125,16 +125,15 @@ fr_dict_attr_autoload_t libfreeradius_aka_sim_dict_attr[] = {
 	{ .out = &attr_eap_aka_sim_bidding, .name = "Bidding", .type = FR_TYPE_UINT16, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_checkcode, .name = "Checkcode", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_ck, .name = "CK", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_ck_prime, .name = "CK-Prime", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_client_error_code, .name = "Client-Error-Code", .type = FR_TYPE_UINT16, .dict = &dict_eap_aka_sim },
-	{ .out = &attr_eap_aka_sim_counter, .name = "Encr-Data.Counter", .type = FR_TYPE_UINT16, .dict = &dict_eap_aka_sim },
-	{ .out = &attr_eap_aka_sim_counter_too_small, .name = "Encr-Data.Counter-Too-Small", .type = FR_TYPE_BOOL, .dict = &dict_eap_aka_sim },
-	{ .out = &attr_eap_aka_sim_encr_data, .name = "Encr-Data", .type = FR_TYPE_TLV, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_fullauth_id_req, .name = "Fullauth-ID-Req", .type = FR_TYPE_BOOL, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_hmac_extra_request, .name = "HMAC-Extra-Request", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_hmac_extra_response, .name = "HMAC-Extra-Response", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_identity, .name = "Identity", .type = FR_TYPE_STRING, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_identity_type, .name = "Identity-Type", .type = FR_TYPE_UINT32, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_ik, .name = "IK", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_ik_prime, .name = "IK-Prime", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_iv, .name = "IV", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_k_aut, .name = "K-Aut", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_k_encr, .name = "K-Encr", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
@@ -146,12 +145,8 @@ fr_dict_attr_autoload_t libfreeradius_aka_sim_dict_attr[] = {
 	{ .out = &attr_eap_aka_sim_mac, .name = "MAC", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_method_hint, .name = "Method-Hint", .type = FR_TYPE_UINT32, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_mk, .name = "MK", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
-	{ .out = &attr_eap_aka_sim_next_pseudonym, .name = "Encr-Data.Next-Pseudonym", .type = FR_TYPE_STRING, .dict = &dict_eap_aka_sim },
-	{ .out = &attr_eap_aka_sim_next_reauth_id, .name = "Encr-Data.Next-Reauth-ID", .type = FR_TYPE_STRING, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_nonce_mt, .name = "Nonce-MT", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
-	{ .out = &attr_eap_aka_sim_nonce_s, .name = "Encr-Data.Nonce-S", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_notification, .name = "Notification", .type = FR_TYPE_UINT16, .dict = &dict_eap_aka_sim },
-	{ .out = &attr_eap_aka_sim_padding, .name = "Encr-Data.Padding", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_permanent_id_req, .name = "Permanent-Id-Req", .type = FR_TYPE_BOOL, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_permanent_identity, .name = "Permanent-Identity", .type = FR_TYPE_STRING, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_rand, .name = "RAND", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
@@ -159,11 +154,18 @@ fr_dict_attr_autoload_t libfreeradius_aka_sim_dict_attr[] = {
 	{ .out = &attr_eap_aka_sim_result_ind, .name = "Result-Ind", .type = FR_TYPE_BOOL, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_selected_version, .name = "Selected-Version", .type = FR_TYPE_UINT16, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_sres, .name = "SRES", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
-	{ .out = &attr_eap_aka_sim_subtype, .name = "Subtype", .type = FR_TYPE_UINT32, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_subtype, .name = "Subtype", .type = FR_TYPE_UINT8, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_version_list, .name = "Version-List", .type = FR_TYPE_UINT16, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_eap_aka_sim_xres, .name = "XRES", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_session_data, .name = "Session-Data", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
 	{ .out = &attr_session_id, .name = "Session-Id", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
+
+	{ .out = &attr_eap_aka_sim_encr_data, .name = "Encr-Data", .type = FR_TYPE_TLV, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_counter, .name = "Encr-Data.Counter", .type = FR_TYPE_UINT16, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_nonce_s, .name = "Encr-Data.Nonce-S", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_next_pseudonym, .name = "Encr-Data.Next-Pseudonym", .type = FR_TYPE_STRING, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_next_reauth_id, .name = "Encr-Data.Next-Reauth-ID", .type = FR_TYPE_STRING, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_counter_too_small, .name = "Encr-Data.Counter-Too-Small", .type = FR_TYPE_BOOL, .dict = &dict_eap_aka_sim },
 
 	{ .out = &attr_ms_mppe_send_key, .name = "Vendor-Specific.Microsoft.MPPE-Send-Key", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_ms_mppe_recv_key, .name = "Vendor-Specific.Microsoft.MPPE-Recv-Key", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
@@ -181,19 +183,24 @@ fr_dict_attr_autoload_t libfreeradius_aka_sim_dict_attr[] = {
 	{ .out = &attr_sim_op, .name = "SIM-OP", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
 	{ .out = &attr_sim_opc, .name = "SIM-OPc", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
 	{ .out = &attr_sim_sqn, .name = "SIM-SQN", .type = FR_TYPE_UINT64, .dict = &dict_freeradius },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 fr_value_box_t const	*enum_eap_type_sim;
 fr_value_box_t const	*enum_eap_type_aka;
 fr_value_box_t const	*enum_eap_type_aka_prime;
 
+fr_value_box_t const	*enum_kdf_prime_with_ck_prime_ik_prime;
+
 extern fr_dict_enum_autoload_t libfreeradius_aka_sim_dict_enum[];
 fr_dict_enum_autoload_t libfreeradius_aka_sim_dict_enum[] = {
 	{ .out = &enum_eap_type_sim, .name = "SIM", .attr = &attr_eap_type },
 	{ .out = &enum_eap_type_aka, .name = "AKA", .attr = &attr_eap_type },
 	{ .out = &enum_eap_type_aka_prime, .name = "AKA-Prime", .attr = &attr_eap_type },
-	{ NULL }
+
+	{ .out = &enum_kdf_prime_with_ck_prime_ik_prime, .name = "Prime-With-CK-Prime-IK-Prime", .attr = &attr_eap_aka_sim_kdf },
+
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 /** SIM AT on-the-wire format attribute sizes
@@ -205,7 +212,7 @@ fr_dict_enum_autoload_t libfreeradius_aka_sim_dict_enum[] = {
  * formats and generic NETWORK formats.
  */
 size_t const fr_aka_sim_attr_sizes[FR_TYPE_MAX + 1][2] = {
-	[FR_TYPE_NULL]		= {~0, 0},
+	[FR_TYPE_NULL]			= {~0, 0},
 
 	[FR_TYPE_STRING]		= {0, ~0},
 	[FR_TYPE_OCTETS]		= {0, ~0},
@@ -219,6 +226,31 @@ size_t const fr_aka_sim_attr_sizes[FR_TYPE_MAX + 1][2] = {
 	[FR_TYPE_TLV]			= {2, ~0},
 
 	[FR_TYPE_MAX]			= {~0, 0}	//!< Ensure array covers all types.
+};
+
+static int dict_flag_encrypt(fr_dict_attr_t **da_p, char const *value, UNUSED fr_dict_flag_parser_rule_t const *rules)
+{
+	static fr_table_num_sorted_t const encrypted[] = {
+		{ L("aes-cbc"),		AKA_SIM_FLAG_ENCRYPT_AES_CBC }
+	};
+	static size_t encrypted_len = NUM_ELEMENTS(encrypted);
+
+	fr_aka_sim_attr_flags_encrypt_t encrypt;
+	fr_aka_sim_attr_flags_t *flags = fr_dict_attr_ext(*da_p, FR_DICT_ATTR_EXT_PROTOCOL_SPECIFIC);
+
+	encrypt = fr_table_value_by_str(encrypted, value, AKA_SIM_FLAG_ENCRYPT_INVALID);
+	if (encrypt == AKA_SIM_FLAG_ENCRYPT_INVALID) {
+		fr_strerror_printf("Unknown encryption type '%s'", value);
+		return -1;
+	}
+
+	flags->encrypt = encrypt;
+
+	return 0;
+}
+
+static fr_dict_flag_parser_t const eap_aka_sim_flags[] = {
+	{ L("encrypt"),	{ .func = dict_flag_encrypt, .needs_value = true} }
 };
 
 /** Return the on-the-wire length of an attribute value
@@ -274,7 +306,10 @@ int fr_aka_sim_init(void)
 		return -1;
 	}
 
-	fr_openssl_init();
+	if (fr_openssl_init() < 0) {
+		PERROR("Failed setting up OpenSSL");
+		return -1;
+	}
 
 	instance_count++;
 
@@ -292,15 +327,15 @@ void fr_aka_sim_free(void)
 	fr_openssl_free();
 }
 
-static fr_table_num_ordered_t const subtype_table[] = {
-	{ L("encrypt=aes-cbc"),		1 }, /* any non-zero value will do */
-};
-
-extern fr_dict_protocol_t libfreeradius_eap_aka_sim_dict_protocol;
 fr_dict_protocol_t libfreeradius_eap_aka_sim_dict_protocol = {
 	.name = "eap_aka_sim",
 	.default_type_size = 1,
 	.default_type_length = 1,
-	.subtype_table = subtype_table,
-	.subtype_table_len = NUM_ELEMENTS(subtype_table),
+	.attr = {
+		.flags = {
+			.table = eap_aka_sim_flags,
+			.table_len = NUM_ELEMENTS(eap_aka_sim_flags),
+			.len = sizeof(fr_aka_sim_attr_flags_t)
+		}
+	}
 };

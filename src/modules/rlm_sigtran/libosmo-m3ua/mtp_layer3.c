@@ -174,7 +174,7 @@ static struct msgb *mtp_sccp_alloc_scmg(struct mtp_link_set *set,
 	/* this appears to be round robin or such.. */
 	hdr->addr = MTP_ADDR(sls % 16, set->dpc, set->sccp_opc);
 
-	/* generate the UDT message... libsccp does not offer formating yet */
+	/* generate the UDT message... libsccp does not offer formatting yet */
 	udt = (struct sccp_data_unitdata *) msgb_put(out, sizeof(*udt));
 	udt->type = SCCP_MSG_TYPE_UDT;
 	udt->proto_class = SCCP_PROTOCOL_CLASS_0;
@@ -306,7 +306,7 @@ int mtp_link_verified(struct mtp_link *link)
 	if (set->isup_opc != set->opc &&
 	    send_tfa(link, set->isup_opc) != 0) {
 		LOGP(DINP, LOGL_ERROR,
-		     "Failed to send TFA for OPC %d on linkset %d.\n", set->sccp_opc, set->nr);
+		     "Failed to send TFA for OPC %d on linkset %d.\n", set->isup_opc, set->nr);
 	}
 
 	if (set->timeout_t18 == 0)
@@ -543,6 +543,13 @@ static int mtp_link_sccp_data(struct mtp_link_set *set, struct mtp_level_3_hdr *
 					  MTP_LINK_SLS(hdr->addr));
 		if (!out)
 			return -1;
+
+		if (!set->slc[sls]) {
+			LOGP(DINP, LOGL_ERROR, "No link for SLS %u on %d/%s\n",
+				sls, set->nr, set->name);
+			msgb_free(out);
+			return -1;
+		}
 
 		mtp_link_submit(set->slc[MTP_LINK_SLS(hdr->addr)], out);
 

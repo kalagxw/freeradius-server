@@ -3,7 +3,8 @@
 #
 # Version:      $Id$
 #
-TARGET		:= libfreeradius-dhcpv4.a
+TARGET		:= libfreeradius-dhcpv4$(L)
+TGT_CATEGORY	:= lib-protocol
 
 SOURCES		:= base.c \
 		   decode.c \
@@ -16,4 +17,4 @@ SOURCES		:= base.c \
 SRC_CFLAGS	:= -I$(top_builddir)/src -DNO_ASSERT
 TGT_LDLIBS	:= $(PCAP_LIBS)
 TGT_LDFLAGS     := $(PCAP_LDFLAGS)
-TGT_PREREQS	:= libfreeradius-util.a
+TGT_PREREQS	:= $(LIBFREERADIUS_UTIL)

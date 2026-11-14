@@ -17,7 +17,7 @@
 /**
  * $Id$
  *
- * @file proto_control/radmin.c
+ * @file src/listen/control/radmin.c
  * @brief Control a running radiusd process.
  *
  * @copyright 2012-2016 The FreeRADIUS server project
@@ -65,17 +65,16 @@ DIAG_ON(strict-prototypes)
 #endif /* HAVE_READLINE_HISTORY */
 #endif /* HAVE_LIBREADLINE */
 
-#define LOG_PREFIX "radmin - "
+#define LOG_PREFIX "radmin"
 
-#include <freeradius-devel/server/base.h>
 #include <freeradius-devel/server/cf_parse.h>
+#include <freeradius-devel/server/cf_file.h>
+#include <freeradius-devel/server/main_config.h>
 #include <freeradius-devel/server/radmin.h>
 
 #include <freeradius-devel/util/conf.h>
-#include <freeradius-devel/util/dict.h>
-#include <freeradius-devel/util/dict.h>
 #include <freeradius-devel/util/md5.h>
-#include <freeradius-devel/util/misc.h>
+#include <freeradius-devel/util/skip.h>
 #include <freeradius-devel/util/socket.h>
 
 #ifdef USE_READLINE_HISTORY
@@ -90,9 +89,9 @@ DIAG_ON(strict-prototypes)
  *	For configuration file stuff.
  */
 static char const *progname = "radmin";
-static char const *radmin_version = RADIUSD_VERSION_STRING_BUILD("radmin");
+static char const *radmin_version = RADIUSD_VERSION_BUILD("radmin");
 
-typedef enum {
+typedef enum : uint8_t {
 	RADMIN_CONN_NONE = 0,				//!< Don't know, never connected.
 	RADMIN_CONN_UNIX,				//!< Connect via unix socket.
 	RADMIN_CONN_TCP					//!< Connect via TCP.
@@ -133,7 +132,7 @@ typedef struct {
 //static radmin_state_t state;
 
 static bool echo = false;
-static char const *secret = "";
+static char const *secret = NULL;
 static bool unbuffered = false;
 static bool use_readline = true;
 
@@ -160,11 +159,31 @@ static char *stack[MAX_STACK];
 
 static fr_cmd_t *local_cmds = NULL;
 
+static fr_dict_t const *dict_freeradius;
+static fr_dict_t const *dict_radius;
+
+static const fr_dict_autoload_t radmin_dict[] = {
+	{ .out = &dict_freeradius, .proto = "freeradius" },
+	{ .out = &dict_radius, .proto = "radius" },
+	DICT_AUTOLOAD_TERMINATOR
+};
+
+static fr_dict_attr_t const *attr_cleartext_password;
+static fr_dict_attr_t const *attr_user_name;
+
+static const fr_dict_attr_autoload_t radmin_dict_attr[] = {
+	{ .out = &attr_cleartext_password, .name = "Password.Cleartext", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
+	{ .out = &attr_user_name, .name = "User-Name", .type = FR_TYPE_STRING, .dict = &dict_radius },
+
+	DICT_AUTOLOAD_TERMINATOR
+};
+
+
 static NEVER_RETURNS void usage(int status)
 {
 	FILE *output = status ? stderr : stdout;
 	fprintf(output, "Usage: %s [ args ]\n", progname);
-	fprintf(output, "  -d raddb_dir    Configuration files are in \"raddbdir/*\".\n");
+	fprintf(output, "  -d <confdir>    Configuration file directory. (defaults to " CONFDIR ").");
 	fprintf(output, "  -D <dictdir>    Set main dictionary directory (defaults to " DICTDIR ").\n");
 	fprintf(output, "  -e command      Execute 'command' and then exit.\n");
 	fprintf(output, "  -E              Echo commands as they are being executed.\n");
@@ -172,14 +191,24 @@ static NEVER_RETURNS void usage(int status)
 	fprintf(output, "  -h              Print usage help information.\n");
 	fprintf(output, "  -i input_file   Read commands from 'input_file'.\n");
 	fprintf(output, "  -l <log_file>   Commands which are executed will be written to this file.\n");
-	fprintf(output, "  -n name         Read raddb/name.conf instead of raddb/radiusd.conf\n");
+	fprintf(output, "  -n name         Read ${confdir}/name.conf instead of ${confdir}/radiusd.conf\n");
 	fprintf(output, "  -q              Reduce output verbosity\n");
-	fprintf(output, "  -s <server>     Look in named server for name of control socket.\n");
+	fprintf(output, "  -s <server>     When '-d' is specified, look in the named virtual server for\n");
+	fprintf(output, "                  the control socket filename.\n");
+	fprintf(output, "                  Otherwise start a TCP connection to the named server and port.\n");
 	fprintf(output, "  -S <secret>     Use argument as shared secret for authentication to the server.\n");
+	fprintf(output, "                  Note that local users may be able to read the secret via 'ps'!\n");
 	fprintf(output, "  -x              Increase output verbosity\n");
 	fr_exit_now(status);
 }
 
+/*
+ *	Create the client socket.
+ *
+ *	@todo - use the BIO code.  But this means lots of changes to convert bare strings into the complex
+ *	data structures needed by the BIO code.  That functionality properly belongs in a BIO FD helper
+ *	function.
+ */
 static int client_socket(char const *server)
 {
 	int fd;
@@ -203,7 +232,7 @@ static int client_socket(char const *server)
 		fr_exit_now(EXIT_FAILURE);
 	}
 
-	fd = fr_socket_client_tcp(NULL, &ipaddr, port, false);
+	fd = fr_socket_client_tcp(NULL, NULL, &ipaddr, port, false);
 	if (fd < 0) {
 		fprintf(stderr, "%s: Failed opening socket %s: %s\n",
 			progname, server, fr_syserror(errno));
@@ -217,6 +246,7 @@ static ssize_t do_challenge(int fd)
 {
 	ssize_t r;
 	fr_conduit_type_t conduit;
+	uint8_t hmac[16];
 	uint8_t challenge[16];
 
 	challenge[0] = 0x00;
@@ -233,10 +263,12 @@ static ssize_t do_challenge(int fd)
 		fr_exit_now(EXIT_FAILURE);
 	}
 
-	fr_hmac_md5(challenge, (uint8_t const *) secret, strlen(secret),
+	if (!secret) return -1;
+
+	fr_hmac_md5(hmac, (uint8_t const *) secret, strlen(secret),
 		    challenge, sizeof(challenge));
 
-	r = fr_conduit_write(fd, FR_CONDUIT_AUTH_RESPONSE, challenge, sizeof(challenge));
+	r = fr_conduit_write(fd, FR_CONDUIT_AUTH_RESPONSE, hmac, sizeof(hmac));
 	if (r <= 0) return r;
 
 	/*
@@ -274,7 +306,7 @@ static ssize_t flush_conduits(int fd, char *buffer, size_t bufsize)
 			break;
 
 		case FR_CONDUIT_STDERR:
-			fprintf(stderr, "ERROR: %s", buffer);
+			fprintf(stderr, "ERROR: %s\n", buffer);
 			break;
 
 		case FR_CONDUIT_CMD_STATUS:
@@ -379,7 +411,7 @@ static int do_connect(int *out, char const *file, char const *server)
 			fr_perror("radmin");
 			if (errno == ENOENT) {
 					fprintf(stderr, "Perhaps you need to run the commands:");
-					fprintf(stderr, "\tcd /etc/raddb\n");
+					fprintf(stderr, "\tcd " CONFDIR "\n");
 					fprintf(stderr, "\tln -s sites-available/control-socket "
 						"sites-enabled/control-socket\n");
 					fprintf(stderr, "and then re-start the server?\n");
@@ -440,7 +472,7 @@ static int do_connect(int *out, char const *file, char const *server)
 }
 
 
-static char *readline_buffer[1024];
+static char readline_buffer[1024];
 
 /*
  *	Wrapper around readline which does the "right thing" depending
@@ -538,7 +570,7 @@ static ssize_t cmd_copy(char const *cmd)
 	for (p += len;
 	     p > cmd_buffer;
 	     p--) {
-		if (!isspace((int) p[-1])) break;
+		if (!isspace((uint8_t) p[-1])) break;
 		p[-1] = '\0';
 	}
 
@@ -659,6 +691,9 @@ radmin_completion(const char *text, int start, UNUSED int end)
 #	define write_history(history_file)
 #endif
 
+/*
+ *	See if there is a control socket in the given virtual server.
+ */
 static int check_server(CONF_SECTION *subcs, uid_t uid, gid_t gid, char const **file_p, char const **server_p)
 {
 	int		rcode;
@@ -683,7 +718,7 @@ static int check_server(CONF_SECTION *subcs, uid_t uid, gid_t gid, char const **
 	*server_p = server;	/* need this for error messages */
 
 	/*	listen {} */
-	cs = cf_section_find(subcs, "listen", NULL);
+	cs = cf_section_find(subcs, "listen", CF_IDENT_ANY);
 	if (!cs) {
 		fprintf(stderr, "%s: Failed parsing 'listen{}' section in 'server %s {...}'\n", progname, server);
 		return -1;
@@ -697,10 +732,10 @@ static int check_server(CONF_SECTION *subcs, uid_t uid, gid_t gid, char const **
 	if (!value) return 0;
 
 	/*	<transport> { ... } */
-	subcs = cf_section_find(cs, value, NULL);
+	subcs = cf_section_find(cs, value, CF_IDENT_ANY);
 	if (!subcs) {
 		fprintf(stderr, "%s: Failed parsing the '%s {}' section in 'server %s {...}'\n",
-			progname, cf_section_name1(subcs), server);
+			progname, value, server);
 		return -1;
 	}
 
@@ -822,7 +857,7 @@ static int local_command(char *line)
 }
 
 
-#define MAX_COMMANDS (4)
+#define MAX_COMMANDS (256)
 
 int main(int argc, char **argv)
 {
@@ -837,19 +872,18 @@ int main(int argc, char **argv)
 	char const		*server = NULL;
 	fr_dict_t		*dict = NULL;
 
-	char const		*raddb_dir = RADIUS_DIR;
+	char const		*confdir = RADIUS_DIR;
 	char const		*dict_dir = DICTDIR;
 #ifdef USE_READLINE_HISTORY
 	char 			history_file[PATH_MAX];
 #endif
 
 	TALLOC_CTX		*autofree;
-	fr_dict_gctx_t const	*dict_gctx = NULL;
 
 	char *commands[MAX_COMMANDS];
-	int num_commands = -1;
+	int num_commands = 0;
 
-	int exit_status = EXIT_SUCCESS;
+	int exit_status = EXIT_FAILURE;
 
 	char const *prompt = "radmin> ";
 	char prompt_buffer[1024];
@@ -862,7 +896,7 @@ int main(int argc, char **argv)
 	autofree = talloc_autofree_context();
 
 #ifndef NDEBUG
-	if (fr_fault_setup(autofree, getenv("PANIC_ACTION"), argv[0]) < 0) {
+	if (fr_fault_setup(autofree, getenv("PANIC_ACTION"), argv[0], PANIC_ACTION_SIGNALS) < 0) {
 		fr_perror("radmin");
 		fr_exit_now(EXIT_FAILURE);
 	}
@@ -881,11 +915,7 @@ int main(int argc, char **argv)
 
 	while ((c = getopt(argc, argv, "d:D:hi:e:Ef:n:qs:S:x")) != -1) switch (c) {
 		case 'd':
-			if (file) {
-				fprintf(stderr, "%s: -d and -f cannot be used together.\n", progname);
-				fr_exit_now(EXIT_FAILURE);
-			}
-			raddb_dir = optarg;
+			confdir = optarg;
 			break;
 
 		case 'D':
@@ -893,13 +923,12 @@ int main(int argc, char **argv)
 			break;
 
 		case 'e':
-			num_commands++; /* starts at -1 */
 			if (num_commands >= MAX_COMMANDS) {
 				fprintf(stderr, "%s: Too many '-e'\n", progname);
 				fr_exit_now(EXIT_FAILURE);
 			}
 
-			commands[num_commands] = optarg;
+			commands[num_commands++] = optarg;
 			break;
 
 		case 'E':
@@ -907,13 +936,13 @@ int main(int argc, char **argv)
 			break;
 
 		case 'f':
-			raddb_dir = NULL;
+			confdir = NULL;
 			file = optarg;
 			break;
 
 		default:
 		case 'h':
-			usage(0);	/* never returns */
+			usage(EXIT_SUCCESS);	/* never returns */
 
 		case 'i':
 			/*
@@ -937,15 +966,11 @@ int main(int argc, char **argv)
 			break;
 
 		case 's':
-			if (file) {
-				fprintf(stderr, "%s: -s and -f cannot be used together.\n", progname);
-				usage(1);
-			}
 			server = optarg;
 			break;
 
 		case 'S':
-			secret = optarg;
+			secret = talloc_strdup(autofree, optarg);
 			break;
 
 		case 'x':
@@ -961,7 +986,7 @@ int main(int argc, char **argv)
 		fr_exit_now(EXIT_FAILURE);
 	}
 
-	if (raddb_dir) {
+	if (confdir) {
 		int		rcode;
 		uid_t		uid;
 		gid_t		gid;
@@ -970,68 +995,72 @@ int main(int argc, char **argv)
 
 		file = NULL;	/* MUST read it from the conf_file now */
 
-		snprintf(io_buffer, sizeof(io_buffer), "%s/%s.conf", raddb_dir, name);
+		snprintf(io_buffer, sizeof(io_buffer), "%s/%s.conf", confdir, name);
 
 		/*
 		 *	Need to read in the dictionaries, else we may get
 		 *	validation errors when we try and parse the config.
 		 */
-		dict_gctx = fr_dict_global_ctx_init(autofree, dict_dir);
-		if (!dict_gctx) {
+		if (!fr_dict_global_ctx_init(NULL, true, dict_dir)) {
+		fail:
 			fr_perror("radmin");
-			fr_exit_now(64);
+			goto done;
 		}
 
-		if (fr_dict_internal_afrom_file(&dict, FR_DICTIONARY_INTERNAL_DIR, __FILE__) < 0) {
-			fr_perror("radmin");
-			fr_exit_now(64);
-		}
+		if (fr_dict_internal_afrom_file(&dict, FR_DICTIONARY_INTERNAL_DIR, __FILE__) < 0) goto fail;
 
-		if (fr_dict_read(dict, raddb_dir, FR_DICTIONARY_FILE) == -1) {
-			fr_perror("radmin");
-			fr_exit_now(64);
-		}
+		if (fr_dict_autoload(radmin_dict) < 0) goto fail;
+
+		if (fr_dict_attr_autoload(radmin_dict_attr) < 0) goto fail;
+
+		if (fr_dict_read(dict, confdir, FR_DICTIONARY_FILE) == -1) goto fail;
 
 		cs = cf_section_alloc(autofree, NULL, "main", NULL);
-		if (!cs) fr_exit_now(EXIT_FAILURE);
+		if (!cs) goto fail;
 
-		if ((cf_file_read(cs, io_buffer) < 0) || (cf_section_pass2(cs) < 0)) {
+		if ((cf_file_read(cs, io_buffer, true) < 0) || (cf_section_pass2(cs) < 0)) {
+			fr_perror("radmin");
 			fprintf(stderr, "%s: Errors reading or parsing %s\n", progname, io_buffer);
-		error:
-			fr_exit_now(EXIT_FAILURE);
+			goto done;
 		}
 
 		uid = getuid();
 		gid = getgid();
+		fr_strerror_clear();
 
 		/*
 		 *	We are looking for: server whatever { namespace="control" ...	}
 		 */
 		if (server) {
 			subcs = cf_section_find(cs, "server", server);
-			if (subcs) {
+			if (!subcs) {
 				fprintf(stderr, "%s: Could not find virtual server %s {}\n", progname, server);
-				goto error;
+				goto done;
 			}
 
 			rcode = check_server(subcs, uid, gid, &file, &server);
-			if (rcode < 0) goto error;
-			if (rcode == 0) file = NULL;
+			if (rcode < 0) goto done;
+			if (rcode == 0) {
+				fprintf(stderr, "%s: Could not find control socket virtual server %s { ... }\n", progname, server);
+				goto done;
+			}
 
 		} else {
 			for (subcs = cf_section_find_next(cs, NULL, "server", CF_IDENT_ANY);
 			     subcs != NULL;
 			     subcs = cf_section_find_next(cs, subcs, "server", CF_IDENT_ANY)) {
 				rcode = check_server(subcs, uid, gid, &file, &server);
-				if (rcode < 0) goto error;
+				if (rcode < 0) goto done;
 				if (rcode == 1) break;
+			}
+
+			if (!file) {
+				fprintf(stderr, "%s: Could not find 'namespace = control' in any virtual server\n", progname);
+				goto done;
 			}
 		}
 
-		if (!file) {
-			fprintf(stderr, "%s: Could not find control socket in %s (server %s {})\n", progname, io_buffer, server);
-			goto error;
-		}
+		fr_assert(file);
 
 		/*
 		 *	Log the commands we've run.
@@ -1044,36 +1073,38 @@ int main(int argc, char **argv)
 					radmin_log.file = cf_pair_value(cp);
 
 					if (!radmin_log.file) {
-						fprintf(stderr, "%s: Invalid value for 'radmin' log destination", progname);
-						goto error;
+						fprintf(stderr, "%s: Invalid value for 'radmin' log destination\n", progname);
+						goto done;
 					}
 				}
 			}
 		}
 
 		if (radmin_log.file) {
-			radmin_log.fd = open(radmin_log.file, O_APPEND | O_CREAT, S_IRUSR | S_IWUSR);
+			radmin_log.fd = open(radmin_log.file, O_APPEND | O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
 			if (radmin_log.fd < 0) {
 				fprintf(stderr, "%s: Failed opening %s: %s\n", progname, radmin_log.file, fr_syserror(errno));
-				goto error;
+				goto done;
 			}
 
 			radmin_log.dst = L_DST_FILES;
 		}
+
+	} else if (!file) {
+		fprintf(stderr, "%s: No '-d <confdir' or '-f <socket_file>' specified.\n", progname);
+		goto done;
+
+	} else if (server) {
+		fprintf(stderr, "%s: -s and -f cannot be used together.\n", progname);
+		usage(EXIT_FAILURE);
 	}
 
 	if (input_file) {
 		inputfp = fopen(input_file, "r");
 		if (!inputfp) {
 			fprintf(stderr, "%s: Failed opening %s: %s\n", progname, input_file, fr_syserror(errno));
-			goto error;
+			goto done;
 		}
-	}
-
-	if (!file) {
-		fprintf(stderr, "%s: Failed to find socket file name\n",
-			progname);
-		goto error;
 	}
 
 	/*
@@ -1086,10 +1117,14 @@ int main(int argc, char **argv)
 
 	if (use_readline) {
 #ifdef USE_READLINE_HISTORY
-		using_history();
-		stifle_history(READLINE_MAX_HISTORY_LINES);
-		snprintf(history_file, sizeof(history_file), "%s/%s", getenv("HOME"), ".radmin_history");
-		read_history(history_file);
+		char const *home = getenv("HOME");
+
+		if (home) {
+			using_history();
+			stifle_history(READLINE_MAX_HISTORY_LINES);
+			snprintf(history_file, sizeof(history_file), "%s/%s", home, ".radmin_history");
+			read_history(history_file);
+		}
 #endif
 #ifdef USE_READLINE
 		rl_attempted_completion_function = radmin_completion;
@@ -1103,7 +1138,7 @@ int main(int argc, char **argv)
 	 */
 	signal(SIGPIPE, SIG_IGN);
 
-	if (do_connect(&sockfd, file, server) < 0) fr_exit_now(EXIT_FAILURE);
+	if (do_connect(&sockfd, file, server) < 0) goto done;
 
 	/*
 	 *	Register local commands.
@@ -1111,7 +1146,7 @@ int main(int argc, char **argv)
 	if (fr_command_add_multi(autofree, &local_cmds, NULL, NULL, cmd_table) < 0) {
 		fprintf(stderr, "%s: Failed registering local commands: %s\n",
 			progname, fr_strerror());
-		goto error;
+		goto done;
 	}
 
 	fr_command_info_init(autofree, &local_info);
@@ -1119,17 +1154,14 @@ int main(int argc, char **argv)
 	/*
 	 *	Run commands from the command-line.
 	 */
-	if (num_commands >= 0) {
+	if (num_commands > 0) {
 		int i;
 
-		for (i = 0; i <= num_commands; i++) {
+		for (i = 0; i < num_commands; i++) {
 			result = run_command(sockfd, commands[i], io_buffer, sizeof(io_buffer));
-			if (result < 0) fr_exit_now(EXIT_FAILURE);
+			if (result < 0) goto done;
 
-			if (result == FR_CONDUIT_FAIL) {
-				exit_status = EXIT_FAILURE;
-				goto exit;
-			}
+			if (result == FR_CONDUIT_FAIL) goto done;
 		}
 
 		if (unbuffered) {
@@ -1139,12 +1171,13 @@ int main(int argc, char **argv)
 		/*
 		 *	We're done all of the commands, exit now.
 		 */
-		goto exit;
+		exit_status = EXIT_SUCCESS;
+		goto done;
 	}
 
 	if (!quiet) {
 		printf("%s - FreeRADIUS Server administration tool.\n", radmin_version);
-		printf("Copyright 2008-2019 The FreeRADIUS server project and contributors.\n");
+		printf("Copyright 2008-2026 The FreeRADIUS server project and contributors.\n");
 		printf("There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A\n");
 		printf("PARTICULAR PURPOSE.\n");
 		printf("You may redistribute copies of FreeRADIUS under the terms of the\n");
@@ -1179,14 +1212,26 @@ int main(int argc, char **argv)
 		if (strcmp(line, "reconnect") == 0) {
 			if (do_connect(&sockfd, file, server) < 0) {
 				radmin_free(line);
-				fr_exit_now(EXIT_FAILURE);
+				goto done;
 			}
 			goto next;
 		}
 
 		if (!secret && !stack_depth && (strncmp(line, "secret ", 7) == 0)) {
-			secret = line + 7;
-			do_challenge(sockfd);
+			secret = talloc_strdup(autofree, line + 7);
+			if (!secret) {
+				radmin_free(line);
+				goto done;
+			}
+
+			if (do_challenge(sockfd) < 0) {
+				radmin_free(line);
+				goto done;
+			}
+
+			/*
+			 *	Don't add the secret to the history.
+			 */
 			goto next;
 		}
 
@@ -1226,7 +1271,7 @@ int main(int argc, char **argv)
 		 *	modifies it's behavior.  These commands MUST
 		 */
 		if (!stack_depth && (strncmp(line, "local", 5) == 0)) {
-			if (!isspace((int) line[5])) {
+			if (!isspace((uint8_t) line[5])) {
 				fprintf(stderr, "'local' commands MUST be specified all on one line");
 				goto next;
 			}
@@ -1252,9 +1297,8 @@ int main(int argc, char **argv)
 
 		len = cmd_copy(line);
 		if (len < 0) {
-			exit_status = EXIT_FAILURE;
 			radmin_free(line);
-			break;
+			goto done;
 		}
 
 	retry:
@@ -1265,7 +1309,7 @@ int main(int argc, char **argv)
 
 			if (do_connect(&sockfd, file, server) < 0) {
 				radmin_free(line);
-				fr_exit_now(EXIT_FAILURE);
+				goto done;
 			}
 
 			retries++;
@@ -1273,20 +1317,19 @@ int main(int argc, char **argv)
 
 			fprintf(stderr, "Failed to connect to server\n");
 			radmin_free(line);
-			fr_exit_now(EXIT_FAILURE);
+			goto done;
 
 		} else if (result == FR_CONDUIT_FAIL) {
 			fprintf(stderr, "Failed running command\n");
-			exit_status = EXIT_FAILURE;
+			goto done;
 
 		} else if (result == FR_CONDUIT_PARTIAL) {
 			char *p;
 
 			if (stack_depth >= (MAX_STACK - 1)) {
 				fprintf(stderr, "Too many sub-contexts running command\n");
-				exit_status = EXIT_FAILURE;
 				radmin_free(line);
-				break;
+				goto done;
 			}
 
 			/*
@@ -1319,19 +1362,29 @@ int main(int argc, char **argv)
 	next:
 		radmin_free(line);
 	}
+	exit_status = EXIT_SUCCESS;
 
-exit:
+done:
+	if (fr_dict_autofree(radmin_dict) < 0) {
+		fr_perror("radmin");
+		exit_status = EXIT_FAILURE;
+	}
+
 	fr_dict_free(&dict, __FILE__);
 
-	if (fr_dict_global_ctx_free(dict_gctx) < 0) fr_perror("radmin");
-
-	if (inputfp != stdin) fclose(inputfp);
+	if (inputfp && (inputfp != stdin)) fclose(inputfp);
 
 	if (radmin_log.dst == L_DST_FILES) close(radmin_log.fd);
 
 	if (sockfd >= 0) close(sockfd);
 
-	if (!quiet) fprintf(stdout, "\n");
+	if (!quiet && (exit_status == EXIT_SUCCESS)) fprintf(stdout, "\n");
+
+	/*
+	 *	Ensure our atexit handlers run before any other
+	 *	atexit handlers registered by third party libraries.
+	 */
+	fr_atexit_global_trigger_all();
 
 	return exit_status;
 }

@@ -1,0 +1,168 @@
+= Expressions
+
+Expressions can be used inside of xref:xlat/index.adoc[dynamic
+expansions], or inside of
+xref:unlang/condition/index.adoc[conditions], or on the right side of
+assignment xref:unlang/edit.adoc[editing].
+
+.Expression in an Expansion
+[source,unlang]
+----
+%{1 + 2}
+----
+
+.Expression in a Condition
+[source,unlang]
+----
+(NAS-Port == 1 + 2)
+----
+
+.Expression in an assignment
+[source,unlang]
+----
+NAS-Port = 1 + 2
+----
+
+== Operators in an Expression
+
+The following operators are supported (in order).
+
+[options="header,autowidth"]
+|===
+| Operator  | Description
+| &         | binary AND
+| \|        | binary OR
+| <<	    | left shift
+| >>        | right shift
+| +         | addition
+| -         | subtraction
+| *         | multiplication
+| /         | division
+| %         | remainder
+| ^         | xor
+| (...)     | sub-expression
+|===
+
+The following unary operators are also supported:
+
+[options="header,autowidth"]
+|===
+| Operator  | Description
+| -         | unary minus
+| ~         | unary complement
+| !         | unary not
+|===
+
+xref:unlang/condition/precedence.adoc[Operator precedence] follows the
+normal rules. Division by zero means that the entire expression is
+invalid.
+
+See the xref:unlang/edit.adoc[edit] documentation for a list of
+attribute editing operators.
+
+== Conditions in Assignments
+
+xref:unlang/condition/index.adoc[Conditions] in assignments are also
+supported.  For example:
+
+[source,unlang]
+----
+NAS-Port = 5 + (User-Name == "bob")
+----
+
+This expression will return `6` if the users name is `bob`, and `5`
+otherwise.
+
+Similarly, expressions are also supported in conditions.  There is no
+need to use `%{expr:...}` in conditions, as was needed in earlier
+versions of the server.  You can just use math in-place.
+
+You do not even need to use `%{expr:...}` in double-quoted strings.
+You can just put math in-place, as with the following example:
+
+[source,unlang]
+----
+Filter-Id = "Adding %{NAS-Port} + 4 = %{NAS-Port + 4}"
+----
+
+The old ``%{expr:...}` syntax will return an error in v4.  That
+functionality is no longer supported.
+
+== Data Types
+
+The new expression parser accepts significantly more data types than
+the old expressions.  The expression in the previous versions assumed
+that all inputs were signed 64-bit integers.  Any attempt to use other
+data types resulted in an error.
+
+In new expressions, the `+` operator can be applied to `string` and
+`octet` data types.  (And incidentally, `-` is the inverse of `+`!)
+
+[source,unlang]
+----
+Reply-Message := "foo" + "bar"
+----
+
+Will result in `Reply-Message == "foobar"`.
+
+The suffix can then be "subtracted" off, with:
+
+[source,unlang]
+----
+Reply-Message -= "bar"
+----
+
+Will result in `Reply-Message == "foo"` !.
+
+Other data types will generally yield results which make sense.  For
+example:
+
+* adding an integer to an `ipv4prefix` type will result in an
+  `ipv4addr` data type,
+* `&` and `|` will work on `string` and `octets` data types,
+* Using `&` with `ipv4addr` data types an `uint32` will result in an
+  `ipv4prefix` data type,
+* `ipv4addr` types can be subtracted, and will return a number which
+  is the number of IPs between the two values,
+* two `date` values can be subtracted, and will return a `time_delta`,
+* operations on integers are upgraded to the next largest integer size
+  when necessary,
+* the logical operators `&&` and `||` return the value which caused
+  them to succeed, e.g. `Foo := (User-Password || "help")` will return
+  the contents of `User-Password` if it exists, otherwise it will
+  return the string `help`.
+
+In most cases, the data types are derived from the attribute
+dictionaries.  However, it is sometimes necessary to force the fields
+(or output) of an expression to be parsed as a particular type.  This
+is where casting is used.
+
+== Casts
+
+xref:type/index.adoc[Type casting] is supported via the `(type)`
+syntax.  The old syntax of `<type>` is not accepted.
+
+[source,unlang]
+----
+NAS-Port-Id = (uint32) "%sql("SELECT...") + 4"
+----
+
+== Errors
+
+Mathematical operations which cause overflow, underflow, or division
+by zero will return a `null` result.  This result will propagate
+through any calculations, so that an expression which relies on `null`
+will generally also return `null`.
+
+A `null` result can be removed via the `||` operator.  For example:
+
+[source,unlang]
+----
+NAS-Port-Id = (5 - "foo") || 6
+----
+
+Will return `6`, as the left side expression of the `||` operator
+evaluates to `null`.
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

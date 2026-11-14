@@ -1,9 +1,9 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
-# dictionary.versanet Vendor specfic attributes for versanet
+# dictionary.versanet Vendor specific attributes for versanet
 #
 #
 #    VersaNet Communications, Inc.
@@ -29,7 +29,7 @@ VENDOR		Versanet			2180
 
 BEGIN-VENDOR	Versanet
 
-ATTRIBUTE	Termination-Cause			1	integer
+ATTRIBUTE	Termination-Cause			1	uint32
 
 VALUE	Termination-Cause		Normal-Hangup-No-Error-Occurred 0
 VALUE	Termination-Cause		Call-Waiting-Caused-Disconnect 3
@@ -55,3 +55,4 @@ VALUE	Termination-Cause		No-connection-established 22
 VALUE	Termination-Cause		Disconnect-after-three-retrains 23
 
 END-VENDOR	Versanet
+ALIAS		Versanet				Vendor-Specific.Versanet

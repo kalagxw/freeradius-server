@@ -42,7 +42,15 @@ extern main_config_t const *main_config;		//!< Global configuration singleton.
 #include <freeradius-devel/server/tmpl.h>
 
 #include <freeradius-devel/util/dict.h>
+#include <freeradius-devel/io/worker.h>
 
+typedef struct {
+	bool		files_is_set;			//!< if we have a limit { files { ... } } section.
+	bool		exec_is_set;			//!< if we have a limit { exec { ... } } section.
+	char const	**allowed_files;		//!< where %file....() is limited to for read / write
+	char const	**readonly_files;      		//!< where %file....() is limited to for read
+	char const	**exec;				//!< where %exec() is limited to
+} main_config_limit_t;
 
 /** Main server configuration
  *
@@ -58,28 +66,25 @@ struct main_config_s {
 	bool		spawn_workers;			//!< Should the server spawn threads.
 	char const      *pid_file;			//!< Path to write out PID file.
 
-	fr_time_delta_t	max_request_time;		//!< How long a request can be processed for before
-							//!< timing out.
-
-	bool		drop_requests;			//!< Administratively disable request processing.
+	bool		write_pid;			//!< write the PID file
 
 	char const	*log_dir;
 	char const	*local_state_dir;
-	char const	*chroot_dir;
 
-	bool		reverse_lookups;
-	bool		hostname_lookups;
+	bool		reverse_lookups;		//!< do IP -> host lookups.  Don't set this!
+	bool		hostname_lookups;		//!< do hostname -> IP lookups
+	bool		drop_requests;			//!< Administratively disable request processing.
+	bool		suppress_secrets;		//!< suppress secrets (or not)
 
 	char const	*radacct_dir;
 	char const	*lib_dir;
 	char const	*sbin_dir;
 	char const	*run_dir;
-	char const	*raddb_dir;			//!< Path to raddb directory
+	char const	*confdir;			//!< Path to configuration directory
 
 	char const	*prefix;
 
 	char const	*log_dest;
-
 	char const	*log_file;
 	bool		do_colourise;
 	bool		log_line_number;		//!< Log src file/line the message was generated on.
@@ -91,27 +96,30 @@ struct main_config_s {
 	int32_t		syslog_facility;
 
 	char const	*dict_dir;			//!< Where to load dictionaries from.
-
-	size_t		talloc_pool_size;		//!< Size of pool to allocate to hold each #request_t.
-
-	uint32_t	max_requests;			//!< maximum number of requests outstanding
-
-	bool		write_pid;			//!< write the PID file
+	fr_dict_t	*dict;				//!< Main dictionary.
 
 #ifdef HAVE_SETUID
 	uid_t		server_uid;			//!< UID we're running as.
-	gid_t		server_gid;			//!< GID we're runing as.
+	gid_t		server_gid;			//!< GID we're running as.
 	uid_t		uid;				//!< UID we should run as.
 	bool		uid_is_set;
 	gid_t		gid;				//!< GID we should run as.
 	bool		gid_is_set;
 #endif
 
+	char const	*chdir;				//!< where to chdir() to when we start.
+	bool		chdir_is_set;
+
+	main_config_limit_t limit;			//!< limit files, exec, etc.
+
+	/*
+	 *	OpenSSL configuration
+	 */
 #ifdef ENABLE_OPENSSL_VERSION_CHECK
 	char const	*allow_vulnerable_openssl;	//!< The CVE number of the last security issue acknowledged.
 #endif
 
-#ifdef HAVE_OPENSSL_CRYPTO_H
+#ifdef WITH_TLS
 	bool		openssl_fips_mode;		//!< Whether OpenSSL fips mode is enabled or disabled.
 	bool		openssl_fips_mode_is_set;	//!< Whether the user specified a value.
 
@@ -122,39 +130,53 @@ struct main_config_s {
 							///< in the async ctx pool.
 #endif
 
-	fr_dict_t	*dict;				//!< Main dictionary.
-
-
 	/*
 	 *	Debugging options
 	 */
-	bool		allow_core_dumps;		//!< Whether the server is allowed to drop a core when
-							//!< receiving a fatal signal.
-
-	char const	*panic_action;			//!< Command to execute if the server receives a fatal
-							//!< signal.
-
 	uint32_t	debug_level;			//!< The base log level for the server.
 
 	bool		talloc_memory_report;		//!< Print a memory report on what's left unfreed.
 							//!< Can only be used when the server is running in single
 							//!< threaded mode.
 
+	bool		talloc_skip_cleanup;		//!< skip talloc cleanups at exit
+
+	bool		allow_core_dumps;		//!< Whether the server is allowed to drop a core when
+							//!< receiving a fatal signal.
+
+	char const	*panic_action;			//!< Command to execute if the server receives a fatal
+							//!< signal.
+
+
+	/*
+	 *	Multiple processing sharing configs
+	 */
 	bool		allow_multiple_procs;		//!< Allow multiple instances of radiusd to run with the
 							///< same config file.
 
 	int		multi_proc_sem_id;		//!< Semaphore we use to prevent multiple processes running.
 	char		*multi_proc_sem_path;		//!< Semaphore path.
 
+	/*
+	 *	Internal scheduler configuration
+	 */
 	uint32_t	max_networks;			//!< for the scheduler
 	uint32_t	max_workers;			//!< for the scheduler
 	fr_time_delta_t	stats_interval;			//!< for the scheduler
 
+	fr_worker_config_t	worker;			//!< Worker thread configuration.
+
+#ifndef NDEBUG
+	uint32_t	ins_max;			//!< max instruction count
+	bool		ins_countup;			//!< count up to "max"
+#endif
 };
 
 void			main_config_name_set_default(main_config_t *config, char const *name, bool overwrite_config);
-void			main_config_raddb_dir_set(main_config_t *config, char const *path);
+void			main_config_confdir_set(main_config_t *config, char const *path);
 void			main_config_dict_dir_set(main_config_t *config, char const *path);
+
+int			main_config_save_override(char const *value);
 
 void			main_config_exclusive_proc_done(main_config_t  const *config);
 int			main_config_exclusive_proc_child(main_config_t const *config);

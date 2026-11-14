@@ -1,0 +1,23 @@
+request += {
+	Framed-IP-Address = 192.0.2.1
+	Framed-IP-Address = 192.0.2.2
+	Framed-IP-Address = 192.0.2.3
+	Framed-IP-Address = 192.0.2.4
+}
+
+if (%{Framed-IP-Address[#]} != 4) {
+	test_fail
+}
+
+#
+#  This expansion should succeed, and should result in an empty string.
+#
+#  It's stupid to do this expansion.  The admin should instead just check
+#  for the existence of the attribute.  But... the syntax allows it, so
+#  it should work.
+#
+if ("%{Framed-IP-Address[4]}" != '') {
+	test_fail
+}
+
+success

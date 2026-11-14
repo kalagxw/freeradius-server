@@ -26,11 +26,10 @@ RCSID("$Id$")
 
 #include "base64.h"
 
-#include <freeradius-devel/util/strerror.h>
 #include <freeradius-devel/util/value.h>
 #define us(x) (uint8_t) x
 
-char const fr_base64_alphabet_encode[UINT8_MAX] = {
+char const fr_base64_alphabet_encode[SBUFF_CHAR_CLASS] = {
 	[62] = '+',
 	[63] = '/',
 	[52] = '0',
@@ -97,7 +96,7 @@ char const fr_base64_alphabet_encode[UINT8_MAX] = {
 	[51] = 'z'
 };
 
-uint8_t const fr_base64_alphabet_decode[UINT8_MAX] = {
+uint8_t const fr_base64_alphabet_decode[SBUFF_CHAR_CLASS] = {
 	F32(0, UINT8_MAX), F8(32, UINT8_MAX), F2(40, UINT8_MAX),
 	['+'] = 62,
 	F2(44, UINT8_MAX),
@@ -171,7 +170,7 @@ uint8_t const fr_base64_alphabet_decode[UINT8_MAX] = {
 	F4(251, UINT8_MAX)
 };
 
-char const fr_base64_url_alphabet_encode[UINT8_MAX] = {
+char const fr_base64_url_alphabet_encode[SBUFF_CHAR_CLASS] = {
 	[62] = '-',
 	[52] = '0',
 	[53] = '1',
@@ -238,7 +237,7 @@ char const fr_base64_url_alphabet_encode[UINT8_MAX] = {
 	[51] = 'z'
 };
 
-uint8_t const fr_base64_url_alphabet_decode[UINT8_MAX] = {
+uint8_t const fr_base64_url_alphabet_decode[SBUFF_CHAR_CLASS] = {
 	F32(0, UINT8_MAX), F8(32, UINT8_MAX), F4(40, UINT8_MAX),
 	['-'] = 62,
 	F2(46, UINT8_MAX),
@@ -325,9 +324,9 @@ uint8_t const fr_base64_url_alphabet_decode[UINT8_MAX] = {
  *	- <0 the number of bytes we would have needed in the ouput buffer.
  */
 ssize_t fr_base64_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in,
-			      bool add_padding, char const alphabet[static UINT8_MAX])
+			      bool add_padding, char const alphabet[static SBUFF_CHAR_CLASS])
 {
-	fr_sbuff_t		our_out = FR_SBUFF_NO_ADVANCE(out);
+	fr_sbuff_t		our_out = FR_SBUFF(out);
 	fr_dbuff_t		our_in = FR_DBUFF(in);
 
 	fr_strerror_const("Insufficient buffer space");
@@ -381,7 +380,7 @@ ssize_t fr_base64_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in,
 
 	fr_sbuff_terminate(&our_out);	/* Ensure this is terminated, even on zero length input */
 	fr_dbuff_set(in, &our_in);
-	return fr_sbuff_set(out, &our_out);
+	FR_SBUFF_SET_RETURN(out, &our_out);
 }
 
 /* Decode base64 encoded input array.
@@ -396,13 +395,13 @@ ssize_t fr_base64_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in,
  *				at the end of the string.
  * @param[in] alphabet		to use for decoding.
  * @return
- *	- <= 0 on failure.  The offset where the decoding error occurred as a negative integer.
+ *	- < 0 on failure.  The offset where the decoding error occurred as a negative integer.
  *	- Length of decoded data.
  */
-ssize_t	fr_base64_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_sbuff_t *in,
-			      bool expect_padding, bool no_trailing, uint8_t const alphabet[static UINT8_MAX])
+fr_slen_t fr_base64_decode_nstd(fr_sbuff_err_t *err, fr_dbuff_t *out, fr_sbuff_t *in,
+				bool expect_padding, bool no_trailing, uint8_t const alphabet[static SBUFF_CHAR_CLASS])
 {
-	fr_sbuff_t		our_in = FR_SBUFF_NO_ADVANCE(in);
+	fr_sbuff_t		our_in = FR_SBUFF(in);
 	fr_dbuff_t		our_out = FR_DBUFF(out);
 	fr_sbuff_marker_t	m_final;
 	uint8_t			pad;
@@ -426,9 +425,9 @@ ssize_t	fr_base64_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_s
 			fr_strerror_printf("Output buffer too small, needed at least %zu bytes",
 					   fr_dbuff_used(&our_out) + 1);
 
-			if (err) *err = FR_SBUFF_PARSE_ERROR_OUT_OF_SPACE;
+			if (err) *err = FR_SBUFF_ERR_NO_SPACE;
 
-			return -fr_sbuff_used(&our_in);
+			FR_SBUFF_ERROR_RETURN(&our_in);
 		}
 
 		fr_sbuff_advance(&our_in, 4);
@@ -439,7 +438,7 @@ ssize_t	fr_base64_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_s
 	/*
 	 *	Find the first non-base64 char
 	 */
-	while (fr_sbuff_extend(&our_in) && fr_is_base64_nstd(*fr_sbuff_current(&our_in), alphabet)) {
+	while (fr_sbuff_extend(&our_in) && fr_is_base64_nstd(fr_sbuff_char(&our_in, '\0'), alphabet)) {
 		fr_sbuff_advance(&our_in, 1);
 	}
 
@@ -473,9 +472,9 @@ ssize_t	fr_base64_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_s
 		fr_strerror_const("Invalid base64 padding data");
 
 	bad_format:
-		if (err) *err = FR_SBUFF_PARSE_ERROR_FORMAT;
+		if (err) *err = FR_SBUFF_ERR_FORMAT;
 
-		return -fr_sbuff_used(&our_in);
+		FR_SBUFF_ERROR_RETURN(&our_in);
 	}
 
 	if (expect_padding) {
@@ -488,7 +487,7 @@ ssize_t	fr_base64_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_s
 			}
 			if (!fr_sbuff_next_if_char(&our_in, '=')) {
 				fr_strerror_printf("Found non-padding char '%c' at end of base64 string",
-						   *fr_sbuff_current(&our_in));
+						   fr_sbuff_char(&our_in, '\0'));
 				goto bad_format;
 			}
 		}
@@ -496,11 +495,11 @@ ssize_t	fr_base64_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_s
 
 	if (no_trailing && fr_sbuff_extend(&our_in)) {
 		fr_strerror_printf("Found trailing garbage '%c' at end of base64 string",
-				   *fr_sbuff_current(&our_in));
+				   fr_sbuff_char(&our_in, '\0'));
 
-		if (err) *err = FR_SBUFF_PARSE_ERROR_TRAILING;
+		if (err) *err = FR_SBUFF_ERR_TRAILING;
 
-		return -fr_sbuff_used(&our_in);
+		FR_SBUFF_ERROR_RETURN(&our_in);
 	}
 
 	fr_sbuff_set(in, &our_in);

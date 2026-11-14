@@ -32,14 +32,12 @@ RCSIDH(base_h, "$Id$")
 #include <freeradius-devel/server/cf_util.h>
 #include <freeradius-devel/server/client.h>
 #include <freeradius-devel/server/command.h>
-#include <freeradius-devel/server/components.h>
-#include <freeradius-devel/server/cond_eval.h>
 #include <freeradius-devel/server/connection.h>
 #include <freeradius-devel/server/dependency.h>
 #include <freeradius-devel/server/dl_module.h>
 #include <freeradius-devel/server/exec.h>
 #include <freeradius-devel/server/exfile.h>
-#include <freeradius-devel/server/listen.h>
+#include <freeradius-devel/server/global_lib.h>
 #include <freeradius-devel/server/log.h>
 #include <freeradius-devel/server/main_config.h>
 #include <freeradius-devel/server/main_loop.h>
@@ -47,21 +45,18 @@ RCSIDH(base_h, "$Id$")
 #include <freeradius-devel/server/map_proc.h>
 #include <freeradius-devel/server/map.h>
 #include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/packet.h>
 #include <freeradius-devel/server/pair.h>
 #include <freeradius-devel/server/paircmp.h>
 #include <freeradius-devel/server/pairmove.h>
 #include <freeradius-devel/server/password.h>
-#include <freeradius-devel/server/cond.h>
 #include <freeradius-devel/server/pool.h>
-#include <freeradius-devel/server/protocol.h>
 #include <freeradius-devel/server/regex.h>
 #include <freeradius-devel/server/rcode.h>
 #include <freeradius-devel/server/request_data.h>
 #include <freeradius-devel/server/request.h>
 #include <freeradius-devel/server/state.h>
 #include <freeradius-devel/server/stats.h>
-#include <freeradius-devel/server/sysutmp.h>
-#include <freeradius-devel/server/tcp.h>
 #include <freeradius-devel/server/tmpl.h>
 #include <freeradius-devel/server/trigger.h>
 #include <freeradius-devel/server/util.h>
@@ -70,5 +65,5 @@ RCSIDH(base_h, "$Id$")
 
 #include <freeradius-devel/util/base.h>
 
-int server_init(CONF_SECTION *cs);
+int server_init(CONF_SECTION *cs, char const *dict_dir, fr_dict_t *dict);
 void server_free(void);

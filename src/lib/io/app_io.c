@@ -26,10 +26,12 @@
 #include <freeradius-devel/util/syserror.h>
 #include <freeradius-devel/util/debug.h>
 
-
+/*
+ *	@todo - include the name of the virtual server, too.
+ */
 char const *fr_app_io_socket_name(TALLOC_CTX *ctx, fr_app_io_t const *app_io,
-				  fr_ipaddr_t const *src_ipaddr, int src_port,
-				  fr_ipaddr_t const *dst_ipaddr, int dst_port,
+				  fr_ipaddr_t const *src_ipaddr, uint16_t src_port,
+				  fr_ipaddr_t const *dst_ipaddr, uint16_t dst_port,
 				  char const *interface)
 {
 	char		    dst_buf[128], src_buf[128];
@@ -45,28 +47,28 @@ char const *fr_app_io_socket_name(TALLOC_CTX *ctx, fr_app_io_t const *app_io,
 			strlcpy(dst_buf, "::", sizeof(dst_buf));
 		}
 	} else {
-		fr_value_box_print(&FR_SBUFF_OUT(dst_buf, sizeof(dst_buf)), fr_box_ipaddr(*dst_ipaddr), NULL);
+		(void) fr_value_box_print(&FR_SBUFF_OUT(dst_buf, sizeof(dst_buf)), fr_box_ipaddr(*dst_ipaddr), NULL);
 	}
 
-	if (src_ipaddr) fr_value_box_print(&FR_SBUFF_OUT(src_buf, sizeof(src_buf)), fr_box_ipaddr(*src_ipaddr), NULL);
+	if (src_ipaddr) (void) fr_value_box_print(&FR_SBUFF_OUT(src_buf, sizeof(src_buf)), fr_box_ipaddr(*src_ipaddr), NULL);
 
 	if (!interface) {
 		if (!src_ipaddr) {
 			return talloc_typed_asprintf(ctx, "%s server %s port %u",
-						     app_io->name, dst_buf, dst_port);
+						     app_io->common.name, dst_buf, dst_port);
 		}
 
 
 		return talloc_typed_asprintf(ctx, "%s from client %s port %u to server %s port %u",
-					     app_io->name, src_buf, src_port, dst_buf, dst_port);
+					     app_io->common.name, src_buf, src_port, dst_buf, dst_port);
 	}
 
 	if (!src_ipaddr) {
 		return talloc_typed_asprintf(ctx, "%s server %s port %u on interface %s",
-					     app_io->name, dst_buf, dst_port, interface);
+					     app_io->common.name, dst_buf, dst_port, interface);
 		}
 
 
 		return talloc_typed_asprintf(ctx, "%s from client %s port %u to server %s port %u on interface %s",
-					     app_io->name, src_buf, src_port, dst_buf, dst_port, interface);
+					     app_io->common.name, src_buf, src_port, dst_buf, dst_port, interface);
 }

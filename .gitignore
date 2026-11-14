@@ -1,45 +1,62 @@
 *~
-*.o
-*.a
-*.lo
-*.loT
-*.la
-*.so
-*.lai
-*.sig
-*.orig
-*.rej
-.libs
-.depends
-*.log
-*.substvars
 *-stamp
-*.swp
-*.swo
+*.a
 *.cache
 *.dist
 *.dylib
-*.rej
-*.orig
 *.dSYM
+*.la
+*.lai
+*.lo
+*.log
+*.loT
+*.o
+*.orig
 *.patch
+*.plist
+*.profraw
+*.rej
+*.sig
+*.so
+*.substvars
+*.swp
+*.swo
 *.sock
+*.wasm
+\#*
+
+.libs
+.depends
 .pc
+__pycache__
+
+# Version markers
+VERSION_COMMIT
+VERSION_COMMIT_DEPTH
+RELEASE
 
 # Editor projects
-*.kdev4
-*.cproject
-*.project
 *.bbprojectd
+*.cproject
+*.kdev4
+*.project
+*.json
 
 # Exuberant ctags
 tags
+
+# This is essentially a log of all source files and how they were compiled.
+# It's consumed by clangd, and is local to the system.
+compile_commands.json
 
 # Local icon files
 icon.png
 
 # OS specific cruft
 .DS_Store
+
+# Claude Code
+CLAUDE.md
 
 # Archives
 freeradius-server-*tar*
@@ -54,7 +71,9 @@ config.status
 Make.inc
 libtool
 autom4te.cache
+aclocal.m4
 config.guess
+config.report
 config.sub
 config.h
 src/bin/unit_test_attribute
@@ -66,11 +85,9 @@ nodes*.conf
 dump*.rdb
 appendonly*.aof
 
-# Analyzer output
-*.plist
-
 # Local scripts
 run.sh
+rpmbuild.sh
 
 # rpm packages
 rpmbuild/
@@ -78,3 +95,15 @@ rpmbuild/
 
 # fuzzer output files
 crash-*
+
+# Antora web site generation
+main-site.yml
+
+# Claude AI
+build-2f*
+
+# Profiling results
+prof-results/
+
+# Core dumps staged for upload by scripts/ci/collect-core-dumps.sh
+ci-core-dumps/

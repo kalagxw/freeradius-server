@@ -8,7 +8,6 @@ RCSID("$Id$")
 
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/strerror.h>
-#include <freeradius-devel/util/talloc.h>
 #include <freeradius-devel/util/atexit.h>
 
 /*
@@ -17,7 +16,33 @@ RCSID("$Id$")
  */
 #include <freeradius-devel/util/md4.h>
 
-static _Thread_local fr_md4_ctx_t *md4_ctx;
+/** The thread local free list
+ *
+ * Any entries remaining in the list will be freed when the thread is joined
+ */
+#define ARRAY_SIZE (8)
+typedef struct {
+	bool		used;
+	fr_md4_ctx_t	*md_ctx;
+} fr_md4_free_list_t;
+static _Thread_local fr_md4_free_list_t *md4_array;
+
+static void fr_md4_local_ctx_reset(fr_md4_ctx_t *ctx);
+static void fr_md4_local_ctx_copy(fr_md4_ctx_t *dst, fr_md4_ctx_t const *src);
+static fr_md4_ctx_t *fr_md4_local_ctx_alloc(void);
+static void fr_md4_local_ctx_free(fr_md4_ctx_t **ctx);
+static void fr_md4_local_update(fr_md4_ctx_t *ctx, uint8_t const *in, size_t inlen);
+static void fr_md4_local_final(uint8_t out[static MD4_DIGEST_LENGTH], fr_md4_ctx_t *ctx);
+
+static fr_md4_funcs_t md4_local_funcs = {
+	.reset = fr_md4_local_ctx_reset,
+	.copy = fr_md4_local_ctx_copy,
+	.alloc = fr_md4_local_ctx_alloc,
+	.free = fr_md4_local_ctx_free,
+	.update = fr_md4_local_update,
+	.final = fr_md4_local_final
+};
+fr_md4_funcs_t const *fr_md4_funcs = &md4_local_funcs;
 
 /*
  *	If we have OpenSSL's EVP API available, then build wrapper functions.
@@ -26,15 +51,11 @@ static _Thread_local fr_md4_ctx_t *md4_ctx;
  *	be operating in FIPS mode where MD4 digest functions are unavailable.
  */
 #ifdef HAVE_OPENSSL_EVP_H
+#  include <freeradius-devel/tls/openssl_user_macros.h>
 #  include <openssl/evp.h>
 #  include <openssl/crypto.h>
-
-static int have_openssl_md4 = -1;
-
-static void _md4_ctx_openssl_free_on_exit(void *arg)
-{
-	EVP_MD_CTX_free(arg);
-}
+#  include <openssl/err.h>
+#  include <openssl/provider.h>
 
 /** @copydoc fr_md4_ctx_reset
  *
@@ -58,35 +79,21 @@ static void fr_md4_openssl_ctx_copy(fr_md4_ctx_t *dst, fr_md4_ctx_t const *src)
 /** @copydoc fr_md4_ctx_alloc
  *
  */
-static fr_md4_ctx_t *fr_md4_openssl_ctx_alloc(bool thread_local)
+static fr_md4_ctx_t *fr_md4_openssl_ctx_alloc(void)
 {
 	EVP_MD_CTX *md_ctx;
 
-	/*
-	 *	Use the thread local ctx to avoid heap allocations.
-	 */
-	if (thread_local) {
-		if (unlikely(!md4_ctx)) {
-			md_ctx = EVP_MD_CTX_new();
-			if (unlikely(!md_ctx)) {
-			oom:
-				fr_strerror_const("Out of memory");
-				return NULL;
-			}
-			fr_atexit_thread_local(md4_ctx, _md4_ctx_openssl_free_on_exit, md_ctx);
-			EVP_DigestInit_ex(md_ctx, EVP_md4(), NULL);
-		} else {
-			md_ctx = md4_ctx;
-		}
-	/*
-	 *	If the MD4 ctx might be used across a yield point
-	 *	shared should be set to false, and new contexts
-	 *	should be allocated.
-	 */
-	} else {
-		md_ctx = EVP_MD_CTX_new();
-		if (unlikely(!md_ctx)) goto oom;
-		EVP_DigestInit_ex(md_ctx, EVP_md4(), NULL);
+	md_ctx = EVP_MD_CTX_new();
+	if (unlikely(!md_ctx)) return NULL;
+
+	if (EVP_DigestInit_ex(md_ctx, EVP_md4(), NULL) != 1) {
+		char buffer[256];
+
+		ERR_error_string_n(ERR_get_error(), buffer, sizeof(buffer));
+		fr_strerror_printf("Failed initialising md4 ctx: %s", buffer);
+		EVP_MD_CTX_free(md_ctx);
+
+		return NULL;
 	}
 
 	return md_ctx;
@@ -97,12 +104,6 @@ static fr_md4_ctx_t *fr_md4_openssl_ctx_alloc(bool thread_local)
  */
 static void fr_md4_openssl_ctx_free(fr_md4_ctx_t **ctx)
 {
-	if (md4_ctx && (md4_ctx == *ctx)) {
-		fr_md4_openssl_ctx_reset(*ctx);
-		*ctx = NULL;
-		return;
-	}
-
 	EVP_MD_CTX_free(*ctx);
 	*ctx = NULL;
 }
@@ -126,6 +127,15 @@ static void fr_md4_openssl_final(uint8_t out[static MD4_DIGEST_LENGTH], fr_md4_c
 
 	if (!fr_cond_assert(len == MD4_DIGEST_LENGTH)) return;
 }
+
+static fr_md4_funcs_t md4_openssl_funcs = {
+	.reset = fr_md4_openssl_ctx_reset,
+	.copy = fr_md4_openssl_ctx_copy,
+	.alloc = fr_md4_openssl_ctx_alloc,
+	.free = fr_md4_openssl_ctx_free,
+	.update = fr_md4_openssl_update,
+	.final = fr_md4_openssl_final
+};
 #endif
 
 /*
@@ -133,7 +143,7 @@ static void fr_md4_openssl_final(uint8_t out[static MD4_DIGEST_LENGTH], fr_md4_c
  * The algorithm is due to Ron Rivest.	This code was
  * written by Colin Plumb in 1993, no copyright is claimed.
  * This code is in the public domain; do with it what you wish.
- * Todd C. Miller modified the MD5 code to do MD4 based on RFC 1186.
+ * Todd C. Miller modified the md4 code to do MD4 based on RFC 1186.
  *
  * Equivalent code is available from RSA Data Security, Inc.
  * This code has been tested against that, and is equivalent,
@@ -211,6 +221,8 @@ static void fr_md4_openssl_final(uint8_t out[static MD4_DIGEST_LENGTH], fr_md4_c
 
 /* This is the central step in the MD4 algorithm. */
 #define MD4STEP(f, w, x, y, z, data, s) (w += f(x, y, z) + data, w = w << s | w >> (32 - s))
+
+DIAG_OFF(cast-align)
 
 /** The core of the MD4 algorithm
  *
@@ -320,86 +332,31 @@ static void fr_md4_local_ctx_copy(fr_md4_ctx_t *dst, fr_md4_ctx_t const *src)
 	memcpy(ctx_local_dst, ctx_local_src, sizeof(*ctx_local_dst));
 }
 
-static void _md4_ctx_local_free_on_exit(void *arg)
-{
-	talloc_free(arg);
-}
-
 /** @copydoc fr_md4_ctx_alloc
  *
  */
-static fr_md4_ctx_t *fr_md4_local_ctx_alloc(bool thread_local)
+static fr_md4_ctx_t *fr_md4_local_ctx_alloc(void)
 {
 	fr_md4_ctx_local_t *ctx_local;
 
-#ifdef HAVE_OPENSSL_EVP_H
-	if (unlikely(have_openssl_md4 == -1)) {
-		/*
-		 *	If we're not in FIPS mode, then swap out the
-		 *	md4 functions, and call the OpenSSL init
-		 *	function.
-		 */
-		if (FIPS_mode() == 0) {
-			have_openssl_md4 = 1;
-
-			/*
-			 *	Swap out the functions pointers
-			 *	for the OpenSSL versions.
-			 */
-			fr_md4_ctx_reset = fr_md4_openssl_ctx_reset;
-			fr_md4_ctx_copy = fr_md4_openssl_ctx_copy;
-			fr_md4_ctx_alloc = fr_md4_openssl_ctx_alloc;
-			fr_md4_ctx_free = fr_md4_openssl_ctx_free;
-			fr_md4_update = fr_md4_openssl_update;
-			fr_md4_final = fr_md4_openssl_final;
-
-			return fr_md4_ctx_alloc(thread_local);
-		}
-
-		have_openssl_md4 = 0;
-	}
-#endif
-
-	/*
-	 *	Use the thread local ctx to avoid heap allocations.
-	 */
-	if (thread_local) {
-		if (unlikely(!md4_ctx)) {
-			ctx_local = talloc(NULL, fr_md4_ctx_local_t);
-			if (unlikely(!ctx_local)) return NULL;
-			fr_md4_local_ctx_reset(ctx_local);
-			fr_atexit_thread_local(md4_ctx, _md4_ctx_local_free_on_exit, ctx_local);
-		} else {
-			ctx_local = md4_ctx;
-		}
-	/*
-	 *	If the MD4 ctx might be used across a yield point
-	 *	shared should be set to false, and new contexts
-	 *	should be allocated.
-	 */
-	} else {
-		ctx_local = talloc(NULL, fr_md4_ctx_local_t);
-		if (unlikely(!ctx_local)) return NULL;
-		fr_md4_local_ctx_reset(ctx_local);
-	}
+	ctx_local = talloc(NULL, fr_md4_ctx_local_t);
+	if (unlikely(!ctx_local)) return NULL;
+	fr_md4_local_ctx_reset(ctx_local);
 
 	return ctx_local;
 }
+
 
 /** @copydoc fr_md4_ctx_free
  *
  */
 static void fr_md4_local_ctx_free(fr_md4_ctx_t **ctx)
 {
-	if (md4_ctx && (md4_ctx == *ctx)) {
-		fr_md4_local_ctx_reset(*ctx);
-		*ctx = NULL;
-		return;	/* Don't free the thread_local ctx */
-	}
-
 	talloc_free(*ctx);
 	*ctx = NULL;
 }
+
+static const uint8_t *zero = (uint8_t[]){ 0x00 };
 
 /** @copydoc fr_md4_update
  *
@@ -415,7 +372,10 @@ static void fr_md4_local_update(fr_md4_ctx_t *ctx, uint8_t const *in, size_t inl
 	 *	ubsan doesn't like arithmetic on
 	 *	NULL pointers.
 	 */
-	if (!in) in = (uint8_t[]){ 0x00 };
+	if (!in) {
+		in = zero;
+		inlen = 0;
+	}
 
 	/* Bytes already stored in ctx_local->buffer */
 	count = (uint32_t)((ctx_local->count[0] >> 3) & 0x3f);
@@ -504,16 +464,6 @@ static void fr_md4_local_final(uint8_t out[static MD4_DIGEST_LENGTH], fr_md4_ctx
 	memset(ctx_local, 0, sizeof(*ctx_local));	/* in case it's sensitive */
 }
 
-/*
- *	Digest function pointers
- */
-fr_md4_ctx_reset_t fr_md4_ctx_reset = fr_md4_local_ctx_reset;
-fr_md4_ctx_copy_t fr_md4_ctx_copy = fr_md4_local_ctx_copy;
-fr_md4_ctx_alloc_t fr_md4_ctx_alloc = fr_md4_local_ctx_alloc;
-fr_md4_ctx_free_t fr_md4_ctx_free = fr_md4_local_ctx_free;
-fr_md4_update_t fr_md4_update = fr_md4_local_update;
-fr_md4_final_t fr_md4_final = fr_md4_local_final;
-
 /** Calculate the MD4 hash of the contents of a buffer
  *
  * @param[out] out Where to write the MD4 digest. Must be a minimum of MD4_DIGEST_LENGTH.
@@ -524,8 +474,148 @@ void fr_md4_calc(uint8_t out[static MD4_DIGEST_LENGTH], uint8_t const *in, size_
 {
 	fr_md4_ctx_t *ctx;
 
-	ctx = fr_md4_ctx_alloc(true);
+	ctx = fr_md4_ctx_alloc_from_list();
 	fr_md4_update(ctx, in, inlen);
 	fr_md4_final(out, ctx);
-	fr_md4_ctx_free(&ctx);
+	fr_md4_ctx_free_from_list(&ctx);
 }
+
+static int _md4_ctx_free_on_exit(void *arg)
+{
+	int i;
+	fr_md4_free_list_t *free_list = arg;
+
+	for (i = 0; i < ARRAY_SIZE; i++) {
+		if (free_list[i].used) continue;
+
+		fr_md4_ctx_free(&free_list[i].md_ctx);
+	}
+
+	if (talloc_free(free_list) < 0) return -1;
+
+	md4_array = NULL;
+	return 0;
+}
+
+/** @copydoc fr_md4_ctx_alloc
+ *
+ */
+fr_md4_ctx_t *fr_md4_ctx_alloc_from_list(void)
+{
+	int			i;
+	fr_md4_ctx_t		*md_ctx;
+	fr_md4_free_list_t	*free_list;
+
+	if (unlikely(!md4_array)) {
+		free_list = talloc_zero_array(NULL, fr_md4_free_list_t, ARRAY_SIZE);
+		if (unlikely(!free_list)) {
+		oom:
+			fr_strerror_const("Out of Memory");
+			return NULL;
+		}
+
+		fr_atexit_thread_local(md4_array, _md4_ctx_free_on_exit, free_list);
+
+		/*
+		 *	Initialize all md4 contexts
+		 */
+		for (i = 0; i < ARRAY_SIZE; i++) {
+			md_ctx = fr_md4_ctx_alloc();
+			if (unlikely(md_ctx == NULL)) goto oom;
+
+			free_list[i].md_ctx = md_ctx;
+		}
+	} else {
+		free_list = md4_array;
+	}
+
+	for (i = 0; i < ARRAY_SIZE; i++) {
+		if (free_list[i].used) continue;
+
+		free_list[i].used = true;
+		return free_list[i].md_ctx;
+	}
+
+	/*
+	 *	No more free contexts, just allocate a new one.
+	 */
+	return fr_md4_ctx_alloc();
+}
+
+/** @copydoc fr_md4_ctx_free
+ *
+ */
+void fr_md4_ctx_free_from_list(fr_md4_ctx_t **ctx)
+{
+	int i;
+	fr_md4_free_list_t *free_list = md4_array;
+
+	if (free_list) {
+		for (i = 0; i < ARRAY_SIZE; i++) {
+			if (free_list[i].md_ctx == *ctx) {
+				free_list[i].used = false;
+				fr_md4_ctx_reset(*ctx);
+				*ctx = NULL;
+				return;
+			}
+		}
+	}
+
+	fr_md4_ctx_free(*ctx);
+	*ctx = NULL;
+}
+
+#ifdef HAVE_OPENSSL_EVP_H
+static void md4_free_list_reinit(fr_md4_funcs_t *funcs)
+{
+	int i;
+	fr_md4_ctx_t	   *md_ctx;
+	fr_md4_free_list_t *free_list = md4_array;
+
+	if (!free_list) {
+		fr_md4_funcs = funcs;
+		return;
+	}
+
+	for (i = 0; i < ARRAY_SIZE; i++) {
+		fr_assert(!free_list[i].used);
+
+		fr_md4_ctx_free(&free_list[i].md_ctx);
+	}
+
+	fr_md4_funcs = funcs;
+
+	for (i = 0; i < ARRAY_SIZE; i++) {
+		md_ctx = fr_md4_ctx_alloc();
+		fr_assert(md_ctx != NULL);
+
+		free_list[i].md_ctx = md_ctx;
+	}
+}
+
+void fr_md4_openssl_init(void)
+{
+	/*
+	 *	If we are in FIPS mode, then we still use the local
+	 *	allocator.
+	 */
+	if (EVP_default_properties_is_fips_enabled(NULL)) return;
+
+	/*
+	 *	OpenSSL isn't in FIPS mode.  Swap out the functions
+	 *	pointers for the OpenSSL versions.
+	 *
+	 *	We do this by swapping out a pointer to a structure
+	 *	containing the functions, as this prevents possible
+	 *	skew where some threads see a mixture of functions.
+	 */
+	md4_free_list_reinit(&md4_openssl_funcs);
+}
+
+void fr_md4_openssl_free(void)
+{
+	if (fr_md4_funcs == &md4_local_funcs) return; /* not initialized, or FIPS. */
+
+	md4_free_list_reinit(&md4_local_funcs);
+}
+#endif

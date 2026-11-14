@@ -1,19 +1,18 @@
 = Directories
 
-The directories in the server source are laid out ad follows:
+The directories in the server source are laid out as follows:
 
 == Documentation
 
-[width="100%",cols="50%,50%",options="header",]
+[width="100%",cols="50%,50%",options="header"]
 |===
 | Directory           | Description
 | `doc/`              | Various snippets of documentation.
 | `doc/introduction/` | Concepts and introduction to FreeRADIUS.
-| `doc/raddb/`        | HTML versions of the configuration files.
 | `doc/developers/`   | Developer documentation for internal APIs
 | `doc/unlang/`       | The unlang processing language.
 | `doc/upgrade/`      | How to upgrade from version 3 to version 4.
-| `doc/rfc/`          | Copies of the RFC’s. If you have Perl, do a `make` in
+| `doc/rfc/`          | Copies of the RFC's. If you have Perl, do a `make` in
                         that directory, and look at the HTML output.
 | `doc/antora/`       | Metadata and documentation source files to build
                         an Antora based documentation site.
@@ -24,7 +23,7 @@ The directories in the server source are laid out ad follows:
 
 == Utility
 
-[cols=",",options="header",]
+[options="header"]
 |===
 |Directory   | Description
 | `mibs/`    | SNMP Mibs for the server.
@@ -33,21 +32,23 @@ The directories in the server source are laid out ad follows:
 
 == Configuration
 
-[width="100%",cols="50%,50%",options="header",]
+[width="100%",cols="50%,50%",options="header"]
 |===
 | Directory               | Description
-| `raddb/`                | Sample configuration files for the server.
-| `raddb/mods-available`  | Module configuration files.
-| `raddb/mods-enabled`    | Directory containing symlinks to `raddb/mods-available`.
+| `<root>/`               | Sample configuration files for the server.
+                            Can be `/etc/freeradius/` or `/etc/raddb/`
+| `mods-available/`       | Module configuration files.
+| `mods-enabled/`         | Directory containing symlinks to `raddb/mods-available`.
                             Controls which modules are enabled.
-| `raddb/sites-available` | Virtual servers.
-| `raddb/sites-enabled`   | Directory containing symlinks to `raddb/sites-available`.
-                            Control which virtual servers are enabled.
+| `sites-available/`      | Virtual servers.
+| `sites-enabled/`        | Directory containing symlinks to
+			    `raddb/sites-available`. Control which
+                            virtual servers are enabled.
 |===
 
 == Packaging
 
-[cols=",",options="header",]
+[options="header"]
 |===
 |Directory  | Description
 | `debian/` | Files to build a `freeradius` Debian Linux package.
@@ -57,7 +58,7 @@ The directories in the server source are laid out ad follows:
 
 == Source
 
-[cols=",",options="header",]
+[options="header"]
 |===
 |Directory         | Description
 | `src/`           | Source code.
@@ -67,3 +68,6 @@ The directories in the server source are laid out ad follows:
 | `src/protocols/` | Dynamic frontend plug-in modules.
 | `src/modules/`   | Dynamic backend plug-in modules.
 |===
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

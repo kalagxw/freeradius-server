@@ -22,7 +22,7 @@
  * @author Jorge Pereira <jpereira@freeradius.org>
  *
  * @copyright 2021 The FreeRADIUS server project.
- * @copyright 2021 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2021 Network RADIUS SAS (legal@networkradius.com)
  */
 
 RCSIDH(tftp_h, "$Id$")
@@ -79,16 +79,16 @@ extern "C" {
  */
 #define FR_TFTP_MAX_FILESIZE				(FR_TFTP_BLOCK_MAX_SIZE * FR_TFTP_BLOCK_MAX_SIZE)
 
-/* tftp.c */
-int fr_tftp_decode(TALLOC_CTX *ctx, uint8_t const *data, size_t data_len, fr_dcursor_t *cursor) CC_HINT(nonnull(2,4));
+ssize_t fr_tftp_decode(TALLOC_CTX *ctx, fr_pair_list_t *out,
+		       uint8_t const *data, size_t data_len) CC_HINT(nonnull(2,3));
 ssize_t fr_tftp_encode(fr_dbuff_t *dbuff, fr_pair_list_t *vps) CC_HINT(nonnull(1,2));
 
 /* base.c */
 extern char const	*fr_tftp_codes[FR_TFTP_MAX_CODE];
 extern char const 	*fr_tftp_error_codes[FR_TFTP_MAX_ERROR_CODE];
 
-int fr_tftp_init(void);
-void fr_tftp_free(void);
+int fr_tftp_global_init(void);
+void fr_tftp_global_free(void);
 
 #ifdef __cplusplus
 }

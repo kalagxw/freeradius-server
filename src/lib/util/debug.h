@@ -27,15 +27,18 @@ extern "C" {
 
 #include <freeradius-devel/build.h>
 #include <freeradius-devel/missing.h>
-#include <freeradius-devel/util/fring.h>
+#include <freeradius-devel/util/talloc.h>
+
+#include <signal.h>
 
 #ifdef NO_ASSERT
 # define MEM(x) error "Use of MEM() not allowed in this source file.  Deal with memory allocation failure gracefully"
 #else
-# define MEM(x) do { if (!(x)) { fr_cond_assert_msg((x), "OUT OF MEMORY"); _fr_exit(__FILE__, __LINE__, EXIT_FAILURE, true); } } while (0)
+/* Short circuit condition to prevent duplicate evaluation */
+# define MEM(x) do { if (!(x)) { fr_cond_assert_msg(0 && (x),  "OUT OF MEMORY"); _fr_exit(__FILE__, __LINE__, EXIT_FAILURE, true); } } while (0)
 #endif
 
-typedef enum {
+typedef enum : int8_t {
 	DEBUGGER_STATE_UNKNOWN_NO_PTRACE	= -3,	//!< We don't have ptrace so can't check.
 	DEBUGGER_STATE_UNKNOWN_NO_PTRACE_CAP	= -2,	//!< CAP_SYS_PTRACE not set for the process.
 	DEBUGGER_STATE_UNKNOWN			= -1,	//!< Unknown, likely fr_get_debug_state() not called yet.
@@ -43,6 +46,7 @@ typedef enum {
 	DEBUGGER_STATE_ATTACHED			= 1	//!< We can't attach, it's likely a debugger is already tracing.
 } fr_debug_state_t;
 
+extern int fr_fault_log_fd;
 extern fr_debug_state_t fr_debug_state;
 
 #define FR_FAULT_LOG(_fmt, ...)			fr_fault_log(_fmt "\n", ## __VA_ARGS__)
@@ -60,7 +64,6 @@ extern fr_debug_state_t fr_debug_state;
  *	- < 0 on failure.
  */
 typedef int (*fr_fault_cb_t)(int signum);
-typedef struct fr_bt_marker fr_bt_marker_t;
 
 int			fr_get_lsan_state(void);
 
@@ -71,12 +74,6 @@ void			fr_debug_state_store(void);
 char const		*fr_debug_state_to_msg(fr_debug_state_t state);
 
 void			fr_debug_break(bool always);
-
-void			backtrace_print(fr_fring_t *fring, void *obj);
-
-int			fr_backtrace_do(fr_bt_marker_t *marker);
-
-fr_bt_marker_t		*fr_backtrace_attach(fr_fring_t **fring, TALLOC_CTX *obj);
 
 void			fr_panic_on_free(TALLOC_CTX *ctx);
 
@@ -94,7 +91,51 @@ void			fr_talloc_fault_setup(void);
 
 void			fr_disable_null_tracking_on_free(TALLOC_CTX *ctx);
 
-int			fr_fault_setup(TALLOC_CTX *ctx, char const *cmd, char const *program);
+/** Bitmask of signal numbers to install the panic-action handler on.
+ *
+ * PANIC_ACTION_SIGNALS is the default set installed by every FreeRADIUS
+ * program. Callers that share a signal with another library (e.g. libFuzzer
+ * also uses SIGALRM for its own timeout) pass PANIC_ACTION_SIGNALS with the
+ * offending bit cleared so the FR handler is not registered for that signal
+ * and the other library's handler stays in place.
+ */
+#ifdef SIGABRT
+#  define _PANIC_ACTION_SIGABRT	(1UL << SIGABRT)
+#else
+#  define _PANIC_ACTION_SIGABRT	0
+#endif
+#ifdef SIGILL
+#  define _PANIC_ACTION_SIGILL	(1UL << SIGILL)
+#else
+#  define _PANIC_ACTION_SIGILL	0
+#endif
+#ifdef SIGFPE
+#  define _PANIC_ACTION_SIGFPE	(1UL << SIGFPE)
+#else
+#  define _PANIC_ACTION_SIGFPE	0
+#endif
+#ifdef SIGSEGV
+#  define _PANIC_ACTION_SIGSEGV	(1UL << SIGSEGV)
+#else
+#  define _PANIC_ACTION_SIGSEGV	0
+#endif
+#ifdef SIGBUS
+#  define _PANIC_ACTION_SIGBUS	(1UL << SIGBUS)
+#else
+#  define _PANIC_ACTION_SIGBUS	0
+#endif
+#ifdef SIGALRM
+#  define _PANIC_ACTION_SIGALRM	(1UL << SIGALRM)
+#else
+#  define _PANIC_ACTION_SIGALRM	0
+#endif
+
+#define PANIC_ACTION_SIGNALS	(_PANIC_ACTION_SIGABRT | _PANIC_ACTION_SIGILL | \
+				 _PANIC_ACTION_SIGFPE | _PANIC_ACTION_SIGSEGV | \
+				 _PANIC_ACTION_SIGBUS | _PANIC_ACTION_SIGALRM)
+
+int			fr_fault_setup(TALLOC_CTX *ctx, char const *cmd, char const *program,
+				       unsigned long fault_signals);
 
 void			fr_fault_set_cb(fr_fault_cb_t func);
 
@@ -161,7 +202,7 @@ NEVER_RETURNS void	_fr_exit(char const *file, int line, int status, bool now);
  *
  * @param _x expression to test (should evaluate to true)
  */
-#define		fr_fatal_assert(_x) if (unlikely(!((bool)(_x)))) _fr_assert_exit(__FILE__, __LINE__, #_x, NULL))
+#define		fr_fatal_assert(_x) if (unlikely(!((bool)(_x)))) _fr_assert_fatal(__FILE__, __LINE__, #_x, NULL)
 
 /** Calls panic_action ifndef NDEBUG, else logs error and causes the server to exit immediately with code 134
  *
@@ -188,10 +229,10 @@ NEVER_RETURNS void	_fr_exit(char const *file, int line, int status, bool now);
 #define		fr_fatal_assert_fail(_msg, ...) _fr_assert_fatal(__FILE__, __LINE__, "false", _msg,  ## __VA_ARGS__)
 
 #ifdef NDEBUG
-#  define fr_assert(_x)
-#  define fr_assert_msg(_x, _msg, ...)
-#  define fr_assert_fail(_msg, ...)
-#elif !defined(__clang_analyzer__)
+#  define fr_assert(_x) ((void)0)
+#  define fr_assert_msg(_x, _msg, ...) ((void)0)
+#  define fr_assert_fail(_msg, ...) ((void)0)
+#elif !defined(STATIC_ANALYZER)
 /** Calls panic_action ifndef NDEBUG, else logs error
  *
  * @param[in] _x	expression to test (should evaluate to true)
@@ -215,7 +256,7 @@ NEVER_RETURNS void	_fr_exit(char const *file, int line, int status, bool now);
 #  include <assert.h>
 #  define fr_assert(_x) assert(_x)
 #  define fr_assert_msg(_x, _msg, ...) assert(_x)
-#  define fr_assert_fail(_msg ...) assert(0)
+#  define fr_assert_fail(_msg, ...) assert(0)
 #endif
 
 /** Exit, producing a log message in debug builds
@@ -230,49 +271,6 @@ NEVER_RETURNS void	_fr_exit(char const *file, int line, int status, bool now);
  */
 #  define	fr_exit_now(_x) _fr_exit(__FILE__, __LINE__, (_x), true)
 /** @} */
-
-void fr_sign_struct(void *ptr, size_t size, size_t offset);
-void fr_verify_struct(void const *ptr, size_t size, size_t offset);
-void fr_verify_struct_member(void const *ptr, size_t len, uint32_t *signature);
-
-/** Manual validation of structures.
- *
- *	typedef struct {
- *		char *a;
- *		int b;
- *		FR_SIGNATURE		// no semicolon!
- *	} foo_t;
- *
- *  and then once the structure is initialized (and will never be changed)
- *
- *	foo_t *ptr;
- *	FR_STRUCT_SIGN(ptr);
- *
- *  and some time later...
- *
- *	foo_t *ptr;
- *	FR_STRUCT_VERIFY(ptr);
- *
- *  Note that the structure can't contain variable elements such as fr_dlist_t.
- *  And that we're not verifying the contents of the members which are pointers.
- */
-#ifndef NDEBUG
-#define FR_STRUCT_SIGN(_ptr)			fr_sign_struct(_ptr, sizeof(__typeof__(*_ptr)), offsetof(__typeof__(*_ptr), _signature));
-#define FR_STRUCT_VERIFY(_ptr)			fr_verify_struct(_ptr, sizeof(__typeof__(*_ptr)), offsetof(__typeof__(*_ptr), _signature))
-#define FR_STRUCT_SIGNATURE			uint32_t _signature;
-
-#define FR_STRUCT_MEMBER_SIGN(_ptr, _member, _len) _ptr->_signature_##_member = fr_hash(_ptr->_member, _len)
-#define FR_STRUCT_MEMBER_VERIFY(_ptr, _member, _len) fr_verify_struct_member(_ptr->_member, _len, &(_ptr->_signature_##_member))
-#define FR_STRUCT_MEMBER_SIGNATURE(_member)	uint32_t _signature_##_member;
-#else
-#define FR_STRUCT_SIGN(_ptr)
-#define FR_STRUCT_VERIFY(_ptr)
-#define FR_STRUCT_SIGNATURE
-
-#define FR_STRUCT_MEMBER_SIGN(_ptr, _member, _len)
-#define FR_STRUCT_MEMBER_VERIFY(_ptr, _member, _len)
-#define FR_STRUCT_MEMBER_SIGNATURE(_member)
-#endif
 
 #ifdef __cplusplus
 }

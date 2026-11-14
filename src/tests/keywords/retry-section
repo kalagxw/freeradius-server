@@ -1,13 +1,10 @@
-# PRE: update if
+# PRE: if
+uint32 count
 
-update request {
-       &Tmp-Integer-0 := 0
-}
+count := 0
 
 group {
-	update request {
-		&Tmp-Integer-0 := "%{expr: &Tmp-Integer-0 + 1}"
-	}
+	count += 1
 
 	noop
 	actions {
@@ -19,7 +16,7 @@ group {
 	}
 }
 
-if (&Tmp-Integer-0 != 3) {
+if (!(count == 3)) {
 	test_fail
 }
 

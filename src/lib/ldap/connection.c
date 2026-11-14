@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -28,119 +28,23 @@ USES_APPLE_DEPRECATED_API
 #include <freeradius-devel/ldap/base.h>
 #include <freeradius-devel/util/debug.h>
 
-#if LDAP_SET_REBIND_PROC_ARGS == 3
-/** Callback for OpenLDAP to rebind and chase referrals
- *
- * Called by OpenLDAP when it receives a referral and has to rebind.
- *
- * @param handle to rebind.
- * @param url to bind to.
- * @param request that triggered the rebind.
- * @param msgid that triggered the rebind.
- * @param ctx fr_ldap configuration.
+/*
+ *	Lookup of libldap result message types to meaningful strings
  */
-static int fr_ldap_rebind(LDAP *handle, LDAP_CONST char *url,
-			  UNUSED ber_tag_t request, UNUSED ber_int_t msgid, void *ctx)
-{
-	fr_ldap_rcode_t			status;
-	fr_ldap_connection_t			*conn = talloc_get_type_abort(ctx, fr_ldap_connection_t);
-	fr_ldap_config_t const	*handle_config = conn->config;
+static char const *ldap_msg_types[UINT8_MAX + 1] = {
+	[LDAP_RES_BIND]			= "bind response",
+	[LDAP_RES_SEARCH_ENTRY]		= "search entry",
+	[LDAP_RES_SEARCH_REFERENCE]	= "search reference",
+	[LDAP_RES_SEARCH_RESULT]	= "search result",
+	[LDAP_RES_MODIFY]		= "modify response",
+	[LDAP_RES_ADD]			= "add response",
+	[LDAP_RES_DELETE]		= "delete response",
+	[LDAP_RES_MODDN]		= "modify dn response",
+	[LDAP_RES_COMPARE]		= "compare response",
+	[LDAP_RES_EXTENDED]		= "extended response",
+	[LDAP_RES_INTERMEDIATE]		= "intermediate response"
+};
 
-	char const			*admin_identity = NULL;
-	char const			*admin_password = NULL;
-
-	int				ldap_errno;
-
-	conn->referred = true;
-	conn->rebound = true;	/* not really, but oh well... */
-	fr_assert(handle == conn->handle);
-
-	DEBUG("Rebinding to URL %s", url);
-
-#  ifdef HAVE_LDAP_URL_PARSE
-	/*
-	 *	Use bindname and x-bindpw extensions to get the bind credentials
-	 *	SASL mech is inherited from the module that defined the connection
-	 *	pool.
-	 */
-	if (handle_config->use_referral_credentials) {
-		LDAPURLDesc	*ldap_url;
-		int		ret;
-		char		**ext;
-
-		ret = ldap_url_parse(url, &ldap_url);
-		if (ret != LDAP_SUCCESS) {
-			ERROR("Failed parsing LDAP URL \"%s\": %s", url, ldap_err2string(ret));
-			return -1;
-		}
-
-		/*
-		 *	If there are no extensions, OpenLDAP doesn't
-		 *	bother allocating an array.
-		 */
-		for (ext = ldap_url->lud_exts; ext && *ext; ext++) {
-			char const *p;
-			bool critical = false;
-
-			p = *ext;
-
-			if (*p == '!') {
-				critical = true;
-				p++;
-			}
-
-			/*
-			 *	LDAP Parse URL unescapes the extensions for us
-			 */
-			switch (fr_table_value_by_substr(fr_ldap_supported_extensions, p, -1, LDAP_EXT_UNSUPPORTED)) {
-			case LDAP_EXT_BINDNAME:
-				p = strchr(p, '=');
-				if (!p) {
-				bad_ext:
-					ERROR("Failed parsing extension \"%s\": "
-					      "No attribute/value delimiter '='", *ext);
-					ldap_free_urldesc(ldap_url);
-					return LDAP_OTHER;
-				}
-				admin_identity = p + 1;
-				break;
-
-			case LDAP_EXT_BINDPW:
-				p = strchr(p, '=');
-				if (!p) goto bad_ext;
-				admin_password = p + 1;
-				break;
-
-			default:
-				if (critical) {
-					ERROR("Failed parsing critical extension \"%s\": "
-					      "Not supported by FreeRADIUS", *ext);
-					ldap_free_urldesc(ldap_url);
-					return LDAP_OTHER;
-				}
-				DEBUG2("Skipping unsupported extension \"%s\"", *ext);
-				continue;
-			}
-		}
-		ldap_free_urldesc(ldap_url);
-	} else
-#  endif
-	{
-		admin_identity = handle_config->admin_identity;
-		admin_password = handle_config->admin_password;
-	}
-
-	status = fr_ldap_bind(NULL, &conn, admin_identity, admin_password,
-			      &conn->config->admin_sasl, 0, NULL, NULL);
-	if (status != LDAP_PROC_SUCCESS) {
-		ldap_get_option(handle, LDAP_OPT_ERROR_NUMBER, &ldap_errno);
-
-		return ldap_errno;
-	}
-
-	return LDAP_SUCCESS;
-}
-#endif
 
 /** Allocate and configure a new connection
  *
@@ -162,33 +66,26 @@ static int fr_ldap_rebind(LDAP *handle, LDAP_CONST char *url,
  */
 int fr_ldap_connection_configure(fr_ldap_connection_t *c, fr_ldap_config_t const *config)
 {
-	LDAP				*handle = NULL;
-	int				ldap_errno, ldap_version;
+	LDAP		*handle = NULL;
+	int		ldap_errno, ldap_version, keepalive, probes, is_server;
+	struct timeval	no_wait = {
+		.tv_sec = 0,
+		.tv_usec = 0
+	};
 
 	fr_assert(config->server);
 
-#ifdef HAVE_LDAP_INITIALIZE
 	ldap_errno = ldap_initialize(&handle, config->server);
 	if (ldap_errno != LDAP_SUCCESS) {
 		ERROR("ldap_initialize failed: %s", ldap_err2string(ldap_errno));
 	error:
 		return -1;
 	}
-#else
-	handle = ldap_init(config->server, config->port);
-	if (!handle) {
-		ERROR("ldap_init failed");
-	error:
-		return -1;
-	}
-#endif
 
-	DEBUG3("New libldap handle %p", handle);
+	DEBUG3("New connection %p libldap handle %p", c, handle);
 
 	c->config = config;
 	c->handle = handle;
-	c->rebound = false;
-	c->referred = false;
 
 	/*
 	 *	We now have a connection structure, but no actual connection.
@@ -196,15 +93,17 @@ int fr_ldap_connection_configure(fr_ldap_connection_t *c, fr_ldap_config_t const
 	 *	Set a bunch of LDAP options, using common code.
 	 */
 #define do_ldap_option(_option, _name, _value) \
-	if (ldap_set_option(c->handle, _option, _value) != LDAP_OPT_SUCCESS) { \
+	if (ldap_set_option(c->handle, _option, _value) != LDAP_OPT_SUCCESS) do { \
 		ldap_get_option(c->handle, LDAP_OPT_ERROR_NUMBER, &ldap_errno); \
 		ERROR("Failed setting connection option %s: %s", _name, \
 		      (ldap_errno != LDAP_SUCCESS) ? ldap_err2string(ldap_errno) : "Unknown error"); \
 		goto error;\
-	}
+	} while (0)
 
+DIAG_OFF(unused-macros)
 #define maybe_ldap_option(_option, _name, _value) \
 	if (_value) do_ldap_option(_option, _name, _value)
+DIAG_ON(unused-macros)
 
 	/*
 	 *	Leave "dereference" unset to use the OpenLDAP default.
@@ -212,56 +111,39 @@ int fr_ldap_connection_configure(fr_ldap_connection_t *c, fr_ldap_config_t const
 	if (config->dereference_str) do_ldap_option(LDAP_OPT_DEREF, "dereference", &(config->dereference));
 
 	/*
-	 *	Leave "chase_referrals" unset to use the OpenLDAP default.
+	 *	We handle our own referral chasing as there is no way to
+	 *	get the fd for a referred query.
 	 */
-	if (!config->chase_referrals_unset) {
-		if (config->chase_referrals) {
-			do_ldap_option(LDAP_OPT_REFERRALS, "chase_referrals", LDAP_OPT_ON);
+	do_ldap_option(LDAP_OPT_REFERRALS, "chase_referrals", LDAP_OPT_OFF);
 
-			if (config->rebind == true) {
-#if LDAP_SET_REBIND_PROC_ARGS == 3
-				ldap_set_rebind_proc(c->handle, fr_ldap_rebind, c);
-#endif
-			}
-		} else {
-			do_ldap_option(LDAP_OPT_REFERRALS, "chase_referrals", LDAP_OPT_OFF);
-		}
-	}
-
-#ifdef LDAP_OPT_NETWORK_TIMEOUT
 	/*
-	 *	A value of zero results in an handle configuration failure.
-	 *
-	 *	When most people specify zero they mean infinite.
-	 *
-	 *	libldap requires tv_sec to be -1 to mean that.
+	 *	libldap must never wait on the network, we do all the waiting
+	 *	in the event loop, and enforce deadlines with our own timers.
+	 *	The one exception is the StartTLS handshake, see start_tls.c.
 	 */
-	do_ldap_option(LDAP_OPT_NETWORK_TIMEOUT, "net_timeout",
-		       (config->net_timeout ? &fr_time_delta_to_timeval(config->net_timeout) :
-					      &(struct timeval) { .tv_sec = -1, .tv_usec = 0 }));
-#endif
+	do_ldap_option(LDAP_OPT_NETWORK_TIMEOUT, "network_timeout", &no_wait);
 
 	do_ldap_option(LDAP_OPT_TIMELIMIT, "srv_timelimit", &fr_time_delta_to_timeval(config->srv_timelimit));
 
 	ldap_version = LDAP_VERSION3;
 	do_ldap_option(LDAP_OPT_PROTOCOL_VERSION, "ldap_version", &ldap_version);
 
-#ifdef LDAP_OPT_X_KEEPALIVE_IDLE
-	do_ldap_option(LDAP_OPT_X_KEEPALIVE_IDLE, "keepalive_idle",
-		       &fr_time_delta_to_timeval(config->keepalive_idle));
-#endif
+	keepalive = (int) fr_time_delta_to_sec(config->keepalive_idle);
+	do_ldap_option(LDAP_OPT_X_KEEPALIVE_IDLE, "keepalive_idle", &keepalive);
 
-#ifdef LDAP_OPT_X_KEEPALIVE_PROBES
-	do_ldap_option(LDAP_OPT_X_KEEPALIVE_PROBES, "keepalive_probes",
-		       &fr_time_delta_to_timeval(config->keepalive_probes));
-#endif
+	probes = config->keepalive_probes;
+	do_ldap_option(LDAP_OPT_X_KEEPALIVE_PROBES, "keepalive_probes", &probes);
 
-#ifdef LDAP_OPT_X_KEEPALIVE_INTERVAL
-	do_ldap_option(LDAP_OPT_X_KEEPALIVE_INTERVAL, "keepalive_interval",
-		       &fr_time_delta_to_timeval(config->keepalive_interval));
-#endif
+	keepalive = (int) fr_time_delta_to_sec(config->keepalive_interval);
+	do_ldap_option(LDAP_OPT_X_KEEPALIVE_INTERVAL, "keepalive_interval", &keepalive);
 
-#ifdef HAVE_LDAP_START_TLS_S
+	if (config->sasl_secprops) do_ldap_option(LDAP_OPT_X_SASL_SECPROPS, "sasl_secprops", config->sasl_secprops);
+
+	/*
+	 *	Everything after this point is TLS related - so don't set if TLS not in use.
+	 */
+	if (!config->tls_mode && !config->start_tls) return 0;
+
 	/*
 	 *	Set all of the TLS options
 	 */
@@ -276,39 +158,29 @@ int fr_ldap_connection_configure(fr_ldap_connection_t *c, fr_ldap_config_t const
 	maybe_ldap_option(LDAP_OPT_X_TLS_CERTFILE, "certificate_file", config->tls_certificate_file);
 	maybe_ldap_option(LDAP_OPT_X_TLS_KEYFILE, "private_key_file", config->tls_private_key_file);
 
-#  ifdef LDAP_OPT_X_TLS_REQUIRE_CERT
 	if (config->tls_require_cert_str) {
 		do_ldap_option(LDAP_OPT_X_TLS_REQUIRE_CERT, "require_cert", &config->tls_require_cert);
 	}
-#  endif
 
-#  ifdef LDAP_OPT_X_TLS_PROTOCOL_MIN
 	if (config->tls_min_version_str) {
 		do_ldap_option(LDAP_OPT_X_TLS_PROTOCOL_MIN, "tls_min_version", &config->tls_min_version);
 	}
-#  endif
 
 	/*
 	 *	Counter intuitively the TLS context appears to need to be initialised
 	 *	after all the TLS options are set on the handle.
 	 */
-#  ifdef LDAP_OPT_X_TLS_NEWCTX
-	{
-		/* Always use the new TLS configuration context */
-		int is_server = 0;
-		do_ldap_option(LDAP_OPT_X_TLS_NEWCTX, "new TLS context", &is_server);
-	}
-#  endif
 
-	if (config->sasl_secprops) do_ldap_option(LDAP_OPT_X_SASL_SECPROPS, "sasl_secprops", config->sasl_secprops);
+	/* Always use the new TLS configuration context */
+	is_server = 0;
+	do_ldap_option(LDAP_OPT_X_TLS_NEWCTX, "new TLS context", &is_server);
 
 	if (config->start_tls) {
-		if (config->port == 636) {
+		if (config->port == LDAPS_PORT) {
 			WARN("Told to Start TLS on LDAPS port this will probably fail, please correct the "
 			     "configuration");
 		}
 	}
-#endif /* HAVE_LDAP_START_TLS_S */
 
 	return 0;
 }
@@ -319,8 +191,21 @@ int fr_ldap_connection_configure(fr_ldap_connection_t *c, fr_ldap_config_t const
  * @param[in] h		to close.
  * @param[in] uctx	Connection config and handle.
  */
-static void _ldap_connection_close(UNUSED fr_event_list_t *el, void *h, UNUSED void *uctx)
+void fr_ldap_connection_close(fr_event_list_t *el, void *h, UNUSED void *uctx)
 {
+	fr_ldap_connection_t *c = talloc_get_type_abort(h, fr_ldap_connection_t);
+
+	/*
+	 *	Explicitly remove the file descriptor event
+	 *
+	 *	Even if the fr_ldap_connection_t has outstanding
+	 *	queries, we still don't want its fd in the event loop.
+	 */
+	if (c->fd >= 0) {
+		fr_event_fd_delete(el, c->fd, FR_EVENT_FILTER_IO);
+		c->fd = -1;
+	}
+
 	talloc_free(h);
 }
 
@@ -334,28 +219,27 @@ static void _ldap_connection_close(UNUSED fr_event_list_t *el, void *h, UNUSED v
  */
 static int _ldap_connection_free(fr_ldap_connection_t *c)
 {
+	/*
+	 *	If there are any pending queries, don't free
+	 */
+	if (((c->queries) && (fr_rb_num_elements(c->queries) > 0)) || (fr_dlist_num_elements(&c->refs) > 0)) return -1;
+
 	talloc_free_children(c);	/* Force inverted free order */
 
+	if (c->handle) {
+		LDAPControl	*our_serverctrls[LDAP_MAX_CONTROLS];
+		LDAPControl	*our_clientctrls[LDAP_MAX_CONTROLS];
+
+		fr_ldap_control_merge(our_serverctrls, our_clientctrls,
+				      NUM_ELEMENTS(our_serverctrls),
+				      NUM_ELEMENTS(our_clientctrls),
+				      c, NULL, NULL);
+
+		DEBUG3("Closing connection %p libldap handle %p", c, c->handle);
+		ldap_unbind_ext(c->handle, our_serverctrls, our_clientctrls);	/* Same code as ldap_unbind_ext_s */
+	}
+
 	fr_ldap_control_clear(c);
-
-	if (!c->handle) return 0;	/* Don't need to do anything else if we don't yet have a handle */
-
-#ifdef HAVE_LDAP_UNBIND_EXT_S
-	LDAPControl	*our_serverctrls[LDAP_MAX_CONTROLS];
-	LDAPControl	*our_clientctrls[LDAP_MAX_CONTROLS];
-
-	fr_ldap_control_merge(our_serverctrls, our_clientctrls,
-			      NUM_ELEMENTS(our_serverctrls),
-			      NUM_ELEMENTS(our_clientctrls),
-			      c, NULL, NULL);
-
-	DEBUG3("Closing libldap handle %p", c->handle);
-	ldap_unbind_ext(c->handle, our_serverctrls, our_clientctrls);	/* Same code as ldap_unbind_ext_s */
-#else
-	DEBUG3("Closing libldap handle %p", c->handle);
-	ldap_unbind(c->handle);						/* Same code as ldap_unbind_s */
-#endif
-	c->handle = NULL;
 
 	return 0;
 }
@@ -382,7 +266,31 @@ fr_ldap_connection_t *fr_ldap_connection_alloc(TALLOC_CTX *ctx)
 
 	talloc_set_destructor(c, _ldap_connection_free);
 
+	/*
+	 *	Ensure the fd is invalid to start with, preventing
+	 *	attempts to remove fd events if the server is shut down
+	 *	before the LDAP connection is established
+	 */
+	c->fd = -1;
+
 	return c;
+}
+
+/** Watcher for LDAP connections being closed
+ *
+ * If there are any outstanding queries on the connection then
+ * re-parent the connection to the NULL ctx so that it remains
+ * until all the queries have been dealt with.
+ */
+static void _ldap_connection_close_watch(connection_t *conn, UNUSED connection_state_t prev,
+					 UNUSED connection_state_t state, void *uctx)
+{
+	fr_ldap_connection_t	*ldap_conn = talloc_get_type_abort(uctx, fr_ldap_connection_t);
+
+	if ((fr_rb_num_elements(ldap_conn->queries) == 0) && (fr_dlist_num_elements(&ldap_conn->refs) == 0)) return;
+
+	talloc_reparent(conn, NULL, ldap_conn);
+	ldap_conn->conn = NULL;
 }
 
 /** (Re-)Initialises the libldap side of the connection handle
@@ -424,18 +332,27 @@ fr_ldap_connection_t *fr_ldap_connection_alloc(TALLOC_CTX *ctx)
  *
  * @param[out] h	Underlying file descriptor from libldap handle.
  * @param[in] conn	Being initialised.
- * @param[in] uctx	Our LDAP connection handle (a #fr_ldap_connection_t).
+ * @param[in] config	LDAP connection configuration.
+ * @param[in] directory	Where the properties of the directory being connected to are recorded.
+ *			May be NULL if directory discovery is not being performed.
  * @return
- *	- FR_CONNECTION_STATE_CONNECTING on success.
- *	- FR_CONNECTION_STATE_FAILED on failure.
+ *	- CONNECTION_STATE_CONNECTING on success.
+ *	- CONNECTION_STATE_FAILED on failure.
  */
-static fr_connection_state_t _ldap_connection_init(void **h, fr_connection_t *conn, void *uctx)
+static connection_state_t ldap_connection_init(void **h, connection_t *conn,
+					       fr_ldap_config_t const *config, fr_ldap_directory_t *directory)
 {
-	fr_ldap_config_t const	*config = talloc_get_type_abort(uctx, fr_ldap_config_t);
 	fr_ldap_connection_t	*c;
 	fr_ldap_state_t		state;
 
 	c = fr_ldap_connection_alloc(conn);
+	c->conn = conn;
+	c->directory = directory;
+	/*
+	 *	Initialise tree for outstanding queries handled by this connection
+	 */
+	MEM(c->queries = fr_rb_inline_talloc_alloc(c, fr_ldap_query_t, node, fr_ldap_query_cmp, NULL));
+	fr_dlist_init(&c->refs, fr_ldap_query_t, entry);
 
 	/*
 	 *	Configure/allocate the libldap handle
@@ -443,91 +360,961 @@ static fr_connection_state_t _ldap_connection_init(void **h, fr_connection_t *co
 	if (fr_ldap_connection_configure(c, config) < 0) {
 	error:
 		talloc_free(c);
-		return FR_CONNECTION_STATE_FAILED;
+		return CONNECTION_STATE_FAILED;
 	}
 
-	/* Don't block */
+	/*
+	 *	Don't block.  libldap returns LDAP_X_CONNECTING while connect()
+	 *	is in progress, and the connection state machine's own timer
+	 *	bounds the attempt.
+	 */
 	if (ldap_set_option(c->handle, LDAP_OPT_CONNECT_ASYNC, LDAP_OPT_ON) != LDAP_OPT_SUCCESS) goto error;
-	fr_ldap_connection_timeout_set(c, 0);					/* Forces LDAP_X_CONNECTING */
 
 	state = fr_ldap_state_next(c);
 	if (state == FR_LDAP_STATE_ERROR) goto error;
 
+	connection_add_watch_pre(conn, CONNECTION_STATE_CLOSED, _ldap_connection_close_watch, true, c);
+
 	*h = c;	/* Set the handle */
 
-	return FR_CONNECTION_STATE_CONNECTING;
+	return CONNECTION_STATE_CONNECTING;
 }
 
-/** Alloc a self re-establishing connection to an LDAP server
+/** Initialise a standalone LDAP connection
  *
- * @param[in] ctx		to allocate any memory in, and to bind the lifetime of the connection to.
- * @param[in] el		to insert I/O and timer callbacks into.
- * @param[in] config		to use to bind the connection to an LDAP server.
- * @param[in] log_prefix	to prepend to connection state messages.
+ * @param[out] h	Underlying file descriptor from libldap handle.
+ * @param[in] conn	Being initialised.
+ * @param[in] uctx	Connection configuration (a #fr_ldap_config_t).
+ * @return
+ *	- CONNECTION_STATE_CONNECTING on success.
+ *	- CONNECTION_STATE_FAILED on failure.
  */
-fr_connection_t	*fr_ldap_connection_state_alloc(TALLOC_CTX *ctx, fr_event_list_t *el,
-					        fr_ldap_config_t const *config, char *log_prefix)
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+connection_state_t fr_ldap_connection_init(void **h, connection_t *conn, void *uctx)
 {
-	fr_connection_t *conn;
+	fr_ldap_config_t const	*config = uctx;
 
-	conn = fr_connection_alloc(ctx, el,
-				   &(fr_connection_funcs_t){
-				   	.init = _ldap_connection_init,
-				   	.close = _ldap_connection_close
-				   },
-				   &(fr_connection_conf_t){
-				   	.connection_timeout = config->net_timeout,
-				   	.reconnection_delay = config->reconnection_delay
-				   },
-				   log_prefix, config);
-	if (!conn) return NULL;
+	return ldap_connection_init(h, conn, config, NULL);
+}
+
+/** Initialise an LDAP trunk connection
+ *
+ * @param[out] h	Underlying file descriptor from libldap handle.
+ * @param[in] conn	Being initialised.
+ * @param[in] uctx	Trunk the connection belongs to (a #fr_ldap_thread_trunk_t).
+ * @return
+ *	- CONNECTION_STATE_CONNECTING on success.
+ *	- CONNECTION_STATE_FAILED on failure.
+ */
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+connection_state_t fr_ldap_trunk_connection_init(void **h, connection_t *conn, void *uctx)
+{
+	fr_ldap_thread_trunk_t	*ttrunk = talloc_get_type_abort(uctx, fr_ldap_thread_trunk_t);
+
+	return ldap_connection_init(h, conn, &ttrunk->config, ttrunk->directory);
+}
+
+/** Callback for closing idle LDAP trunk
+ *
+ */
+static void _ldap_trunk_idle_timeout(fr_timer_list_t *tl, UNUSED fr_time_t now, void *uctx)
+{
+	fr_ldap_thread_trunk_t	*ttrunk = talloc_get_type_abort(uctx, fr_ldap_thread_trunk_t);
+
+	if (ttrunk->trunk->req_alloc == 0) {
+		DEBUG2("Removing idle LDAP trunk to \"%s\"", ttrunk->uri);
+		talloc_free(ttrunk->trunk);
+		talloc_free(ttrunk);
+	} else {
+		/*
+		 *	There are still pending queries - insert a new event
+		 */
+		(void) fr_timer_in(ttrunk, tl, &ttrunk->ev, ttrunk->t->config->idle_timeout,
+				   false, _ldap_trunk_idle_timeout, ttrunk);
+	}
+}
+
+/** Callback when an LDAP trunk request is cancelled
+ *
+ * Ensure the request is removed from the list of outstanding requests
+ */
+static void ldap_request_cancel(UNUSED connection_t *conn, void *preq, UNUSED trunk_cancel_reason_t reason,
+			        UNUSED void *uctx) {
+	fr_ldap_query_t	*query = talloc_get_type_abort(preq, fr_ldap_query_t);
+
+	if (query->ldap_conn) {
+		fr_rb_remove(NULL, query->ldap_conn->queries, query);
+		query->ldap_conn = NULL;
+	}
+}
+
+/** Callback to cancel LDAP queries
+ *
+ * Inform the remote LDAP server that we no longer want responses to specific queries.
+ *
+ * @param[in] el	For timer management.
+ * @param[in] tconn	The trunk connection handle
+ * @param[in] conn	The specific connection queries will be cancelled on
+ * @param[in] uctx	Context provided to trunk_alloc
+ */
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void ldap_request_cancel_mux(UNUSED fr_event_list_t *el, trunk_connection_t *tconn,
+				    connection_t *conn, UNUSED void *uctx)
+{
+	trunk_request_t	*treq;
+	fr_ldap_connection_t	*ldap_conn = talloc_get_type_abort(conn->h, fr_ldap_connection_t);
+	fr_ldap_query_t		*query;
+
+	while ((trunk_connection_pop_cancellation(&treq, tconn)) == 0) {
+		query = talloc_get_type_abort(treq->preq, fr_ldap_query_t);
+		ldap_abandon_ext(ldap_conn->handle, query->msgid, NULL, NULL);
+
+		trunk_request_signal_cancel_complete(treq);
+	}
+}
+
+/** Callback to tidy up when a trunk request fails
+ *
+ */
+static void ldap_request_fail(request_t *request, void *preq, UNUSED void *rctx,
+			      UNUSED trunk_request_state_t state, UNUSED void *uctx)
+{
+	fr_ldap_query_t		*query = talloc_get_type_abort(preq, fr_ldap_query_t);
+
+	/*
+	 *	Failed trunk requests get freed - so remove association in query.
+	 */
+	query->treq = NULL;
+	query->ret = LDAP_RESULT_ERROR;
+
+	/*
+	 *	Ensure request is runnable.
+	 */
+	if (request) unlang_interpret_mark_runnable(request);
+}
+
+TRUNK_NOTIFY_FUNC(ldap_trunk_connection_notify, fr_ldap_connection_t)
+
+/** Allocate an LDAP trunk connection
+ *
+ * @param[in] tconn		Trunk handle.
+ * @param[in] el		Event list which will be used for I/O and timer events.
+ * @param[in] conn_conf		Configuration of the connection.
+ * @param[in] log_prefix	What to prefix log messages with.
+ * @param[in] uctx		User context passed to trunk_alloc.
+ */
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static connection_t *ldap_trunk_connection_alloc(trunk_connection_t *tconn, fr_event_list_t *el,
+						    connection_conf_t const *conn_conf,
+						    char const *log_prefix, void *uctx)
+{
+	fr_ldap_thread_trunk_t	*thread_trunk = talloc_get_type_abort(uctx, fr_ldap_thread_trunk_t);
+	connection_t		*conn;
+
+	conn = connection_alloc(tconn, el,
+				&(connection_funcs_t){
+					.init = fr_ldap_trunk_connection_init,
+					.close = fr_ldap_connection_close
+				},
+				conn_conf, log_prefix, thread_trunk);
+	if (!conn) {
+		PERROR("Failed allocating state handler for new LDAP trunk connection");
+		return NULL;
+	}
 
 	return conn;
 }
 
-int fr_ldap_connection_timeout_set(fr_ldap_connection_t const *c, fr_time_delta_t timeout)
+#define POPULATE_LDAP_CONTROLS(_dest, _src) do { \
+	int i; \
+	for (i = 0; (i < LDAP_MAX_CONTROLS) && (_src[i].control); i++) { \
+		_dest[i] = _src[i].control; \
+	} \
+	_dest[i] = NULL; \
+} while (0)
+
+/** Take LDAP pending queries from the queue and send them.
+ *
+ * @param[in] el	Event list for timers.
+ * @param[in] tconn	Trunk handle.
+ * @param[in] conn	on which to send the queries
+ * @param[in] uctx	User context passed to trunk_alloc
+ */
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void ldap_trunk_request_mux(UNUSED fr_event_list_t *el, trunk_connection_t *tconn,
+				   connection_t *conn, UNUSED void *uctx)
 {
-#ifdef LDAP_OPT_NETWORK_TIMEOUT
-	int ldap_errno;
+	fr_ldap_connection_t	*ldap_conn = talloc_get_type_abort(conn->h, fr_ldap_connection_t);
+	trunk_request_t	*treq;
 
-	/*
-	 *	A value of zero results in an handle configuration failure.
-	 *
-	 *	When most people specify zero they mean infinite.
-	 *
-	 *	libldap requires tv_sec to be -1 to mean that.
-	 */
-	do_ldap_option(LDAP_OPT_NETWORK_TIMEOUT, "net_timeout",
-		       (timeout ? &fr_time_delta_to_timeval(timeout) :
-				  &(struct timeval) { .tv_sec = -1, .tv_usec = 0 }));
-#endif
+	LDAPURLDesc		*referral_url = NULL;
 
-	return 0;
+	fr_ldap_query_t		*query = NULL;
+	fr_ldap_rcode_t		status;
 
-error:
-	return -1;
+	while (trunk_connection_pop_request(&treq, tconn) == 0) {
+		LDAPControl	*our_serverctrls[LDAP_MAX_CONTROLS + 1];
+		LDAPControl	*our_clientctrls[LDAP_MAX_CONTROLS + 1];
+
+		if (!treq) break;
+
+		query = talloc_get_type_abort(treq->preq, fr_ldap_query_t);
+
+		switch (query->type) {
+		case LDAP_REQUEST_SEARCH:
+			/*
+			 *	This query is a LDAP search
+			 */
+			if (query->referral) referral_url = query->referral->referral_url;
+
+			POPULATE_LDAP_CONTROLS(our_serverctrls, query->serverctrls);
+			POPULATE_LDAP_CONTROLS(our_clientctrls, query->clientctrls);
+
+			/*
+			 *	If we are chasing a referral, referral_url will be populated and may
+			 *	have a base dn or scope to override the original query
+			 */
+			status = fr_ldap_search_async(&query->msgid, query->treq->request, ldap_conn,
+						      (referral_url && referral_url->lud_dn) ?
+						      	referral_url->lud_dn : query->dn,
+						      (referral_url && referral_url->lud_scope) ?
+					      		referral_url->lud_scope : query->search.scope,
+					      	      query->search.filter, query->search.attrs,
+						      our_serverctrls, our_clientctrls);
+			break;
+
+		case LDAP_REQUEST_MODIFY:
+			/*
+			 *	Send a request to modify an object
+			 */
+			POPULATE_LDAP_CONTROLS(our_serverctrls, query->serverctrls);
+			POPULATE_LDAP_CONTROLS(our_clientctrls, query->clientctrls);
+
+			status = fr_ldap_modify_async(&query->msgid, query->treq->request,
+						      ldap_conn, query->dn, query->mods,
+						      our_serverctrls, our_clientctrls);
+			break;
+
+		case LDAP_REQUEST_DELETE:
+			/*
+			 *	Send a request to delete an object
+			 */
+			POPULATE_LDAP_CONTROLS(our_serverctrls, query->serverctrls);
+			POPULATE_LDAP_CONTROLS(our_clientctrls, query->clientctrls);
+
+			status = fr_ldap_delete_async(&query->msgid, query->treq->request,
+						      ldap_conn, query->dn,
+						      our_serverctrls, our_clientctrls);
+			break;
+
+		case LDAP_REQUEST_EXTENDED:
+			/*
+			 *	This query is an LDAP extended operation.
+			 */
+			status = fr_ldap_extended_async(&query->msgid, query->treq->request, ldap_conn,
+							query->extended.reqoid, query->extended.reqdata);
+			break;
+
+		default:
+			status = LDAP_PROC_ERROR;
+			ERROR("Invalid LDAP query for trunk connection");
+		error:
+			trunk_request_signal_fail(query->treq);
+			if (status == LDAP_PROC_BAD_CONN) trunk_connection_signal_reconnect(tconn, CONNECTION_FAILED);
+			continue;
+
+		}
+
+		if (status != LDAP_PROC_SUCCESS) goto error;
+
+		/*
+		 *	If the query has previously been associated with a different
+		 *	connection, remove that reference.  Typically when following references.
+		 */
+		if (query->ldap_conn) fr_dlist_remove(&query->ldap_conn->refs, query);
+
+		/*
+		 *	Record which connection was used for this query
+		 *	- results processing often needs access to an LDAP handle
+		 */
+		query->ldap_conn = ldap_conn;
+
+		/*
+		 *	Add the query to the tree of pending queries for this trunk
+		 */
+		fr_rb_insert(query->ldap_conn->queries, query);
+
+		trunk_request_signal_sent(treq);
+	}
+
 }
 
-int fr_ldap_connection_timeout_reset(fr_ldap_connection_t const *c)
+/** Read LDAP responses
+ *
+ * Responses from the LDAP server will cause the fd to become readable and trigger this
+ * callback.  Most LDAP search responses have multiple messages in their response - we
+ * only gather those which are complete before either following a referral or passing
+ * the head of the resulting chain of messages back.
+ *
+ * @param[in] el	To insert timers into.
+ * @param[in] tconn	Trunk connection associated with these results.
+ * @param[in] conn	Connection handle for these results.
+ * @param[in] uctx	Thread specific trunk structure - contains tree of pending queries.
+ */
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void ldap_trunk_request_demux(fr_event_list_t *el, trunk_connection_t *tconn, connection_t *conn, void *uctx)
 {
+	fr_ldap_connection_t	*ldap_conn = talloc_get_type_abort(conn->h, fr_ldap_connection_t);
+	fr_ldap_thread_trunk_t	*ttrunk = talloc_get_type_abort(uctx, fr_ldap_thread_trunk_t);
 
-#ifdef LDAP_OPT_NETWORK_TIMEOUT
-	int ldap_errno;
+	int 			ret = 0, msgtype;
+	struct timeval		poll = { 0, 10 };
+	LDAPMessage		*result = NULL;
+	fr_ldap_rcode_t		rcode;
+	fr_ldap_query_t		find = { .msgid = -1 }, *query = NULL;
+	request_t		*request;
+	bool			really_no_result = false;
+	trunk_request_t		*treq;
 
 	/*
-	 *	A value of zero results in an handle configuration failure.
-	 *
-	 *	When most people specify zero they mean infinite.
-	 *
-	 *	libldap requires tv_sec to be -1 to mean that.
+	 *  Reset the idle timeout event
 	 */
-	do_ldap_option(LDAP_OPT_NETWORK_TIMEOUT, "net_timeout",
-		       (c->config->net_timeout ? &fr_time_delta_to_timeval(c->config->net_timeout) :
-						 &(struct timeval) { .tv_sec = -1, .tv_usec = 0 }));
-#endif
+	(void) fr_timer_in(ttrunk, el->tl, &ttrunk->ev,
+			   ttrunk->t->config->idle_timeout, false, _ldap_trunk_idle_timeout, ttrunk);
+
+	do {
+		/*
+		 *	Look for any results for which we have the complete result message
+		 *	ldap_result will return a pointer to a chain of messages.
+		 *
+		 *	The first time ldap_result is called when there's pending network
+		 *	data, it may read the data, but not return any results.
+		 *
+		 *	In order to fix the spurious debugging messages and overhead,
+		 *	if this is the first iteration through the loop and ldap_result
+		 *	returns no result (0), we call it again.
+		 */
+		ret = ldap_result(ldap_conn->handle, LDAP_RES_ANY, LDAP_MSG_ALL, &poll, &result);
+		switch (ret) {
+		case 0:
+			if (really_no_result) return;
+			really_no_result = true;
+			continue;
+
+		case -1:
+			rcode = fr_ldap_error_check(NULL, ldap_conn, NULL, NULL);
+			if (rcode == LDAP_PROC_BAD_CONN) {
+				ERROR("Bad LDAP connection");
+				connection_signal_reconnect(tconn->conn, CONNECTION_FAILED);
+			}
+			return;
+
+		default:
+			/*
+			 *	We only retry ldap_result the first time through the loop.
+			 */
+			really_no_result = true;
+			break;
+		}
+
+		find.msgid = ldap_msgid(result);
+		fr_rb_find((void **)&query, ldap_conn->queries, &find);
+
+		if (!query) {
+			WARN("Ignoring msgid %i - doesn't match any outstanding queries (it may have been cancelled)",
+			      find.msgid);
+			ldap_msgfree(result);
+			continue;
+		}
+
+		/*
+		 *	Remove the query from the tree of outstanding queries
+		 */
+		fr_rb_remove(NULL, ldap_conn->queries, query);
+
+		/*
+		 *	Add the query to the list of queries referencing this connection.
+		 *	Prevents the connection from being freed until the query has finished using it.
+		 */
+		fr_dlist_insert_tail(&ldap_conn->refs, query);
+
+		/*
+		 *	This really shouldn't happen - as we only retrieve complete sets of results -
+		 *	but as the query data structure will last until its results are fully handled
+		 *	better to have this safety check here.
+		 */
+		if (query->ret != LDAP_RESULT_PENDING) {
+			WARN("Received results for msgid %i which has already been handled - ignoring", find.msgid);
+			ldap_msgfree(result);
+			continue;
+		}
+
+		msgtype = ldap_msgtype(result);
+
+		/*
+		 *	Request to reference in debug output
+		 */
+		request = query->treq->request;
+
+		ROPTIONAL(RDEBUG2, DEBUG2, "Got %s response for message %d",
+			  ((unsigned int)msgtype < NUM_ELEMENTS(ldap_msg_types) && ldap_msg_types[msgtype]) ?
+			  ldap_msg_types[msgtype] : "unknown", query->msgid);
+		rcode = fr_ldap_error_check(NULL, ldap_conn, result, query->dn);
+
+		switch (rcode) {
+		case LDAP_PROC_SUCCESS:
+			switch (query->type) {
+			case LDAP_REQUEST_SEARCH:
+				query->ret = (ldap_count_entries(ldap_conn->handle, result) == 0) ?
+						LDAP_RESULT_NO_RESULT : LDAP_RESULT_SUCCESS;
+				break;
+
+			default:
+				query->ret = LDAP_RESULT_SUCCESS;
+				break;
+			}
+			break;
+
+		case LDAP_PROC_REFERRAL:
+			if (!ttrunk->t->config->chase_referrals) {
+				ROPTIONAL(REDEBUG, ERROR,
+					  "LDAP referral received but 'chase_referrals' is set to 'no'");
+				query->ret = LDAP_RESULT_EXCESS_REFERRALS;
+				break;
+			}
+
+			if (query->referral_depth >= ttrunk->t->config->referral_depth) {
+				ROPTIONAL(REDEBUG, ERROR, "Maximum LDAP referral depth (%d) exceeded",
+					  ttrunk->t->config->referral_depth);
+				query->ret = LDAP_RESULT_EXCESS_REFERRALS;
+				break;
+			}
+
+			/*
+			 *	If we've come here as the result of an existing referral
+			 *	clear the previous list of URLs before getting the next list.
+			 */
+			if (query->referral_urls) ldap_memvfree((void **)query->referral_urls);
+
+			ldap_get_option(ldap_conn->handle, LDAP_OPT_REFERRAL_URLS, &query->referral_urls);
+			if (!(query->referral_urls) || (!(query->referral_urls[0]))) {
+				ROPTIONAL(REDEBUG, ERROR, "LDAP referral missing referral URL");
+				query->ret = LDAP_RESULT_MISSING_REFERRAL;
+				break;
+			}
+
+			query->referral_depth ++;
+
+			if (fr_ldap_referral_follow(ttrunk->t, request, query) == 0) {
+			next_follow:
+				ldap_msgfree(result);
+				continue;
+			}
+
+			ROPTIONAL(REDEBUG, ERROR, "Unable to follow any LDAP referral URLs");
+			query->ret = LDAP_RESULT_REFERRAL_FAIL;
+			break;
+
+		case LDAP_PROC_BAD_DN:
+			ROPTIONAL(RDEBUG2, DEBUG2, "DN %s does not exist", query->dn);
+			query->ret = LDAP_RESULT_BAD_DN;
+			break;
+
+		default:
+			ROPTIONAL(RPERROR, PERROR, "LDAP server returned an error");
+
+			if (query->referral_depth > 0) {
+				/*
+				 *	We're processing a referral - see if there are any more to try
+				 */
+				fr_dlist_talloc_free_item(&query->referrals, query->referral);
+				query->referral = NULL;
+
+				if ((fr_dlist_num_elements(&query->referrals) > 0) &&
+				    (fr_ldap_referral_next(ttrunk->t, request, query) == 0)) goto next_follow;
+			}
+
+			query->ret = LDAP_RESULT_REFERRAL_FAIL;
+			break;
+		}
+
+		query->result = result;
+
+		/*
+		 *	If we have a specific parser to handle the result, call it
+		 */
+		if (query->parser && (rcode == LDAP_PROC_SUCCESS)) query->parser(ldap_conn->handle, query,
+										 result, query->treq->rctx);
+
+		/*
+		 *	Set the request as runnable
+		 */
+		if (request) unlang_interpret_mark_runnable(request);
+
+		/*
+		 *	If referral following failed, there is no active trunk request.
+		 */
+		if (!query->treq) continue;
+
+		/*
+		 *	If the query is parented off the treq then it will be freed when
+		 *	the request is completed.  If it is parented by something else then it will not.
+		 */
+		treq = query->treq;
+		query->treq = NULL;
+		trunk_request_signal_complete(treq);
+	} while (1);
+}
+
+static int _thread_ldap_trunk_free(fr_ldap_thread_trunk_t *ttrunk)
+{
+	if (ttrunk->t && fr_rb_node_inline_in_tree(&ttrunk->node)) fr_rb_remove(NULL, ttrunk->t->trunks, ttrunk);
 
 	return 0;
+}
 
-error:
-	return -1;
+/** Find a thread specific LDAP connection for a specific URI / bind DN
+ *
+ * If no existing connection exists for that combination then create a new one
+ *
+ * @param[in] thread		to which the connection belongs
+ * @param[in] uri		of the host to find / create a connection to
+ * @param[in] bind_dn		to make the connection as
+ * @param[in] bind_password	for making connection
+ * @param[in] request		currently being processed (only for debug messages)
+ * @param[in] config		LDAP config of the module requesting the connection.
+ * @return
+ *	- an existing or new connection matching the URI and bind DN
+ *	- NULL on failure
+ */
+fr_ldap_thread_trunk_t *fr_thread_ldap_trunk_get(fr_ldap_thread_t *thread, char const *uri,
+						 char const *bind_dn, char const *bind_password,
+						 request_t *request, fr_ldap_config_t const *config)
+{
+	fr_ldap_thread_trunk_t *found, find = {.uri = uri, .bind_dn = bind_dn};
+	fr_ldap_thread_trunk_t *new;
+	trunk_conf_t		trunk_conf;
+
+	ROPTIONAL(RDEBUG2, DEBUG2, "Looking for LDAP connection to \"%s\" bound as \"%s\"", uri,
+		 bind_dn ? bind_dn : "(anonymous)");
+	fr_rb_find((void **)&found, thread->trunks, &find);
+
+	if (found) return found;
+
+	/*
+	 *	No existing connection matching the requirement - create a new one
+	 */
+	ROPTIONAL(RDEBUG2, DEBUG2, "No existing connection new - creating new one");
+	MEM(new = talloc_zero(thread, fr_ldap_thread_trunk_t));
+	talloc_set_destructor(new, _thread_ldap_trunk_free);
+
+	/*
+	 *	Build config for this connection - start with module settings and
+	 *	override server and bind details
+	 */
+	memcpy(&new->config, config, sizeof(fr_ldap_config_t));
+	new->config.server = talloc_strdup(new, uri);
+	new->config.admin_identity = talloc_strdup(new, bind_dn);
+	new->config.admin_password = talloc_strdup(new, bind_password);
+
+	new->uri = new->config.server;
+	new->bind_dn = new->config.admin_identity;
+
+	/*
+	 *	Allocated before the trunk so the pointer is valid when
+	 *	connection init callbacks run, populated by the first
+	 *	connection's discovery state before it starts serving
+	 *	requests.
+	 */
+	new->directory = fr_ldap_directory_alloc(new);
+
+	/*
+	 *	Referral chasing creates trunks and waits for one to
+	 *	transition to active before sending the query, so a trunk
+	 *	must always open a connection, even with no requests
+	 *	enqueued.
+	 */
+	trunk_conf = *thread->trunk_conf;
+	if (trunk_conf.start == 0) trunk_conf.start = 1;
+
+	new->trunk = trunk_alloc(new, thread->el,
+				 &(trunk_io_funcs_t){
+					.connection_alloc = ldap_trunk_connection_alloc,
+					.connection_notify = ldap_trunk_connection_notify,
+					.request_mux = ldap_trunk_request_mux,
+					.request_demux = ldap_trunk_request_demux,
+					.request_cancel = ldap_request_cancel,
+					.request_cancel_mux = ldap_request_cancel_mux,
+					.request_fail = ldap_request_fail,
+				 },
+				 &trunk_conf,
+				 "rlm_ldap", new, false, thread->trigger_args);
+
+	if (!new->trunk) {
+	error:
+		ROPTIONAL(REDEBUG, ERROR, "Unable to create LDAP connection");
+		talloc_free(new);
+		return NULL;
+	}
+
+	new->t = thread;
+
+	/*
+	 *  Insert event to close trunk if it becomes idle
+	 */
+	if (!fr_cond_assert_msg(fr_timer_in(new, thread->el->tl, &new->ev, thread->config->idle_timeout,
+					    false, _ldap_trunk_idle_timeout, new) == 0, "cannot insert trunk idle event")) goto error;
+
+	fr_rb_insert(thread->trunks, new);
+
+	return new;
+}
+
+/** Lookup the state of a thread specific LDAP connection trunk for a specific URI / bind DN
+ *
+ * @param[in] thread		to which the connection belongs
+ * @param[in] uri		of the host to find / create a connection to
+ * @param[in] bind_dn		to make the connection as
+ * @return
+ *	- State of a trunk matching the URI and bind DN
+ *	- TRUNK_STATE_MAX if no matching trunk
+ */
+trunk_state_t fr_thread_ldap_trunk_state(fr_ldap_thread_t *thread, char const *uri, char const *bind_dn)
+{
+	fr_ldap_thread_trunk_t	*found, find = {.uri = uri, .bind_dn = bind_dn};
+
+	fr_rb_find((void **)&found, thread->trunks, &find);
+
+	return (found) ? found->trunk->state : TRUNK_STATE_MAX;
+}
+
+/** Take pending LDAP bind auths from the queue and send them.
+ *
+ * @param[in] el	Event list for timers.
+ * @param[in] tconn	Trunk handle.
+ * @param[in] conn	on which to send the queries
+ * @param[in] uctx	User context passed to trunk_alloc
+ */
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void ldap_trunk_bind_auth_mux(UNUSED fr_event_list_t *el, trunk_connection_t *tconn,
+				   connection_t *conn, void *uctx)
+{
+	fr_ldap_connection_t	*ldap_conn = talloc_get_type_abort(conn->h, fr_ldap_connection_t);
+	fr_ldap_thread_trunk_t	*ttrunk = talloc_get_type_abort(uctx, fr_ldap_thread_trunk_t);
+	fr_ldap_thread_t	*thread = ttrunk->t;
+	trunk_request_t	*treq;
+
+	fr_ldap_bind_auth_ctx_t	*bind = NULL;
+	int			ret = 0;
+	struct berval		cred;
+	request_t		*request;
+
+	if (trunk_connection_pop_request(&treq, tconn) != 0) return;
+
+	/* Pacify clang scan */
+	if (!treq) return;
+
+	bind = talloc_get_type_abort(treq->preq, fr_ldap_bind_auth_ctx_t);
+	request = bind->request;
+
+	switch (bind->type) {
+	case LDAP_BIND_SIMPLE:
+	{
+		fr_ldap_bind_ctx_t	*bind_ctx = bind->bind_ctx;
+
+		RDEBUG2("Starting bind auth operation as %s", bind_ctx->bind_dn);
+
+		if (bind_ctx->password) {
+			memcpy(&cred.bv_val, &bind_ctx->password, sizeof(cred.bv_val));
+			cred.bv_len = talloc_strlen(bind_ctx->password);
+		} else {
+			cred.bv_val = NULL;
+			cred.bv_len = 0;
+		}
+
+		ret = ldap_sasl_bind(ldap_conn->handle, bind_ctx->bind_dn, LDAP_SASL_SIMPLE,
+			     	     &cred, NULL, NULL, &bind->msgid);
+
+		switch (ret) {
+		case LDAP_SUCCESS:
+			fr_rb_insert(thread->binds, bind);
+			RDEBUG3("Bind auth sent as LDAP msgid %d", bind->msgid);
+			break;
+
+		default:
+			bind->ret = LDAP_PROC_ERROR;
+			unlang_interpret_mark_runnable(treq->request);
+			RERROR("Failed to send bind auth");
+			break;
+		}
+	}
+		break;
+
+#ifdef WITH_SASL
+	case LDAP_BIND_SASL:
+	{
+		fr_ldap_sasl_ctx_t	*sasl_ctx = bind->sasl_ctx;
+
+		RDEBUG2("%s SASL bind auth operation as %s", sasl_ctx->rmech ? "Continuing" : "Starting",
+			sasl_ctx->identity);
+
+		ret = fr_ldap_sasl_bind_auth_send(sasl_ctx, &bind->msgid, ldap_conn);
+
+		switch (ret) {
+		case LDAP_SASL_BIND_IN_PROGRESS:
+			/*
+			 *	Add the bind to the list of pending binds.
+			 */
+			fr_rb_insert(thread->binds, bind);
+			RDEBUG3("SASL bind auth sent as LDAP msgid %d", bind->msgid);
+			break;
+
+		case LDAP_SUCCESS:
+			bind->ret = LDAP_PROC_SUCCESS;
+			unlang_interpret_mark_runnable(treq->request);
+			break;
+
+		default:
+			bind->ret = LDAP_PROC_ERROR;
+			unlang_interpret_mark_runnable(treq->request);
+			RERROR("Failed to send SASL bind auth");
+			break;
+		}
+	}
+	break;
+#endif
+	}
+	/*
+	 *	The request is marked as sent, to remove from the pending list.
+	 *	This is regardless of whether the sending was successful or not as
+	 *	the different states are handled by the resume function which then
+	 *	marks the request as complete triggering the tidy up.
+	 */
+	trunk_request_signal_sent(treq);
+}
+
+/** Read LDAP bind auth responses
+ *
+ * @param[in] el	To insert timers into.
+ * @param[in] tconn	Trunk connection associated with these results.
+ * @param[in] conn	Connection handle for these results.
+ * @param[in] uctx	Thread specific trunk structure - contains tree of pending queries.
+ */
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void ldap_trunk_bind_auth_demux(UNUSED fr_event_list_t *el, UNUSED trunk_connection_t *tconn,
+				       connection_t *conn, void *uctx)
+{
+	fr_ldap_connection_t	*ldap_conn = talloc_get_type_abort(conn->h, fr_ldap_connection_t);
+	fr_ldap_thread_trunk_t	*ttrunk = talloc_get_type_abort(uctx, fr_ldap_thread_trunk_t);
+	fr_ldap_thread_t	*thread = ttrunk->t;
+	fr_ldap_bind_auth_ctx_t	find = { .msgid = -1 }, *bind = NULL;
+
+	int 			ret = 0;
+	LDAPMessage		*result = NULL;
+	request_t		*request;
+	bool			really_no_result = false;
+
+	do {
+		/*
+		 *	The first time ldap_result is called when there's pending network
+		 *	data, it may read the data, but actually return a timeout.
+		 *
+		 *	In order to fix the spurious debugging messages and overhead,
+		 *	if this is the first iteration through the loop and fr_ldap_result
+		 *	returns a timeout, we call it again.
+		 */
+		ret = fr_ldap_result(&result, NULL, ldap_conn, LDAP_RES_ANY, LDAP_MSG_ALL, NULL, fr_time_delta_wrap(10));
+		if (ret == LDAP_PROC_TIMEOUT) {
+			if (really_no_result) return;
+			really_no_result = true;
+			continue;
+		}
+
+		if (!result) return;
+
+		really_no_result = true;
+		find.msgid = ldap_msgid(result);
+		fr_rb_find((void **)&bind, thread->binds, &find);
+
+		if (!bind) {
+			WARN("Ignoring bind result msgid %i - doesn't match any outstanding binds", find.msgid);
+			ldap_msgfree(result);
+			result = NULL;
+			continue;
+		}
+	} while (!bind);
+
+	/*
+	 *	There will only ever be one bind in flight at a time on a given
+	 *	connection - so having got a result, no need to loop.
+	 */
+
+	fr_rb_remove(NULL, thread->binds, bind);
+	request = bind->request;
+	bind->ret = ret;
+
+	switch (ret) {
+	/*
+	 *	Accept or reject will be SUCCESS, NOT_PERMITTED or REJECT
+	 */
+	case LDAP_PROC_NOT_PERMITTED:
+	case LDAP_PROC_REJECT:
+	case LDAP_PROC_BAD_DN:
+	case LDAP_PROC_NO_RESULT:
+		break;
+
+	case LDAP_PROC_SUCCESS:
+		if (bind->type == LDAP_BIND_SIMPLE) break;
+
+		/*
+		 *	With SASL binds, we will be here after ldap_sasl_interactive_bind
+		 *	returned LDAP_SASL_BIND_IN_PROGRESS.  That always requires a further
+		 *	call of ldap_sasl_interactive_bind to get the final result.
+		 */
+		bind->ret = LDAP_PROC_CONTINUE;
+		FALL_THROUGH;
+
+	case LDAP_PROC_CONTINUE:
+	{
+		fr_ldap_sasl_ctx_t	*sasl_ctx = bind->sasl_ctx;
+		struct berval		*srv_cred;
+
+		/*
+		 *	Free any previous result and track the new one.
+		 */
+		if (sasl_ctx->result) ldap_msgfree(sasl_ctx->result);
+		sasl_ctx->result = result;
+		result = NULL;
+
+		ret = ldap_parse_sasl_bind_result(ldap_conn->handle, sasl_ctx->result, &srv_cred, 0);
+		if (ret != LDAP_SUCCESS) {
+			RERROR("SASL decode failed (bind failed): %s", ldap_err2string(ret));
+			break;
+		}
+
+		if (srv_cred) {
+			RDEBUG3("SASL response  : %pV",
+				fr_box_strvalue_len(srv_cred->bv_val, srv_cred->bv_len));
+			ber_bvfree(srv_cred);
+		}
+
+		if (sasl_ctx->rmech) RDEBUG3("Continuing SASL mech %s...", sasl_ctx->rmech);
+	}
+		break;
+
+	default:
+		break;
+	}
+
+	ldap_msgfree(result);
+	unlang_interpret_mark_runnable(request);
+}
+
+/** Callback to cancel LDAP bind auth
+ *
+ * Inform the remote LDAP server that we no longer want responses to specific bind.
+ *
+ * @param[in] el	For timer management.
+ * @param[in] tconn	The trunk connection handle
+ * @param[in] conn	The specific connection binds will be cancelled on
+ * @param[in] uctx	Context provided to trunk_alloc
+ */
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void ldap_bind_auth_cancel_mux(UNUSED fr_event_list_t *el, trunk_connection_t *tconn,
+				    connection_t *conn, UNUSED void *uctx)
+{
+	trunk_request_t	*treq;
+	fr_ldap_connection_t	*ldap_conn = talloc_get_type_abort(conn->h, fr_ldap_connection_t);
+	fr_ldap_bind_auth_ctx_t	*bind;
+
+	while ((trunk_connection_pop_cancellation(&treq, tconn)) == 0) {
+		bind = talloc_get_type_abort(treq->preq, fr_ldap_bind_auth_ctx_t);
+#ifdef WITH_SASL
+		if (bind->type == LDAP_BIND_SASL) {
+			/*
+			 *	With SASL binds, abandoning the bind part way through
+			 *	seems to leave the connection in an unpredictable state
+			 *	so safer to restart.
+			 */
+			trunk_connection_signal_reconnect(tconn, CONNECTION_FAILED);
+		} else {
+#endif
+			ldap_abandon_ext(ldap_conn->handle, bind->msgid, NULL, NULL);
+#ifdef WITH_SASL
+		}
+#endif
+		trunk_request_signal_cancel_complete(treq);
+	}
+}
+
+/** Callback to tidy up when a bind auth trunk request fails
+ *
+ */
+static void ldap_trunk_bind_auth_fail(request_t *request, void *preq, UNUSED void *rctx,
+				UNUSED trunk_request_state_t state, UNUSED void *uctx)
+{
+	fr_ldap_bind_auth_ctx_t	*bind = talloc_get_type_abort(preq, fr_ldap_bind_auth_ctx_t);
+
+	/*
+	 *	Remove the connection from the bind tree before freeing it.
+	 */
+	if (fr_rb_node_inline_in_tree(&bind->node)) fr_rb_remove(NULL, bind->thread->binds, bind);
+
+	/*
+	 *	Failed trunk requests get freed - so remove association in bind structure,
+	 *	and change talloc parentage so resume function still has something to work with.
+	 */
+	bind->treq = NULL;
+	bind->ret = LDAP_PROC_ERROR;
+	talloc_steal(NULL, bind);
+
+	/*
+	 *	Ensure request is runnable.
+	 */
+	if (request) unlang_interpret_mark_runnable(request);
+}
+
+/** Find the thread specific trunk to use for LDAP bind auths
+ *
+ * If there is no current trunk then a new one is created.
+ *
+ * @param[in] thread	to which the connection belongs
+ * @return
+ *	- an existing or new trunk.
+ *	- NULL on failure
+ */
+fr_ldap_thread_trunk_t *fr_thread_ldap_bind_trunk_get(fr_ldap_thread_t *thread)
+{
+	fr_ldap_thread_trunk_t	*ttrunk;
+
+	if (thread->bind_trunk) return (thread->bind_trunk);
+
+	MEM(ttrunk = talloc_zero(thread, fr_ldap_thread_trunk_t));
+	memcpy(&ttrunk->config, thread->config, sizeof(fr_ldap_config_t));
+
+	ttrunk->uri = ttrunk->config.server;
+	ttrunk->bind_dn = ttrunk->config.admin_identity;
+
+	ttrunk->trunk = trunk_alloc(ttrunk, thread->el,
+				       &(trunk_io_funcs_t){
+					      .connection_alloc = ldap_trunk_connection_alloc,
+					      .connection_notify = ldap_trunk_connection_notify,
+					      .request_mux = ldap_trunk_bind_auth_mux,
+					      .request_demux = ldap_trunk_bind_auth_demux,
+					      .request_cancel_mux = ldap_bind_auth_cancel_mux,
+					      .request_fail = ldap_trunk_bind_auth_fail,
+					},
+				       thread->bind_trunk_conf,
+				       "rlm_ldap bind auth", ttrunk, false, thread->bind_trigger_args);
+
+	if (!ttrunk->trunk) {
+		ERROR("Unable to create LDAP connection");
+		talloc_free(ttrunk);
+		return NULL;
+	}
+
+	ttrunk->t = thread;
+	thread->bind_trunk = ttrunk;
+
+	return ttrunk;
 }

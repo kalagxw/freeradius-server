@@ -29,20 +29,21 @@ extern "C" {
 #endif
 
 #include <freeradius-devel/server/cf_util.h>
-#include <freeradius-devel/server/components.h>
 #include <freeradius-devel/server/tmpl.h>
+#include <freeradius-devel/server/virtual_servers.h>
 #include <freeradius-devel/util/retry.h>
+#include <freeradius-devel/unlang/mod_action.h>
 
-typedef struct {
-	int			actions[RLM_MODULE_NUMCODES];
-	fr_retry_config_t	retry;
-} unlang_actions_t;
+void		unlang_compile_init(TALLOC_CTX *ctx);
 
-int		unlang_compile(CONF_SECTION *cs, rlm_components_t component, tmpl_rules_t const *rules, void **instruction);
+int 		unlang_compile(virtual_server_t const *vs,
+			       CONF_SECTION *cs, unlang_mod_actions_t const *actions, tmpl_rules_t const *rules, void **instruction);
 
 bool		unlang_compile_is_keyword(const char *name);
 
-bool		unlang_compile_actions(unlang_actions_t *actions, CONF_SECTION *parent, bool module_retry);
+bool		unlang_compile_actions(unlang_mod_actions_t *actions, CONF_SECTION *parent, bool module_retry);
+
+int		unlang_compile_virtual_module(CONF_SECTION *cs, fr_dict_t const *dict) CC_HINT(nonnull);
 
 #ifdef __cplusplus
 }

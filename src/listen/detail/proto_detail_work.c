@@ -23,14 +23,11 @@
  * @copyright 2017 Alan DeKok (aland@deployingradius.com)
  */
 #include <netdb.h>
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/protocol.h>
-#include <freeradius-devel/io/base.h>
+#include <freeradius-devel/server/pair.h>
+#include <freeradius-devel/server/main_loop.h>
 #include <freeradius-devel/io/application.h>
 #include <freeradius-devel/io/listen.h>
-#include <freeradius-devel/util/dlist.h>
-#include <freeradius-devel/util/time.h>
-#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/syserror.h>
 #include "proto_detail.h"
 
 #include <fcntl.h>
@@ -62,35 +59,35 @@ typedef struct {
 	size_t				packet_len;		//!< for retransmissions
 
 	fr_retry_t			retry;			//!< our retry timers
-	fr_event_timer_t const		*ev;			//!< retransmission timer
+	fr_timer_t			*ev;			//!< retransmission timer
 	fr_dlist_t			entry;			//!< for the retransmission list
 } fr_detail_entry_t;
 
-static CONF_PARSER limit_config[] = {
-	{ FR_CONF_OFFSET("initial_rtx_time", FR_TYPE_TIME_DELTA, proto_detail_work_t, retry_config.irt), .dflt = STRINGIFY(2) },
-	{ FR_CONF_OFFSET("max_rtx_time", FR_TYPE_TIME_DELTA, proto_detail_work_t, retry_config.mrt), .dflt = STRINGIFY(16) },
+static conf_parser_t limit_config[] = {
+	{ FR_CONF_OFFSET("initial_rtx_time", proto_detail_work_t, retry_config.irt), .dflt = STRINGIFY(2) },
+	{ FR_CONF_OFFSET("max_rtx_time", proto_detail_work_t, retry_config.mrt), .dflt = STRINGIFY(16) },
 
 	/*
 	 *	Retransmit indefinitely, as v2 and v3 did.
 	 */
-	{ FR_CONF_OFFSET("max_rtx_count", FR_TYPE_UINT32, proto_detail_work_t, retry_config.mrc), .dflt = STRINGIFY(0) },
+	{ FR_CONF_OFFSET("max_rtx_count", proto_detail_work_t, retry_config.mrc), .dflt = STRINGIFY(0) },
 	/*
 	 *	...again same as v2 and v3.
 	 */
-	{ FR_CONF_OFFSET("max_rtx_duration", FR_TYPE_TIME_DELTA, proto_detail_work_t, retry_config.mrd), .dflt = STRINGIFY(0) },
-	{ FR_CONF_OFFSET("max_outstanding", FR_TYPE_UINT16, proto_detail_work_t, max_outstanding), .dflt = STRINGIFY(1) },
+	{ FR_CONF_OFFSET("max_rtx_duration", proto_detail_work_t, retry_config.mrd), .dflt = STRINGIFY(0) },
+	{ FR_CONF_OFFSET("max_outstanding", proto_detail_work_t, max_outstanding), .dflt = STRINGIFY(1) },
 	CONF_PARSER_TERMINATOR
 };
 
 
-static const CONF_PARSER file_listen_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_STRING | FR_TYPE_REQUIRED, proto_detail_work_t, filename_work ) },
+static const conf_parser_t file_listen_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("filename", CONF_FLAG_REQUIRED, proto_detail_work_t, filename_work ) },
 
-	{ FR_CONF_OFFSET("track", FR_TYPE_BOOL, proto_detail_work_t, track_progress ) },
+	{ FR_CONF_OFFSET("track", proto_detail_work_t, track_progress ) },
 
-	{ FR_CONF_OFFSET("retransmit", FR_TYPE_BOOL, proto_detail_work_t, retransmit ), .dflt = "yes" },
+	{ FR_CONF_OFFSET("retransmit", proto_detail_work_t, retransmit ), .dflt = "yes" },
 
-	{ FR_CONF_POINTER("limit", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) limit_config },
+	{ FR_CONF_POINTER("limit", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) limit_config },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -100,7 +97,7 @@ extern fr_dict_autoload_t proto_detail_work_dict[];
 fr_dict_autoload_t proto_detail_work_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_packet_transmit_counter;
@@ -108,7 +105,7 @@ static fr_dict_attr_t const *attr_packet_transmit_counter;
 extern fr_dict_attr_autoload_t proto_detail_work_dict_attr[];
 fr_dict_attr_autoload_t proto_detail_work_dict_attr[] = {
 	{ .out = &attr_packet_transmit_counter, .name = "Packet-Transmit-Counter", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 /*
@@ -118,7 +115,7 @@ static int mod_decode(void const *instance, request_t *request, UNUSED uint8_t *
 {
 
 	proto_detail_work_t const	*inst = talloc_get_type_abort_const(instance, proto_detail_work_t);
-	fr_detail_entry_t const		*track = request->async->packet_ctx;
+	fr_detail_entry_t const		*track = talloc_get_type_abort_const(request->async->packet_ctx, fr_detail_entry_t);
 	fr_pair_t *vp;
 
 	request->client = inst->client;
@@ -143,9 +140,11 @@ static fr_event_update_t resume_read[] = {
 	{ 0 }
 };
 
-static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer, size_t buffer_len, size_t *leftover, uint32_t *priority, UNUSED bool *is_dup)
+static ssize_t mod_read(fr_listen_instance_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer,
+			size_t buffer_len, size_t *leftover)
 {
-	proto_detail_work_t const	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_detail_work_t);
+	proto_detail_work_t const       *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_detail_work_t);
 	proto_detail_work_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_detail_work_thread_t);
 
 	ssize_t				data_size;
@@ -157,6 +156,7 @@ static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time
 
 	fr_assert(*leftover < buffer_len);
 	fr_assert(thread->fd >= 0);
+	fr_assert(thread->el);
 
 	MPRINT("AT COUNT %d offset %ld", thread->count, (long) thread->read_offset);
 
@@ -186,7 +186,6 @@ static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time
 		DEBUG("Retrying packet %d (retransmission %u)", track->id, track->retry.count);
 		*packet_ctx = track;
 		*recv_time_p = track->timestamp;
-		*priority = inst->parent->priority;
 		return track->packet_len;
 	}
 
@@ -235,7 +234,7 @@ static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time
 	 */
 	partial = buffer + *leftover;
 
-	MPRINT("READ leftover %zd", *leftover);
+	MPRINT("READ leftover %zu", *leftover);
 
 	/*
 	 *	Try to read as much data as possible.
@@ -264,7 +263,7 @@ static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time
 		 */
 		thread->eof = (data_size == 0) || (thread->read_offset == thread->file_size) || ((size_t) data_size < room);
 		if (thread->eof) {
-			MPRINT("Set EOF data_size %ld vs room %ld", data_size, room);
+			MPRINT("Set EOF data_size %ld vs room %zu", data_size, room);
 			MPRINT("Set EOF read %ld vs file %ld", (long) thread->read_offset, (long) thread->file_size);
 		}
 		end = partial + data_size;
@@ -292,7 +291,7 @@ redo:
 	 */
 	fr_assert((buffer + thread->last_search) <= end);
 
-	MPRINT("Starting search from offset %ld", thread->last_search);
+	MPRINT("Starting search from offset %zu", thread->last_search);
 
 	p = buffer + thread->last_search;
 	while (p < end) {
@@ -315,6 +314,7 @@ redo:
 			p[1] = '\0';
 			next = p + 2;
 			stopped_search = next;
+			thread->last_line++;
 			break;
 		}
 
@@ -323,9 +323,10 @@ redo:
 		 *	record, every line MUST have a leading tab.
 		 */
 		if (p[1] != '\t') {
-			ERROR("proto_detail (%s): Malformed line found at offset %zu in file %s",
-			      thread->name, (size_t)((p - buffer) + thread->header_offset),
-			      thread->filename_work);
+			ERROR("proto_detail (%s): Missing tab indent at %s[%u], offset from start of file %zu",
+			      thread->name,
+			      thread->filename_work, thread->last_line,
+			      (size_t)((p - buffer) + thread->header_offset));
 			return -1;
 		}
 
@@ -348,7 +349,7 @@ redo:
 		/*
 		 *	Skip attribute name
 		 */
-		while ((p < end) && !isspace(*p)) p++;
+		while ((p < end) && !isspace((uint8_t) *p)) p++;
 
 		/*
 		 *	Not enough room for " = ", skip this sanity
@@ -365,10 +366,10 @@ redo:
 		 *	this, it's malformed.
 		 */
 		if (memcmp(p, " = ", 3) != 0) {
-			ERROR("proto_detail (%s): Malformed line found at offset %zu: %.*s of file %s",
+			ERROR("proto_detail (%s): Missing pair assignment operator at %s[%u], offset from start of file %zu: %.*s",
 			      thread->name,
-			      (size_t)((p - buffer) + thread->header_offset), (int) (end - p), p,
-			      thread->filename_work);
+			      thread->filename_work, thread->last_line,
+			      (size_t)((p - buffer) + thread->header_offset), (int) (end - p), p);
 			return -1;
 		}
 
@@ -389,7 +390,7 @@ redo:
 		packet_len = next - buffer;
 		*leftover = end - next;
 
-		MPRINT("FOUND next at %zd, leftover is %zd", packet_len, *leftover);
+		MPRINT("FOUND next at %zu, leftover is %zu", packet_len, *leftover);
 
 	} else if (!thread->eof) {
 		if ((size_t) (end - buffer) == buffer_len) {
@@ -407,7 +408,7 @@ redo:
 		 *	there's more data.
 		 */
 		*leftover = end - buffer;
-		MPRINT("Not at EOF, and no next.  Leftover is %zd", *leftover);
+		MPRINT("Not at EOF, and no next.  Leftover is %zu", *leftover);
 		return 0;
 
 	} else {
@@ -419,7 +420,7 @@ redo:
 		packet_len = end - buffer;
 		*leftover = 0;
 
-		MPRINT("NO end of record, but at EOF, found %zd leftover is 0", packet_len);
+		MPRINT("NO end of record, but at EOF, found %zu leftover is 0", packet_len);
 	}
 
 	/*
@@ -449,6 +450,7 @@ redo:
 		}
 
 		fr_assert(*leftover == 0);
+		packet_len = 0;
 		goto done;
 	}
 
@@ -484,14 +486,14 @@ redo:
 	/*
 	 *	Allocate the tracking entry.
 	 */
-	track = talloc_zero(thread, fr_detail_entry_t);
+	MEM(track = talloc_zero(thread, fr_detail_entry_t));
 	track->parent = thread;
 	track->timestamp = fr_time();
 	track->id = thread->count++;
 
 	track->done_offset = done_offset;
 	if (inst->retransmit) {
-		track->packet = talloc_memdup(track, buffer, packet_len);
+		MEM(track->packet = talloc_memdup(track, buffer, packet_len));
 		track->packet_len = packet_len;
 	}
 
@@ -502,7 +504,8 @@ redo:
 
 	*packet_ctx = track;
 	*recv_time_p = track->timestamp;
-	*priority = inst->parent->priority;
+
+	thread->outstanding++;
 
 done:
 	/*
@@ -513,8 +516,6 @@ done:
 		thread->closing = (*leftover == 0);
 		MPRINT("AT EOF, BUT CLOSING %d", thread->closing);
 	}
-
-	thread->outstanding++;
 
 	/*
 	 *	Pause reading until such time as we need more packets.
@@ -540,13 +541,12 @@ done:
 }
 
 
-static void work_retransmit(UNUSED fr_event_list_t *el, UNUSED fr_time_t now, void *uctx)
+static void work_retransmit(UNUSED fr_timer_list_t *tl, UNUSED fr_time_t now, void *uctx)
 {
 	fr_detail_entry_t		*track = talloc_get_type_abort(uctx, fr_detail_entry_t);
 	proto_detail_work_thread_t     	*thread = track->parent;
 
 	DEBUG("%s - retransmitting packet %d", thread->name, track->id);
-	track->retry.count++;
 
 	fr_dlist_insert_tail(&thread->list, track);
 
@@ -567,14 +567,15 @@ static void work_retransmit(UNUSED fr_event_list_t *el, UNUSED fr_time_t now, vo
 	(void) lseek(thread->fd, 0, SEEK_SET);
 
 #ifdef __linux__
-	fr_network_listen_read(thread->nr, thread->listen);
+	fr_network_listen_read(thread->nr, thread->li);
 #endif
 }
 
-static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, UNUSED fr_time_t request_time,
-			 uint8_t *buffer, size_t buffer_len, UNUSED size_t written)
+static ssize_t mod_write(fr_listen_instance_t *li, void *packet_ctx, UNUSED fr_time_t request_time, uint8_t *buffer,
+			 size_t buffer_len, UNUSED size_t written)
 {
-	proto_detail_work_t const	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_detail_work_t);
+	proto_detail_work_t const       *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_detail_work_t);
 	proto_detail_work_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_detail_work_thread_t);
 	fr_detail_entry_t		*track = packet_ctx;
 
@@ -584,7 +585,9 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, UNUSED fr_time_t req
 	fr_assert(thread->fd >= 0);
 
 	if (!buffer[0]) {
-		if (track->retry.start == 0) {
+		if (!inst->retransmit) goto mark_done;
+
+		if (fr_time_eq(track->retry.start, fr_time_wrap(0))) {
 			fr_retry_init(&track->retry, fr_time(), &inst->retry_config);
 		} else {
 			fr_retry_state_t state;
@@ -605,11 +608,11 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, UNUSED fr_time_t req
 			}
 		}
 
-		DEBUG("%s - packet %d failed during processing.  Will retransmit in %d.%06ds",
-			      thread->name, track->id, (int) (track->retry.rt / NSEC), (int) ((track->retry.rt % NSEC) / 1000));
+		DEBUG("%s - packet %d failed during processing.  Will retransmit in %.6fs",
+		      thread->name, track->id, fr_time_delta_to_sec_double(track->retry.rt));
 
-		if (fr_event_timer_at(thread, thread->el, &track->ev,
-				      track->retry.next, work_retransmit, track) < 0) {
+		if (fr_timer_at(thread, thread->el->tl, &track->ev,
+				 track->retry.next, false, work_retransmit, track) < 0) {
 			ERROR("%s - Failed inserting retransmission timeout", thread->name);
 		fail:
 			if (inst->track_progress && (track->done_offset > 0)) goto mark_done;
@@ -665,19 +668,21 @@ free_track:
 	 */
 	if (thread->closing && !thread->outstanding) {
 		MPRINT("WRITE ASKED TO CLOSE");
-		return 0;
+		errno = ECONNRESET;
+		return -1;
 	}
 
-	MPRINT("WRITE RETURN B %ld", buffer_len);
+	MPRINT("WRITE RETURN B %zu", buffer_len);
 	return buffer_len;
 }
 
 /** Open a detail listener
  *
  */
-static int mod_open(fr_listen_t *li)
+static int mod_open(fr_listen_instance_t *li)
 {
-	proto_detail_work_t const	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_detail_work_t);
+	proto_detail_work_t const       *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_detail_work_t);
 	proto_detail_work_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_detail_work_thread_t);
 
 	fr_dlist_init(&thread->list, fr_detail_entry_t, entry);
@@ -686,7 +691,7 @@ static int mod_open(fr_listen_t *li)
 	 *	Open the file if we haven't already been given one.
 	 */
 	if (thread->fd < 0) {
-		thread->filename_work = talloc_strdup(inst, inst->filename_work);
+		thread->filename_work = talloc_strdup(thread, inst->filename_work);
 
 		li->fd = thread->fd = open(thread->filename_work, inst->mode);
 		if (thread->fd < 0) {
@@ -702,7 +707,7 @@ static int mod_open(fr_listen_t *li)
 		struct stat buf;
 
 		if (fstat(thread->fd, &buf) < 0) {
-			cf_log_err(inst->cs, "Failed examining %s: %s", thread->filename_work, fr_syserror(errno));
+			cf_log_err(inst->cs, "Failed checking %s: %s", thread->filename_work, fr_syserror(errno));
 			return -1;
 		}
 
@@ -718,12 +723,26 @@ static int mod_open(fr_listen_t *li)
 	fr_assert(thread->filename_work != NULL);
 	thread->name = talloc_typed_asprintf(thread, "detail_work reading file %s", thread->filename_work);
 
+	/*
+	 *	Linux doesn't like us adding write callbacks for FDs
+	 *	which reference files.  Since the callback is only
+	 *	used when the FD blocks, and files don't (mostly)
+	 *	block, we just mark this read-only.
+	 *
+	 *	The code in src/lib/io/network.c will call the
+	 *	mod_write() callback on any write, even if the
+	 *	listener is marked "read_only"
+	 */
+	li->listen->no_write_callback = true;
+
 	return 0;
 }
 
 
 static int mod_close_internal(proto_detail_work_thread_t *thread)
 {
+	proto_detail_work_t const	*inst = talloc_get_type_abort_const(thread->inst, proto_detail_work_t);
+
 	/*
 	 *	One less worker...  we check for "0" because of the
 	 *	hacks in proto_detail which let us start up with
@@ -735,24 +754,27 @@ static int mod_close_internal(proto_detail_work_thread_t *thread)
 		pthread_mutex_unlock(&thread->file_parent->worker_mutex);
 	}
 
-	DEBUG("Closing and deleting detail worker file %s", thread->name);
+	DEBUG("Closing %sdetail worker file %s", thread->outstanding == 0 ? "and deleting " : "", thread->name);
 
 #ifdef NOTE_REVOKE
 	fr_event_fd_delete(thread->el, thread->fd, FR_EVENT_FILTER_VNODE);
 #endif
 	fr_event_fd_delete(thread->el, thread->fd, FR_EVENT_FILTER_IO);
 
-	unlink(thread->filename_work);
+	if (thread->outstanding == 0) unlink(thread->filename_work);
 
 	close(thread->fd);
 	thread->fd = -1;
 
-	/*
-	 *	If we've been spawned from proto_detail_file, clean
-	 *	ourselves up, including our listener.
-	 */
-	if (thread->listen) {
-		talloc_free(thread->listen);
+	if (inst->parent->exit_when_done) {
+		INFO("Done reading detail files, process will now exit");
+
+		/*
+		 *	The least hacky way of signalling that the server
+		 *	should exit.  This is an almost identical code
+		 *	path as receiving a SIGTERM.
+		 */
+		main_loop_signal_raise(RADIUS_SIGNAL_SELF_TERM);
 	}
 
 	return 0;
@@ -762,7 +784,7 @@ static int mod_close_internal(proto_detail_work_thread_t *thread)
 /** Close  a detail listener
  *
  */
-static int mod_close(fr_listen_t *li)
+static int mod_close(fr_listen_instance_t *li)
 {
 	proto_detail_work_thread_t *thread = talloc_get_type_abort(li->thread_instance, proto_detail_work_thread_t);
 
@@ -790,7 +812,7 @@ static void mod_revoke(UNUSED fr_event_list_t *el, UNUSED int fd, UNUSED int fla
  * @param[in] el the event list
  * @param[in] nr context from the network side
  */
-static void mod_event_list_set(fr_listen_t *li, fr_event_list_t *el, void *nr)
+static void mod_event_list_set(fr_listen_instance_t *li, fr_event_list_t *el, void *nr)
 {
 	proto_detail_work_thread_t *thread = talloc_get_type_abort(li->thread_instance, proto_detail_work_thread_t);
 
@@ -810,45 +832,21 @@ static void mod_event_list_set(fr_listen_t *li, fr_event_list_t *el, void *nr)
 }
 
 
-static char const *mod_name(fr_listen_t *li)
+static char const *mod_name(fr_listen_instance_t *li)
 
 {	proto_detail_work_thread_t *thread = talloc_get_type_abort(li->thread_instance, proto_detail_work_thread_t);
 
 	return thread->name;
 }
 
-static int mod_instantiate(void *instance, UNUSED CONF_SECTION *cs)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	proto_detail_work_t *inst = talloc_get_type_abort(instance, proto_detail_work_t);
-	RADCLIENT *client;
+	proto_detail_work_t *inst = talloc_get_type_abort(mctx->mi->data, proto_detail_work_t);
+	fr_client_t *client;
+	CONF_SECTION		*cs = mctx->mi->conf;
+	module_instance_t const	*mi = mctx->mi;
 
-	client = inst->client = talloc_zero(inst, RADCLIENT);
-	if (!inst->client) return 0;
-
-	client->ipaddr.af = AF_INET;
-	client->ipaddr.addr.v4.s_addr = htonl(INADDR_NONE);
-	client->src_ipaddr = client->ipaddr;
-
-	client->longname = client->shortname = client->secret = inst->filename;
-	client->nas_type = talloc_strdup(client, "other");
-
-	return 0;
-}
-
-static int mod_bootstrap(void *instance, CONF_SECTION *cs)
-{
-	proto_detail_work_t	*inst = talloc_get_type_abort(instance, proto_detail_work_t);
-	dl_module_inst_t const	*dl_inst;
-
-	/*
-	 *	Find the dl_module_inst_t holding our instance data
-	 *	so we can find out what the parent of our instance
-	 *	was.
-	 */
-	dl_inst = dl_module_instance_by_data(instance);
-	fr_assert(dl_inst);
-
-	inst->parent = talloc_get_type_abort(dl_inst->parent->data, proto_detail_t);
+	inst->parent = talloc_get_type_abort(mi->parent->data, proto_detail_t);
 	inst->cs = cs;
 
 	if (inst->track_progress) {
@@ -876,23 +874,31 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 
 	FR_INTEGER_BOUND_CHECK("limit.max_outstanding", inst->max_outstanding, >=, 1);
 
+	MEM(client = inst->client = talloc_zero(inst, fr_client_t));
+
+	client->ipaddr.af = AF_INET;
+	client->ipaddr.addr.v4.s_addr = htonl(INADDR_NONE);
+	client->src_ipaddr = client->ipaddr;
+
+	client->longname = client->shortname = client->secret = inst->filename_work;
+	client->nas_type = talloc_strdup(client, "other");
+
 	return 0;
 }
-
 
 /** Private interface for use by proto_detail_file
  *
  */
 extern fr_app_io_t proto_detail_work;
 fr_app_io_t proto_detail_work = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "detail_work",
-	.config			= file_listen_config,
-	.inst_size		= sizeof(proto_detail_work_t),
-	.thread_inst_size	= sizeof(proto_detail_work_thread_t),
-	.bootstrap		= mod_bootstrap,
-	.instantiate		= mod_instantiate,
-
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "detail_work",
+		.config			= file_listen_config,
+		.inst_size		= sizeof(proto_detail_work_t),
+		.thread_inst_size	= sizeof(proto_detail_work_thread_t),
+		.instantiate		= mod_instantiate
+	},
 	.default_message_size	= 65536,
 	.default_reply_size	= 32,
 

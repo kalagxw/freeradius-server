@@ -15,7 +15,7 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
 #
-#    Copyright (C) 2009 Network RADIUS SARL <legal@networkradius.com>
+#    Copyright (C) 2009 Network RADIUS SARL (legal@networkradius.com)
 #
 ######################################################################
 #
@@ -47,14 +47,14 @@ do
 	;;
   D)    extra="$extra -D $OPTARG"
 	;;
-  i)    x="(Packet-Src-IP-Address == $OPTARG)"
+  i)    x="(Net.Src.IP == $OPTARG)"
 	if [ "$condition" = "" ]; then
 	    condition="$x"
 	else
 	  condition="$condition && $x"
 	fi
 	;;
-  I)	x="(Packet-Src-IPv6-Address == $OPTARG)"
+  I)	x="(Net.Src.IP == $OPTARG)"
 	if [ "$condition" = "" ]; then
 	    condition="$x"
 	else

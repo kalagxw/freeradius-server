@@ -9,13 +9,18 @@
 #
 #  - Defined by the target
 #
-#  PORT      := Run the service
 #  TEST      := test.$target
 #
 #  - Parameter
 #
 #  ${1}		config-name found in $(DIR)/config, e.g: src/tests/$target/config/${config-name}.conf
 #  ${2}		output directory
+#
+#  - Global variables defined
+#
+#  <test>_port  Passing TEST=test.foo results in "foo_port" being set to the port assigned to the
+#               radiusd instance created for the test suite.
+#
 #
 #  - How to use
 #
@@ -25,8 +30,7 @@
 #
 #    $(TEST).radiusd_kill and $(TEST).radiusd_start
 #
-#  3. The target 'radiusd_start' define the variable $(RADIUSD_RUN) with the
-#  exactly command used to start the service.
+#  3. $(TEST).radiusd_start starts the server by running RADIUSD_CMD.<test>.
 #
 #  4. You could use the 'RADIUSD_BIN' to set such path to the "radiusd" binary
 #  that you want to against the tests.
@@ -37,8 +41,28 @@
 #
 include Make.inc
 
+#
+#  The package test includes this file without the rest of the build
+#  framework, so pull in SHELL_QUOTE directly rather than relying on
+#  scripts/boiler.mk having defined it.
+#
+include scripts/utils.mk
+
 define RADIUSD_SERVICE
-$$(eval RADIUSD_BIN := $(JLIBTOOL) --silent --mode=execute $$(TEST_BIN)/radiusd)
+$$(eval RADIUSD_BIN := $(JLIBTOOL) $(if ${VERBOSE},--debug,--silent) --mode=execute $$(TEST_BIN)/radiusd)
+#
+#  The package test runs an already installed server with no build tree, so the
+#  allocator, which is a loadable make function, is not there.  Counting
+#  upwards from the standard RADIUS port is enough, because the package test is
+#  the only thing running.
+#
+#  This has to be one $(if), not an ifdef block.  $(call) expands every
+#  $(eval) in the define body before the outer $(eval) parses the ifdef
+#  lines, so both branches would run and the undefined allocator function
+#  would expand to nothing and empty the port.
+#
+$(eval PORT := $(if $(PACKAGE_TEST),$(shell echo $$(($(PORT)+20))),$(unique-port $(PORT_FILE),$(TEST),20,$(PORT_FIRST))))
+$(eval $(subst test.,,$(TEST))_port := $(PORT))
 
 #
 #  Kill it.  We don't care if it failed or not.  However, we do care
@@ -48,8 +72,8 @@ $$(eval RADIUSD_BIN := $(JLIBTOOL) --silent --mode=execute $$(TEST_BIN)/radiusd)
 $(TEST).radiusd_kill: | ${2}
 	${Q}if [ -f ${2}/radiusd.pid ]; then \
 		if ! ps `cat ${2}/radiusd.pid` >/dev/null 2>&1; then \
-		    rm -f ${2}/radiusd.pid; \
 		    echo "FreeRADIUS terminated during test called by $(TEST).radiusd_kill"; \
+		    rm -f ${2}/radiusd.pid; \
 		    echo "GDB output was:"; \
 		    cat "${2}/gdb.log" 2> /dev/null; \
 		    echo "--------------------------------------------------"; \
@@ -58,6 +82,7 @@ $(TEST).radiusd_kill: | ${2}
 		    exit 0; \
 		fi; \
 		if ! kill -9 `cat ${2}/radiusd.pid` >/dev/null 2>&1; then \
+			rm -f ${2}/radiusd.pid; \
 			exit 1; \
 		fi; \
 		rm -f ${2}/radiusd.pid; \
@@ -72,7 +97,7 @@ $(TEST).radiusd_stop: | ${2}
 	${Q}if [ -f ${2}/radiusd.pid ]; then \
 		if ! ps `cat ${2}/radiusd.pid` >/dev/null 2>&1; then \
 		    rm -f ${2}/radiusd.pid; \
-		    echo "FreeRADIUS terminated during test called by $(TEST).radiusd_kill"; \
+		    echo "FreeRADIUS terminated during test called by $(TEST).radiusd_stop"; \
 		    echo "GDB output was:"; \
 		    cat "${2}/gdb.log" 2> /dev/null; \
 		    echo "--------------------------------------------------"; \
@@ -87,18 +112,39 @@ $(TEST).radiusd_stop: | ${2}
 		exit 0; \
 	fi
 
+RADIUSD_CMD.$(TEST) := \
+	TESTDIR=$(call SHELL_QUOTE,$(DIR)) \
+	OUTPUT=$(call SHELL_QUOTE,${2}) \
+	TEST_PORT=$(PORT) \
+	TEST=$(call SHELL_QUOTE,$(subst test.,,$(TEST))) \
+	$$(RADIUSD_BIN) \
+	-Pxxx \
+	-d $(call SHELL_QUOTE,$(DIR)/config) \
+	-e 600 \
+	-n ${1} \
+	-D $(call SHELL_QUOTE,$(DICT_PATH)) \
+	-l $(call SHELL_QUOTE,${2}/radiusd.log)
+
 #
 #	Start radiusd instance
 #
-${2}/radiusd.pid: ${2}
-	$$(eval RADIUSD_RUN := TESTDIR=$(DIR) OUTPUT=$(OUTPUT) TEST_PORT=$(PORT) $$(RADIUSD_BIN) -Pxxx -d $(DIR)/config -n ${1} -D $(DICT_PATH) -l ${2}/radiusd.log)
+#  A server left behind by an earlier run still holds the port, so the kill has
+#  to finish before this rule starts a new one.  Make builds the order-only
+#  prerequisites of one target at the same time under "make -j", so naming the
+#  kill and the start side by side on a test output does not order them.
+#
+${2}/radiusd.pid: ${2} | $(TEST).radiusd_kill
 	${Q}rm -f ${2}/radiusd.log
-	${Q}if ! $$(RADIUSD_RUN); then \
+	${Q}if test ! -z "$$(PRINT_PORT)"; then \
+		echo "$(PORT)"; \
+	fi
+	${Q}if ! $$(RADIUSD_CMD.$(TEST)); then \
 		echo "FAILED STARTING RADIUSD"; \
 		grep 'Error :' "${2}/radiusd.log"; \
 		echo "Last entries in server log (${2}/radiusd.log):"; \
 		tail -n 100 "${2}/radiusd.log" 2> /dev/null; \
-		echo "RADIUSD_RUN: $$(RADIUSD_RUN)"; \
+		echo $$(call SHELL_QUOTE,$$(RADIUSD_CMD.$(TEST))); \
+		exit 1; \
 	fi
 
 .PHONY: $(TEST).radiusd_start

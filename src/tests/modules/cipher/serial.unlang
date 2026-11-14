@@ -1,14 +1,8 @@
-update request {
-	&Tmp-Octets-0 := "%(cipher_rsa_certificate:serial)"
-}
+octets test_octets
 
-if ("%(length:%{Tmp-Octets-0})" != 1) {
-	test_fail
-} else {
-	test_pass
-}
+test_octets := %cipher_rsa.certificate('serial')
 
-if ("%{hex:%{Tmp-Octets-0}}" != "01") {
+if (%length(%{test_octets}) != 1) {
 	test_fail
 } else {
 	test_pass

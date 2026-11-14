@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License, version 2 of the
  *   License as published by the Free Software Foundation.
  *
@@ -125,7 +125,7 @@ static ssize_t fr_ethernet_decode(void *proto_ctx, uint8_t const *data, size_t d
 
 	default:
 		fr_strerror_const("Exceeded maximum level of VLAN tag nesting (2)");
-		break;
+		return -1;
 	}
 	p = ((uint8_t const *)vlan_hdr) + sizeof(ether_hdr->ether_type);
 
@@ -156,7 +156,7 @@ static ssize_t fr_ethernet_encode(void *proto_ctx, uint8_t *data, size_t data_le
 	p += sizeof(ether_hdr->src_addr) + sizeof(ether_hdr->dst_addr);
 	if (unlikely(p >= end)) {
 	oob:
-		fr_strerror_printf("insufficient buffer space, needed %zu bytes, have %zu bytes",
+		fr_strerror_printf("insufficient buffer space, needed %td bytes, have %zu bytes",
 				   p - data, data_len);
 		return data - p;
 	}
@@ -265,31 +265,31 @@ static int fr_ethernet_get_option(fr_value_box_t *out, void const *proto_ctx, fr
 	case PROTO_OPT_GROUP_CUSTOM:
 		switch (opt) {
 		case PROTO_OPT_ETHERNET_SVLAN_TPID:
-			return fr_value_box_shallow(out, ether_ctx->svlan_tpid, true);
+			return fr_value_box(out, ether_ctx->svlan_tpid, true);
 
 		case PROTO_OPT_ETHERNET_SVLAN_PCP:
-			return fr_value_box_shallow(out, ether_ctx->svlan_pcp, true);
+			return fr_value_box(out, ether_ctx->svlan_pcp, true);
 
 		case PROTO_OPT_ETHERNET_SVLAN_DEI:
-			return fr_value_box_shallow(out, ether_ctx->svlan_dei, true);
+			return fr_value_box(out, ether_ctx->svlan_dei, true);
 
 		case PROTO_OPT_ETHERNET_SVLAN_VID:
-			return fr_value_box_shallow(out, ether_ctx->svlan_vid, true);
+			return fr_value_box(out, ether_ctx->svlan_vid, true);
 
 		case PROTO_OPT_ETHERNET_CVLAN_TPID:
-			return fr_value_box_shallow(out, ether_ctx->cvlan_tpid, true);
+			return fr_value_box(out, ether_ctx->cvlan_tpid, true);
 
 		case PROTO_OPT_ETHERNET_CVLAN_PCP:
-			return fr_value_box_shallow(out, ether_ctx->cvlan_pcp, true);
+			return fr_value_box(out, ether_ctx->cvlan_pcp, true);
 
 		case PROTO_OPT_ETHERNET_CVLAN_DEI:
-			return fr_value_box_shallow(out, ether_ctx->cvlan_dei, true);
+			return fr_value_box(out, ether_ctx->cvlan_dei, true);
 
 		case PROTO_OPT_ETHERNET_CVLAN_VID:
-			return fr_value_box_shallow(out, ether_ctx->cvlan_vid, true);
+			return fr_value_box(out, ether_ctx->cvlan_vid, true);
 
 		default:
-			fr_strerror_printf("Option %i group %i not implemented", opt, group);
+			fr_strerror_printf("Option %i group %u not implemented", opt, group);
 			return -1;
 		}
 
@@ -307,15 +307,15 @@ static int fr_ethernet_get_option(fr_value_box_t *out, void const *proto_ctx, fr
 			return fr_value_box_ethernet_addr(out, NULL, &ether_ctx->dst_addr, true);
 
 		case PROTO_OPT_L2_NEXT_PROTOCOL:
-			return fr_value_box_shallow(out, ether_ctx->ether_type, true);
+			return fr_value_box(out, ether_ctx->ether_type, true);
 
 		default:
-			fr_strerror_printf("Option %i group %i not implemented", opt, group);
+			fr_strerror_printf("Option %i group %u not implemented", opt, group);
 			return -1;
 		}
 
 	default:
-		fr_strerror_printf("Option group %i not implemented", group);
+		fr_strerror_printf("Option group %u not implemented", group);
 		return -1;
 	}
 }
@@ -362,7 +362,7 @@ static int fr_ethernet_set_option(void *proto_ctx, fr_proto_opt_group_t group, i
 			return fr_value_unbox_shallow(&ether_ctx->cvlan_vid, in);
 
 		default:
-			fr_strerror_printf("Option %i group %i not implemented", opt, group);
+			fr_strerror_printf("Option %i group %u not implemented", opt, group);
 			return -1;
 		}
 
@@ -371,8 +371,8 @@ static int fr_ethernet_set_option(void *proto_ctx, fr_proto_opt_group_t group, i
 		case PROTO_OPT_L2_PAYLOAD_LEN:
 			if (in->type != FR_TYPE_SIZE) {
 				fr_strerror_printf("Unboxing failed.  Needed type %s, had type %s",
-						   fr_table_str_by_value(fr_value_box_type_table, FR_TYPE_SIZE, "?Unknown?"),
-						   fr_table_str_by_value(fr_value_box_type_table, in->type, "?Unknown?"));
+						   fr_type_to_str(FR_TYPE_SIZE),
+						   fr_type_to_str(in->type));
 				return -1;
 			}
 			ether_ctx->payload_len = in->vb_size;
@@ -388,12 +388,12 @@ static int fr_ethernet_set_option(void *proto_ctx, fr_proto_opt_group_t group, i
 			return fr_value_unbox_shallow(&ether_ctx->ether_type, in);
 
 		default:
-			fr_strerror_printf("Option %i group %i not implemented", opt, group);
+			fr_strerror_printf("Option %i group %u not implemented", opt, group);
 			return -1;
 		}
 
 	default:
-		fr_strerror_printf("Option group %i not implemented", group);
+		fr_strerror_printf("Option group %u not implemented", group);
 		return -1;
 	}
 
@@ -401,10 +401,8 @@ static int fr_ethernet_set_option(void *proto_ctx, fr_proto_opt_group_t group, i
 
 extern fr_proto_lib_t const libfreeradius_ethernet;
 fr_proto_lib_t const libfreeradius_ethernet = {
-	.magic		= RLM_MODULE_INIT,
+	.magic		= MODULE_MAGIC_INIT,
 	.name		= "ethernet",
-	.inst_size	= sizeof(fr_ethernet_proto_ctx_t),
-
 	.opt_group	= PROTO_OPT_GROUP_CUSTOM | PROTO_OPT_GROUP_L2,
 
 	.decode		= fr_ethernet_decode,

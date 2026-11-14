@@ -1,14 +1,11 @@
 #
 #  over-ride password set in radiusd.conf
 #
-update control {
-	&Password.Cleartext -= 'hello'
-	&Password.With-Header := 'oracle01'
+control.Password := {
+	Cleartext = 'oracle01'
 }
 
 #
 #  Set CHAP-Password
 #
-update request {
-	&CHAP-Password := "%(chap_password:%{request.CHAP-Password})"
-}
+request.CHAP-Password := %chap.password("%{request.CHAP-Password}")

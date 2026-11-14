@@ -30,6 +30,12 @@ RCSIDH(worker_h, "$Id$")
 extern "C" {
 #endif
 
+/** Events for a worker's own control messages, in the FR_CONTROL_EVENTSET_WORKER event set
+ */
+typedef enum fr_worker_control_event_t : uint16_t {
+	FR_WORKER_CONTROL_LISTEN_DEAD = 0	//!< A listener has been closed.
+} fr_worker_control_event_t;
+
 /**
  *  A data structure to track the worker.
  *
@@ -46,6 +52,7 @@ typedef struct fr_worker_s fr_worker_t;
 #include <freeradius-devel/util/event.h>
 #include <freeradius-devel/util/heap.h>
 #include <freeradius-devel/util/log.h>
+#include <freeradius-devel/util/slab.h>
 #include <freeradius-devel/util/talloc.h>
 
 #include <pthread.h>
@@ -56,34 +63,45 @@ extern "C" {
 extern fr_cmd_table_t cmd_worker_table[];
 
 typedef struct {
-	int		max_requests;		//!< max requests this worker will handle
+	int			max_requests;		//!< max requests this worker will handle
 
-	int		max_channels;		//!< maximum number of channels
+	int			max_channels;		//!< maximum number of channels
 
-	int             message_set_size;	//!< default start number of messages
-	int             ring_buffer_size;	//!< default start size for the ring buffers
+	int			message_set_size;	//!< default start number of messages
+	int			ring_buffer_size;	//!< default start size for the ring buffers
 
-	fr_time_delta_t	max_request_time;	//!< maximum time a request can be processed
+	fr_time_delta_t		max_request_time;	//!< maximum time a request can be processed
 
-	size_t		talloc_pool_size;	//!< for each request
+	fr_slab_config_t	reuse;			//!< slab allocator configuration
 } fr_worker_config_t;
 
-fr_worker_t	*fr_worker_create(TALLOC_CTX *ctx, fr_event_list_t *el, char const *name,
+int		fr_worker_request_timeout_set(fr_worker_t *worker, request_t *request, fr_time_delta_t timeout) CC_HINT(nonnull);
+
+fr_worker_t	*fr_worker_alloc(TALLOC_CTX *ctx, fr_event_list_t *el, char const *name,
 				  fr_log_t const *logger, fr_log_lvl_t lvl, fr_worker_config_t *config) CC_HINT(nonnull(2,3,4));
 
-void		fr_worker_destroy(fr_worker_t *worker) CC_HINT(nonnull);
+int		fr_worker_close_event_insert(fr_worker_t *worker);
+
+void		fr_worker_shutting_down(fr_worker_t *worker) CC_HINT(nonnull);
+
+void		fr_worker_exit(fr_worker_t *worker);
 
 void		fr_worker(fr_worker_t *worker) CC_HINT(nonnull);
 
 void		fr_worker_debug(fr_worker_t *worker, FILE *fp) CC_HINT(nonnull);
 
-int		fr_worker_pre_event(fr_time_t wake, void *uctx);
+int		fr_worker_pre_event(fr_time_t now, fr_time_delta_t wake, void *uctx);
 
 void		fr_worker_post_event(fr_event_list_t *el, fr_time_t now, void *uctx);
 
-fr_channel_t	*fr_worker_channel_create(fr_worker_t *worker, TALLOC_CTX *ctx, fr_control_t *master) CC_HINT(nonnull);
+fr_channel_t	*fr_worker_channel_create(fr_worker_t *worker, TALLOC_CTX *ctx, fr_control_t *master,
+					  fr_message_set_t *reply_ms) CC_HINT(nonnull);
 
 int		fr_worker_stats(fr_worker_t const *worker, int num, uint64_t *stats) CC_HINT(nonnull);
+
+int		fr_worker_listen_cancel(fr_worker_t *worker, fr_listen_instance_t const *li);
+
+fr_worker_config_t const *fr_worker_config(fr_worker_t *worker) CC_HINT(nonnull);
 
 #include <freeradius-devel/server/module.h>
 

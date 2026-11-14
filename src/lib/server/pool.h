@@ -59,7 +59,7 @@ struct fr_pool_state_s {
 	fr_time_t	last_held_min;		//!< Last time we warned about a low latency event.
 	fr_time_t	last_held_max;		//!< Last time we warned about a high latency event.
 
-	uint32_t	next_delay;    	 	//!< The next delay time.  cleanup.  Initialized to
+	fr_time_delta_t	next_delay;    	 	//!< The next delay time.  cleanup.  Initialized to
 						//!< cleanup_interval, and decays from there.
 
 	uint64_t	count;			//!< Number of connections spawned over the lifetime
@@ -167,13 +167,17 @@ void	fr_pool_free(fr_pool_t *pool);
 /*
  *	Connection lifecycle
  */
+CC_ACQUIRE_HANDLE("conn_pool_handle")
 void	*fr_pool_connection_get(fr_pool_t *pool, request_t *request);
 
-void	fr_pool_connection_release(fr_pool_t *pool, request_t *request, void *conn);
+void	fr_pool_connection_release(fr_pool_t *pool, request_t *request,
+				   CC_RELEASE_HANDLE("conn_pool_handle") void *conn);
 
-void	*fr_pool_connection_reconnect(fr_pool_t *pool, request_t *request, void *conn);
+void	*fr_pool_connection_reconnect(fr_pool_t *pool, request_t *request,
+				      CC_RELEASE_HANDLE("conn_pool_handle") void *conn);
 
-int	fr_pool_connection_close(fr_pool_t *pool, request_t *request, void *conn);
+int	fr_pool_connection_close(fr_pool_t *pool,
+				 request_t *request, CC_RELEASE_HANDLE("conn_pool_handle") void *conn);
 
 #ifdef __cplusplus
 }

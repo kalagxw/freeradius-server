@@ -26,204 +26,36 @@
 
 RCSID("$Id$")
 
-#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/util/regex.h>
+#include <freeradius-devel/util/syserror.h>
+
+#include <freeradius-devel/server/cf_util.h>
+#include <freeradius-devel/server/dependency.h>
+#include <freeradius-devel/server/log.h>
+
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 static uint64_t	libmagic = RADIUSD_MAGIC_NUMBER;
-char const	*radiusd_version_short = RADIUSD_VERSION_STRING;
+char const	*radiusd_version_short = STRINGIFY(RADIUSD_VERSION_MAJOR) "." STRINGIFY(RADIUSD_VERSION_MINOR) "." STRINGIFY(RADIUSD_VERSION_INCRM);
 
 static CONF_SECTION *default_feature_cs;		//!< Default configuration section to add features to.
 static CONF_SECTION *default_version_cs;		//!< Default configuration section to add features to.
 
-#ifdef HAVE_OPENSSL_CRYPTO_H
+#include <freeradius-devel/tls/openssl_user_macros.h>
+
+#ifdef WITH_TLS
+#  include <freeradius-devel/tls/version.h>
 #  include <openssl/crypto.h>
 #  include <openssl/opensslv.h>
-#  include <openssl/engine.h>
-
-#ifdef HAVE_VALGRIND_H
-#  include <valgrind.h>
 #endif
 
-static long ssl_built = OPENSSL_VERSION_NUMBER;
+#ifdef HAVE_GPERFTOOLS_PROFILER_H
+#  include <gperftools/profiler.h>
+#endif
 
-/** Check built and linked versions of OpenSSL match
- *
- * OpenSSL version number consists of:
- * MNNFFPPS: major minor fix patch status
- *
- * Where status >= 0 && < 10 means beta, and status 10 means release.
- *
- *	https://wiki.openssl.org/index.php/Versioning
- *
- * Startup check for whether the linked version of OpenSSL matches the
- * version the server was built against.
- *
- * @return
- *	- 0 if ok.
- *	- -1 if not ok.
- */
-int ssl_check_consistency(void)
-{
-	long ssl_linked;
-
-	ssl_linked = SSLeay();
-
-	/*
-	 *	Major and minor versions mismatch, that's bad.
-	 */
-	if ((ssl_linked & 0xfff00000) != (ssl_built & 0xfff00000)) goto mismatch;
-
-	/*
-	 *	1.1.0 and later export all of the APIs we need, so we
-	 *	don't care about mismatches in fix / patch / status
-	 *	fields.  If the major && minor fields match, that's
-	 *	good enough.
-	 */
-	if ((ssl_linked & 0xfff00000) >= 0x10100000) return 0;
-
-	/*
-	 *	Before 1.1.0, we need all kinds of stupid checks to
-	 *	see if it might work.
-	 */
-
-	/*
-	 *	Status mismatch always triggers error.
-	 */
-	if ((ssl_linked & 0x0000000f) != (ssl_built & 0x0000000f)) {
-	mismatch:
-		ERROR("libssl version mismatch.  built: %lx linked: %lx",
-		      (unsigned long) ssl_built,
-		      (unsigned long) ssl_linked);
-
-		return -1;
-	}
-
-	/*
-	 *	Use the OpenSSH approach and relax fix checks after version
-	 *	1.0.0 and only allow moving backwards within a patch
-	 *	series.
-	 */
-	if (ssl_built & 0xf0000000) {
-		if ((ssl_built & 0xfffff000) != (ssl_linked & 0xfffff000) ||
-		    (ssl_built & 0x00000ff0) > (ssl_linked & 0x00000ff0)) goto mismatch;
-	/*
-	 *	Before 1.0.0 we require the same major minor and fix version
-	 *	and ignore the patch number.
-	 */
-	} else if ((ssl_built & 0xfffff000) != (ssl_linked & 0xfffff000)) goto mismatch;
-
-	return 0;
-}
-
-/** Convert a version number to a text string
- *
- * @note Not thread safe.
- *
- * @param v version to convert.
- * @return pointer to a static buffer containing the version string.
- */
-char const *ssl_version_by_num(uint32_t v)
-{
-	/* 2 (%s) + 1 (.) + 2 (%i) + 1 (.) + 2 (%i) + 1 (c) + 8 (%s) + \0 */
-	static char buffer[18];
-	char *p = buffer;
-
-	p += sprintf(p, "%u.%u.%u",
-		     (0xf0000000 & v) >> 28,
-		     (0x0ff00000 & v) >> 20,
-		     (0x000ff000 & v) >> 12);
-
-	if ((0x00000ff0 & v) >> 4) {
-		*p++ =  (char) (0x60 + ((0x00000ff0 & v) >> 4));
-	}
-
-	*p++ = ' ';
-
-	/*
-	 *	Development (0)
-	 */
-	if ((0x0000000f & v) == 0) {
-		strcpy(p, "dev");
-	/*
-	 *	Beta (1-14)
-	 */
-	} else if ((0x0000000f & v) <= 14) {
-		sprintf(p, "beta %u", 0x0000000f & v);
-	} else {
-		strcpy(p, "release");
-	}
-
-	return buffer;
-}
-
-/** Return the linked SSL version number as a string
- *
- * @return pointer to a static buffer containing the version string.
- */
-char const *ssl_version_num(void)
-{
-	long ssl_linked;
-
-	ssl_linked = SSLeay();
-	return ssl_version_by_num((uint32_t)ssl_linked);
-}
-
-/** Convert two openssl version numbers into a range string
- *
- * @note Not thread safe.
- *
- * @param low version to convert.
- * @param high version to convert.
- * @return pointer to a static buffer containing the version range string.
- */
-char const *ssl_version_range(uint32_t low, uint32_t high)
-{
-	/* 18 (version) + 3 ( - ) + 18 (version) */
-	static char buffer[40];
-	char *p = buffer;
-
-	p += strlcpy(p, ssl_version_by_num(low), sizeof(buffer));
-	p += strlcpy(p, " - ", sizeof(buffer) - (p - buffer));
-	strlcpy(p, ssl_version_by_num(high), sizeof(buffer) - (p - buffer));
-
-	return buffer;
-}
-
-/** Print the current linked version of Openssl
- *
- * Print the currently linked version of the OpenSSL library.
- *
- * @note Not thread safe.
- * @return pointer to a static buffer containing libssl version information.
- */
-char const *ssl_version(void)
-{
-	static char buffer[256];
-
-	uint32_t v = SSLeay();
-
-	snprintf(buffer, sizeof(buffer), "%s 0x%.8x (%s)",
-		 SSLeay_version(SSLEAY_VERSION),		/* Not all builds include a useful version number */
-		 v,
-		 ssl_version_by_num(v));
-
-	return buffer;
-}
-#  else
-int ssl_check_consistency(void) {
-	return 0;
-}
-
-char const *ssl_version_num(void)
-{
-	return "not linked";
-}
-
-char const *ssl_version()
-{
-	return "not linked";
-}
-#endif /* ifdef HAVE_OPENSSL_CRYPTO_H */
+#ifdef HAVE_VALGRIND_VALGRIND_H
+#  include <valgrind/valgrind.h>
+#endif
 
 /** Check if the application linking to the library has the correct magic number
  *
@@ -359,14 +191,6 @@ void dependency_features_init(CONF_SECTION *cs)
 #endif
 				);
 
-	dependency_feature_add(cs, "regex-pcre",
-#ifdef HAVE_REGEX_PCRE
-				true
-#else
-				false
-#endif
-				);
-
 	dependency_feature_add(cs, "regex-pcre2",
 #ifdef HAVE_REGEX_PCRE2
 				true
@@ -390,7 +214,7 @@ void dependency_features_init(CONF_SECTION *cs)
 #endif
 
 	dependency_feature_add(cs, "regex-binsafe",
-#if defined(HAVE_REGNEXEC) || defined(HAVE_REGEX_PCRE) || defined(HAVE_REGEX_PCRE2)
+#if defined(HAVE_REGNEXEC) || defined(HAVE_REGEX_PCRE2)
 				true
 #else
 				false
@@ -452,7 +276,20 @@ void dependency_features_init(CONF_SECTION *cs)
 	dependency_feature_add(cs, "runtime-lsan", (fr_get_lsan_state() == 1));
 #endif
 
-#ifdef HAVE_VALGRIND_H
+#ifdef HAVE_GPERFTOOLS_PROFILER_H
+	{
+		struct ProfilerState state;
+
+		ProfilerGetCurrentState(&state);
+		/*
+		 *	Were we build with gperftools support,
+		 *	and is it currently enabled.
+		 */
+		dependency_feature_add(cs, "runtime-gperftools", state.enabled);
+	}
+#endif
+
+#ifdef HAVE_VALGRIND_VALGRIND_H
 	/*
 	 *	Are we running under valgrind
 	 */
@@ -464,6 +301,28 @@ void dependency_features_init(CONF_SECTION *cs)
 	 */
 	dependency_feature_add(cs, "runtime-debugger", (fr_get_debug_state() == 1));
 }
+
+#ifdef EVFILT_LIBKQUEUE
+static void dependency_libqueue_version(CONF_SECTION *cs)
+{
+	int kqfd, ret;
+	struct kevent kev, receipt;
+
+	kqfd = kqueue();
+	if (kqfd < 0) {
+	kqueue_error:
+		dependency_version_number_add(cs, "libkqueue", fr_syserror(errno));
+		return;
+	}
+
+	EV_SET(&kev, 0, EVFILT_LIBKQUEUE, EV_ADD, NOTE_VERSION_STR, 0, NULL);
+	ret = kevent(kqfd, &kev, 1, &receipt, 1, &(struct timespec){});
+	close(kqfd);
+	if (ret != 1) goto kqueue_error;
+
+	dependency_version_number_add(cs, "libkqueue", (char *)receipt.udata);
+}
+#endif
 
 /** Initialise core version flags
  *
@@ -481,29 +340,19 @@ void dependency_version_numbers_init(CONF_SECTION *cs)
 	snprintf(buffer, sizeof(buffer), "%i.%i.*", talloc_version_major(), talloc_version_minor());
 	dependency_version_number_add(cs, "talloc", buffer);
 
-	dependency_version_number_add(cs, "ssl", ssl_version_num());
+#ifdef WITH_TLS
+	dependency_version_number_add(cs, "ssl", fr_openssl_version_basic());
+#endif
 
 #ifdef HAVE_REGEX
 #  ifdef HAVE_REGEX_PCRE2
 	snprintf(buffer, sizeof(buffer), "%i.%i (%s) - retrieved at build time", PCRE2_MAJOR, PCRE2_MINOR, STRINGIFY(PCRE2_DATE));
 	dependency_version_number_add(cs, "pcre2", buffer);
-#  elif defined(HAVE_REGEX_PCRE)
-	dependency_version_number_add(cs, "pcre", pcre_version());
 #  endif
 #endif
 
-#ifdef LIBKQUEUE_VERSION_STRING
-	{
-		char const *libkqueue_version = LIBKQUEUE_VERSION_STRING
-#  ifdef LIBKQUEUE_VERSION_COMMIT
-		" (git #"LIBKQUEUE_VERSION_COMMIT")"
-#  endif
-#  ifdef LIBKQUEUE_VERSION_DATE
-		" ("LIBKQUEUE_VERSION_DATE") retrieved at build time"
-#  endif
-		;
-		dependency_version_number_add(cs, "libkqueue", libkqueue_version);
-	}
+#ifdef EVFILT_LIBKQUEUE
+	dependency_libqueue_version(cs);
 #endif
 }
 
@@ -518,12 +367,20 @@ void dependency_version_print(void)
 	CONF_ITEM *ci;
 	CONF_PAIR *cp;
 
+	INFO("Copyright 1999-2026 The FreeRADIUS server project and contributors");
+	INFO("There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A");
+	INFO("PARTICULAR PURPOSE");
+	INFO("You may redistribute copies of FreeRADIUS under the terms of the");
+	INFO("GNU General Public License");
+	INFO("For more information about these matters, see the file named COPYRIGHT");
+	INFO(" ");
+	INFO("FreeRADIUS is developed, maintained, and supported by InkBridge Networks ");
+	INFO("with contributions from the open source community.");
+	INFO("For commercial support, please email sales@inkbridgenetworks.com");
+	INFO("https://inkbridgenetworks.com/");
+
 	if (DEBUG_ENABLED3) {
-#ifdef WITH_TLS
-		ENGINE *engine;
-		char const *engine_id;
-#endif
-		int max = 0, len;
+		size_t max = 0, len;
 
 		MEM(features = cf_section_alloc(NULL, NULL, "feature", NULL));
 		dependency_features_init(features);
@@ -546,15 +403,6 @@ void dependency_version_print(void)
 			len = talloc_array_length(cf_pair_attr(cf_item_to_pair(ci)));
 			if (max < len) max = len;
 		}
-
-#ifdef WITH_TLS
-		for (engine = ENGINE_get_first();
-		     engine;
-		     engine = ENGINE_get_next(engine)) {
-			len = strlen(ENGINE_get_id(engine) + 1);
-			if (max < len) max = len;
-		}
-#endif
 
 		for (ci = cf_item_next(features, NULL);
 		     ci;
@@ -585,18 +433,6 @@ void dependency_version_print(void)
 		talloc_free(features);
 		talloc_free(versions);
 
-#ifdef WITH_TLS
-		DEBUG3("OpenSSL engines:");
-		for (engine = ENGINE_get_first();
-		     engine;
-		     engine = ENGINE_get_next(engine)) {
-			engine_id = ENGINE_get_id(engine);
-
-			DEBUG3("  %s%.*s : %s", engine_id, (int)(max - (strlen(engine_id) + 1)), spaces,
-			       ENGINE_get_name(engine));
-		}
-#endif
-
 		DEBUG2("Endianness:");
 #ifdef WORDS_BIGENDIAN
 		DEBUG2("  big");
@@ -606,27 +442,19 @@ void dependency_version_print(void)
 
 		DEBUG2("Compilation flags:");
 #ifdef BUILT_WITH_CPPFLAGS
-		DEBUG2("  cppflags : " BUILT_WITH_CPPFLAGS);
+		DEBUG2("  cppflags : %s", BUILT_WITH_CPPFLAGS);
 #endif
 #ifdef BUILT_WITH_CFLAGS
-		DEBUG2("  cflags   : " BUILT_WITH_CFLAGS);
+		DEBUG2("  cflags   : %s", BUILT_WITH_CFLAGS);
 #endif
 #ifdef BUILT_WITH_LDFLAGS
-		DEBUG2("  ldflags  : " BUILT_WITH_LDFLAGS);
+		DEBUG2("  ldflags  : %s", BUILT_WITH_LDFLAGS);
 #endif
 #ifdef BUILT_WITH_LIBS
-		DEBUG2("  libs     : " BUILT_WITH_LIBS);
+		DEBUG2("  libs     : %s", BUILT_WITH_LIBS);
 #endif
 		DEBUG2("  ");
 	}
-	INFO("FreeRADIUS Version " RADIUSD_VERSION_STRING);
-	INFO("Copyright 1999-2021 The FreeRADIUS server project and contributors");
-	INFO("There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A");
-	INFO("PARTICULAR PURPOSE");
-	INFO("You may redistribute copies of FreeRADIUS under the terms of the");
-	INFO("GNU General Public License");
-	INFO("For more information about these matters, see the file named COPYRIGHT");
 
 	fflush(NULL);
 }
-

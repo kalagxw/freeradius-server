@@ -1,6 +1,6 @@
 #pragma once
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -29,6 +29,8 @@
 RCSIDH(sim_h, "$Id$")
 
 #include <assert.h>
+
+#include <freeradius-devel/tls/openssl_user_macros.h>
 #include <openssl/evp.h>
 #include <freeradius-devel/eap/compose.h>
 #include <freeradius-devel/eap/types.h>
@@ -84,7 +86,7 @@ RCSIDH(sim_h, "$Id$")
 
 /** The type of auth vector held by a fr_aka_sim_keys_t
  */
-typedef enum {
+typedef enum : uint8_t {
 	AKA_SIM_VECTOR_NONE = 0,
 	AKA_SIM_VECTOR_GSM,					//!< Vector is GSM triplets.
 	AKA_SIM_VECTOR_UMTS,					//!< Vector is UMTS quintuplets.
@@ -94,7 +96,7 @@ typedef enum {
 
 /** Where to get EAP-SIM vectors from
  */
-typedef enum {
+typedef enum : uint8_t {
 	AKA_SIM_VECTOR_SRC_AUTO,				//!< Discover where to get Triplets from automatically.
 	AKA_SIM_VECTOR_SRC_TRIPLETS,				//!< Source of triplets is EAP-SIM-* attributes.
 	AKA_SIM_VECTOR_SRC_QUINTUPLETS,				//!< Source of triplets is derived from EAP-AKA-*
@@ -215,6 +217,10 @@ typedef struct {
 	 */
 	uint8_t		ck_prime[AKA_SIM_VECTOR_UMTS_CK_SIZE];	//!< Derived from CK, for AKA'.
 	uint8_t		ik_prime[AKA_SIM_VECTOR_UMTS_IK_SIZE];	//!< Derived from IK, for AKA'.
+	bool		ck_ik_prime_provided;			//!< CK'/IK' were supplied directly (e.g. by a
+								//!< 3GPP HSS over SWx which already performed the
+								//!< RFC 5448 transform), so the AKA' KDF must not
+								//!< derive them again from CK/IK.
 
 	/*
 	 *	Outputs
@@ -250,14 +256,55 @@ typedef struct {
 
 extern size_t const fr_aka_sim_attr_sizes[FR_TYPE_MAX + 1][2];
 
+typedef enum : int8_t {
+	AKA_SIM_FLAG_ENCRYPT_INVALID = -1,			//!< Invalid encryption flag.
+	AKA_SIM_FLAG_ENCRYPT_NONE = 0,				//!< No encryption.
+	AKA_SIM_FLAG_ENCRYPT_AES_CBC = 1,			//!< Encrypt attribute RFC 2865 style.
+} fr_aka_sim_attr_flags_encrypt_t;
+
+typedef struct {
+	fr_aka_sim_attr_flags_encrypt_t	encrypt;		//!< Attribute has a tag and is encrypted
+} fr_aka_sim_attr_flags_t;
+
+extern fr_dict_protocol_t libfreeradius_eap_aka_sim_dict_protocol;
+
+/** Return AKA/SIM-specific flags for a given attribute
+ *
+ * Assert in debug builds when the attribute belongs to another dictionary, as
+ * the flags of one protocol say nothing about an attribute of another.
+ *
+ * If the attribute does not carry the protocol-specific extension, then assert.
+ * Other builds log the error and return zeroed flags instead of NULL.
+ */
+static inline fr_aka_sim_attr_flags_t const * fr_aka_sim_attr_flags(fr_dict_attr_t const *da)
+{
+	static fr_aka_sim_attr_flags_t const	no_flags = {};
+	fr_aka_sim_attr_flags_t const		*flags;
+
+	fr_assert_msg(fr_dict_protocol(da->dict) == &libfreeradius_eap_aka_sim_dict_protocol,
+		      "%s is not an AKA/SIM attribute, it is from the \"%s\" dictionary",
+		      da->name, fr_dict_root(da->dict)->name);
+
+	flags = fr_dict_attr_ext(da, FR_DICT_ATTR_EXT_PROTOCOL_SPECIFIC);
+	if (!fr_cond_assert_msg(flags, "%s is not an AKA/SIM attribute, it has no protocol extension",
+				da->name)) return &no_flags;
+
+	return flags;
+}
+
+static inline fr_aka_sim_attr_flags_encrypt_t fr_aka_sim_flag_encrypted(fr_dict_attr_t const *da)
+{
+	return fr_aka_sim_attr_flags(da)->encrypt;
+}
+
 /*
  *	decode.c
  */
-ssize_t		fr_aka_sim_decode_pair(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+ssize_t		fr_aka_sim_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr_t const *parent,
 				       uint8_t const *data, size_t data_len, void *decode_ctx);
 
-int		fr_aka_sim_decode(request_t *request, fr_dcursor_t *decoded, fr_dict_t const *dict,
-				  uint8_t const *data, size_t data_len, fr_aka_sim_ctx_t *ctx);
+int		fr_aka_sim_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_t const *dict,
+				  uint8_t const *data, size_t data_len, fr_aka_sim_ctx_t *decode_ctx);
 
 /*
  *	encode.c
@@ -324,6 +371,10 @@ int		fr_aka_sim_vector_umts_from_attrs(request_t *request, fr_pair_list_t *vps,
 						  fr_aka_sim_keys_t *keys,
 						  fr_aka_sim_vector_src_t *src);
 
+int		fr_aka_sim_vector_umts_ck_ik_prime_from_attrs(request_t *request,
+							      fr_pair_t *ck_prime_vp, fr_pair_t *ik_prime_vp,
+							      fr_aka_sim_keys_t *keys);
+
 int		fr_aka_sim_vector_gsm_umts_kdf_0_reauth_from_attrs(request_t *request, fr_pair_list_t *vps,
 								   fr_aka_sim_keys_t *keys);
 
@@ -344,5 +395,5 @@ void		fr_aka_sim_fips186_2prf(uint8_t out[static 160], uint8_t mk[static 20]);
 /*
  *	xlat.c
  */
-void		fr_aka_sim_xlat_register(void);
-void		fr_aka_sim_xlat_unregister(void);
+int		fr_aka_sim_xlat_func_register(void);
+void		fr_aka_sim_xlat_func_unregister(void);

@@ -24,6 +24,91 @@ RCSID("$Id$")
 
 #include <freeradius-devel/util/dict_priv.h>
 
+static int dict_attr_unknown_init(fr_dict_attr_t const *parent, fr_dict_attr_t const *da, fr_type_t type, fr_dict_attr_flags_t *flags)
+{
+	flags->is_unknown = true;
+
+	if (parent->flags.local) {
+		fr_strerror_printf("Cannot create 'raw' attribute of data type '%s' which is a local variable",
+				   fr_type_to_str(type));
+		return -1;
+	}
+
+	if (parent->flags.internal) {
+		fr_strerror_printf("Cannot create 'raw' attribute of data type '%s' which is 'internal'",
+				   fr_type_to_str(type));
+		return -1;
+	}
+
+	if ((parent->type == FR_TYPE_UNION) && (type != FR_TYPE_OCTETS)) {
+		fr_strerror_printf("Cannot create 'raw' attribute of data type '%s' which has parent data type 'union'",
+				   fr_type_to_str(type));
+		return -1;
+	}
+
+	if (parent->depth >= FR_DICT_MAX_TLV_STACK) {
+		fr_strerror_const("Attribute depth is too large");
+		return -1;
+	}
+
+	/*
+	 *	If we are leveraging an existing attribute, then do some additional checks.
+	 */
+	if (da) {
+		if (da->flags.internal) {
+			fr_strerror_printf("Cannot create unknown attribute from internal attribute %s", da->name);
+			return -1;
+		}
+
+		/*
+		 *	@todo - do we actually care about this?
+		 *
+		 *	If we fix the unknown allocations to always use the raw number as the name, then it
+		 *	should be fine to change the data types.
+		 */
+		if (type != FR_TYPE_OCTETS) {
+			if (da->type != type) {
+				fr_strerror_printf("Cannot allocate unknown attribute (%s) which changes data type from '%s' to '%s'",
+					   da->name,
+						   fr_type_to_str(da->type),
+						   fr_type_to_str(type));
+				return -1;
+			}
+		}
+	}
+
+	/*
+	 *	Ensure that raw members of a structure have the correct length.
+	 */
+	if (parent->type == FR_TYPE_STRUCT) {
+		if (!da) {
+			fr_strerror_printf("Cannot create 'raw' attribute of data type '%s' which has parent data type 'struct'",
+					   fr_type_to_str(type));
+			return -1;
+		}
+
+		if (fr_type_is_leaf(da->type)) {
+			if (fr_type_is_structural(type)) goto cannot_change_type;
+
+			fr_assert(da->flags.is_known_width);
+
+			flags->is_known_width = true;
+			flags->length = da->flags.length;
+
+		} else if (da->type != type) {
+		cannot_change_type:
+			/*
+			 *	@todo - why not?  So long as the size is the same...
+			 */
+			fr_strerror_printf("Cannot create 'raw' attribute in 'struct' which changes data type from '%s' to '%s'",
+					   fr_type_to_str(da->type), fr_type_to_str(type));
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
 /** Converts an unknown to a known by adding it to the internal dictionaries.
  *
  * Does not free old #fr_dict_attr_t, that is left up to the caller.
@@ -35,7 +120,7 @@ RCSID("$Id$")
  *	- Existing #fr_dict_attr_t if unknown was found in a dictionary.
  *	- A new entry representing unknown.
  */
-fr_dict_attr_t const *fr_dict_unknown_add(fr_dict_t *dict, fr_dict_attr_t const *unknown)
+fr_dict_attr_t const *fr_dict_attr_unknown_add(fr_dict_t *dict, fr_dict_attr_t const *unknown)
 {
 	fr_dict_attr_t const *da;
 	fr_dict_attr_t const *parent;
@@ -46,11 +131,15 @@ fr_dict_attr_t const *fr_dict_unknown_add(fr_dict_t *dict, fr_dict_attr_t const 
 		return NULL;
 	}
 
+#ifdef STATIC_ANALYZER
+	if (!unknown->name || !unknown->parent) return NULL;
+#endif
+
 	da = fr_dict_attr_by_name(NULL, unknown->parent, unknown->name);
 	if (da) {
 		if (da->attr == unknown->attr) return da;
 
-		fr_strerror_printf("Unknown attribute '%s' conflicts with existing attribute in context %s",
+		fr_strerror_printf("Unknown attribute '%s' conflicts with existing attribute in namespace '%s'",
 				   da->name, unknown->parent->name);
 		return da;
 	}
@@ -59,15 +148,12 @@ fr_dict_attr_t const *fr_dict_unknown_add(fr_dict_t *dict, fr_dict_attr_t const 
 	 *	Define the complete unknown hierarchy
 	 */
 	if (unknown->parent && unknown->parent->flags.is_unknown) {
-		parent = fr_dict_unknown_add(dict, unknown->parent);
+		parent = fr_dict_attr_unknown_add(dict, unknown->parent);
 		if (!parent) {
 			fr_strerror_printf_push("Failed adding parent \"%s\"", unknown->parent->name);
 			return NULL;
 		}
 	} else {
-#ifdef __clang_analyzer__
-		if (!unknown->parent) return NULL;
-#endif
 		parent = unknown->parent;
 	}
 
@@ -124,10 +210,6 @@ fr_dict_attr_t const *fr_dict_unknown_add(fr_dict_t *dict, fr_dict_attr_t const 
 		return n;
 	}
 
-#ifdef __clang_analyzer__
-	if (!unknown->name) return NULL;
-#endif
-
 	/*
 	 *	Add the attribute by both name and number.
 	 *
@@ -148,10 +230,8 @@ fr_dict_attr_t const *fr_dict_unknown_add(fr_dict_t *dict, fr_dict_attr_t const 
  *
  * @param[in] da to free.
  */
-void fr_dict_unknown_free(fr_dict_attr_t const **da)
+void fr_dict_attr_unknown_free(fr_dict_attr_t const **da)
 {
-	fr_dict_attr_t **tmp;
-
 	if (!da || !*da) return;
 
 	/* Don't free real DAs */
@@ -159,36 +239,57 @@ void fr_dict_unknown_free(fr_dict_attr_t const **da)
 		return;
 	}
 
-	memcpy(&tmp, &da, sizeof(*tmp));
-	talloc_free(*tmp);
+	talloc_const_free(*da);
 
-	*tmp = NULL;
+	*da = NULL;
 }
 
-/** Copy a known or unknown attribute to produce an unknown attribute with the specified name
+/**  Allocate an unknown DA.
  *
- * Will copy the complete hierarchy down to the first known attribute.
  */
-fr_dict_attr_t *fr_dict_unknown_afrom_da(TALLOC_CTX *ctx, fr_dict_attr_t const *da)
+fr_dict_attr_t *fr_dict_attr_unknown_alloc(TALLOC_CTX *ctx, fr_dict_attr_t const *da, fr_type_t type)
 {
 	fr_dict_attr_t		*n;
 	fr_dict_attr_t const	*parent;
-	fr_dict_attr_flags_t	flags = da->flags;
-	fr_type_t		type = da->type;
+	fr_dict_attr_flags_t	flags = {};
+
+	fr_assert(!da->flags.is_root); /* cannot copy root attributes */
+	fr_assert(da->parent);
+
+	switch (type) {
+	case FR_TYPE_LEAF:
+	case FR_TYPE_GROUP:
+	case FR_TYPE_TLV:
+	case FR_TYPE_VSA:
+	case FR_TYPE_VENDOR:
+		break;
+
+	default:
+		fr_strerror_printf("Invalid data type '%s' for unknown attribute", fr_type_to_str(type));
+		return NULL;
+	}
+
+	switch (da->type) {
+	case FR_TYPE_LEAF:
+	case FR_TYPE_STRUCTURAL:
+		break;
+
+	default:
+		fr_strerror_printf("Cannot create unknown attribute from data type '%s'", fr_type_to_str(da->type));
+		return NULL;
+	}
+
+	if (dict_attr_unknown_init(da->parent, da, type, &flags)) return NULL;
 
 	/*
-	 *	Set the unknown flag, and clear other flags which are
-	 *	no longer relevant.
+	 *	Set the unknown flags.  Note that we don't copy any other flags, as they are all likely to be wrong.
 	 */
-	flags.is_unknown = 1;
-	flags.array = 0;
-	flags.has_value = 0;
-	flags.length = 0;	/* unknown length */
+	flags.is_raw = 1;
 
 	/*
 	 *	Allocate an attribute.
 	 */
-	n = dict_attr_alloc_null(ctx);
+	n = dict_attr_alloc_null(ctx, da->dict->proto);
 	if (!n) return NULL;
 
 	/*
@@ -198,8 +299,9 @@ fr_dict_attr_t *fr_dict_unknown_afrom_da(TALLOC_CTX *ctx, fr_dict_attr_t const *
 	 *	the parent from the 'da'.
 	 */
 	if (da->parent->flags.is_unknown) {
-		parent = fr_dict_unknown_afrom_da(n, da->parent);
+		parent = fr_dict_attr_unknown_copy(n, da->parent);
 		if (!parent) {
+		error:
 			talloc_free(n);
 			return NULL;
 		}
@@ -209,12 +311,56 @@ fr_dict_attr_t *fr_dict_unknown_afrom_da(TALLOC_CTX *ctx, fr_dict_attr_t const *
 	}
 
 	/*
-	 *	VENDOR and TLV are structural, and can have unknown
-	 *	children.  But they're left alone.  All other base
-	 *	types are mangled to OCTETs.
+	 *	Initialize the rest of the fields.
 	 */
-	switch (type) {
+	if (dict_attr_init(&n, parent, da->name, da->attr, type, &(dict_attr_args_t){ .flags = &flags }) < 0) {
+		goto error;
+	}
+
+	/*
+	 *	Copy protocol-specific extents, and hope to heck that the protocol encoder knows what it's doing.
+	 */
+	if (fr_dict_attr_ext(da, FR_DICT_ATTR_EXT_PROTOCOL_SPECIFIC) &&
+	    !dict_attr_ext_copy(&n, da, FR_DICT_ATTR_EXT_PROTOCOL_SPECIFIC)) {
+		goto error;
+	}
+
+	/*
+	 *	Do NOT copy extents.  The name and da_stack extents are already defined.  We do NOT copy
+	 *	existing children, references, keys, enumv, etc.  If the unknown attribute is a group, it's
+	 *	ref is already set to the root, or to a copy of the input DA.  If the unknown attribute is a
+	 *	TLV, then it cannot have known children.  If an unknown attribute is a leaf, then it cannot
+	 *	have known enums.
+	 */
+
+	DA_VERIFY(n);
+
+	return n;
+}
+
+/** Copy a known or unknown attribute to produce an unknown attribute with the specified name
+ *
+ * Will copy the complete hierarchy down to the first known attribute.
+ */
+fr_dict_attr_t *fr_dict_attr_unknown_afrom_da(TALLOC_CTX *ctx, fr_dict_attr_t const *da)
+{
+	fr_type_t type = da->type;
+
+	/*
+	 *	VENDOR, etc. are logical containers, and can have
+	 *	unknown children, so they're left alone.  All other
+	 *	base types are mangled to OCTETs.
+	 *
+	 *	Note that we can't allocate an unknown STRUCT.  If the
+	 *	structure is malformed, then it's just a sequence of
+	 *	OCTETS.  Similarly, if a GROUP is malformed, then we
+	 *	have no idea what's inside of it, and we make it OCTETS.
+	 */
+	if (!da->flags.is_unknown) switch (type) {
 	case FR_TYPE_VENDOR:
+		fr_assert(da->flags.type_size != 0);
+		break;
+
 	case FR_TYPE_TLV:
 	case FR_TYPE_VSA:
 		break;
@@ -224,196 +370,81 @@ fr_dict_attr_t *fr_dict_unknown_afrom_da(TALLOC_CTX *ctx, fr_dict_attr_t const *
 		break;
 	}
 
-	/*
-	 *	Initialize the rest of the fields.
-	 */
-	dict_attr_init(&n, parent, da->name, da->attr, type, &(dict_attr_args_t){ .flags = &flags });
-	dict_attr_ext_copy_all(&n, da);
-	DA_VERIFY(n);
-
-	return n;
+	return fr_dict_attr_unknown_alloc(ctx, da, type);
 }
 
-/** Build an unknown vendor, parented by a VSA attribute
+/** Initialise a fr_dict_attr_t from a number and a data type
  *
- * This allows us to complete the path back to the dictionary root in the case
- * of unknown attributes with unknown vendors.
- *
- * @note Will return known vendors attributes where possible.  Do not free directly,
- *	use #fr_dict_unknown_free.
- *
- * @param[in] ctx to allocate the vendor attribute in.
- * @param[in] parent		of the VSA attribute.
- * @param[in] vendor		id.
+ * @param[in] ctx		to allocate the attribute in.
+ * @param[in] parent		of the unknown attribute (may also be unknown).
+ * @param[in] num		of the unknown attribute.
+ * @param[in] type		data type
+ * @param[in] raw		is it raw, i.e. _bad_ value, versus unknown?
  * @return
- *	- 0 on success.
- *	- -1 on failure.
+ *	- An fr_dict_attr_t on success.
+ *	- NULL on failure.
  */
-fr_dict_attr_t	*fr_dict_unknown_vendor_afrom_num(TALLOC_CTX *ctx,
-						  fr_dict_attr_t const *parent, unsigned int vendor)
+fr_dict_attr_t *fr_dict_attr_unknown_typed_afrom_num_raw(TALLOC_CTX *ctx, fr_dict_attr_t const *parent, unsigned int num, fr_type_t type, bool raw)
 {
 	fr_dict_attr_flags_t	flags = {
-					.is_unknown = 1,
-					.type_size = 1,
-					.length = 1
+					.is_raw = raw,
 				};
+	fr_dict_attr_t const	*da = NULL;
 
-	/*
-	 *	Vendor attributes can occur under VSA attribute.
-	 */
-	switch (parent->type) {
-	case FR_TYPE_VSA:
-		if (!fr_cond_assert(!parent->flags.is_unknown)) return NULL;
-		return dict_attr_alloc(ctx, parent, NULL, vendor, FR_TYPE_VENDOR,
-				       &(dict_attr_args_t){ .flags = &flags });
+	if (parent->flags.internal) {
+		fr_strerror_printf("Cannot create 'raw' attribute from internal parent '%s' of data type '%s'",
+				   parent->name, fr_type_to_str(parent->type));
+		return NULL;
+	}
+
+	if (((parent->type == FR_TYPE_TLV) || (parent->type == FR_TYPE_VENDOR))) {
+		if ((uint64_t) num >= ((uint64_t) 1 << (8 * parent->flags.type_size))) {
+			fr_strerror_printf("Invalid attribute number '%u' - it must be no more than %u bits in size",
+					   num, 8U * parent->flags.type_size);
+			return NULL;
+		}
+	}
+
+	switch (type) {
+	default:
+		fr_strerror_printf("Cannot allocate unknown attribute '%u' - invalid data type '%s'",
+				   num, fr_type_to_str(type));
+		return NULL;
 
 	case FR_TYPE_VENDOR:
-		if (!fr_cond_assert(!parent->flags.is_unknown)) return NULL;
-		fr_strerror_const("Unknown vendor cannot be parented by another vendor");
-		return NULL;
+		if (parent->type != FR_TYPE_VSA) goto fail;
 
-	default:
-		fr_strerror_printf("Unknown vendors can only be parented by a vsa, not a %s",
-				   fr_table_str_by_value(fr_value_box_type_table, parent->type, "?Unknown?"));
-		return NULL;
-	}
-}
+		if (parent->flags.is_unknown) goto fail;
+		break;
 
-/** Initialise a fr_dict_attr_t from a number
- *
- * @param[in] ctx		to allocate the attribute in.
- * @param[in] parent		of the unknown attribute (may also be unknown).
- * @param[in] num		of the unknown attribute.
- * @return
- *	- 0 on success.
- *	- -1 on failure.
- */
-fr_dict_attr_t *fr_dict_unknown_tlv_afrom_num(TALLOC_CTX *ctx, fr_dict_attr_t const *parent, unsigned int num)
-{
-	fr_dict_attr_flags_t	flags = {
-					.is_unknown = true,
-				};
-
-	if (!fr_type_is_structural_except_vsa(parent->type)) {
-		fr_strerror_printf("%s: Cannot allocate unknown tlv attribute (%u) with parent type %s",
-				   __FUNCTION__,
-				   num,
-				   fr_table_str_by_value(fr_value_box_type_table, parent->type, "<INVALID>"));
-		return NULL;
-	}
-
-	return dict_attr_alloc(ctx, parent, NULL, num, FR_TYPE_TLV,
-			       &(dict_attr_args_t){ .flags = &flags });
-}
-
-/** Initialise a fr_dict_attr_t from a number
- *
- * @param[in] ctx		to allocate the attribute in.
- * @param[in] parent		of the unknown attribute (may also be unknown).
- * @param[in] num		of the unknown attribute.
- * @return
- *	- 0 on success.
- *	- -1 on failure.
- */
-fr_dict_attr_t	*fr_dict_unknown_attr_afrom_num(TALLOC_CTX *ctx, fr_dict_attr_t const *parent, unsigned int num)
-{
-	fr_dict_attr_flags_t	flags = {
-					.is_unknown = true,
-				};
-
-	if (!fr_type_is_structural_except_vsa(parent->type)) {
-		fr_strerror_printf("%s: Cannot allocate unknown octets attribute (%u) with parent type %s",
-				   __FUNCTION__,
-				   num,
-				   fr_table_str_by_value(fr_value_box_type_table, parent->type, "<INVALID>"));
-		return NULL;
-	}
-
-	return dict_attr_alloc(ctx, parent, NULL, num, FR_TYPE_OCTETS,
-			       &(dict_attr_args_t){ .flags = &flags });
-}
-
-/** Initialise an octets type attribute from a da
- *
- * @param[in] ctx		to allocate the attribute in.
- * @param[in] da		of the unknown attribute.
- * @return
- *	- 0 on success.
- *	- -1 on failure.
- */
-fr_dict_attr_t	*fr_dict_unknown_attr_afrom_da(TALLOC_CTX *ctx, fr_dict_attr_t const *da)
-{
-	fr_dict_attr_t		*n;
-	fr_dict_attr_t const	*parent;
-	fr_dict_attr_flags_t	flags = da->flags;
-
-	/*
-	 *	Set the unknown flag, and clear other flags which are
-	 *	no longer relevant.
-	 */
-	flags.is_unknown = 1;
-	flags.array = 0;
-	flags.has_value = 0;
-	flags.length = 0;	/* unknown length */
-
-	/*
-	 *	Allocate an attribute.
-	 */
-	n = dict_attr_alloc_null(ctx);
-	if (!n) return NULL;
-
-	/*
-	 *	We want to have parent / child relationships, AND to
-	 *	copy all unknown parents, AND to free the unknown
-	 *	parents when this 'da' is freed.  We therefore talloc
-	 *	the parent from the 'da'.
-	 */
-	if (da->parent->flags.is_unknown) {
-		parent = fr_dict_unknown_afrom_da(n, da->parent);
-		if (!parent) {
-			talloc_free(n);
+	case FR_TYPE_LEAF:
+	case FR_TYPE_TLV:
+	case FR_TYPE_VSA:
+		if (!fr_type_is_structural_except_vsa(parent->type)) {
+		fail:
+			fr_strerror_printf("Cannot allocate unknown attribute '%u' data type '%s' with parent %s data type '%s'",
+					   num, fr_type_to_str(type),
+					   parent->name, fr_type_to_str(parent->type));
 			return NULL;
 		}
 
-	} else {
-		parent = da->parent;
+		/*
+		 *	We can convert anything to 'octets'.
+		 */
+		if (type == FR_TYPE_OCTETS) break;
+
+		/*
+		 *	But we shouldn't be able to create a raw attribute which is a _different_ type than an
+		 *	existing one.
+		 */
+		da = fr_dict_attr_child_by_num(parent, num);
+		break;
 	}
 
-	/*
-	 *	Initialize the rest of the fields.
-	 */
-	dict_attr_init(&n, parent, da->name, da->attr, FR_TYPE_OCTETS, &(dict_attr_args_t){ .flags = &flags });
-	DA_VERIFY(n);
+	if (dict_attr_unknown_init(parent, da, type, &flags)) return NULL;
 
-	return n;
-}
-
-/** Initialise two #fr_dict_attr_t from numbers
- *
- * @param[in] ctx		to allocate the unknown attributes in.
- * @param[in] parent		of the unknown attribute (may also be unknown).
- * @param[in] vendor		of the unknown attribute.
- * @param[in] attr		of the unknown attribute.
- * @return
- *	- 0 on success.
- *	- -1 on failure.
- */
-fr_dict_attr_t	*fr_dict_unknown_afrom_fields(TALLOC_CTX *ctx, fr_dict_attr_t const *parent,
-					      unsigned int vendor, unsigned int attr)
-{
-	fr_dict_attr_t *unknown_vendor, *unknown;
-
-	unknown_vendor = fr_dict_unknown_vendor_afrom_num(ctx, parent, vendor);
-	if (unlikely(!unknown_vendor)) return NULL;
-
-	unknown = fr_dict_unknown_attr_afrom_num(ctx, unknown_vendor, attr);
-	if (unlikely(!unknown)) {
-		talloc_free(unknown_vendor);
-		return NULL;
-	}
-	talloc_steal(unknown, unknown_vendor);
-
-	return unknown;
+	return dict_attr_alloc(ctx, parent, NULL, num, type,
+			       &(dict_attr_args_t){ .flags = &flags });
 }
 
 /** Create a fr_dict_attr_t from an ASCII attribute and value
@@ -431,100 +462,30 @@ fr_dict_attr_t	*fr_dict_unknown_afrom_fields(TALLOC_CTX *ctx, fr_dict_attr_t con
  *				dictionary attributes.
  * @param[in] parent		Attribute to use as the root for resolving OIDs in.
  *				Usually the root of a protocol dictionary.
- * @param[in] in		of attribute.
- * @param[in] tt		Terminal strings.
+ * @param[in] in		OID string to parse
+ * @param[in] type		data type of the unknown attribute
  * @return
  *	- The number of bytes parsed on success.
  *	- <= 0 on failure.  Negative offset indicates parse error position.
  */
-ssize_t fr_dict_unknown_afrom_oid_substr(TALLOC_CTX *ctx,
-					 fr_dict_attr_err_t *err, fr_dict_attr_t **out,
-			      	  	 fr_dict_attr_t const *parent,
-			      	  	 fr_sbuff_t *in, fr_sbuff_term_t const *tt)
+fr_slen_t fr_dict_attr_unknown_afrom_oid_substr(TALLOC_CTX *ctx,
+					   fr_dict_attr_t const **out,
+			      		   fr_dict_attr_t const *parent,
+					   fr_sbuff_t *in, fr_type_t type)
 {
-	fr_dict_attr_t const	*our_parent;
+	fr_sbuff_t		our_in = FR_SBUFF(in);
+	fr_dict_attr_t const	*our_parent = parent;
 	fr_dict_attr_t		*n = NULL;
-	fr_dict_attr_err_t	our_err;
-	fr_dict_attr_flags_t	flags = {
-					.is_unknown = true
-				};
-	fr_sbuff_marker_t	start;
-	ssize_t			slen;
-	bool			is_raw;
+	int			depth;
+	fr_dict_attr_flags_t	flags = { .is_raw = true, };
 
 	*out = NULL;
-
-	fr_sbuff_marker(&start, in);
-
-	is_raw = fr_sbuff_adv_past_str_literal(in, "raw");
-
-	/*
-	 *	Resolve all the known bits first...
-	 */
-	slen = fr_dict_attr_by_oid_substr(&our_err, &our_parent, parent, in, tt);
-	switch (our_err) {
-	/*
-	 *	Um this is awkward, we were asked to
-	 *	produce an unknown but all components
-	 *	are known...
-	 *
-	 *	Just exit and pass back the known
-	 *	attribute, unless we got a raw prefix
-	 *	in which case process that.
-	 */
-	case FR_DICT_ATTR_OK:
-		if (is_raw) {
-			*out = fr_dict_unknown_attr_afrom_da(ctx, our_parent);
-			(*out)->flags.is_raw = 1;
-			if (err) *err = *out ? FR_DICT_ATTR_OK : FR_DICT_ATTR_PARSE_ERROR;
-		} else {
-			*out = fr_dict_attr_unconst(our_parent);	/* Which is the resolved attribute in this case */
-			if (err) *err = FR_DICT_ATTR_OK;
-		}
-
-		return fr_sbuff_marker_release_behind(&start);
-
-	/*
-	 *	This is what we want... Everything
-	 *      up to the non-matching OID was valid.
-	 *
-	 *	our_parent should be left pointing
-	 *	to the last known attribute, or be
-	 *	so to NULL if we couldn't resolve
-	 *	anything.
-	 */
-	case FR_DICT_ATTR_NOTFOUND:
-		if (our_parent) {
-			switch (parent->type) {
-			case FR_TYPE_STRUCTURAL:
-				break;
-
-			default:
-				fr_strerror_printf("Parent OID component (%s) specified a non-structural type (%s)",
-						   our_parent->name,
-						   fr_table_str_by_value(fr_value_box_type_table,
-									 our_parent->type, "<INVALID>"));
-				goto error;
-			}
-		} else {
-			our_parent = parent;
-		}
-		break;
-
-	/*
-	 *	All other errors are fatal.
-	 */
-	default:
-		if (err) *err = our_err;
-		fr_sbuff_marker_release(&start);
-		return slen;
-	}
 
 	/*
 	 *	Allocate the final attribute first, so that any
 	 *	unknown parents can be freed when this da is freed.
 	 *
-	 *      See fr_dict_unknown_afrom_da() for more details.
+	 *      See fr_dict_attr_unknown_afrom_da() for more details.
 	 *
 	 *	Note also that we copy the input name, even if it is
 	 *	not normalized.
@@ -533,34 +494,26 @@ ssize_t fr_dict_unknown_afrom_oid_substr(TALLOC_CTX *ctx,
 	 *	or more of the leading components may, in fact, be
 	 *	known.
 	 */
-	n = dict_attr_alloc_null(ctx);
-
-	/*
-	 *	fr_dict_attr_by_oid_substr parsed *something*
-	 *	we expected the next component to be a '.'.
-	 */
-	if (fr_sbuff_behind(&start) > 0) {
-		if (!fr_sbuff_next_if_char(in, '.')) {	/* this is likely a logic bug if the test fails ? */
-			fr_strerror_printf("Missing OID component separator %s", fr_sbuff_current(in));
-		error:
-			if (err) *err = FR_DICT_ATTR_PARSE_ERROR;
-			talloc_free(n);
-			return -fr_sbuff_marker_release_reset_behind(&start);
-		}
-	} else if (fr_sbuff_next_if_char(in, '.')) {
-		our_parent = fr_dict_root(fr_dict_by_da(parent));		/* From the root */
-	}
+	n = dict_attr_alloc_null(ctx, parent->dict->proto);
 
 	/*
 	 *	Loop until there's no more component separators.
 	 */
-	for (;;) {
+	for (depth = 0; depth < FR_DICT_MAX_TLV_STACK; depth++) {
 		uint32_t		num;
-		fr_sbuff_parse_error_t	sberr;
+		fr_sbuff_err_t		sberr;
 
-		fr_sbuff_out(&sberr, &num, in);
+		/*
+		 *	Cannot create attributes that are too deeply nested.
+		 */
+		if ((depth + parent->depth) >= FR_DICT_MAX_TLV_STACK) {
+			fr_strerror_printf("Attribute depth (%d) is too large", depth + parent->depth);
+			goto error;
+		}
+
+		sberr = fr_sbuff_out(&num, &our_in);
 		switch (sberr) {
-		case FR_SBUFF_PARSE_OK:
+		case FR_SBUFF_OK:
 			switch (our_parent->type) {
 			/*
 			 *	If the parent is a VSA, this component
@@ -570,9 +523,13 @@ ssize_t fr_dict_unknown_afrom_oid_substr(TALLOC_CTX *ctx,
 			{
 				fr_dict_attr_t	*ni;
 
-				if (fr_sbuff_next_if_char(in, '.')) {
-					ni = fr_dict_unknown_vendor_afrom_num(n, our_parent, num);
-					if (!ni) goto error;
+				if (fr_sbuff_next_if_char(&our_in, '.')) {
+					ni = fr_dict_attr_unknown_vendor_afrom_num(n, our_parent, num);
+					if (!ni) {
+					error:
+						talloc_free(n);
+						FR_SBUFF_ERROR_RETURN(&our_in);
+					}
 					our_parent = ni;
 					continue;
 				}
@@ -589,8 +546,8 @@ ssize_t fr_dict_unknown_afrom_oid_substr(TALLOC_CTX *ctx,
 			{
 				fr_dict_attr_t	*ni;
 
-				if (fr_sbuff_next_if_char(in, '.')) {
-					ni = fr_dict_unknown_tlv_afrom_num(n, our_parent, num);
+				if (fr_sbuff_next_if_char(&our_in, '.')) {
+					ni = fr_dict_attr_unknown_typed_afrom_num(n, our_parent, num, FR_TYPE_TLV);
 					if (!ni) goto error;
 					our_parent = ni;
 					continue;
@@ -603,38 +560,69 @@ ssize_t fr_dict_unknown_afrom_oid_substr(TALLOC_CTX *ctx,
 				 *	Leaf type with more components
 				 *	is an error.
 				 */
-				if (fr_sbuff_is_char(in, '.')) {
-					fr_strerror_printf("Interior OID component cannot proceed a %s type",
-							   fr_table_str_by_value(fr_value_box_type_table,
-										 our_parent->type, "<INVALID>"));
+				if (fr_sbuff_is_char(&our_in, '.')) {
+					fr_strerror_printf("Interior OID component cannot precede a %s type",
+							   fr_type_to_str(our_parent->type));
 					goto error;
 				}
-				flags.is_raw = is_raw;
-				if (dict_attr_init(&n, our_parent, NULL, num, FR_TYPE_OCTETS,
+
+				if (dict_attr_unknown_init(our_parent, NULL, type, &flags)) goto error;
+
+				if (dict_attr_init(&n, our_parent, NULL, num, type,
 						   &(dict_attr_args_t){ .flags = &flags }) < 0) goto error;
 				break;
 			}
 			break;
 
-		default:
+		case FR_SBUFF_ERR_OVERFLOW:
 		{
 			fr_sbuff_marker_t c_start;
 
-			fr_sbuff_marker(&c_start, in);
-			fr_sbuff_adv_past_allowed(in, FR_DICT_ATTR_MAX_NAME_LEN, fr_dict_attr_allowed_chars, NULL);
-			fr_strerror_printf("Unknown attribute  \"%.*s\" for parent \"%s\"",
-					   (int)fr_sbuff_behind(&c_start), fr_sbuff_current(&c_start), our_parent->name);
+			fr_sbuff_marker(&c_start, &our_in);
+			fr_sbuff_adv_past_allowed(&our_in, FR_DICT_ATTR_MAX_NAME_LEN, fr_dict_attr_allowed_chars, NULL);
+			fr_strerror_printf("Invalid value \"%.*s\" - attribute numbers must be less than 2^32",
+					   (int)fr_sbuff_behind(&c_start), fr_sbuff_current(&c_start));
 			goto error;
+		}
+
+		default:
+		{
+			size_t len;
+			fr_sbuff_marker_t c_start;
+
+			fr_sbuff_marker(&c_start, &our_in);
+			len = fr_sbuff_adv_past_allowed(&our_in, FR_DICT_ATTR_MAX_NAME_LEN, fr_dict_attr_allowed_chars, NULL);
+
+			/*
+			 *	If we saw no valid characters at the start, it's a bad attribute name.
+			 *
+			 *	If we saw valid characters but didn't parse them into an attribute name, it's
+			 *	a bad attribute name.
+			 *
+			 *	Otherwise we parsed at least one attribute, and then ran out of valid
+			 *	attribute characters to parse.  The result must be OK.
+			 *
+			 *	This check is here really only because there's a lot of code which parses
+			 *	attributes, but does not properly set either the buffer size to be _just_ the
+			 *	attribute name, OR the set of terminal characters.  This means that the
+			 *	attribute parsing code can't error out if there are invalid characters after a
+			 *	valid attribute name.  Instead, the caller has to check the return code.
+			 */
+			if (((depth == 0) && (len == 0)) || ((depth > 0) && (len > 0))) {
+				fr_strerror_printf("Unknown attribute \"%.*s\" for parent \"%s\"",
+					   (int)fr_sbuff_behind(&c_start), fr_sbuff_current(&c_start), our_parent->name);
+				goto error;
+			}
 		}
 		}
 		break;
-	};
+	}
 
 	DA_VERIFY(n);
 
 	*out = n;
 
-	return fr_sbuff_marker_release_behind(&start);
+	FR_SBUFF_SET_RETURN(in, &our_in);
 }
 
 /** Fixup the parent of an unknown attribute using an equivalent known attribute
@@ -690,7 +678,7 @@ int fr_dict_attr_unknown_parent_to_known(fr_dict_attr_t *da, fr_dict_attr_t cons
 		}
 	}
 
-	da->parent = parent;
+	da->parent = fr_dict_attr_unconst(parent);
 
 	return 0;
 }

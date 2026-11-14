@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -7,7 +7,7 @@
 #	http://www.ietf.org/rfc/rfc6677.txt
 #
 
-ATTRIBUTE	EAP-Lower-Layer				163	integer
+ATTRIBUTE	EAP-Lower-Layer				163	uint32
 
 VALUE	EAP-Lower-Layer			Wired-IEEE-802.1X	1
 VALUE	EAP-Lower-Layer			IEEE-802.1X-No-Preauth	2

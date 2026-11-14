@@ -1,23 +1,18 @@
-#
-# PRE: update
-#
+time_delta result
 
 # This is mainly a smoke test... i.e. if it crashes there's smoke
 
-"%(delay_10s:)"	# Should 'blip' the request
+%delay_10s()	# Should 'blip' the request
 
-update request {
-	&Tmp-Float-0 := "%(delay_10s:0.1)"
-}
-
-if (!&Tmp-Float-0) {
+result := %delay_10s(0.1s)
+if (!result) {
 	fail
 }
 
 #
 # Check the delay was ~100ms
 #
-if (&Tmp-Float-0 < 0.1) {
+if ((result < 0.1s) || (result > 0.2s)) {
 	fail
 }
 

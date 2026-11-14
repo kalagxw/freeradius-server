@@ -1,0 +1,53 @@
+name: Claude Code Review
+
+#
+#  The workflow reviews pull requests whose branch is in the FreeRADIUS
+#  repository.  Only a person with write access can push such a branch.
+#
+#  A pull request from a fork gets no review here, for two reasons:
+#
+#    1. GitHub grants no `id-token` permission to a fork's `pull_request`
+#       run, and the Claude Code action needs the token for authentication.
+#    2. A `pull_request_target` run has the permission, but Anthropic's
+#       GitHub App token exchange rejects the OpenID Connect (OIDC) token
+#       of that event.  See anthropics/claude-code-action issue 713.
+#
+#  To review a pull request from a fork, a maintainer comments `@claude`
+#  on the pull request.  The 'Claude Code' workflow in `claude.yml` runs
+#  the review from the maintainer's comment.
+#
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+jobs:
+  claude-review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_federation_rule_id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          anthropic_organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          anthropic_service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          anthropic_workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
+

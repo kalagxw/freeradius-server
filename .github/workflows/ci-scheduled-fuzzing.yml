@@ -1,29 +1,58 @@
-name: Scheduled fuzzing
-
 #
 #  This workflow will normally run on a schedule.
 #
-#  It can also be invoked manually by pushing to a branch called
-#  run-fuzzer[-<timeout>], e.g.
+#  You can also run the workflow manually by pushing to a branch named as
+#  follows:
 #
-#    - 'run-fuzzer':      Start fuzzing immediately
-#    - 'run-fuzzer-3600': Limit the runtime to one hour
+#      run-fuzzer[[-<protocol>]-<timeout>]
 #
+#      <timeout> is total run length, including setup.
+#      <protocol> is the name of the unit to fuzz.
+#
+#  For example:
+#
+#    - 'run-fuzzer':             Start fuzzing all protocols (default timeout)
+#    - 'run-fuzzer-3600':        Start fuzzing all protocols for one hour
+#    - 'run-fuzzer-radius-7200': Start fuzzing RADIUS for two hours
+#
+#  The `fuzzer` job uploads fuzzing failures (full log output including
+#  backtraces and reproducers) as 'artifacts' for the GitHub Actions run.
+#
+#  The following script lists fuzzer failures and downloads reproducers for
+#  local reproduction:
+#
+#      scripts/build/fuzzer-fetch-artifacts
+#
+#  If local reproduction does not recreate the failure then attempt the
+#  reproduction within a GitHub Actions runner. To attempt the reproduction
+#  within a runner, push to the following branch:
+#
+#    - 'debug-fuzzer-<protocol>'
+#
+#  On a push to a `debug-fuzzer` branch the workflow builds with the fuzzer
+#  enabled, and then launches a tmate session instead of fuzzing. Use the
+#  tmate session to access the environment. Further details are at the end
+#  of this file.
+#
+
+name: Scheduled fuzzing
 
 on:
   push:
     branches:
       - 'run-fuzzer**'
+      - 'debug-fuzzer-**'
 
   schedule:
     - cron: '0 4 * * *'
 
+  workflow_dispatch:
+
 env:
   ASAN_OPTIONS: symbolize=1 detect_leaks=1 detect_stack_use_after_return=1
   LSAN_OPTIONS: fast_unwind_on_malloc=0:malloc_context_size=50
-  KQUEUE_DEBUG: yes
   M_PERTURB: "0x42"
-  PANIC_ACTION: "gdb -batch -x raddb/panic.gdb %e %p 1>&0 2>&0"
+  PANIC_ACTION: "gdb -batch -x raddb/panic.gdb %e %p"
   ANALYZE_C_DUMP: 1
   FR_GLOBAL_POOL: 4M
   TEST_CERTS: yes
@@ -33,20 +62,108 @@ env:
   CC: clang
 
 jobs:
+  #
+  #  The `common_vars` job determines which registry holds the continuous
+  #  integration (CI) images.  See `.github/workflows/common_vars.yml`.
+  #
+  common_vars:
+    name: Common vars
+    uses: ./.github/workflows/common_vars.yml
+
+
+  #
+  #  The `set-matrix` job constructs a matrix of protocols to fuzz, as JSON.
+  #  When the main `fuzzer` job uses the JSON as the job matrix, the matrix is
+  #  equivalent to the following YAML:
+  #
+  #    matrix:
+  #      env:
+  #        - { "PROTOCOL": "radius", "TOTAL_RUNTIME": "20000", "UPLOAD_SLOT": "0", "NUM_SLOTS": "15" }
+  #        - { "PROTOCOL": "dhcpv4", "TOTAL_RUNTIME": "20000", "UPLOAD_SLOT": "3", "NUM_SLOTS": "15" }
+  #        - ...
+  #
+  set-matrix:
+
+    name: Setup build matrix
+
+    runs-on: ${{ github.repository_owner == 'FreeRADIUS' && 'self-hosted' || 'ubuntu-latest' }}
+
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      starttimestamp: ${{ steps.starttimestamp.outputs.starttimestamp }}
+
+    steps:
+
+    - id: starttimestamp
+      name: Record run start time
+      run: |
+        echo starttimestamp=`date +%s` >> $GITHUB_OUTPUT
+
+    - uses: actions/checkout@v6
+      with:
+        lfs: false
+
+    - id: set-matrix
+      name: Setup the matrix
+      run: |
+        #
+        #  By default we fuzz all protocols for 20000s (just short of the 6h
+        #  GitHub Action run limit)
+        #
+        TOTAL_RUNTIME=20000
+        SLOT_SPREAD=3  # secs
+        read -r -a PROTOS <<< $(sed -ne 's/^FUZZER_PROTOCOLS\s\+=\s\+\(.*\)/\1/p' src/fuzzer/all.mk)
+        read -r -a NON_PROTOS <<< $(sed -ne 's/^FUZZER_NON_PROTOCOL_TARGETS\s\+=\s\+\(.*\)/\1/p' src/fuzzer/all.mk)
+        PROTOS=( "${PROTOS[@]}" "${NON_PROTOS[@]}" )
+        #
+        if [[ "$GITHUB_REF" = refs/heads/run-fuzzer-*-* ]]; then
+          PROTOS=${GITHUB_REF#refs/heads/run-fuzzer-}
+          TOTAL_RUNTIME=${PROTOS##*-}
+          PROTOS=( "${PROTOS%-*}" )
+        elif [[ "$GITHUB_REF" = refs/heads/run-fuzzer-* ]]; then
+          TOTAL_RUNTIME=${GITHUB_REF#refs/heads/run-fuzzer-}
+        elif [[ "$GITHUB_REF" = refs/heads/debug-fuzzer-* ]]; then
+          PROTOS=${GITHUB_REF#refs/heads/debug-fuzzer-}
+          PROTOS=( "${PROTOS%-*}" )
+        fi
+        P=$(
+            for i in ${!PROTOS[@]}; do
+              echo "{ \"PROTOCOL\": \"${PROTOS[$i]}\", \"TOTAL_RUNTIME\": \"$TOTAL_RUNTIME\", \"UPLOAD_SLOT\": \"$((i * $SLOT_SPREAD))\", \"NUM_SLOTS\": \"$((${#PROTOS[@]} * $SLOT_SPREAD))\" },"
+            done
+          )
+        M=$(cat <<EOF
+        {
+          "env": [
+            ${P:0:-1}
+          ]
+        }
+        EOF
+          )
+        echo "Matrix:"
+        echo "$M"
+        echo matrix=$M >> $GITHUB_OUTPUT
+
+
   fuzzer:
 
-    runs-on: ubuntu-20.04
+    needs:
+      - set-matrix
+      - common_vars
 
-    # TOTAL_RUNTIME: 20000 is just short of the 6 hours GH Actions limit
+    if: github.repository_owner == 'FreeRADIUS'
+
+    runs-on: self-hosted
+
+    container:
+      image: ${{ needs.common_vars.outputs.image_prefix }}self-hosted:latest
+
+    defaults:
+      run:
+        shell: bash
+
     strategy:
       fail-fast: false
-      matrix:
-        env:
-          - { PROTOCOL: radius, TOTAL_RUNTIME: 20000 }
-          - { PROTOCOL: dhcpv4, TOTAL_RUNTIME: 20000 }
-          - { PROTOCOL: dhcpv6, TOTAL_RUNTIME: 20000 }
-          - { PROTOCOL: vmps,   TOTAL_RUNTIME: 20000 }
-          - { PROTOCOL: tacacs, TOTAL_RUNTIME: 20000 }
+      matrix: ${{ fromJson(needs.set-matrix.outputs.matrix) }}
 
     env: ${{ matrix.env }}
 
@@ -54,67 +171,55 @@ jobs:
 
     steps:
 
-    - name: Stamp start time
-      run: date +%s > ~/start_timestamp
-
-    #  Checkout, but defer pulling LFS objects until we've restored the cache
+    #  Checkout, but defer pulling Git Large File Storage (LFS) objects until
+    #  we have restored the cache
     #
-    #  We include a bit of depth since we will walk the tree until we find a
-    #  commit that builds.
+    #  We fetch additional history because we need to see when the corpus
+    #  was last updated.  We also walk the tree until we find a commit that
+    #  builds.
     #
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
       with:
         lfs: false
-        fetch-depth: 50
+        fetch-depth: 500
 
-    - name: Create LFS file list as cache key
-      run: git lfs ls-files -l | cut -d' ' -f1 | sort > .lfs-assets-id
+    #
+    #  We push changes to the corpus to the GitHub Actions cache, and restore
+    #  the corpus based on the commit date of the corpus tar file from the
+    #  repo.
+    #
+    #  Therefore, if a new corpus is pushed to the repo then we use the new
+    #  corpus.  Otherwise we search the cache for a version of the corpus
+    #  merged more recently than the version in the repo.
+    #
+    - name: Get the corpus age
+      id: corpusparams
+      run: |
+        CORPUSCT="$(git log -1 --format=%ct -- src/tests/fuzzer-corpus/$PROTOCOL.tar)"
+        CORPUSAGE="$((`date +%s` - "$CORPUSCT"))"
+        CORPUSDAYS="$(($CORPUSAGE / 86400))"
+        echo "$PROTOCOL corpus age $CORPUSAGE secs ($CORPUSDAYS days)"
+        echo "corpusct=$CORPUSCT" >> $GITHUB_OUTPUT
+        echo "corpusage=$CORPUSAGE" >> $GITHUB_OUTPUT
 
-    - name: Restore LFS cache
-      uses: actions/cache@v2
-      id: lfs-cache
+    - name: Restore the fuzzer corpus tar file from cache
+      uses: actions/cache@v5
+      id: corpus-cache
       with:
-        path: .git/lfs
-        key: ${{ runner.os }}-lfs-${{ hashFiles('.lfs-assets-id') }}-v1
+        path: src/tests/fuzzer-corpus/${{ matrix.env.PROTOCOL }}.tar
+        key: corpus-${{ matrix.env.PROTOCOL }}-${{ steps.corpusparams.outputs.corpusct }}-${{ github.run_number }}
+        restore-keys: |
+          corpus-${{ matrix.env.PROTOCOL }}-${{ steps.corpusparams.outputs.corpusct }}-
+      if: ${{ !startsWith(github.ref, 'refs/heads/debug-fuzzer-') }}
 
-    # Now the LFS pull will be local if we hit the cache, or remote otherwise
-    - name: Git LFS pull
-      run: git lfs pull
-
-    - name: Package manager performance improvements
-      run: |
-        sudo sh -c 'echo force-unsafe-io > /etc/dpkg/dpkg.cfg.d/02speedup'
-        echo 'man-db man-db/auto-update boolean false' | sudo debconf-set-selections
-        sudo dpkg-reconfigure man-db
-        sudo sed -i 's/^update_initramfs=.*/update_initramfs=no/' /etc/initramfs-tools/update-initramfs.conf
-
-    - name: Install build dependencies based on Debian packages plus extra CI packages
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends build-essential devscripts equivs quilt
-        debian/rules debian/control
-        sudo mk-build-deps -irt"apt-get -y --no-install-recommends" debian/control
-        sudo mk-build-deps -irt"apt-get -y --no-install-recommends" scripts/ci/extra-packages.debian.control
-
-    - name: Install tacacs_plus
-      run: |
-        pip3 install tacacs_plus
-
-#    - name: Install LLVM snapshot
-#      run: |
-#        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add
-#        sudo apt-add-repository "deb http://apt.llvm.org/focal/ llvm-toolchain-focal main"
-#        sudo apt-get install -y --no-install-recommends clang llvm gdb
-#        sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-12 60 && sudo update-alternatives --set clang /usr/bin/clang-12
-#        sudo update-alternatives --install /usr/bin/llvm-symbolizer llvm-symbolizer /usr/bin/llvm-symbolizer-12 60 && sudo update-alternatives --set llvm-symbolizer /usr/bin/llvm-symbolizer-12
-
-    - name: Install LLVM 10
-      run: |
-        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add
-        sudo apt-add-repository "deb http://apt.llvm.org/focal/ llvm-toolchain-focal main"
-        sudo apt-get install -y --no-install-recommends clang-10 llvm-10 gdb
-        sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-10 60 && sudo update-alternatives --set clang /usr/bin/clang-10
-        sudo update-alternatives --install /usr/bin/llvm-symbolizer llvm-symbolizer /usr/bin/llvm-symbolizer-10 60 && sudo update-alternatives --set llvm-symbolizer /usr/bin/llvm-symbolizer-10
+    - name: Prepare the runner
+      uses: ./.github/actions/runner-prep
+      with:
+        selfhosted: '1'
+        use_docker: true
+        cc: ${{ env.CC }}
+        llvm_ver: ${{ needs.common_vars.outputs.llvm_version }}
+        gcc_ver: ${{ needs.common_vars.outputs.gcc_version }}
 
     - name: Show versions
       run: |
@@ -124,13 +229,18 @@ jobs:
         pcre-config --libs-posix --version 2>/dev/null || :
         pcre2-config --libs-posix --version 2>/dev/null || :
 
-    # We walk up the tree if necessary to find a commit that builds so that we
-    # will fuzz something
+    #
+    #  We walk up the tree if necessary to find a commit that builds so that we
+    #  will fuzz something
+    #
     - name: Find a commit that builds
       id: pick_commit
       run: |
         while : ; do
-          CFLAGS="-DWITH_EVAL_DEBUG -O2 -g3" ./configure -C \
+          echo "Testing commit:"
+          git log -n1
+          echo
+          CFLAGS="-g3" ./configure -C \
             --enable-werror \
             --enable-address-sanitizer \
             --enable-undefined-behaviour-sanitizer \
@@ -146,24 +256,106 @@ jobs:
           git reset --hard HEAD^
           git clean -fxd
         done
-        echo "::set-output name=commit_id::$(git rev-parse --short HEAD)"
+        echo "commit_id=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        make -j `nproc`
+        make -j `nproc` test.unit
 
     - name: Run fuzzer tests
       run: |
-        [[ "$GITHUB_REF" = refs/heads/run-fuzzer-* ]] && TOTAL_RUNTIME=${GITHUB_REF#refs/heads/run-fuzzer-}
-        REMAINING_TIME=$(( $TOTAL_RUNTIME + `cat ~/start_timestamp` - `date +%s` ))
-        echo "Fuzzing ${{ steps.pick_commit.outputs.commit_id }}:$PROTOCOL for $REMAINING_TIME secs"
+        REMAINING_TIME=$(( $TOTAL_RUNTIME + $START_TIMESTAMP - `date +%s` ))
+        echo "Started at $START_TIMESTAMP for $TOTAL_RUNTIME secs. Fuzzing ${{ steps.pick_commit.outputs.commit_id }}:$PROTOCOL for $REMAINING_TIME secs"
         [[ "$REMAINING_TIME" -lt 1 ]] && exit 1
-        timeout "$REMAINING_TIME" make test.fuzzer.$PROTOCOL FUZZER_TIMEOUT=300 FUZZER_ARGUMENTS="-jobs=10000 -workers=`nproc`" || :
-        cp fuzz-*.log build/fuzzer
-        find build/fuzzer -type f ! -name 'fuzz-*.log' | grep . && exit 1 || :
+        make test.fuzzer.$PROTOCOL FUZZER_TIMEOUT="$REMAINING_TIME" FUZZER_ARGUMENTS="-jobs=`nproc` -workers=`nproc`" | tee build/fuzzer/$PROTOCOL.out.log || :
+        find build/fuzzer -type f ! -path 'build/fuzzer/*.log' | grep . && exit 1 || :
+        ! grep -sqr FAILED build/fuzzer/*.log
       env:
         GITHUB_REF: "${{ github.ref }}"
+        START_TIMESTAMP: "${{ needs.set-matrix.outputs.starttimestamp }}"
+      if: ${{ !startsWith(github.ref, 'refs/heads/debug-fuzzer-') }}
 
     - name: "Clang libFuzzer: Store assets on failure"
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v6
       with:
-        name: fuzzer-${{ matrix.env.PROTOCOL }}-${{ steps.pick_commit.outputs.commit_id }}
+        name: clang-fuzzer-${{ matrix.env.PROTOCOL }}-${{ steps.pick_commit.outputs.commit_id }}
         path: build/fuzzer
         retention-days: 30
-      if: ${{ failure() }}
+      if: ${{ !startsWith(github.ref, 'refs/heads/debug-fuzzer') && failure() }}
+
+    #
+    #  Merge the corpus.  The cache step stores the merged corpus for the
+    #  next run.
+    #
+    - name: Merge the corpus
+      run: |
+        make test.fuzzer.$PROTOCOL.merge
+      if: ${{ !startsWith(github.ref, 'refs/heads/debug-fuzzer-') }}
+
+    - name: Generate app token to push corpus
+      id: app-token
+      env:
+        NODE_USE_ENV_PROXY: 1
+      if: ${{ !startsWith(github.ref, 'refs/heads/debug-fuzzer-') && steps.corpusparams.outputs.corpusage > 2592000 && github.repository_owner == 'FreeRADIUS' }}
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ vars.GH_APP_CLIENT_ID_CI_MERGE }}
+        private-key: ${{ secrets.GH_APP_PRIVATE_KEY_CI_MERGE }}
+
+    #
+    #  We can push the LFS file directly, but we must use the GitHub API to
+    #  create the actual commit due to the 'signed-commits' branch protection
+    #  rule for the `master` branch.
+    - name: Monthly push back of corpus
+      run: |
+        export FILE=src/tests/fuzzer-corpus/$PROTOCOL.tar
+        if ! git diff --exit-code "$FILE"; then
+          . /opt/corpus-venv/bin/activate
+          git add "$FILE"
+          OID="$(git lfs ls-files -l -I "$FILE" | cut -f1 -d ' ')"
+          git lfs push --object-id origin "$OID"
+          export CONTENTS="$(git show ":$FILE" | base64)"
+          SLEEP_FOR=$(( ( $UPLOAD_SLOT - `date +%s` % $NUM_SLOTS + $NUM_SLOTS ) % $NUM_SLOTS ))
+          echo Waiting $SLEEP_FOR secs for our upload slot...
+          sleep $SLEEP_FOR
+          python3 scripts/ci/commit_lfs_file_update.py
+        fi
+      env:
+        APP_TOKEN: ${{ steps.app-token.outputs.token }}
+      if: ${{ !startsWith(github.ref, 'refs/heads/debug-fuzzer-') && steps.corpusparams.outputs.corpusage > 2592000 && github.repository_owner == 'FreeRADIUS' }}
+
+
+    #
+    #  On a 'debug-fuzzer-*' branch the workflow starts a tmate session that
+    #  provides interactive shell access to the runner.  Use the tmate session
+    #  to attempt the reproducers in an environment identical to the
+    #  environment in which the scheduled fuzzing ran.
+    #
+    #  tmate prints the Secure Shell (SSH) rendezvous point continuously in the
+    #  job output:
+    #
+    #      SSH: ssh VfuX8SrNuU5pGPMyZcz7TpJTa@sfo2.tmate.io
+    #
+    #  To use the session:
+    #
+    #    1. Push the failing commit: `git push origin debug-fuzzer-radius --force`
+    #    2. Open the job output in https://github.com/FreeRADIUS/freeradius-server/actions
+    #    3. Run the ssh command from the job output.
+    #
+    #  Access requires that you have the private key corresponding to the
+    #  public key of the GitHub user that initiated the job.
+    #
+    #  Within the tmate session you can run `scripts/build/fuzzer-fetch-artifacts`
+    #  to download the reproducers just as you would run the script locally,
+    #  e.g.
+    #
+    #      export GITHUB_TOKEN=<personal-access-token>
+    #      scripts/build/fuzzer-fetch-artifacts
+    #      scripts/build/fuzzer-fetch-artifacts https://api.github.com/repos/FreeRADIUS/freeradius-server/actions/artifacts/186571481/zip
+    #      scripts/build/fuzzer build/fuzzer/radius/crash-f1536d0fa2de775038e5dab74d233487a7cde819
+    #
+    - name: "Debug: Start tmate"
+      uses: mxschmitt/action-tmate@v3
+      with:
+        limit-access-to-actor: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      if: ${{ startsWith(github.ref, 'refs/heads/debug-fuzzer-') && always() }}

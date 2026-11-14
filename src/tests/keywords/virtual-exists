@@ -1,6 +1,0 @@
-#
-#  PRE: update if
-#
-if (&Client-Shortname) {
-	success
-}

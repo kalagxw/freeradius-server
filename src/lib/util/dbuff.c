@@ -28,8 +28,8 @@ RCSID("$Id$")
 #include <freeradius-devel/util/dbuff.h>
 #include <freeradius-devel/util/syserror.h>
 
-#if defined(__clang_analyzer__) || !defined(NDEBUG)
-#  define CHECK_DBUFF_INIT(_sbuff)	if (!(_sbuff)->extend && (unlikely(!(_sbuff)->buff) || unlikely(!(_sbuff)->start) || unlikely(!(_sbuff)->end) || unlikely(!(_sbuff)->p))) return 0;
+#if defined(STATIC_ANALYZER) || !defined(NDEBUG)
+#  define CHECK_DBUFF_INIT(_sbuff)	do { if (!(_sbuff)->extend && (unlikely(!(_sbuff)->buff) || unlikely(!(_sbuff)->start) || unlikely(!(_sbuff)->end) || unlikely(!(_sbuff)->p))) return 0; } while (0)
 #else
 #  define CHECK_DBUFF_INIT(_sbuff)
 #endif
@@ -101,7 +101,7 @@ void fr_dbuff_update(fr_dbuff_t *dbuff, uint8_t *new_buff, size_t new_len)
 	}
 }
 
-/** Shift the contents of the sbuff, returning the number of bytes we managed to shift
+/** Shift the contents of the dbuff, returning the number of bytes we managed to shift
  *
  * @param[in] dbuff	to shift.
  * @param[in] shift	the number of bytes to shift
@@ -317,6 +317,39 @@ int fr_dbuff_trim_talloc(fr_dbuff_t *dbuff, size_t len)
 			return -1;
 		}
 		fr_dbuff_update(dbuff, new_buff, nlen);
+	}
+
+	return 0;
+}
+
+/** Reset a talloced buffer to its initial length, clearing any data stored
+ *
+ * @param[in] dbuff to reset.
+ * @return
+ *	- 0 on success.
+ *	- -1 on failure - markers present pointing past the end of string data.
+ */
+int fr_dbuff_reset_talloc(fr_dbuff_t *dbuff)
+{
+	fr_dbuff_uctx_talloc_t	*tctx = dbuff->uctx;
+
+	CHECK_DBUFF_INIT(dbuff);
+
+	fr_dbuff_set_to_start(dbuff);	/* Clear data */
+
+	/*
+	 *	If someone trimmed the buffer, then increase its size to the minimum required.
+	 */
+	if (fr_dbuff_len(dbuff) < tctx->init) {
+		uint8_t *new_buff;
+
+		new_buff = talloc_realloc(tctx->ctx, dbuff->buff, uint8_t, tctx->init);
+		if (!new_buff) {
+			fr_strerror_printf("Failed reallocing from %zu to %zu",
+					   talloc_array_length(dbuff->buff), tctx->init);
+			return -1;
+		}
+		fr_dbuff_update(dbuff, new_buff, tctx->init);
 	}
 
 	return 0;

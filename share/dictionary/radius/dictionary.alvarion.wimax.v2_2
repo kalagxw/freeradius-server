@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -21,7 +21,7 @@ BEGIN-VENDOR	Alvarion
 
 ATTRIBUTE	R3-IF-Descriptor			1	tlv
 ATTRIBUTE	R3-IF-Name				.1	string
-ATTRIBUTE	R3-IF-ID				.2	integer
+ATTRIBUTE	R3-IF-ID				.2	uint32
 ATTRIBUTE	PDFID					.3	short
 ATTRIBUTE	IPv4-Address				.4	ipaddr
 # IPv4 subnet mask plus bit-width mask
@@ -34,3 +34,4 @@ ATTRIBUTE	Ref-R3-IF-Name				.1	string
 ATTRIBUTE	DHCP-Option-Container			.2	string
 
 END-VENDOR 	Alvarion
+ALIAS		Alvarion				Vendor-Specific.Alvarion

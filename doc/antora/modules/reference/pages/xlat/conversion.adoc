@@ -1,0 +1,143 @@
+= Data Conversion
+
+The following functions perform conversion to/from different types of
+data encoding.
+
+== %base64.encode( ... )
+
+Encode a string using Base64.
+
+.Return: _string_
+
+.Example
+
+[source,unlang]
+----
+string test
+
+test := "Caipirinha"
+reply.Reply-Message := "The base64 of %{test} is %base64.encode(test)"
+----
+
+.Output
+
+----
+The base64 of foo is Q2FpcGlyaW5oYQ==
+----
+
+== %base64.decode( ... )
+
+Decode a string previously encoded using Base64.
+
+.Return: _string_
+
+.Example
+
+[source,unlang]
+----
+string test
+
+test := "Q2FpcGlyaW5oYQ=="
+reply.Reply-Message := "The base64.decode of %{test} is %base64.decode(test)"
+----
+
+.Output
+
+----
+The base64.decode of Q2FpcGlyaW5oYQ== is Caipirinha
+----
+
+== %bin( ... )
+
+Convert string to binary.
+
+.Return: _octal_
+
+.Example
+
+[source,unlang]
+----
+string test
+
+test := "10"
+reply.Reply-Message := "The %{test} in binary is %bin(test)"
+----
+
+.Output
+
+----
+The 10 in binary is \020
+----
+
+== %hex( ... )
+
+Convert to hex.
+
+.Return: _string_
+
+.Example
+
+[source,unlang]
+----
+string test
+
+test := "12345"
+reply.Reply-Message := "The value of %{test} in hex is %hex(test)"
+----
+
+.Output
+
+----
+The value of 12345 in hex is 3132333435
+----
+
+== %url.quote( ... )
+
+Quote URL special characters.
+
+.Return: _string_.
+
+.Example
+
+[source,unlang]
+----
+string test
+
+test := "http://example.org/"
+reply += {
+	Reply-Message = "The urlquote of %{test} is %url.quote(test)"
+}
+----
+
+.Output
+
+----
+The urlquote of http://example.org/ is http%3A%2F%2Fexample.org%2F
+----
+
+== %url.unquote( ... )
+
+Unquote URL special characters.
+
+.Return: _string_.
+
+.Example
+
+[source,unlang]
+----
+string test
+
+test := "http%%3A%%2F%%2Fexample.org%%2F" # Attention for the double %.
+reply += {
+	Reply-Message = "The urlunquote of %{test} is %url.unquote(test)"
+}
+----
+
+.Output
+
+----
+The urlunquote of http%3A%2F%2Fexample.org%2F is http://example.org/
+----
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

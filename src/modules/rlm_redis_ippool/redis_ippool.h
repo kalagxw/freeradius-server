@@ -37,7 +37,7 @@ RCSIDH(redis_ippool_h, "$Id$")
 #define _IPPOOL_RCODE_POOL_EMPTY	-4
 #define _IPPOOL_RCODE_FAIL		-5
 
-typedef enum {
+typedef enum : int8_t {
 	IPPOOL_RCODE_SUCCESS = _IPPOOL_RCODE_SUCCESS,
 	IPPOOL_RCODE_NOT_FOUND = _IPPOOL_RCODE_NOT_FOUND,
 	IPPOOL_RCODE_EXPIRED = _IPPOOL_RCODE_EXPIRED,
@@ -46,17 +46,18 @@ typedef enum {
 	IPPOOL_RCODE_FAIL = _IPPOOL_RCODE_FAIL
 } ippool_rcode_t;
 
-typedef enum {
+typedef enum : uint8_t {
 	POOL_ACTION_ALLOCATE = 1,
 	POOL_ACTION_UPDATE = 2,
 	POOL_ACTION_RELEASE = 3,
 	POOL_ACTION_BULK_RELEASE = 4,
 } ippool_action_t;
 
-#define IPPOOL_MAX_KEY_PREFIX_SIZE	128
+#define IPPOOL_MAX_KEY_PREFIX_SIZE	128U
 #define IPPOOL_POOL_KEY			"pool"
 #define IPPOOL_ADDRESS_KEY		"ip"
 #define IPPOOL_OWNER_KEY		"device"
+#define IPPOOL_STATIC_BIT		0x10000000000000   /* A high bit which Redis ZSCORE will represent accurately*/
 
 /** {prefix}:pool
  */
@@ -66,14 +67,23 @@ typedef enum {
  */
 #define IPPOOL_MAX_IP_KEY_SIZE		IPPOOL_MAX_KEY_PREFIX_SIZE + (sizeof("{}:" IPPOOL_ADDRESS_KEY ":") - 1) + INET6_ADDRSTRLEN + 4
 
+/** {prefix}:device
+ */
+#define IPPOOL_MAX_OWNER_KEY_SIZE	IPPOOL_MAX_KEY_PREFIX_SIZE + (sizeof("{}:" IPPOOL_OWNER_KEY ":") - 1) + 128
 
-#define IPADDR_LEN(_af) ((_af == AF_UNSPEC) ? 0 : ((_af == AF_INET6) ? 128 : 32))
+
+#define IPADDR_LEN(_af) ((_af == AF_UNSPEC) ? 0U : ((_af == AF_INET6) ? 128U : 32U))
 
 /** Wrap the prefix in {} and add the pool suffix
  *
  */
 #define IPPOOL_BUILD_KEY(_buff, _p, _key, _key_len) \
 do { \
+	if (_key_len > sizeof(_buff) - sizeof(IPPOOL_POOL_KEY) - sizeof("{}:") - 1) { \
+		ERROR("Pool name too long"); \
+		ret = IPPOOL_RCODE_FAIL; \
+		break; \
+	} \
 	*_p++ = '{'; \
 	memcpy(_p, _key, _key_len); \
 	_p += _key_len; \
@@ -96,16 +106,37 @@ do { \
 	if (is_truncated((size_t)_slen, sizeof(_buff) - (_p - _buff))) { \
 		REDEBUG("IP key too long"); \
 		ret = IPPOOL_RCODE_FAIL; \
-		goto finish; \
+		break; \
 	} \
 	_p += (size_t)_slen;\
-	_slen = fr_pair_print_value_quoted(&FR_SBUFF_OUT((char *)_p, sizeof(_buff) - (_p - _buff)), _ip, T_BARE_WORD); \
+	_slen = fr_value_box_print(&FR_SBUFF_OUT((char *)_p, sizeof(_buff) - (_p - _buff)), _ip, NULL); \
 	if (_slen < 0) { \
 		REDEBUG("IP key too long"); \
 		ret = IPPOOL_RCODE_FAIL; \
-		goto finish; \
+		break; \
 	} \
 	_p += (size_t)_slen;\
+} while (0)
+
+#define IPPOOL_BUILD_IP_KEY_FROM_STR(_buff, _p, _key, _key_len, _ip_str) \
+do { \
+	ssize_t _slen; \
+	if (_key_len > sizeof(_buff) - sizeof(IPPOOL_ADDRESS_KEY) - sizeof("{}:") - 1) { \
+		ERROR("Pool name too long"); \
+		ret = IPPOOL_RCODE_FAIL; \
+		break; \
+	} \
+	*_p++ = '{'; \
+	memcpy(_p, _key, _key_len); \
+	_p += _key_len; \
+	_slen = strlcpy((char *)_p, "}:"IPPOOL_ADDRESS_KEY":", sizeof(_buff) - (_p - _buff)); \
+	if (is_truncated((size_t)_slen, sizeof(_buff) - (_p - _buff))) { \
+		ERROR("IP key too long"); \
+		ret = IPPOOL_RCODE_FAIL;\
+		break; \
+	} \
+	_p += (size_t)_slen;\
+	_p += strlcpy((char *)_p, _ip_str, sizeof(_buff) - (_p - _buff)); \
 } while (0)
 
 /** If the prefix is as wide as the AF data size then print it without CIDR notation.

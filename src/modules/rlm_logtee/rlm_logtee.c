@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -26,16 +26,14 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/server/connection.h>
 
 #ifdef HAVE_FCNTL_H
 #  include <fcntl.h>
 #endif
 
 #ifdef HAVE_UNISTD_H
-#  include <unistd.h>
 #endif
 
 #ifdef HAVE_GRP_H
@@ -51,7 +49,7 @@ RCSID("$Id$")
 
 #include <sys/uio.h>
 
-typedef enum {
+typedef enum : uint8_t {
 	LOGTEE_DST_INVALID = 0,
 	LOGTEE_DST_FILE,				//!< Log to a file.
 	LOGTEE_DST_UNIX,				//!< Log via Unix socket.
@@ -93,8 +91,6 @@ typedef struct {
 		uint32_t		permissions;		//!< Permissions to use when creating new files.
 		char const		*group_str;		//!< Group to set on new files.
 		gid_t			group;			//!< Resolved gid.
-		bool			escape;			//!< Do filename escaping, yes / no.
-		xlat_escape_legacy_t		escape_func;		//!< Escape function.
 	} file;
 
 	struct {
@@ -115,7 +111,7 @@ typedef struct {
 typedef struct {
 	rlm_logtee_t const	*inst;			//!< Instance of logtee.
 	fr_event_list_t		*el;			//!< This thread's event list.
-	fr_connection_t		*conn;			//!< Connection to our log destination.
+	connection_t		*conn;			//!< Connection to our log destination.
 
 	fr_fring_t		*fring;			//!< Circular buffer used to batch up messages.
 
@@ -129,49 +125,48 @@ typedef struct {
 } rlm_logtee_thread_t;
 
 
-static const CONF_PARSER file_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_OUTPUT | FR_TYPE_XLAT, rlm_logtee_t, file.name) },
-	{ FR_CONF_OFFSET("permissions", FR_TYPE_UINT32, rlm_logtee_t, file.permissions), .dflt = "0600" },
-	{ FR_CONF_OFFSET("group", FR_TYPE_STRING, rlm_logtee_t, file.group_str) },
-	{ FR_CONF_OFFSET("escape_filenames", FR_TYPE_BOOL, rlm_logtee_t, file.escape), .dflt = "no" },
+static const conf_parser_t file_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("filename", CONF_FLAG_FILE_WRITABLE | CONF_FLAG_XLAT, rlm_logtee_t, file.name) },
+	{ FR_CONF_OFFSET("permissions", rlm_logtee_t, file.permissions), .dflt = "0600" },
+	{ FR_CONF_OFFSET("group", rlm_logtee_t, file.group_str) },
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER unix_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_INPUT, rlm_logtee_t, unix_sock.path) },
+static const conf_parser_t unix_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("filename", CONF_FLAG_FILE_READABLE, rlm_logtee_t, unix_sock.path) },
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER udp_config[] = {
-	{ FR_CONF_OFFSET("server", FR_TYPE_COMBO_IP_ADDR, logtee_net_t, dst_ipaddr) },
-	{ FR_CONF_OFFSET("port", FR_TYPE_UINT16, logtee_net_t, port) },
+static const conf_parser_t udp_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("server", FR_TYPE_COMBO_IP_ADDR, 0, logtee_net_t, dst_ipaddr) },
+	{ FR_CONF_OFFSET("port", logtee_net_t, port) },
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER tcp_config[] = {
-	{ FR_CONF_OFFSET("server", FR_TYPE_COMBO_IP_ADDR, logtee_net_t, dst_ipaddr) },
-	{ FR_CONF_OFFSET("port", FR_TYPE_UINT16, logtee_net_t, port) },
+static const conf_parser_t tcp_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("server", FR_TYPE_COMBO_IP_ADDR, 0, logtee_net_t, dst_ipaddr) },
+	{ FR_CONF_OFFSET("port", logtee_net_t, port) },
 
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("destination", FR_TYPE_STRING | FR_TYPE_REQUIRED, rlm_logtee_t, log_dst_str) },
-	{ FR_CONF_OFFSET("buffer_depth", FR_TYPE_SIZE, rlm_logtee_t, buffer_depth), .dflt = "10000" },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("destination", CONF_FLAG_REQUIRED, rlm_logtee_t, log_dst_str) },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("buffer_depth", FR_TYPE_SIZE, 0, rlm_logtee_t, buffer_depth), .dflt = "10000" },
 
-	{ FR_CONF_OFFSET("delimiter", FR_TYPE_STRING, rlm_logtee_t, delimiter), .dflt = "\n" },
-	{ FR_CONF_OFFSET("format", FR_TYPE_TMPL, rlm_logtee_t, log_fmt), .dflt = "%n - %s", .quote = T_DOUBLE_QUOTED_STRING },
+	{ FR_CONF_OFFSET("delimiter", rlm_logtee_t, delimiter), .dflt = "\n" },
+	{ FR_CONF_OFFSET("format", rlm_logtee_t, log_fmt), .dflt = "%n - %s", .quote = T_DOUBLE_QUOTED_STRING },
 
 	/*
 	 *	Log destinations
 	 */
-	{ FR_CONF_POINTER("file", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) file_config },
-	{ FR_CONF_POINTER("unix", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) unix_config },
-	{ FR_CONF_OFFSET("tcp", FR_TYPE_SUBSECTION, rlm_logtee_t, tcp), .subcs= (void const *) tcp_config },
-	{ FR_CONF_OFFSET("udp", FR_TYPE_SUBSECTION, rlm_logtee_t, udp), .subcs = (void const *) udp_config },
+	{ FR_CONF_POINTER("file", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) file_config },
+	{ FR_CONF_POINTER("unix", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) unix_config },
+	{ FR_CONF_OFFSET_SUBSECTION("tcp", 0, rlm_logtee_t, tcp, tcp_config) },
+	{ FR_CONF_OFFSET_SUBSECTION("udp", 0, rlm_logtee_t, udp, udp_config) },
 
-	{ FR_CONF_OFFSET("connection_timeout", FR_TYPE_TIME_DELTA, rlm_logtee_t, connection_timeout), .dflt = "1.0" },
-	{ FR_CONF_OFFSET("reconnection_delay", FR_TYPE_TIME_DELTA, rlm_logtee_t, reconnection_delay), .dflt = "1.0" },
+	{ FR_CONF_OFFSET("connection_timeout", rlm_logtee_t, connection_timeout), .dflt = "1.0" },
+	{ FR_CONF_OFFSET("reconnection_delay", rlm_logtee_t, reconnection_delay), .dflt = "1.0" },
 
 	CONF_PARSER_TERMINATOR
 };
@@ -181,7 +176,7 @@ static fr_dict_t const *dict_freeradius;
 extern fr_dict_autoload_t rlm_logtee_dict[];
 fr_dict_autoload_t rlm_logtee_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_log_level;
@@ -193,7 +188,7 @@ fr_dict_attr_autoload_t rlm_logtee_dict_attr[] = {
 	{ .out = &attr_log_level, .name = "Log-Level", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
 	{ .out = &attr_log_message, .name = "Log-Message", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 	{ .out = &attr_log_type, .name = "Log-Type", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static void logtee_fd_idle(rlm_logtee_thread_t *t);
@@ -205,7 +200,7 @@ static void logtee_it(fr_log_type_t type, fr_log_lvl_t lvl, request_t *request,
 		      char const *fmt, va_list ap, void *uctx)
 		      CC_HINT(format (printf, 6, 0)) CC_HINT(nonnull (3, 6));
 
-static unlang_action_t mod_insert_logtee(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request) CC_HINT(nonnull);
+static unlang_action_t mod_insert_logtee(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request) CC_HINT(nonnull);
 
 /** Connection errored
  *
@@ -214,12 +209,12 @@ static void _logtee_conn_error(UNUSED fr_event_list_t *el, int sock, UNUSED int 
 {
 	rlm_logtee_thread_t	*t = talloc_get_type_abort(uctx, rlm_logtee_thread_t);
 
-	ERROR("Connection failed (%i): %s", sock, fr_syserror(fd_errno));
+	if (fd_errno) ERROR("Connection failed (%i): %s", sock, fr_syserror(fd_errno));
 
 	/*
 	 *	Something bad happened... Fix it...
 	 */
-	fr_connection_signal_reconnect(t->conn, FR_CONNECTION_FAILED);
+	connection_signal_reconnect(t->conn, CONNECTION_FAILED);
 }
 
 /** Drain any data we received
@@ -244,7 +239,7 @@ static void _logtee_conn_read(UNUSED fr_event_list_t *el, int sock, UNUSED int f
 		case ETIMEDOUT:
 		case EIO:
 		case ENXIO:
-			fr_connection_signal_reconnect(t->conn, FR_CONNECTION_FAILED);
+			connection_signal_reconnect(t->conn, CONNECTION_FAILED);
 			return;
 
 		/*
@@ -271,7 +266,7 @@ static void _logtee_conn_writable(UNUSED fr_event_list_t *el, int sock, UNUSED i
 	while ((msg = fr_fring_next(t->fring))) {
 		ssize_t slen;
 
-		slen = write(sock, msg, talloc_array_length(msg) - 1) ;
+		slen = write(sock, msg, talloc_strlen(msg)) ;
 	write_error:
 		if (slen < 0) {
 			switch (errno) {
@@ -289,7 +284,7 @@ static void _logtee_conn_writable(UNUSED fr_event_list_t *el, int sock, UNUSED i
 			case ENXIO:
 			case EPIPE:
 			case ENETDOWN:
-				fr_connection_signal_reconnect(t->conn, FR_CONNECTION_FAILED);
+				connection_signal_reconnect(t->conn, CONNECTION_FAILED);
 				return;
 
 			/*
@@ -319,7 +314,7 @@ static void logtee_fd_idle(rlm_logtee_thread_t *t)
 	int fd = *((int *)t->conn->h);
 
 	DEBUG3("Marking socket (%i) as idle", fd);
-	if (fr_event_fd_insert(t->conn, t->el, fd,
+	if (fr_event_fd_insert(t->conn, NULL, t->el, fd,
 			       _logtee_conn_read,
 			       NULL,
 			       _logtee_conn_error,
@@ -339,7 +334,7 @@ static void logtee_fd_active(rlm_logtee_thread_t *t)
 	int fd = *((int *)t->conn->h);
 
 	DEBUG3("Marking socket (%i) as active - Draining requests", fd);
-	if (fr_event_fd_insert(t->conn, t->el, fd,
+	if (fr_event_fd_insert(t->conn, NULL, t->el, fd,
 			       _logtee_conn_read,
 			       _logtee_conn_writable,
 			       _logtee_conn_error,
@@ -363,7 +358,7 @@ static void _logtee_conn_close(UNUSED fr_event_list_t *el, void *h, UNUSED void 
 /** Process notification that fd is open
  *
  */
-static fr_connection_state_t _logtee_conn_open(UNUSED fr_event_list_t *el, UNUSED void *h, void *uctx)
+static connection_state_t _logtee_conn_open(UNUSED fr_event_list_t *el, UNUSED void *h, void *uctx)
 {
 	rlm_logtee_thread_t	*t = talloc_get_type_abort(uctx, rlm_logtee_thread_t);
 
@@ -378,7 +373,7 @@ static fr_connection_state_t _logtee_conn_open(UNUSED fr_event_list_t *el, UNUSE
 		logtee_fd_idle(t);
 	}
 
-	return FR_CONNECTION_STATE_CONNECTED;
+	return CONNECTION_STATE_CONNECTED;
 }
 
 /** Initialise a new outbound connection
@@ -387,7 +382,8 @@ static fr_connection_state_t _logtee_conn_open(UNUSED fr_event_list_t *el, UNUSE
  * @param[in] conn	being initialised.
  * @param[in] uctx	A #rlm_logtee_thread_t.
  */
-static fr_connection_state_t _logtee_conn_init(void **h_out, fr_connection_t *conn, void *uctx)
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static connection_state_t _logtee_conn_init(void **h_out, connection_t *conn, void *uctx)
 {
 	rlm_logtee_thread_t	*t = talloc_get_type_abort(uctx, rlm_logtee_thread_t);
 	rlm_logtee_t const	*inst = t->inst;
@@ -398,21 +394,21 @@ static fr_connection_state_t _logtee_conn_init(void **h_out, fr_connection_t *co
 	case LOGTEE_DST_UNIX:
 		DEBUG2("Opening UNIX socket at \"%s\"", inst->unix_sock.path);
 		fd = fr_socket_client_unix(inst->unix_sock.path, true);
-		if (fd < 0) return FR_CONNECTION_STATE_FAILED;
+		if (fd < 0) return CONNECTION_STATE_FAILED;
 		break;
 
 	case LOGTEE_DST_TCP:
 		DEBUG2("Opening TCP connection to %pV:%u",
 		       fr_box_ipaddr(inst->tcp.dst_ipaddr), inst->tcp.port);
-		fd = fr_socket_client_tcp(NULL, &inst->tcp.dst_ipaddr, inst->tcp.port, true);
-		if (fd < 0) return FR_CONNECTION_STATE_FAILED;
+		fd = fr_socket_client_tcp(NULL, NULL, &inst->tcp.dst_ipaddr, inst->tcp.port, true);
+		if (fd < 0) return CONNECTION_STATE_FAILED;
 		break;
 
 	case LOGTEE_DST_UDP:
 		DEBUG2("Opening UDP connection to %pV:%u",
 		       fr_box_ipaddr(inst->udp.dst_ipaddr), inst->udp.port);
-		fd = fr_socket_client_udp(NULL, NULL, &inst->udp.dst_ipaddr, inst->udp.port, true);
-		if (fd < 0) return FR_CONNECTION_STATE_FAILED;
+		fd = fr_socket_client_udp(NULL, NULL, NULL, &inst->udp.dst_ipaddr, inst->udp.port, true);
+		if (fd < 0) return CONNECTION_STATE_FAILED;
 		break;
 
 	/*
@@ -421,7 +417,7 @@ static fr_connection_state_t _logtee_conn_init(void **h_out, fr_connection_t *co
 	case LOGTEE_DST_INVALID:
 	case LOGTEE_DST_FILE:
 		fr_assert(0);
-		return FR_CONNECTION_STATE_FAILED;
+		return CONNECTION_STATE_FAILED;
 	}
 
 	/*
@@ -431,9 +427,9 @@ static fr_connection_state_t _logtee_conn_init(void **h_out, fr_connection_t *co
 	*fd_s = fd;
 	*h_out = fd_s;
 
-	fr_connection_signal_on_fd(conn, fd);
+	connection_signal_on_fd(conn, fd);
 
-	return FR_CONNECTION_STATE_CONNECTING;
+	return CONNECTION_STATE_CONNECTING;
 }
 
 /** Logging callback to write log messages to a destination
@@ -473,7 +469,7 @@ static void logtee_it(fr_log_type_t type, fr_log_lvl_t lvl, request_t *request,
 	t->type->vp_uint32 = (uint32_t) type;
 	t->lvl->vp_uint32 = (uint32_t) lvl;
 
-	fr_dcursor_init(&cursor, &request->request_pairs);
+	fr_pair_dcursor_init(&cursor, &request->request_pairs);
 	fr_dcursor_prepend(&cursor, t->msg);
 	fr_dcursor_prepend(&cursor, t->type);
 	fr_dcursor_prepend(&cursor, t->lvl);
@@ -488,7 +484,10 @@ static void logtee_it(fr_log_type_t type, fr_log_lvl_t lvl, request_t *request,
 	 */
 	dst = request->log.dst;
 	request->log.dst = NULL;
-	if (tmpl_aexpand(t, &exp, request, inst->log_fmt, NULL, NULL) < 0) goto finish;
+	if (tmpl_aexpand(t, &exp, request, inst->log_fmt, NULL, NULL) < 0) {
+		request->log.dst = dst;
+		goto finish;
+	}
 	request->log.dst = dst;
 
 	fr_fring_overwrite(t->fring, exp);	/* Insert it into the buffer */
@@ -500,7 +499,7 @@ static void logtee_it(fr_log_type_t type, fr_log_lvl_t lvl, request_t *request,
 
 finish:
 	/*
-	 *	Don't free, we re-use the fr_pair_ts for the next message
+	 *	Don't free, we reuse the fr_pair_ts for the next message
 	 */
 	vp = fr_dcursor_remove(&cursor);
 	if (!fr_cond_assert(vp == t->lvl)) fr_dcursor_append(&cursor, vp);
@@ -522,46 +521,45 @@ finish:
  * @param[in] mctx	Module calling ctx.
  * @param[in] request	request to add our log destination to.
  */
-static unlang_action_t mod_insert_logtee(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t mod_insert_logtee(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	fr_cursor_t	cursor;
-	log_dst_t	*dst;
-	bool		exists = false;
+	log_dst_t	*dst, **last = NULL;
 
-	for (dst = fr_cursor_init(&cursor, &request->log.dst); dst; dst = fr_cursor_next(&cursor)) {
-		if (dst->uctx == mctx->thread) exists = true;
+	for (dst = request->log.dst; dst; dst = dst->next) {
+		if (dst->uctx == mctx->thread) {
+			RETURN_UNLANG_NOOP;
+		}
+
+		last = &(dst->next);
 	}
 
-	if (exists) RETURN_MODULE_NOOP;
+	if (!last) RETURN_UNLANG_NOOP;
 
 	dst = talloc_zero(request, log_dst_t);
 	dst->func = logtee_it;
 	dst->uctx = mctx->thread;
 
-	fr_cursor_append(&cursor, dst);
+	*last = dst;
 
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
 /** Create thread-specific connections and buffers
  *
- * @param[in] conf	section containing the configuration of this module instance.
- * @param[in] instance	of rlm_logtee_t.
- * @param[in] el	The event list serviced by this thread.
- * @param[in] thread	specific data.
+ * @param[in] mctx	specific data.
  * @return
  *	- 0 on success.
  *	- -1 on failure.
  */
-static int mod_thread_instantiate(UNUSED CONF_SECTION const *conf, void *instance, fr_event_list_t *el, void *thread)
+static int mod_thread_instantiate(module_thread_inst_ctx_t const *mctx)
 {
-	rlm_logtee_t		*inst = talloc_get_type_abort(instance, rlm_logtee_t);
-	rlm_logtee_thread_t	*t = talloc_get_type_abort(thread, rlm_logtee_thread_t);
+	rlm_logtee_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_logtee_t);
+	rlm_logtee_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_logtee_thread_t);
 
 	MEM(t->fring = fr_fring_alloc(t, inst->buffer_depth, false));
 
 	t->inst = inst;
-	t->el = el;
+	t->el = mctx->el;
 
 	/*
 	 *	Pre-allocate temporary attributes
@@ -574,20 +572,20 @@ static int mod_thread_instantiate(UNUSED CONF_SECTION const *conf, void *instanc
 	/*
 	 *	This opens the outbound connection
 	 */
-	t->conn = fr_connection_alloc(t, el,
-				      &(fr_connection_funcs_t){
+	t->conn = connection_alloc(t, t->el,
+				      &(connection_funcs_t){
 					.init = _logtee_conn_init,
 				   	.open = _logtee_conn_open,
 				   	.close = _logtee_conn_close
 				      },
-				      &(fr_connection_conf_t){
+				      &(connection_conf_t){
 					.connection_timeout = inst->connection_timeout,
 				   	.reconnection_delay = inst->reconnection_delay
 				      },
 				      inst->name, t);
 	if (t->conn == NULL) return -1;
 
-	fr_connection_signal_init(t->conn);
+	connection_signal_init(t->conn);
 
 	return 0;
 }
@@ -595,28 +593,17 @@ static int mod_thread_instantiate(UNUSED CONF_SECTION const *conf, void *instanc
 /*
  *	Instantiate the module.
  */
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_logtee_t	*inst = instance;
+	rlm_logtee_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_logtee_t);
+	CONF_SECTION    *conf = mctx->mi->conf;
 	char		prefix[100];
-
-	/*
-	 *	Escape filenames only if asked.
-	 */
-	if (inst->file.escape) {
-		inst->file.escape_func = rad_filename_escape;
-	} else {
-		inst->file.escape_func = rad_filename_make_safe;
-	}
 
 	inst->log_dst = fr_table_value_by_str(logtee_dst_table, inst->log_dst_str, LOGTEE_DST_INVALID);
 	if (inst->log_dst == LOGTEE_DST_INVALID) {
 		cf_log_err(conf, "Invalid log destination \"%s\"", inst->log_dst_str);
 		return -1;
 	}
-
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) inst->name = cf_section_name1(conf);
 
 	snprintf(prefix, sizeof(prefix), "rlm_logtee (%s)", inst->name);
 
@@ -633,7 +620,7 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 
 	case LOGTEE_DST_UNIX:
 #ifndef HAVE_SYS_UN_H
-		cf_log_err(conf, "Unix sockets are not supported on this sytem");
+		cf_log_err(conf, "Unix sockets are not supported on this system");
 		return -1;
 #endif
 
@@ -648,7 +635,7 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 		break;
 	}
 
-	inst->delimiter_len = talloc_array_length(inst->delimiter) - 1;
+	inst->delimiter_len = talloc_strlen(inst->delimiter);
 
 	return 0;
 }
@@ -657,21 +644,21 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 /*
  *	Externally visible module definition.
  */
-extern module_t rlm_logtee;
-module_t rlm_logtee = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "logtee",
-	.inst_size		= sizeof(rlm_logtee_t),
-	.thread_inst_size	= sizeof(rlm_logtee_thread_t),
-	.config			= module_config,
-	.instantiate		= mod_instantiate,
-	.thread_instantiate	= mod_thread_instantiate,
-
-	.methods = {
-		[MOD_AUTHENTICATE]	= mod_insert_logtee,
-		[MOD_AUTHORIZE]		= mod_insert_logtee,
-		[MOD_PREACCT]		= mod_insert_logtee,
-		[MOD_ACCOUNTING]	= mod_insert_logtee,
-		[MOD_POST_AUTH]		= mod_insert_logtee,
+extern module_rlm_t rlm_logtee;
+module_rlm_t rlm_logtee = {
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "logtee",
+		.inst_size		= sizeof(rlm_logtee_t),
+		.thread_inst_size	= sizeof(rlm_logtee_thread_t),
+		.config			= module_config,
+		.instantiate		= mod_instantiate,
+		.thread_instantiate	= mod_thread_instantiate,
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME(CF_IDENT_ANY, CF_IDENT_ANY), .method = mod_insert_logtee },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

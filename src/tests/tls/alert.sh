@@ -1,0 +1,110 @@
+#!/bin/sh
+#
+#  Run unit_test_tls with -A, so that it rejects the peer with a fatal TLS
+#  alert instead of completing the handshake.  Then check that the alert
+#  reached the peer.
+#
+#  The alert record is built by hand, in fr_tls_session_alert_send() in
+#  src/lib/tls/session.c, rather than by OpenSSL.  That makes it the one place
+#  which writes octets straight into a record buffer, so it is the one place
+#  where a mistake sends nothing at all rather than sending something wrong.
+#
+#  That function clears from_ssl before writing, so the record always has
+#  room, and it asserts that the write was the full seven octets.  Neither
+#  guard says the octets reached the peer, which is what this test is for.
+#
+#  This is the only TLS test where the handshake itself fails.  The reject
+#  test fails a session, but only after the handshake has succeeded.
+#
+#  The check is what the client saw, not what the server logged.  Only the
+#  client can tell us the octets left the machine.
+#
+#  Environment:
+#    UNIT_TEST_TLS  command that runs unit_test_tls, possibly several words
+#    OUTPUT         directory for the log file and the receipt file
+#    CONFDIR        directory holding unit_test_tls.conf
+#    CERTDIR        directory holding the client certificate
+#    DICT_PATH      dictionary directory
+#    PORT           port unit_test_tls listens on
+#
+#  "make test.tls" sets every variable above and runs this script.  The recipe
+#  is in src/tests/tls/all.mk.
+#
+#  $Id$
+#
+
+LOG="$OUTPUT/alert.log"
+CLIENT_LOG="$OUTPUT/alert_client.log"
+RECEIPT="$OUTPUT/alert.receipt"
+
+mkdir -p "$OUTPUT"
+rm -f "$LOG" "$CLIENT_LOG" "$RECEIPT"
+
+fail() {
+	echo "alert.sh: $1"
+	echo "--- $LOG ---"
+	cat "$LOG"
+	echo "--- $CLIENT_LOG ---"
+	cat "$CLIENT_LOG"
+	exit 1
+}
+
+if [ ! -r "$CERTDIR/client.pem" ]; then
+	echo "alert.sh: no client certificate in $CERTDIR, run 'make certs'"
+	exit 1
+fi
+
+#
+#  s_client writes to its own file.  unit_test_tls is still writing to $LOG
+#  at this point, and two programs writing to one file overwrite each other,
+#  which loses whichever lines land in the gap.
+#
+#  s_client exits non-zero because the handshake failed, which is the point,
+#  so its exit status says nothing and is ignored.
+#
+export CLIENT_LOG
+
+$UNIT_TEST_TLS -d "$CONFDIR" -D "$DICT_PATH" -xx -A \
+	-e 'echo | openssl s_client -connect "127.0.0.1:$PORT" \
+		-cert "$CERTDIR/client.pem" \
+		-key "$CERTDIR/client.key" -pass pass:whatever \
+		-CAfile "$CERTDIR/ca.pem" > "$CLIENT_LOG" 2>&1' \
+	> "$LOG" 2>&1
+
+#
+#  SSL_AD_ACCESS_DENIED is alert number 49.  OpenSSL prints both the name and
+#  the number, and both are checked: the name alone would also match a log
+#  line about some other alert, and the number alone is easy to misread.
+#
+grep -q "alert access denied" "$CLIENT_LOG" || \
+	fail "the client did not report the alert, so fr_tls_session_alert_send() sent nothing"
+
+grep -q "SSL alert number 49" "$CLIENT_LOG" || \
+	fail "the client reported an alert, but not SSL_AD_ACCESS_DENIED (49)"
+
+#
+#  The server must not record a completed handshake.  When the server records
+#  a completed handshake, the client received the alert and ignored the alert.
+#  A client which ignores an alert is a different bug, and the two bugs
+#  produce the same log lines.
+#
+if grep -q "TLS handshake completed" "$LOG"; then
+	fail "the handshake completed, so the alert did not stop it"
+fi
+
+#
+#  The server sends the alert and then waits.  openssl s_client reads the
+#  fatal alert and closes, so the dead socket is the only thing which ends
+#  this connection.  fr_tls_connection_failed() records that as
+#  `System-Call-Failed`, separately from the alert itself, which is what lets
+#  a policy tell "we rejected the peer" from "the peer went away".
+#
+#  alert_recv.sh cannot check this.  There the server fails the handshake on
+#  the peer's alert and usually finishes before it notices the socket, so the
+#  value appears in roughly two runs out of five.
+#
+grep -q "request.Error = ::System-Call-Failed" "$LOG" || \
+	fail "the dead socket did not record System-Call-Failed"
+
+touch "$RECEIPT"
+exit 0

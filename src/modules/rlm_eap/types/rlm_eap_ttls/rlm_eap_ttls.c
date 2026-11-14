@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -26,21 +26,16 @@
 RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
-#define LOG_PREFIX "rlm_eap_ttls - "
-
 #include <freeradius-devel/eap/tls.h>
-#include "eap_ttls.h"
+#include <freeradius-devel/eap/chbind.h>
+#include <freeradius-devel/tls/strerror.h>
 
 typedef struct {
 	SSL_CTX		*ssl_ctx;		//!< Thread local SSL_CTX.
 } rlm_eap_ttls_thread_t;
 
 typedef struct {
-	/*
-	 *	TLS configuration
-	 */
-	char const	*tls_conf_name;
-	fr_tls_conf_t	*tls_conf;
+	fr_tls_conf_t		*tls_conf;		//!< TLS configuration
 
 	/*
 	 *	RFC 5281 (TTLS) says that the length field MUST NOT be
@@ -51,27 +46,33 @@ typedef struct {
 	 *	RFC, we add the option here.  If set to "no", it sends
 	 *	the length field in ONLY the first fragment.
 	 */
-	bool		include_length;
+	bool			include_length;
 
-	/*
-	 *	Virtual server for inner tunnel session.
-	 */
-	char const	*virtual_server;
+	virtual_server_t	*virtual_server;	//!< Virtual server for inner tunnel session.
 
-	/*
-	 * 	Do we do require a client cert?
-	 */
-	bool		req_client_cert;
+	virtual_server_t	*resume_virtual_server;	//!< Virtual server to send resumed sessions through.
+
+	bool			req_client_cert;	//!< Do we do require a client cert?
 } rlm_eap_ttls_t;
 
+typedef struct {
+	fr_pair_t	*username;
+	bool		authenticated;
+} ttls_tunnel_t;
 
-static CONF_PARSER submodule_config[] = {
-	{ FR_CONF_OFFSET("tls", FR_TYPE_STRING, rlm_eap_ttls_t, tls_conf_name) },
-	{ FR_CONF_DEPRECATED("copy_request_to_tunnel", FR_TYPE_BOOL, rlm_eap_ttls_t, NULL), .dflt = "no" },
-	{ FR_CONF_DEPRECATED("use_tunneled_reply", FR_TYPE_BOOL, rlm_eap_ttls_t, NULL), .dflt = "no" },
-	{ FR_CONF_OFFSET("virtual_server", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_NOT_EMPTY, rlm_eap_ttls_t, virtual_server) },
-	{ FR_CONF_OFFSET("include_length", FR_TYPE_BOOL, rlm_eap_ttls_t, include_length), .dflt = "yes" },
-	{ FR_CONF_OFFSET("require_client_cert", FR_TYPE_BOOL, rlm_eap_ttls_t, req_client_cert), .dflt = "no" },
+static conf_parser_t submodule_config[] = {
+	{ FR_CONF_SUBSECTION_ALLOC("tls", CONF_FLAG_REQUIRED, rlm_eap_ttls_t, tls_conf, fr_tls_server_config),
+	  .subcs_type = "fr_tls_conf_t" },
+	{ FR_CONF_V3_DEPRECATED("copy_request_to_tunnel", rlm_eap_ttls_t, NULL), .dflt = "no" },
+	{ FR_CONF_V3_DEPRECATED("use_tunneled_reply", rlm_eap_ttls_t, NULL), .dflt = "no" },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("virtual_server", FR_TYPE_VOID, CONF_FLAG_REQUIRED | CONF_FLAG_NOT_EMPTY, rlm_eap_ttls_t, virtual_server),
+				    .func = virtual_server_cf_parse,
+				    .uctx = &(virtual_server_cf_parse_uctx_t){ .process_module_name = "radius"} },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("resume_virtual_server", FR_TYPE_VOID, CONF_FLAG_NOT_EMPTY, rlm_eap_ttls_t, resume_virtual_server),
+				    .func = virtual_server_cf_parse,
+				    .uctx = &(virtual_server_cf_parse_uctx_t){ .process_module_name = "radius"} },
+	{ FR_CONF_OFFSET("include_length", rlm_eap_ttls_t, include_length), .dflt = "yes" },
+	{ FR_CONF_OFFSET("require_client_cert", rlm_eap_ttls_t, req_client_cert), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -82,31 +83,27 @@ extern fr_dict_autoload_t rlm_eap_ttls_dict[];
 fr_dict_autoload_t rlm_eap_ttls_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
-fr_dict_attr_t const *attr_eap_tls_require_client_cert;
-fr_dict_attr_t const *attr_proxy_to_realm;
+static fr_dict_attr_t const *attr_eap_tls_require_client_cert;
 
-fr_dict_attr_t const *attr_chap_challenge;
-fr_dict_attr_t const *attr_ms_chap2_success;
-fr_dict_attr_t const *attr_eap_message;
-fr_dict_attr_t const *attr_freeradius_proxied_to;
-fr_dict_attr_t const *attr_ms_chap_challenge;
-fr_dict_attr_t const *attr_reply_message;
-fr_dict_attr_t const *attr_eap_channel_binding_message;
-fr_dict_attr_t const *attr_user_name;
-fr_dict_attr_t const *attr_user_password;
-fr_dict_attr_t const *attr_vendor_specific;
+static fr_dict_attr_t const *attr_chap_challenge;
+static fr_dict_attr_t const *attr_ms_chap2_success;
+static fr_dict_attr_t const *attr_eap_message;
+static fr_dict_attr_t const *attr_ms_chap_challenge;
+static fr_dict_attr_t const *attr_reply_message;
+static fr_dict_attr_t const *attr_eap_channel_binding_message;
+static fr_dict_attr_t const *attr_user_name;
+static fr_dict_attr_t const *attr_user_password;
+static fr_dict_attr_t const *attr_vendor_specific;
 
 extern fr_dict_attr_autoload_t rlm_eap_ttls_dict_attr[];
 fr_dict_attr_autoload_t rlm_eap_ttls_dict_attr[] = {
 	{ .out = &attr_eap_tls_require_client_cert, .name = "EAP-TLS-Require-Client-Cert", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
-	{ .out = &attr_proxy_to_realm, .name = "Proxy-To-Realm", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 
 	{ .out = &attr_chap_challenge, .name = "CHAP-Challenge", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_eap_message, .name = "EAP-Message", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
-	{ .out = &attr_freeradius_proxied_to, .name = "Vendor-Specific.FreeRADIUS.Proxied-To", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_radius },
 	{ .out = &attr_ms_chap_challenge, .name = "Vendor-Specific.Microsoft.CHAP-Challenge", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_ms_chap2_success, .name = "Vendor-Specific.Microsoft.CHAP2-Success", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_reply_message, .name = "Reply-Message", .type = FR_TYPE_STRING, .dict = &dict_radius },
@@ -114,26 +111,847 @@ fr_dict_attr_autoload_t rlm_eap_ttls_dict_attr[] = {
 	{ .out = &attr_user_name, .name = "User-Name", .type = FR_TYPE_STRING, .dict = &dict_radius },
 	{ .out = &attr_user_password, .name = "User-Password", .type = FR_TYPE_STRING, .dict = &dict_radius },
 	{ .out = &attr_vendor_specific, .name = "Vendor-Specific", .type = FR_TYPE_VSA, .dict = &dict_radius },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
+
+
+#define FR_DIAMETER_AVP_FLAG_VENDOR	0x80
+#define FR_DIAMETER_AVP_FLAG_MANDATORY	0x40
+/*
+ *    0                   1                   2                   3
+ *    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *   |                           AVP Code                            |
+ *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *   |V M r r r r r r|                  AVP Length                   |
+ *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *   |                        Vendor-ID (opt)                        |
+ *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *   |    Data ...
+ *   +-+-+-+-+-+-+-+-+
+ */
+
+/*
+ *	Verify that the diameter packet is valid.
+ */
+static int diameter_verify(request_t *request, uint8_t const *data, unsigned int data_len)
+{
+	uint32_t attr;
+	uint32_t length;
+	unsigned int hdr_len;
+	unsigned int remaining = data_len;
+
+	while (remaining > 0) {
+		hdr_len = 8;	/* 4 octet attr + 4 octet length */
+
+		if (remaining < hdr_len) {
+		  RDEBUG2("Diameter attribute is too small (%u) to contain a Diameter header", remaining);
+			return 0;
+		}
+
+		memcpy(&attr, data, sizeof(attr));
+		attr = ntohl(attr);
+		memcpy(&length, data + 4, sizeof(length));
+		length = ntohl(length);
+
+		if ((data[4] & 0x80) != 0) {
+			hdr_len += 4;
+
+			if (remaining < hdr_len) {
+				RDEBUG2("Diameter attribute is too small to contain a Diameter header with Vendor-Id");
+				return 0;
+			}
+		}
+
+		/*
+		 *	Get the length.  If it's too big, die.
+		 */
+		length &= 0x00ffffff;
+
+		/*
+		 *	Too short or too long is bad.
+		 */
+		if (length < hdr_len) {
+			RDEBUG2("Tunneled attribute %u is too short (%u < %u) to contain anything useful.", attr,
+				length, hdr_len);
+			return 0;
+		}
+
+		if (length > remaining) {
+			RDEBUG2("Tunneled attribute %u is longer than room remaining in the packet (%u > %u).", attr,
+				length, remaining);
+			return 0;
+		}
+
+		/*
+		 *	Check for broken implementations, which don't
+		 *	pad the AVP to a 4-octet boundary.
+		 */
+		if (remaining == length) break;
+
+		/*
+		 *	The length does NOT include the padding, so
+		 *	we've got to account for it here by rounding up
+		 *	to the nearest 4-byte boundary.
+		 */
+		length += 0x03;
+		length &= ~0x03;
+
+		/*
+		 *	If the rest of the diameter packet is larger than
+		 *	this attribute, continue.
+		 *
+		 *	Otherwise, if the attribute over-flows the end
+		 *	of the packet, die.
+		 */
+		if (remaining < length) {
+			REDEBUG2("Diameter attribute overflows packet!");
+			return 0;
+		}
+
+		/*
+		 *	remaining > length, continue.
+		 */
+		remaining -= length;
+		data += length;
+	}
+
+	/*
+	 *	We got this far.  It looks OK.
+	 */
+	return 1;
+}
+
+/*
+ *	Convert diameter attributes to our fr_pair_t's
+ */
+static ssize_t eap_ttls_decode_pair(request_t *request, TALLOC_CTX *ctx, fr_pair_list_t *out,
+				    fr_dict_attr_t const *parent,
+				    uint8_t const *data, size_t data_len,
+				    void *decode_ctx)
+{
+	uint8_t const		*p = data, *end = p + data_len;
+
+	fr_pair_t		*vp = NULL;
+	SSL			*ssl = decode_ctx;
+	fr_dict_attr_t const   	*attr_radius;
+	fr_dict_attr_t const	*da, *da_unknown;
+	TALLOC_CTX		*tmp_ctx = NULL;
+
+	attr_radius = fr_dict_root(dict_radius);
+
+	while (p < end) {
+		ssize_t			ret;
+		uint32_t		attr, vendor;
+		uint64_t		value_len;
+		uint8_t			flags;
+		fr_dict_attr_t const	*our_parent = parent;
+
+		if ((end - p) < 8) {
+			fr_strerror_printf("Malformed diameter attribute at offset %td.  Needed at least 8 bytes, got %td bytes",
+					   p - data, end - p);
+		error:
+			talloc_free(tmp_ctx);
+			fr_pair_list_free(out);
+			return -1;
+		}
+
+		RDEBUG3("%04td %02x%02x%02x%02x %02x%02x%02x%02x ...", p - data,
+			p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+
+		attr = fr_nbo_to_uint32(p);
+		p += 4;
+
+		flags = p[0];
+		p++;
+
+		value_len = fr_nbo_to_uint64v(p, 3);	/* Yes, that is a 24 bit length field */
+		p += 3;
+
+		if (value_len < 8) {
+			fr_strerror_printf("Malformed diameter attribute at offset %td.  Needed at least length of 8, got %u",
+					   p - data, (unsigned int) value_len);
+			goto error;
+		}
+
+		/*
+		 *	Account for the 8 bytes we've already read from the packet.
+		 */
+		if ((p + ((value_len + 0x03) & ~0x03)) - 8 > end) {
+		overflow:
+			fr_strerror_printf("Malformed diameter attribute at offset %td.  Value length %u overflows input",
+					   p - data, (unsigned int) value_len);
+			goto error;
+		}
+
+		value_len -= 8;	/* -= 8 for AVP code (4), flags (1), AVP length (3) */
+
+		/*
+		 *	Do we have a vendor field?
+		 */
+		if (flags & FR_DIAMETER_AVP_FLAG_VENDOR) {
+			vendor = fr_nbo_to_uint32(p);
+			p += 4;
+
+			if (value_len <= 4) goto overflow;
+
+			value_len -= 4;	/* -= 4 for the vendor ID field */
+
+			our_parent = fr_dict_vendor_da_by_num(attr_vendor_specific, vendor);
+			if (!our_parent) {
+				if (flags & FR_DIAMETER_AVP_FLAG_MANDATORY) {
+					fr_strerror_printf("Mandatory bit set and no vendor %u found", vendor);
+					goto error;
+				}
+
+				if (!tmp_ctx) {
+					fr_dict_attr_t *n;
+
+					MEM(our_parent = n = fr_dict_attr_unknown_vendor_afrom_num(ctx, parent, vendor));
+					tmp_ctx = n;
+				} else {
+					MEM(our_parent = fr_dict_attr_unknown_vendor_afrom_num(tmp_ctx, parent, vendor));
+				}
+			}
+		} else {
+			our_parent = attr_radius;
+		}
+
+		/*
+		 *	Is the attribute known?
+		 */
+		da_unknown = NULL;
+		da = fr_dict_attr_child_by_num(our_parent, attr);
+		if (!da) {
+			if (flags & FR_DIAMETER_AVP_FLAG_MANDATORY) {
+				fr_strerror_printf("Mandatory bit set and no attribute %u defined for parent %s", attr, parent->name);
+				goto error;
+			}
+
+			MEM(da_unknown = fr_dict_attr_unknown_raw_afrom_num(ctx, our_parent, attr));
+			da = da_unknown;
+		}
+
+		MEM(vp = fr_pair_afrom_da_nested(ctx, out, da));
+		fr_dict_attr_unknown_free(&da_unknown);
+
+		ret = fr_value_box_from_network(vp, &vp->data, vp->vp_type, vp->da,
+						&FR_DBUFF_TMP(p, (size_t)value_len), value_len, true);
+		if (ret < 0) {
+			/*
+			 *	Mandatory bit is set, and the attribute
+			 *	is malformed. Fail.
+			 */
+			if (flags & FR_DIAMETER_AVP_FLAG_MANDATORY) {
+				fr_strerror_const("Mandatory bit is set and attribute is malformed");
+				goto error;
+			}
+
+			fr_pair_raw_afrom_pair(vp, p, value_len);
+		}
+
+		/*
+		 *	The length does NOT include the padding, so
+		 *	we've got to account for it here by rounding up
+		 *	to the nearest 4-byte boundary.
+		 */
+		p += (value_len + 0x03) & ~0x03;
+
+		if (vp->da->flags.is_unknown) continue;
+
+		/*
+		 *	Ensure that the client is using the correct challenge.
+		 *
+		 *	This weirdness is to protect against against replay
+		 *	attacks, where anyone observing the CHAP exchange could
+		 *	pose as that user, by simply choosing to use the same
+		 *	challenge.
+		 *	By using a challenge based on information from the
+		 *	current session, we can guarantee that the client is
+		 *	not *choosing* a challenge. We're a little forgiving in
+		 *	that we have loose checks on the length, and we do NOT
+		 *	check the Id (first octet of the response to the
+		 *	challenge) But if the client gets the challenge correct,
+		 *	we're not too worried about the Id.
+		 */
+		if ((vp->da == attr_chap_challenge) || (vp->da == attr_ms_chap_challenge)) {
+			uint8_t	challenge[17];
+			static const char label[] = "ttls challenge";
+
+			if ((vp->vp_length < 8) || (vp->vp_length > 16)) {
+				fr_strerror_const("Tunneled challenge has invalid length");
+				goto error;
+			}
+
+			/*
+			 *	TLSv1.3 exports a different key depending on the length
+			 *	requested so ask for *exactly* what the spec requires
+			 */
+			if (SSL_export_keying_material(ssl, challenge, vp->vp_length + 1,
+						       label, sizeof(label) - 1, NULL, 0, 0) != 1) {
+				fr_tls_strerror_printf("Failed generating phase2 challenge");
+				goto error;
+			}
+
+			if (memcmp(challenge, vp->vp_octets, vp->vp_length) != 0) {
+				fr_strerror_const("Tunneled challenge is incorrect");
+				goto error;
+			}
+		}
+
+		/*
+		 *	Diameter pads strings (i.e. User-Password) with trailing zeros.
+		 */
+		if (vp->vp_type == FR_TYPE_STRING) fr_pair_value_strtrim(vp);
+	}
+
+	/*
+	 *	We got this far.  It looks OK.
+	 */
+	talloc_free(tmp_ctx);
+	return p - data;
+}
+
+/*
+ *	Convert fr_pair_t's to diameter attributes, and write them
+ *	to an SSL session.
+ *
+ *	The ONLY fr_pair_t's which may be passed to this function
+ *	are ones which can go inside of a RADIUS (i.e. diameter)
+ *	packet.  So no server-configuration attributes, or the like.
+ */
+static int vp2diameter(request_t *request, fr_tls_session_t *tls_session, fr_pair_list_t *list)
+{
+	/*
+	 *	RADIUS packets are no more than 4k in size, so if
+	 *	we've got more than 4k of data to write, it's very
+	 *	bad.
+	 */
+	uint8_t		buffer[4096];
+	uint8_t		*p;
+	uint32_t	attr;
+	uint32_t	length;
+	uint32_t	vendor;
+	size_t		total;
+	uint64_t	attr64;
+	fr_pair_t	*vp;
+
+	p = buffer;
+	total = 0;
+
+	for (vp = fr_pair_list_head(list);
+	     vp;
+	     vp = fr_pair_list_next(list, vp)) {
+		/*
+		 *	Too much data: die.
+		 */
+		if ((total + vp->vp_length + 12 + 3) >= sizeof(buffer)) {
+			RDEBUG2("output buffer is full!");
+			return 0;
+		}
+
+		/*
+		 *	Hmm... we don't group multiple EAP-Messages
+		 *	together.  Maybe we should...
+		 */
+
+		length = vp->vp_length;
+		if (length >= ((1 << 24) - 12)) {
+			RDEBUG2("Attribute is too long!");
+			return 0;
+		}
+
+		vendor = fr_dict_vendor_num_by_da(vp->da);
+		if (vendor != 0) {
+			attr = vp->da->attr & 0xffff;
+			length |= ((uint32_t)1 << 31);
+		} else {
+			attr = vp->da->attr;
+		}
+
+		/*
+		 *	Hmm... set the M bit for all attributes?
+		 */
+		length |= (1 << 30);
+
+		attr = ntohl(attr);
+
+		memcpy(p, &attr, sizeof(attr));
+		p += 4;
+		total += 4;
+
+		length += 8;	/* includes 8 bytes of attr & length */
+
+		if (vendor != 0) {
+			length += 4; /* include 4 bytes of vendor */
+
+			length = ntohl(length);
+			memcpy(p, &length, sizeof(length));
+			p += 4;
+			total += 4;
+
+			vendor = ntohl(vendor);
+			memcpy(p, &vendor, sizeof(vendor));
+			p += 4;
+			total += 4;
+		} else {
+			length = ntohl(length);
+			memcpy(p, &length, sizeof(length));
+			p += 4;
+			total += 4;
+		}
+
+		switch (vp->vp_type) {
+		case FR_TYPE_DATE:
+			attr = htonl(fr_unix_time_to_sec(vp->vp_date)); /* stored in host order */
+			memcpy(p, &attr, sizeof(attr));
+			length = 4;
+			break;
+
+		case FR_TYPE_UINT32:
+			attr = htonl(vp->vp_uint32); /* stored in host order */
+			memcpy(p, &attr, sizeof(attr));
+			length = 4;
+			break;
+
+		case FR_TYPE_UINT64:
+			attr64 = htonll(vp->vp_uint64); /* stored in host order */
+			memcpy(p, &attr64, sizeof(attr64));
+			length = 8;
+			break;
+
+		case FR_TYPE_IPV4_ADDR:
+			memcpy(p, &vp->vp_ipv4addr, 4); /* network order */
+			length = 4;
+			break;
+
+		case FR_TYPE_STRING:
+		case FR_TYPE_OCTETS:
+		default:
+			memcpy(p, vp->vp_strvalue, vp->vp_length);
+			length = vp->vp_length;
+			break;
+		}
+
+		/*
+		 *	Skip to the end of the data.
+		 */
+		p += length;
+		total += length;
+
+		/*
+		 *	Align the data to a multiple of 4 bytes.
+		 */
+		if ((total & 0x03) != 0) {
+			size_t i;
+
+			length = 4 - (total & 0x03);
+			for (i = 0; i < length; i++) {
+				*p = '\0';
+				p++;
+				total++;
+			}
+		}
+	} /* loop over the VP's to write. */
+
+	/*
+	 *	Write the data in the buffer to the SSL session.
+	 */
+	if (total > 0) {
+		(void) fr_dbuff_in_memcpy_partial(&tls_session->clean_in, buffer, total);
+
+		/*
+		 *	FIXME: Check the return code.
+		 */
+		fr_tls_session_send(request, tls_session);
+	}
+
+	/*
+	 *	Everything's OK.
+	 */
+	return 1;
+}
+
+
+static unlang_action_t eap_ttls_success(unlang_result_t *p_result, request_t *request, eap_session_t *eap_session)
+{
+	eap_tls_prf_label_t prf_label;
+
+	eap_crypto_prf_label_init(&prf_label, eap_session,
+				  "ttls keying material",
+				  sizeof("ttls keying material") - 1);
+
+	p_result->rcode = RLM_MODULE_OK;
+	return eap_tls_success(request, eap_session, &prf_label);
+}
+
+
+/*
+ *	Use a reply packet to determine what to do.
+ *
+ *	This runs in the child request, after the inner tunnel has run.  The TLS session is bound
+ *	to the parent request, so everything which writes to the TLS session takes the parent.
+ *	The result of this function is the result of the child, and process_rcode() reads the
+ *	result in the parent.
+ */
+static unlang_action_t process_reply(unlang_result_t *p_result, request_t *request, void *uctx)
+{
+	eap_session_t		*eap_session = talloc_get_type_abort(uctx, eap_session_t);
+	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
+	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
+	fr_pair_t		*vp = NULL, *copy;
+	fr_pair_list_t		tunnel_vps;
+	ttls_tunnel_t		*t = tls_session->opaque;
+	request_t		*parent = request->parent;
+	fr_packet_t		*reply = request->reply;
+
+	fr_pair_list_init(&tunnel_vps);
+	fr_assert(eap_session->request == parent->parent);
+
+	p_result->priority = MOD_PRIORITY_MAX;
+
+	/*
+	 *	If the response packet was Access-Accept, then
+	 *	we're OK.  If not, die horribly.
+	 *
+	 *	FIXME: Take MS-CHAP2-Success attribute, and
+	 *	tunnel it back to the client, to authenticate
+	 *	ourselves to the client.
+	 *
+	 *	FIXME: If we have an Access-Challenge, then
+	 *	the Reply-Message is tunneled back to the client.
+	 *
+	 *	FIXME: If we have an EAP-Message, then that message
+	 *	must be tunneled back to the client.
+	 *
+	 *	FIXME: If we have an Access-Challenge with a State
+	 *	attribute, then do we tunnel that to the client, or
+	 *	keep track of it ourselves?
+	 *
+	 *	FIXME: EAP-Messages can only start with 'identity',
+	 *	NOT 'eap start', so we should check for that....
+	 */
+	switch (reply->code) {
+	case FR_RADIUS_CODE_ACCESS_ACCEPT:
+		/*
+		 *	Copy what we need into the TTLS tunnel and leave
+		 *	the rest to be cleaned up.
+		 */
+		if ((vp = fr_pair_find_by_da_nested(&request->reply_pairs, attr_ms_chap2_success))) {
+			RDEBUG2("Got MS-CHAP2-Success, tunneling it to the client in a challenge");
+		} else {
+			vp = fr_pair_find_by_da_nested(&request->reply_pairs, attr_eap_channel_binding_message);
+		}
+		if (vp) {
+			t->authenticated = true;
+			MEM(copy = fr_pair_copy(tls_session, vp));
+			fr_pair_prepend(&tunnel_vps, copy);
+			reply->code = FR_RADIUS_CODE_ACCESS_CHALLENGE;
+			break;
+		}
+
+		/*
+		 *	Success: process_rcode() automatically returns MPPE keys.
+		 */
+		RETURN_UNLANG_OK;
+
+	case FR_RADIUS_CODE_ACCESS_REJECT:
+		RETURN_UNLANG_REJECT;
+
+	/*
+	 *	Handle Access-Challenge, but only if we
+	 *	send tunneled reply data.  This is because
+	 *	an Access-Challenge means that we MUST tunnel
+	 *	a Reply-Message to the client.
+	 */
+	case FR_RADIUS_CODE_ACCESS_CHALLENGE:
+		/*
+		 *	Copy what we need into the TTLS tunnel and leave
+		 *	the rest to be cleaned up.
+		 */
+		vp = NULL;
+		while ((vp = fr_pair_list_next(&request->reply_pairs, vp))) {
+		     	if ((vp->da == attr_eap_message) || (vp->da == attr_reply_message)) {
+				MEM(copy = fr_pair_copy(tls_session, vp));
+				fr_pair_prepend(&tunnel_vps, copy);
+		     	} else if (vp->da == attr_eap_channel_binding_message) {
+				MEM(copy = fr_pair_copy(tls_session, vp));
+				fr_pair_prepend(&tunnel_vps, copy);
+		     	}
+		}
+		break;
+
+	default:
+		REDEBUG("Unknown RADIUS packet type %u: rejecting tunneled user", reply->code);
+		RETURN_UNLANG_INVALID;
+	}
+
+
+	/*
+	 *	Pack any tunneled VPs and send them back
+	 *	to the supplicant.
+	 */
+	if (!fr_pair_list_empty(&tunnel_vps)) {
+		RDEBUG2("Sending tunneled reply attributes");
+		log_request_pair_list(L_DBG_LVL_2, request, NULL, &tunnel_vps, NULL);
+
+		vp2diameter(parent, tls_session, &tunnel_vps);
+		fr_pair_list_free(&tunnel_vps);
+	}
+
+	RETURN_UNLANG_HANDLED;
+}
+
+/*
+ *	Construct the reply appropriately based on the rcode from TTLS processing.
+ *
+ *	This runs in the request which holds the TLS session, once the child has finished.
+ */
+static unlang_action_t process_rcode(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
+{
+	eap_session_t		*eap_session = talloc_get_type_abort(mctx->rctx, eap_session_t);
+
+	RDEBUG3("Tunneled request complete");
+
+	switch (eap_session->submodule_result.rcode) {
+	case RLM_MODULE_OK:
+		return eap_ttls_success(p_result, request, eap_session);
+
+	case RLM_MODULE_HANDLED:
+		eap_tls_request(request, eap_session);
+		RETURN_UNLANG_OK;
+
+	default:
+		p_result->rcode = eap_session->submodule_result.rcode;
+		return eap_tls_fail(request, eap_session);
+	}
+}
+
+/*
+ *	Process the "diameter" contents of the tunneled data.
+ *
+ *	The inner tunnel runs in a child request, so that the session-state list of the TLS
+ *	session stays in this request.  The state code moves the session-state list out of the
+ *	request which ran the inner tunnel, and the TLS session needs the list when it stores
+ *	a session ticket.
+ */
+static unlang_action_t eap_ttls_process(unlang_result_t *p_result, module_ctx_t const *mctx,
+					request_t *request, eap_session_t *eap_session, fr_tls_session_t *tls_session)
+{
+	fr_pair_t		*vp = NULL;
+	ttls_tunnel_t		*t;
+	uint8_t			const *data;
+	size_t			data_len;
+	chbind_packet_t		*chbind;
+	fr_pair_t		*username;
+	request_t		*child = NULL;
+	rlm_eap_ttls_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_eap_ttls_t);
+	rlm_rcode_t		rcode = RLM_MODULE_FAIL;
+
+	/*
+	 *	Read the buffer directly, rather than copying the
+	 *	octets out of it.
+	 */
+	data_len = fr_dbuff_used(&tls_session->clean_out);
+	data = fr_dbuff_start(&tls_session->clean_out);
+	fr_tls_record_init(&tls_session->clean_out);
+
+	t = (ttls_tunnel_t *) tls_session->opaque;
+
+	/*
+	 *	If there's no data, maybe this is an ACK to an
+	 *	MS-CHAP2-Success.
+	 */
+	if (data_len == 0) {
+		if (t->authenticated) {
+			RDEBUG2("Got ACK, and the user was already authenticated");
+			RETURN_UNLANG_OK;
+		} /* else no session, no data, die. */
+
+		/*
+		 *	FIXME: Call SSL_get_error() to see what went
+		 *	wrong.
+		 */
+		RDEBUG2("SSL_read Error");
+		RETURN_UNLANG_FAIL;
+	}
+
+	if (!diameter_verify(request, data, data_len)) RETURN_UNLANG_FAIL;
+
+	MEM(child = unlang_subrequest_alloc(request, request->proto_dict));
+	fr_assert(fr_pair_list_empty(&child->request_pairs));
+
+	/*
+	 *	Add the tunneled attributes to the child request.
+	 */
+	if (eap_ttls_decode_pair(request, child->request_ctx, &child->request_pairs, fr_dict_root(fr_dict_internal()),
+				 data, data_len, tls_session->ssl) < 0) {
+		RPEDEBUG("Decoding TTLS TLVs failed");
+		goto finish;
+	}
+
+	/*
+	 *	Update other items in the request_t data structure.
+	 */
+
+	/*
+	 *	No User-Name, try to create one from stored data.
+	 */
+	username = fr_pair_find_by_da(&child->request_pairs, NULL, attr_user_name);
+	if (!username) {
+		/*
+		 *	No User-Name in the stored data, look for
+		 *	an EAP-Identity, and pull it out of there.
+		 */
+		if (!t->username) {
+			vp = fr_pair_find_by_da(&child->request_pairs, NULL, attr_eap_message);
+			if (vp &&
+			    (vp->vp_length >= EAP_HEADER_LEN + 2) &&
+			    (vp->vp_strvalue[0] == FR_EAP_CODE_RESPONSE) &&
+			    (vp->vp_strvalue[EAP_HEADER_LEN] == FR_EAP_METHOD_IDENTITY) &&
+			    (vp->vp_strvalue[EAP_HEADER_LEN + 1] != 0)) {
+				/*
+				 *	Create & remember a User-Name
+				 */
+				MEM(t->username = fr_pair_afrom_da(t, attr_user_name));
+				t->username->vp_tainted = true;
+
+				fr_pair_value_bstrndup(t->username,
+						       (char const *)vp->vp_octets + 5, vp->vp_length - 5, true);
+
+				RDEBUG2("Got tunneled identity of %pV", &t->username->data);
+			} else {
+				/*
+				 *	Don't reject the request outright,
+				 *	as it's permitted to do EAP without
+				 *	user-name.
+				 */
+				RWDEBUG2("No EAP-Identity found to start EAP conversation");
+			}
+		} /* else there WAS a t->username */
+
+		if (t->username) {
+			MEM(vp = fr_pair_copy(child->request_ctx, t->username));
+			fr_pair_append(&child->request_pairs, vp);
+		}
+	} /* else the request ALREADY had a User-Name */
+
+	/*
+	 *	Process channel binding.
+	 */
+	chbind = eap_chbind_vp2packet(child, &child->request_pairs);
+	if (chbind) {
+		fr_radius_packet_code_t chbind_code;
+		CHBIND_REQ *req = talloc_zero(child, CHBIND_REQ);
+
+		RDEBUG2("received chbind request");
+		req->request = chbind;
+		if (username) {
+			req->username = username;
+		} else {
+			req->username = NULL;
+		}
+		chbind_code = chbind_process(child, req);
+
+		/* encapsulate response here */
+		if (req->response) {
+			RDEBUG2("sending chbind response");
+			fr_pair_append(&child->reply_pairs,
+				    eap_chbind_packet2vp(child->reply_ctx, req->response));
+		} else {
+			RDEBUG2("no chbind response");
+		}
+
+		/* clean up chbind req */
+		talloc_free(req);
+
+		if (chbind_code != FR_RADIUS_CODE_ACCESS_ACCEPT) goto finish;
+	}
+
+	RDEBUG2("Got tunneled request");
+	log_request_pair_list(L_DBG_LVL_2, request, NULL, &child->request_pairs, NULL);
+
+	/*
+	 *	Set the child up for execution.
+	 */
+	if (unlang_subrequest_child_push(&eap_session->submodule_result, child,
+					 child,
+					 false, UNLANG_SUB_FRAME) < 0) goto finish;
+
+	/*
+	 *	Set up a function in the child to process the result of the inner tunnel.  The function
+	 *	runs in the child after the virtual server executes.  The function sets the rcode of the
+	 *	subrequest, which is written to eap_session->submodule_result.
+	 */
+	if (unlang_function_push_with_result(NULL,
+					     child,
+					     NULL,
+					     process_reply,
+					     NULL, FR_SIGNAL_NONE,
+					     UNLANG_SUB_FRAME, eap_session) != UNLANG_ACTION_PUSHED_CHILD) goto finish;
+
+	/*
+	 *	Call authentication recursively, which will
+	 *	do PAP, CHAP, MS-CHAP, etc.
+	 */
+	if (unlikely(eap_virtual_server(child, eap_session, inst->virtual_server) == UNLANG_ACTION_FAIL)) goto finish;
+
+	/*
+	 *	We now yield to the subrequest.  unlang_subrequest_child_push
+	 *	pushed a new frame in the context of the parent which'll start
+	 *	the subrequest.
+	 */
+	return UNLANG_ACTION_PUSHED_CHILD;
+
+finish:
+	if (child) {
+		/*
+		 *	We can't just free the child, we need to detach it
+		 *	and then let the interpreter to unwind and eventually
+		 *	free the request.
+		 */
+		request_detach(child);
+		unlang_interpret_signal(child, FR_SIGNAL_CANCEL);
+	}
+
+	RETURN_UNLANG_RCODE(rcode);
+}
 
 /*
  *	Allocate the TTLS per-session data
  */
-static ttls_tunnel_t *ttls_alloc(TALLOC_CTX *ctx, rlm_eap_ttls_t *inst)
+static ttls_tunnel_t *ttls_alloc(TALLOC_CTX *ctx)
 {
 	ttls_tunnel_t *t;
 
 	t = talloc_zero(ctx, ttls_tunnel_t);
-	t->virtual_server = inst->virtual_server;
 
 	return t;
 }
 
-static unlang_action_t mod_handshake_resume(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx,
-					    request_t *request, void *rctx)
+static unlang_action_t process_resume_reply(unlang_result_t *p_result, request_t *request, NDEBUG_UNUSED void *uctx)
 {
-	eap_session_t		*eap_session = talloc_get_type_abort(rctx, eap_session_t);
+#ifndef NDEBUG
+	eap_session_t	*eap_session = talloc_get_type_abort(uctx, eap_session_t);
+	request_t	*parent = request->parent;
+#endif
+
+	fr_assert(eap_session->request == parent->parent);
+
+	p_result->priority = MOD_PRIORITY_MAX;
+
+	switch (request->reply->code) {
+	case FR_RADIUS_CODE_ACCESS_ACCEPT:
+		RETURN_UNLANG_OK;
+
+	default:
+		RETURN_UNLANG_REJECT;
+	}
+}
+
+static unlang_action_t mod_handshake_resume(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
+{
+	eap_session_t		*eap_session = talloc_get_type_abort(mctx->rctx, eap_session_t);
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
 	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
 
@@ -155,45 +973,55 @@ static unlang_action_t mod_handshake_resume(rlm_rcode_t *p_result, UNUSED module
 	 */
 	case EAP_TLS_ESTABLISHED:
 		if (SSL_session_reused(tls_session->ssl)) {
+			rlm_eap_ttls_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_eap_ttls_t);
+			request_t	*child;
+
 			RDEBUG2("Skipping Phase2 due to session resumption");
-			goto do_keys;
+
+			/*
+			 *	A simplified version of the code used to process tunnelled TTLS data.
+			 *
+			 *	In this case, the request is populated with pairs restored from
+			 *	the cached session-state.
+			 */
+			(void) unlang_module_yield(request, process_rcode, NULL, FR_SIGNAL_NONE, eap_session);
+
+			MEM(child = unlang_subrequest_alloc(request, request->proto_dict));
+
+			if (unlikely(fr_pair_list_copy(child->request_ctx, &child->request_pairs,
+						       &request->session_state_pairs) < 0)) {
+			error:
+				request_detach(child);
+				unlang_interpret_signal(child, FR_SIGNAL_CANCEL);
+				RETURN_UNLANG_FAIL;
+			}
+
+			RDEBUG2("Resumed session-state:");
+			log_request_pair_list(L_DBG_LVL_2, request, NULL, &child->request_pairs, NULL);
+
+			if (unlang_subrequest_child_push(&eap_session->submodule_result, child, child,
+							 false, UNLANG_SUB_FRAME) < 0) goto error;
+
+			if (unlang_function_push_with_result(NULL, child, NULL, process_resume_reply, NULL,
+							     FR_SIGNAL_NONE, UNLANG_SUB_FRAME,
+							     eap_session) != UNLANG_ACTION_PUSHED_CHILD) goto error;
+
+			if (unlikely(eap_virtual_server(child, eap_session,
+							inst->resume_virtual_server) == UNLANG_ACTION_FAIL)) goto error;
+
+			return UNLANG_ACTION_PUSHED_CHILD;
 		}
 
-		if (tunnel && tunnel->authenticated) {
-			eap_tls_prf_label_t prf_label;
+		if (tunnel && tunnel->authenticated) return eap_ttls_success(p_result, request, eap_session);
 
-		do_keys:
-			eap_crypto_prf_label_init(&prf_label, eap_session,
-						  "ttls keying material",
-						  sizeof("ttls keying material") - 1);
-			/*
-			 *	Success: Automatically return MPPE keys.
-			 */
-			if (eap_tls_success(request, eap_session, &prf_label) < 0) RETURN_MODULE_FAIL;
-
-			/*
-			 *	Result is always OK, even if we fail to persist the
-			 *	session data.
-			 */
-			*p_result = RLM_MODULE_OK;
-
-			/*
-			 *	Write the session to the session cache
-			 *
-			 *	We do this here (instead of relying on OpenSSL to call the
-			 *	session caching callback), because we only want to write
-			 *	session data to the cache if all phases were successful.
-			 *
-			 *	If we wrote out the cache data earlier, and the server
-			 *	exited whilst the session was in progress, the supplicant
-			 *	could resume the session (and get access) even if phase2
-			 *	never completed.
-			 */
-			return fr_tls_cache_pending_push(request, tls_session);
-		}
+		/*
+		 *	Some supplicants send application data in the same packet as
+		 *	the end of the handshake - continue to process that data.
+		 */
+		if (fr_dbuff_used(&tls_session->clean_out) > 0) break;
 
 		eap_tls_request(request, eap_session);
-		RETURN_MODULE_OK;
+		RETURN_UNLANG_OK;
 
 	/*
 	 *	The TLS code is still working on the TLS
@@ -201,7 +1029,7 @@ static unlang_action_t mod_handshake_resume(rlm_rcode_t *p_result, UNUSED module
 	 *	do nothing.
 	 */
 	case EAP_TLS_HANDLED:
-		RETURN_MODULE_HANDLED;
+		RETURN_UNLANG_HANDLED;
 
 	/*
 	 *	Handshake is done, proceed with decoding tunneled
@@ -214,7 +1042,8 @@ static unlang_action_t mod_handshake_resume(rlm_rcode_t *p_result, UNUSED module
 	 *	Anything else: fail.
 	 */
 	default:
-		RETURN_MODULE_FAIL;
+		p_result->rcode = RLM_MODULE_FAIL;
+		return eap_tls_fail(request, eap_session);
 	}
 
 	/*
@@ -224,50 +1053,21 @@ static unlang_action_t mod_handshake_resume(rlm_rcode_t *p_result, UNUSED module
 	RDEBUG2("Session established.  Decoding Diameter attributes");
 
 	/*
+	 *	Set up the resume point to prepare the correct reply based on
+	 *	the rcode coming back from the inner tunnel.
+	 */
+	(void) unlang_module_yield(request, process_rcode, NULL, FR_SIGNAL_NONE, eap_session);
+
+	/*
 	 *	Process the TTLS portion of the request.
 	 */
-	switch (eap_ttls_process(request, eap_session, tls_session)) {
-	case FR_RADIUS_CODE_ACCESS_REJECT:
-		eap_tls_fail(request, eap_session);
-		RETURN_MODULE_REJECT;
-
-		/*
-		 *	Access-Challenge, continue tunneled conversation.
-		 */
-	case FR_RADIUS_CODE_ACCESS_CHALLENGE:
-		eap_tls_request(request, eap_session);
-		RETURN_MODULE_OK;
-
-		/*
-		 *	Success: Automatically return MPPE keys.
-		 */
-	case FR_RADIUS_CODE_ACCESS_ACCEPT:
-		goto do_keys;
-
-	/*
-	 *	No response packet, MUST be proxying it.
-	 *	The main EAP module will take care of discovering
-	 *	that the request now has a "proxy" packet, and
-	 *	will proxy it, rather than returning an EAP packet.
-	 */
-	case FR_RADIUS_CODE_STATUS_CLIENT:
-		RETURN_MODULE_OK;
-
-	default:
-		break;
-	}
-
-	/*
-	 *	Something we don't understand: Reject it.
-	 */
-	eap_tls_fail(request, eap_session);
-	RETURN_MODULE_INVALID;
+	return eap_ttls_process(&eap_session->submodule_result, mctx, request, eap_session, tls_session);
 }
 
 /*
  *	Do authentication, by letting EAP-TLS do most of the work.
  */
-static unlang_action_t mod_handshake_process(UNUSED rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx,
+static unlang_action_t mod_handshake_process(UNUSED unlang_result_t *p_result, UNUSED module_ctx_t const *mctx,
 					     request_t *request)
 {
 	eap_session_t		*eap_session = eap_session_get(request->parent);
@@ -275,7 +1075,7 @@ static unlang_action_t mod_handshake_process(UNUSED rlm_rcode_t *p_result, UNUSE
 	/*
 	 *	Setup the resumption frame to process the result
 	 */
-	(void)unlang_module_yield(request, mod_handshake_resume, NULL, eap_session);
+	(void)unlang_module_yield(request, mod_handshake_resume, NULL, FR_SIGNAL_NONE, eap_session);
 
 	/*
 	 *	Process TLS layer until done.
@@ -283,12 +1083,9 @@ static unlang_action_t mod_handshake_process(UNUSED rlm_rcode_t *p_result, UNUSE
 	return eap_tls_process(request, eap_session);
 }
 
-/*
- *	Send an initial eap-tls request to the peer, using the libeap functions.
- */
-static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t mod_session_init_resume(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_eap_ttls_t		*inst = talloc_get_type_abort(mctx->instance, rlm_eap_ttls_t);
+	rlm_eap_ttls_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_eap_ttls_t);
 	rlm_eap_ttls_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_eap_ttls_thread_t);
 	eap_session_t		*eap_session = eap_session_get(request->parent);
 
@@ -297,13 +1094,11 @@ static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t cons
 	fr_pair_t		*vp;
 	bool			client_cert;
 
-	eap_session->tls = true;
-
 	/*
 	 *	EAP-TLS-Require-Client-Cert attribute will override
 	 *	the require_client_cert configuration option.
 	 */
-	vp = fr_pair_find_by_da(&request->control_pairs, attr_eap_tls_require_client_cert, 0);
+	vp = fr_pair_find_by_da(&request->control_pairs, NULL, attr_eap_tls_require_client_cert);
 	if (vp) {
 		client_cert = vp->vp_uint32 ? true : false;
 	} else {
@@ -311,7 +1106,7 @@ static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t cons
 	}
 
 	eap_session->opaque = eap_tls_session = eap_tls_session_init(request, eap_session, t->ssl_ctx, client_cert);
-	if (!eap_tls_session) RETURN_MODULE_FAIL;
+	if (!eap_tls_session) RETURN_UNLANG_FAIL;
 	tls_session = eap_tls_session->tls_session;
 
 	eap_tls_session->include_length = inst->include_length;
@@ -322,21 +1117,37 @@ static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t cons
 	 */
 	if (eap_tls_start(request, eap_session) < 0) {
 		talloc_free(eap_tls_session);
-		RETURN_MODULE_FAIL;
+		RETURN_UNLANG_FAIL;
 	}
 
-	tls_session->opaque = ttls_alloc(tls_session, inst);
+	tls_session->opaque = ttls_alloc(tls_session);
 
 	eap_session->process = mod_handshake_process;
 
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
-static int mod_thread_instantiate(UNUSED CONF_SECTION const *cs, void *instance,
-				  UNUSED fr_event_list_t *el, void *thread)
+/*
+ *	Send an initial eap-tls request to the peer, using the libeap functions.
+ */
+static unlang_action_t mod_session_init(UNUSED unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_eap_ttls_t		*inst = talloc_get_type_abort(instance, rlm_eap_ttls_t);
-	rlm_eap_ttls_thread_t	*t = talloc_get_type_abort(thread, rlm_eap_ttls_thread_t);
+	rlm_eap_ttls_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_eap_ttls_t);
+	eap_session_t		*eap_session = eap_session_get(request->parent);
+
+	eap_session->tls = true;
+
+	(void) unlang_module_yield(request, mod_session_init_resume, NULL, FR_SIGNAL_NONE, NULL);
+
+	if (inst->tls_conf->new_session) return fr_tls_new_session_push(request, inst->tls_conf);
+
+	return UNLANG_ACTION_CALCULATE_RESULT;
+}
+
+static int mod_thread_instantiate(module_thread_inst_ctx_t const *mctx)
+{
+	rlm_eap_ttls_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_eap_ttls_t);
+	rlm_eap_ttls_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_eap_ttls_thread_t);
 
 	t->ssl_ctx = fr_tls_ctx_alloc(inst->tls_conf, false);
 	if (!t->ssl_ctx) return -1;
@@ -344,9 +1155,9 @@ static int mod_thread_instantiate(UNUSED CONF_SECTION const *cs, void *instance,
 	return 0;
 }
 
-static int mod_thread_detach(UNUSED fr_event_list_t *el, void *thread)
+static int mod_thread_detach(module_thread_inst_ctx_t const *mctx)
 {
-	rlm_eap_ttls_thread_t	*t = talloc_get_type_abort(thread, rlm_eap_ttls_thread_t);
+	rlm_eap_ttls_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_eap_ttls_thread_t);
 
 	if (likely(t->ssl_ctx != NULL)) SSL_CTX_free(t->ssl_ctx);
 	t->ssl_ctx = NULL;
@@ -357,24 +1168,16 @@ static int mod_thread_detach(UNUSED fr_event_list_t *el, void *thread)
 /*
  *	Attach the module.
  */
-static int mod_instantiate(void *instance, CONF_SECTION *cs)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_eap_ttls_t *inst = talloc_get_type_abort(instance, rlm_eap_ttls_t);
+	rlm_eap_ttls_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_eap_ttls_t);
+	CONF_SECTION 	*conf = mctx->mi->conf;
 
-	if (!virtual_server_find(inst->virtual_server)) {
-		cf_log_err_by_child(cs, "virtual_server", "Unknown virtual server '%s'", inst->virtual_server);
-		return -1;
-	}
+	eap_tls_conf_check(conf, inst->tls_conf, true);
 
-	/*
-	 *	Read tls configuration, either from group given by 'tls'
-	 *	option, or from the eap-tls configuration.
-	 */
-	inst->tls_conf = eap_tls_conf_parse(cs, "tls");
-	if (!inst->tls_conf) {
-		ERROR("Failed initializing SSL context");
-		return -1;
-	}
+	if (eap_tls_check_stateless(conf, inst->tls_conf) < 0) return -1;
+
+	if (!inst->resume_virtual_server) inst->resume_virtual_server = inst->virtual_server;
 
 	return 0;
 }
@@ -385,17 +1188,19 @@ static int mod_instantiate(void *instance, CONF_SECTION *cs)
  */
 extern rlm_eap_submodule_t rlm_eap_ttls;
 rlm_eap_submodule_t rlm_eap_ttls = {
-	.name			= "eap_ttls",
-	.magic			= RLM_MODULE_INIT,
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "eap_ttls",
 
+		.inst_size		= sizeof(rlm_eap_ttls_t),
+		.config			= submodule_config,
+		.instantiate		= mod_instantiate,	/* Create new submodule instance */
+
+		.thread_inst_size	= sizeof(rlm_eap_ttls_thread_t),
+		.thread_instantiate	= mod_thread_instantiate,
+		.thread_detach		= mod_thread_detach,
+	},
 	.provides		= { FR_EAP_METHOD_TTLS },
-	.inst_size		= sizeof(rlm_eap_ttls_t),
-	.config			= submodule_config,
-	.instantiate		= mod_instantiate,	/* Create new submodule instance */
-
-	.thread_inst_size	= sizeof(rlm_eap_ttls_thread_t),
-	.thread_instantiate	= mod_thread_instantiate,
-	.thread_detach		= mod_thread_detach,
-
 	.session_init		= mod_session_init,	/* Initialise a new EAP session */
+	.tunnel			= true
 };

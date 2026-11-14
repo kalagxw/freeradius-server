@@ -30,13 +30,11 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/dependency.h>
-#include <freeradius-devel/server/map_proc.h>
-#include <freeradius-devel/server/module.h>
-#include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/server/radmin.h>
-#include <freeradius-devel/server/state.h>
-#include <freeradius-devel/server/virtual_servers.h>
+#include <freeradius-devel/server/snmp.h>
+#include <freeradius-devel/util/size.h>
+
+#include <freeradius-devel/io/thread.h>
 
 #include <freeradius-devel/tls/base.h>
 #include <freeradius-devel/tls/log.h>
@@ -46,9 +44,11 @@ RCSID("$Id$")
 #include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/syserror.h>
 
-#include <ctype.h>
+#ifdef HAVE_CAPABILITY_H
+#include <freeradius-devel/util/cap.h>
+#endif
+
 #include <fcntl.h>
-#include <signal.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 
@@ -70,8 +70,13 @@ RCSID("$Id$")
 #  include <systemd/sd-daemon.h>
 #endif
 
-char const *radiusd_version = RADIUSD_VERSION_STRING_BUILD("FreeRADIUS");
-static pid_t radius_pid;
+#ifdef WITH_TLS
+#  include <freeradius-devel/tls/version.h>
+#endif
+
+char const	*radiusd_version = RADIUSD_VERSION_BUILD("FreeRADIUS");
+static pid_t	radius_pid;
+static char const	*program = NULL;
 
 /*
  *  Configuration items.
@@ -80,7 +85,7 @@ static pid_t radius_pid;
 /*
  *	Static functions.
  */
-static void usage(main_config_t const *config, int status);
+static void usage(int status);
 
 static void sig_fatal (int);
 #ifdef SIGHUP
@@ -121,12 +126,10 @@ static int talloc_config_set(main_config_t *config)
  */
 static int thread_instantiate(TALLOC_CTX *ctx, fr_event_list_t *el, UNUSED void *uctx)
 {
-	if (modules_thread_instantiate(ctx, el) < 0) return -1;
-	if (xlat_thread_instantiate(ctx) < 0) return -1;
-#ifdef WITH_TLS
-	if (fr_openssl_thread_init(main_config->openssl_async_pool_init,
-				   main_config->openssl_async_pool_max) < 0) return -1;
-#endif
+	if (fr_thread_instantiate(ctx, el) < 0) return -1;
+
+	if (modules_rlm_coord_attach(el) < 0) return -1;
+
 	return 0;
 }
 
@@ -135,8 +138,7 @@ static int thread_instantiate(TALLOC_CTX *ctx, fr_event_list_t *el, UNUSED void 
  */
 static void thread_detach(UNUSED void *uctx)
 {
-	modules_thread_detach();
-	xlat_thread_detach();
+	fr_thread_detach();
 }
 
 #define EXIT_WITH_FAILURE \
@@ -151,39 +153,60 @@ do { \
 	goto cleanup; \
 } while (0)
 
-static fr_event_timer_t const *fr_time_sync_ev = NULL;
+#define EXIT_WITH_PERROR \
+do { \
+	fr_perror("%s", program); \
+	EXIT_WITH_FAILURE; \
+} while (0)
 
-static void fr_time_sync_event(fr_event_list_t *el, UNUSED fr_time_t now, UNUSED void *uctx)
+static fr_timer_t *fr_time_sync_ev = NULL;
+
+static void fr_time_sync_event(fr_timer_list_t *tl, UNUSED fr_time_t now, UNUSED void *uctx)
 {
-	fr_time_delta_t when = NSEC;
+	fr_time_delta_t when = fr_time_delta_from_sec(1);
 
-	(void) fr_event_timer_in(el, el, &fr_time_sync_ev, when, fr_time_sync_event, NULL);
+	(void) fr_timer_in(tl, tl, &fr_time_sync_ev, when, false, fr_time_sync_event, NULL);
 	(void) fr_time_sync();
 }
 
 #ifndef NDEBUG
 /** Encourage the server to exit after a period of time
  *
- * @param[in] el	The main loop.
+ * @param[in] tl	The main loop.
  * @param[in] now	Current time.  Should be 0, when adding the event.
  * @param[in] uctx	Pointer to a fr_time_delta_t indicating how long
  *			the server should run before exit.
  */
-static void fr_exit_after(fr_event_list_t *el, fr_time_t now, void *uctx)
+static void fr_exit_after(fr_timer_list_t *tl, fr_time_t now, void *uctx)
 {
-	static fr_event_timer_t const *ev;
+	static fr_timer_t *ev;
 
 	fr_time_delta_t	exit_after = *(fr_time_delta_t *)uctx;
 
-	if (now == 0) {
-		if (fr_event_timer_in(el, el, &ev, exit_after, fr_exit_after, uctx) < 0) {
-			PERROR("Failed inserting exit event");
+	if (fr_time_eq(now, fr_time_wrap(0))) {
+		if (fr_timer_in(tl, tl, &ev, exit_after, false, fr_exit_after, uctx) < 0) {
+			PERROR("%s: Failed inserting exit event", program);
 		}
 		return;
 	}
 
 	main_loop_signal_raise(RADIUS_SIGNAL_SELF_TERM);
 }
+#endif
+
+#ifdef HAVE_CAPABILITY_H
+#define DUMP_CAPABILITIES(_phase) \
+do { \
+	char *cap_str; \
+	if (fr_cap_set_to_str(talloc_autofree_context(), &cap_str) < 0) { \
+		PWARN("Failed retrieving %s capabilities", _phase); \
+	} else { \
+		INFO("%s capabilities: %s", _phase, cap_str); \
+		talloc_free(cap_str); \
+	} \
+} while (0)
+#else
+#define DUMP_CAPABILITIES(_phase) ((void)0)
 #endif
 
 /** Entry point for the daemon
@@ -197,7 +220,6 @@ int main(int argc, char *argv[])
 	bool			display_version = false;
 	bool			radmin = false;
 	int			from_child[2] = {-1, -1};
-	char			*program;
 	fr_schedule_t		*sc = NULL;
 	int			ret = EXIT_SUCCESS;
 
@@ -205,18 +227,16 @@ int main(int argc, char *argv[])
 	main_config_t		*config = NULL;
 	bool			talloc_memory_report = false;
 
-	bool			raddb_dir_set = false;
+	bool			confdir_set = false;
 
 	size_t			pool_size = 0;
-	void			*pool_page_start = NULL, *pool_page_end = NULL;
+	void			*pool_page_start = NULL;
+	size_t			pool_page_len = 0;
 	bool			do_mprotect;
-
-	fr_dict_gctx_t const	*dict_gctx = NULL;
-
-	dl_module_loader_t *dl_modules = NULL;
+	int			std_fd[3];
 
 #ifndef NDEBUG
-	fr_time_delta_t	exit_after = 0;
+	fr_time_delta_t	exit_after = fr_time_delta_wrap(0);
 #endif
 	/*
 	 *	Must be called first, so the handler is called last
@@ -227,6 +247,16 @@ int main(int argc, char *argv[])
 	 *	Setup talloc callbacks so we get useful errors
 	 */
 	(void) fr_talloc_fault_setup();
+
+	/*
+	 *	Set some default values
+	 */
+	program = strrchr(argv[0], FR_DIR_SEP);
+	if (!program) {
+		program = argv[0];
+	} else {
+		program++;
+	}
 
 	/*
 	 * 	We probably don't want to free the talloc global_ctx context
@@ -247,8 +277,8 @@ int main(int argc, char *argv[])
 		 */
 		env = getenv("FR_GLOBAL_POOL");
 		if (env) {
-			if (fr_size_from_str(&pool_size, env) < 0) {
-				fr_perror("Invalid pool size string \"%s\"", env);
+			if (fr_size_from_str(&pool_size, &FR_SBUFF_IN_STR(env)) < 0) {
+				fr_perror("%s: Invalid pool size string \"%s\"", program, env);
 				EXIT_WITH_FAILURE;
 			}
 
@@ -258,7 +288,7 @@ int main(int argc, char *argv[])
 			 *	catch any stray writes.
 			 */
 			global_ctx = talloc_page_aligned_pool(talloc_autofree_context(),
-							      &pool_page_start, &pool_page_end, pool_size);
+							      &pool_page_start, &pool_page_len, 0, pool_size);
 			do_mprotect = true;
 		} else {
 	 		global_ctx = talloc_new(talloc_autofree_context());
@@ -281,33 +311,10 @@ int main(int argc, char *argv[])
 		EXIT_WITH_FAILURE;
 	}
 
-	/*
-	 *	Set some default values
-	 */
-	program = strrchr(argv[0], FR_DIR_SEP);
-	if (!program) {
-		program = argv[0];
-	} else {
-		program++;
-	}
 	main_config_name_set_default(config, program, false);
 
 	config->daemonize = true;
 	config->spawn_workers = true;
-
-#ifdef OSFC2
-	set_auth_parameters(argc, argv);
-#endif
-
-#ifdef WIN32
-	{
-		WSADATA wsaData;
-		if (WSAStartup(MAKEWORD(2, 0), &wsaData)) {
-			fprintf(stderr, "%s: Unable to initialize socket library.\n", config->name);
-			EXIT_WITH_FAILURE;
-		}
-	}
-#endif
 
 	fr_debug_lvl = 0;
 	fr_time_start();
@@ -319,16 +326,17 @@ int main(int argc, char *argv[])
 	default_log.dst = L_DST_NULL;
 	default_log.fd = -1;
 	default_log.print_level = true;
+	default_log.suppress_secrets = true;
 
 	/*
 	 *  Set the panic action and enable other debugging facilities
 	 */
-	if (fr_fault_setup(global_ctx, getenv("PANIC_ACTION"), argv[0]) < 0) {
-		fr_perror("Failed installing fault handlers... continuing");
+	if (fr_fault_setup(global_ctx, getenv("PANIC_ACTION"), argv[0], PANIC_ACTION_SIGNALS) < 0) {
+		fr_perror("%s: Failed installing fault handlers... continuing", program);
 	}
 
 	/*  Process the options.  */
-	while ((c = getopt(argc, argv, "Cd:D:e:fhi:l:Mmn:p:PrstTvxX")) != -1) switch (c) {
+	while ((c = getopt(argc, argv, "Cd:D:e:fhl:Mmn:PrsS:tTvxX")) != -1) switch (c) {
 		case 'C':
 			check_config = true;
 			config->spawn_workers = false;
@@ -336,38 +344,41 @@ int main(int argc, char *argv[])
 			break;
 
 		case 'd':
-			main_config_raddb_dir_set(config, optarg);
-			raddb_dir_set = true;
+			main_config_confdir_set(config, optarg);
+			confdir_set = true;
 			break;
 
 		case 'D':
 			main_config_dict_dir_set(config, optarg);
 			break;
 
-#ifndef NDEBUG
 		case 'e':
-			exit_after = (fr_time_delta_t)atoi(optarg) * NSEC;
-			break;
+			/*
+			 *	For non-debug builds, accept '-e', but ignore it.
+			 */
+#ifndef NDEBUG
+			exit_after = fr_time_delta_from_sec(atoi(optarg));
 #endif
+			break;
 
 		case 'f':
 			config->daemonize = false;
 			break;
 
 		case 'h':
-			usage(config, EXIT_SUCCESS);
+			usage(EXIT_SUCCESS);
 			break;
 
 		case 'l':
 			if (strcmp(optarg, "stdout") == 0) goto do_stdout;
 
-			config->log_file = talloc_typed_strdup(global_ctx, optarg);
-			default_log.file = talloc_typed_strdup(global_ctx, optarg);
+			config->log_file = talloc_strdup(global_ctx, optarg);
+			default_log.file = talloc_strdup(global_ctx, optarg);
 			default_log.dst = L_DST_FILES;
 			default_log.fd = open(config->log_file, O_WRONLY | O_APPEND | O_CREAT, 0640);
 			if (default_log.fd < 0) {
 				fprintf(stderr, "%s: Failed to open log file %s: %s\n",
-					config->name, config->log_file, fr_syserror(errno));
+					program, config->log_file, fr_syserror(errno));
 				EXIT_WITH_FAILURE;
 			}
 			break;
@@ -399,6 +410,14 @@ int main(int argc, char *argv[])
 			config->daemonize = false;
 			break;
 
+		case 'S':	/* Migration support */
+			if (main_config_save_override(optarg) < 0) {
+				fprintf(stderr, "%s: Failed saving configuration option '%s' - %s\n",
+					program, optarg, fr_strerror());
+				EXIT_WITH_FAILURE;
+			}
+			break;
+
 		case 't':	/* no child threads */
 			config->spawn_workers = false;
 			break;
@@ -415,6 +434,7 @@ int main(int argc, char *argv[])
 			config->spawn_workers = false;
 			config->daemonize = false;
 			fr_debug_lvl += 2;
+
 	do_stdout:
 			default_log.dst = L_DST_STDOUT;
 			default_log.fd = STDOUT_FILENO;
@@ -425,9 +445,11 @@ int main(int argc, char *argv[])
 			break;
 
 		default:
-			usage(config, EXIT_FAILURE);
+			usage(EXIT_FAILURE);
 			break;
 	}
+
+	if (fr_debug_lvl > 2) default_log.suppress_secrets = false;
 
 	/*
 	 *	Allow the configuration directory to be set from an
@@ -435,10 +457,10 @@ int main(int argc, char *argv[])
 	 *	configuration directory without changing the scripts
 	 *	being executed.
 	 */
-	if (!raddb_dir_set) {
-		char const *raddb_dir = getenv("FREERADIUS_CONFIG_DIR");
+	if (!confdir_set) {
+		char const *confdir = getenv("FREERADIUS_CONFIG_DIR");
 
-		if (raddb_dir) main_config_raddb_dir_set(config, raddb_dir);
+		if (confdir) main_config_confdir_set(config, confdir);
 	}
 
 	/*
@@ -451,19 +473,17 @@ int main(int argc, char *argv[])
 	 *  Mismatch between the binary and the libraries it depends on.
 	 */
 	if (fr_check_lib_magic(RADIUSD_MAGIC_NUMBER) < 0) {
-		fr_perror("%s", config->name);
-		EXIT_WITH_FAILURE;
+		EXIT_WITH_PERROR;
 	}
 
 	if (rad_check_lib_magic(RADIUSD_MAGIC_NUMBER) < 0) EXIT_WITH_FAILURE;
 
-
-#ifdef HAVE_OPENSSL_CRYPTO_H
+#ifdef WITH_TLS
 	/*
 	 *  Mismatch between build time OpenSSL and linked SSL, better to die
 	 *  here than segfault later.
 	 */
-	if (ssl_check_consistency() < 0) EXIT_WITH_FAILURE;
+	if (fr_openssl_version_consistent() < 0) EXIT_WITH_FAILURE;
 
 	/*
 	 *  Initialising OpenSSL once, here, is safer than having individual modules do it.
@@ -482,8 +502,7 @@ int main(int argc, char *argv[])
 	 *  So we can't run with a null context and threads.
 	 */
 	if (talloc_config_set(config) != 0) {
-		fr_perror("%s", config->name);
-		EXIT_WITH_FAILURE;
+		EXIT_WITH_PERROR;
 	}
 
 	/*
@@ -494,12 +513,27 @@ int main(int argc, char *argv[])
 		default_log.dst = L_DST_STDOUT;
 		default_log.fd = STDOUT_FILENO;
 
-		INFO("%s - %s", config->name, radiusd_version);
+		INFO("%s - %s", program, radiusd_version);
 		dependency_version_print();
 		EXIT_WITH_SUCCESS;
 	}
 
 	if (fr_debug_lvl) dependency_version_print();
+
+#ifdef WITH_VERIFY_PTR
+	WARN(" ");
+	WARN("#######################################################################");
+	WARN("# ");
+	WARN("# The server was built with the 'WITH_VERIFY_PTR' flag set.  This is a");
+	WARN("# developer-only build option that DRASTICALLY slows down the server.");
+	WARN("# If you are using the server in a production environment, you will see");
+	WARN("# significantly improved performance (3x-4x) by re-running 'configure'");
+	WARN("# with the flag '--disable-developer', and then re-building and");
+	WARN("# re-installing the server.");
+	WARN("# ");
+	WARN("#######################################################################");
+	WARN(" ");
+#endif
 
 	/*
 	 *  Under linux CAP_SYS_PTRACE is usually only available before setuid/setguid,
@@ -518,28 +552,58 @@ int main(int argc, char *argv[])
 	 *      config file parser.  Note that we pass an empty path
 	 *      here, as we haven't yet read the configuration file.
 	 */
-	dl_modules = dl_module_loader_init(NULL);
-	if (!dl_modules) {
-		fr_perror("%s", program);
-		EXIT_WITH_FAILURE;
-	}
+	modules_init(NULL);
 
 	/*
 	 *	Initialise the top level dictionary hashes which hold
 	 *	the protocols.
 	 */
-	dict_gctx = fr_dict_global_ctx_init(global_ctx, config->dict_dir);
-	if (!dict_gctx) {
-		fr_perror("%s", program);
-		EXIT_WITH_FAILURE;
+	if (!fr_dict_global_ctx_init(NULL, true, config->dict_dir)) {
+		EXIT_WITH_PERROR;
 	}
 
-#ifdef HAVE_OPENSSL_CRYPTO_H
+#ifdef WITH_TLS
 	if (fr_tls_dict_init() < 0) {
-		fr_perror("%s", program);
-		EXIT_WITH_FAILURE;
+		EXIT_WITH_PERROR;
 	}
 #endif
+
+	/*
+	 *	Setup the global structures for module lists
+	 */
+	if (modules_rlm_init() < 0) {
+		EXIT_WITH_PERROR;
+	}
+
+	if (virtual_servers_init() < 0) {
+		EXIT_WITH_PERROR;
+	}
+
+	/*
+	 *	Load dictionary attributes used
+	 *	for requests.
+	 */
+	if (request_global_init() < 0) {
+		EXIT_WITH_PERROR;
+	}
+
+	/*
+	 *	The radmin functions need to write somewhere.
+	 *
+	 *	The log functions redirect stdin and stdout to /dev/null, so that exec'd programs can't mangle
+	 *	them.  But radmin needs to be able to use them.
+	 */
+#define RDUP(_x) \
+do { \
+	if ((std_fd[_x] = dup(_x)) < 0) EXIT_WITH_PERROR; \
+	if (fr_cloexec(std_fd[_x]) < 0) EXIT_WITH_PERROR; \
+} while (0)
+
+	if (radmin) {
+	  	RDUP(STDIN_FILENO);
+	  	RDUP(STDOUT_FILENO);
+	  	RDUP(STDERR_FILENO);
+	}
 
 	/*
 	 *  Read the configuration files, BEFORE doing anything else.
@@ -547,32 +611,26 @@ int main(int argc, char *argv[])
 	if (main_config_init(config) < 0) EXIT_WITH_FAILURE;
 
 	/*
+	 *	Suppress secrets if asked, and if at a low debug level.
+	 */
+	default_log.suppress_secrets = config->suppress_secrets && (fr_debug_lvl <= 2);
+
+	/*
 	 *  Check we're the only process using this config.
 	 */
-	if (!config->allow_multiple_procs) {
+	if (!config->allow_multiple_procs && !check_config) {
 		switch (main_config_exclusive_proc(config)) {
 		case 0:		/* No other processes running */
 			break;
 
 		case -1:	/* Permissions error - fail open */
-			PWARN("%s - Process concurrency checks disabled", program);
+			PWARN("%s: Process concurrency checks disabled", program);
 			break;
 
 		case 1:
 		default:	/* All other errors */
-			fr_perror("%s", program);
-			EXIT_WITH_FAILURE;
+			EXIT_WITH_PERROR;
 		}
-	}
-
-	if (modules_init() < 0) {
-		fr_perror("%s", program);
-		EXIT_WITH_FAILURE;
-	}
-
-	if (virtual_servers_init(config->root_cs) < 0) {
-		fr_perror("%s", program);
-		EXIT_WITH_FAILURE;
 	}
 
 	/*
@@ -580,8 +638,8 @@ int main(int argc, char *argv[])
 	 *  environment.
 	 */
 	if (config->panic_action && !getenv("PANIC_ACTION") &&
-	    (fr_fault_setup(global_ctx, config->panic_action, argv[0]) < 0)) {
-		fr_perror("radiusd - Failed configuring panic action: %s", config->name);
+	    (fr_fault_setup(global_ctx, config->panic_action, argv[0], PANIC_ACTION_SIGNALS) < 0)) {
+		fr_perror("%s: Failed configuring panic action", program);
 		EXIT_WITH_FAILURE;
 	}
 
@@ -591,31 +649,46 @@ int main(int argc, char *argv[])
 	INFO("%s", fr_debug_state_to_msg(fr_debug_state));
 
 	/*
+	 *	Track configuration versions.  This lets us know if the configuration changed.
+	 */
+	if (fr_debug_lvl) {
+		uint8_t digest[16];
+
+		cf_md5_final(digest);
+
+		digest[6] &= 0x0f; /* ver is 0b0100 at bits 48:51 */
+		digest[6] |= 0x40;
+		digest[8] &= ~0xc0; /* var is 0b10 at bits 64:65 */
+		digest[8] |= 0x80;
+
+		/*
+		 *	UUIDv4 format: 4-2-2-2-6
+		 */
+		INFO("Configuration version: %02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+		     digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+		     digest[8], digest[9], digest[10], digest[11], digest[12], digest[13], digest[14], digest[15]);
+	}
+
+	/*
 	 *  Call this again now we've loaded the configuration. Yes I know...
 	 */
-	if (talloc_config_set(config) < 0) {
-		fr_perror("%s", config->name);
-		EXIT_WITH_FAILURE;
+	if (talloc_config_set(config) != 0) {
+		EXIT_WITH_PERROR;
 	}
 
 	/*
 	 *  Check for vulnerabilities in the version of libssl were linked against.
 	 */
-#if defined(HAVE_OPENSSL_CRYPTO_H) && defined(ENABLE_OPENSSL_VERSION_CHECK)
+#ifdef WITH_TLS
+#  ifdef ENABLE_OPENSSL_VERSION_CHECK
 	if (fr_openssl_version_check(config->allow_vulnerable_openssl) < 0) EXIT_WITH_FAILURE;
-#endif
+#  endif
 
-#ifdef HAVE_OPENSSL_CRYPTO_H
 	/*
-	 *  Toggle OpenSSL FIPS mode
+	 *  Toggle FIPS mode
 	 */
-	if (config->openssl_fips_mode_is_set) {
-		if (FIPS_mode_set(config->openssl_fips_mode ? 1 : 0) == 0) {
-			fr_tls_log_error(NULL, "Failed %s OpenSSL FIPS mode",
-				      config->openssl_fips_mode ? "enabling" : "disabling");
-			EXIT_WITH_FAILURE;
-		}
-	}
+	if (config->openssl_fips_mode_is_set &&
+	    (fr_openssl_fips_mode(config->openssl_fips_mode) < 0)) EXIT_WITH_FAILURE;
 #endif
 
 	/*
@@ -632,7 +705,7 @@ int main(int argc, char *argv[])
 	 *	will stay permanently as "activating".
 	 *
 	 *	We detect this condition and warn about it here, using the
-	 *	presence of the NOTIFY_SOCKET envrionmental variable to determine
+	 *	presence of the NOTIFY_SOCKET environmental variable to determine
 	 *	whether we're running under systemd.
 	 */
 	if (getenv("NOTIFY_SOCKET")) INFO("Built without support for systemd watchdog, but running under systemd");
@@ -643,7 +716,7 @@ int main(int argc, char *argv[])
 	 */
 	if (check_config) radmin = false;
 
-	if (fr_radmin_start(config, radmin) < 0) EXIT_WITH_FAILURE;
+	if (fr_radmin_start(config, radmin, std_fd) < 0) EXIT_WITH_FAILURE;
 
 	/*
 	 *  Disconnect from session
@@ -652,9 +725,13 @@ int main(int argc, char *argv[])
 		pid_t pid;
 		int devnull;
 
+		DUMP_CAPABILITIES("pre-fork");
+
 		/*
 		 *  Really weird things happen if we leave stdin open and call things like
 		 *  system() later.
+		 *
+		 *  main_config_init() already calls fr_log_init_legacy(), which closes stdout/stderr.
 		 */
 		devnull = open("/dev/null", O_RDWR);
 		if (devnull < 0) {
@@ -696,7 +773,7 @@ int main(int argc, char *argv[])
 			 *  The child writes a 0x01 byte on success, and closes
 			 *  the pipe on error.
 			 */
-			if ((read(from_child[0], &child_ret, 1) < 0)) child_ret = 0;
+			if ((read(from_child[0], &child_ret, 1) <= 0)) child_ret = 0;
 
 			/* For cleanliness... */
 			close(from_child[0]);
@@ -722,7 +799,7 @@ int main(int argc, char *argv[])
 		 */
 		} else if (pid == 0) {
 			if (main_config_exclusive_proc_child(main_config) < 0) {
-				PWARN("%s - Failed incrementing exclusive proc semaphore in child", program);
+				PWARN("%s: Failed incrementing exclusive proc semaphore in child", program);
 			}
 		}
 
@@ -731,6 +808,10 @@ int main(int argc, char *argv[])
 #ifdef HAVE_SETSID
 		setsid();
 #endif
+
+		DUMP_CAPABILITIES("post-fork");
+	} else {
+		DUMP_CAPABILITIES("pre-suid-down");
 	}
 
 	/*
@@ -742,9 +823,26 @@ int main(int argc, char *argv[])
 	/*
 	 *	Initialise the interpreter, registering operations.
 	 */
-	if (unlang_init_global() < 0) EXIT_WITH_FAILURE;
+	if (unlang_global_init() < 0) EXIT_WITH_FAILURE;
 
-	if (server_init(config->root_cs) < 0) EXIT_WITH_FAILURE;
+	/*
+	 *  Initialize the global event loop which handles things like
+	 *  systemd.
+	 *
+	 *  This has to be done post-fork in case we're using kqueue, where the
+	 *  queue isn't inherited by the child process.
+	 *
+	 *  Done before `server_init` so that module instantiate callbacks can
+	 *  register fds / timers against `main_loop_event_list()` directly.
+	 *  `main_loop_init` has no dependencies on module or virtual server
+	 *  state, so this reordering is safe.
+	 */
+	if (main_loop_init() < 0) {
+		PERROR("Failed initialising main event loop");
+		EXIT_WITH_FAILURE;
+	}
+
+	if (server_init(config->root_cs, config->confdir, fr_dict_unconst(fr_dict_internal())) < 0) EXIT_WITH_FAILURE;
 
 	/*
 	 *  Everything seems to have loaded OK, exit gracefully.
@@ -763,48 +861,26 @@ int main(int argc, char *argv[])
 	}
 
 	/*
-	 *  Initialize the global event loop which handles things like
-	 *  systemd.
-	 *
-	 *  This has to be done post-fork in case we're using kqueue, where the
-	 *  queue isn't inherited by the child process.
-	 */
-	if (main_loop_init() < 0) {
-		PERROR("Failed initialising main event loop");
-		EXIT_WITH_FAILURE;
-	}
-
-	/*
-	 *  Redirect stderr/stdout as appropriate.
-	 */
-	if (log_global_init(&default_log, config->daemonize) < 0) EXIT_WITH_FAILURE;
-
-	/*
 	 *	Start the network / worker threads.
 	 */
 	{
-		fr_event_list_t *el = NULL;
 		fr_schedule_config_t *schedule;
 
-		schedule = talloc_zero(global_ctx, fr_schedule_config_t);
+		MEM(schedule = talloc_zero(global_ctx, fr_schedule_config_t));
 		schedule->max_workers = config->max_workers;
 		schedule->max_networks = config->max_networks;
 		schedule->stats_interval = config->stats_interval;
 
-		schedule->network.max_outstanding = config->max_requests;
-		schedule->worker.max_requests = config->max_requests;
-		schedule->worker.max_request_time = config->max_request_time;
+		schedule->network.max_outstanding = config->worker.max_requests;
+		schedule->worker = config->worker;
+		schedule->cs = cf_section_find(config->root_cs, "thread", CF_IDENT_ANY);
 
 		/*
-		 *	Single server mode: use the global event list.
-		 *	Otherwise, each network thread will create
-		 *	its own event list.
+		 *	Fix spurious messages
 		 */
-		if (!config->spawn_workers) {
-			el = main_loop_event_list();
-		}
-
-		sc = fr_schedule_create(NULL, el, &default_log, fr_debug_lvl,
+		fr_strerror_clear();
+		sc = fr_schedule_create(NULL, !config->spawn_workers, main_loop_event_list(),
+					&default_log, fr_debug_lvl,
 					thread_instantiate, thread_detach, schedule);
 		if (!sc) {
 			PERROR("Failed starting the scheduler");
@@ -822,6 +898,19 @@ int main(int argc, char *argv[])
 	 *	back to root uid.
 	 */
 	rad_suid_down_permanent();
+
+	/*
+	 *	Move the current working directory to a place where it
+	 *	can't hurt anything.
+	 */
+	if (main_config->chdir_is_set) {
+		if (chdir(main_config->chdir) < 0) {
+			ERROR("Failed changing working to %s: %s", main_config->chdir, fr_syserror(errno));
+			EXIT_WITH_FAILURE;
+		}
+	}
+
+	DUMP_CAPABILITIES("post-suid-down");
 
 	/*
 	 *	Dropping down may change the RLIMIT_CORE value, so
@@ -850,15 +939,14 @@ int main(int argc, char *argv[])
 	 *  what to do, so we might as well do the default, and die.
 	 */
 #ifdef SIGPIPE
-	signal(SIGPIPE, SIG_IGN);
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		ERROR("Failed ignoring SIGPIPE: %s", fr_syserror(errno));
+		goto cleanup;
+	}
 #endif
 
 	if (fr_set_signal(SIGHUP, sig_hup) < 0) goto set_signal_error;
 	if (fr_set_signal(SIGTERM, sig_fatal) < 0) goto set_signal_error;
-
-#ifdef WITH_STATS
-	radius_stats_init(0);
-#endif
 
 	/*
 	 *  Write the PID after we've forked, so that we write the correct one.
@@ -880,7 +968,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	trigger_exec(NULL, NULL, NULL, "server.start", false, NULL);
+	trigger(NULL, NULL, NULL, "server.start", false, NULL, NULL);
 
 	/*
 	 *  Inform the parent (who should still be waiting) that the rest of
@@ -912,40 +1000,40 @@ int main(int argc, char *argv[])
 	 *  to write to this memory we get a SIGBUS.
 	 */
 	if (do_mprotect) {
-	    	if (mprotect(pool_page_start, (uintptr_t)pool_page_end - (uintptr_t)pool_page_start, PROT_READ) < 0) {
-			PERROR("Protecting global memory failed: %s", fr_syserror(errno));
+	    	if (mprotect(pool_page_start, pool_page_len, PROT_READ) < 0) {
+			ERROR("Protecting global memory failed: %s", fr_syserror(errno));
 			EXIT_WITH_FAILURE;
 		}
 		DEBUG("Global memory protected");
 	}
 
-	fr_time_sync_event(main_loop_event_list(), fr_time(), NULL);
+	fr_time_sync_event(main_loop_event_list()->tl, fr_time(), NULL);
 #ifndef NDEBUG
-	if (exit_after > 0) fr_exit_after(main_loop_event_list(), 0, &exit_after);
+	if (fr_time_delta_ispos(exit_after)) fr_exit_after(main_loop_event_list()->tl, fr_time_wrap(0), &exit_after);
 #endif
 	/*
 	 *  Process requests until HUP or exit.
 	 */
 	INFO("Ready to process requests");	/* we were actually ready a while ago, but oh well */
 	while ((status = main_loop_start()) == 0x80) {
-#ifdef WITH_STATS
-		radius_stats_init(1);
-#endif
 		main_config_hup(config);
 	}
 
 	/*
 	 *  Ignore the TERM signal: we're about to die.
 	 */
-	signal(SIGTERM, SIG_IGN);
+	if (unlikely(signal(SIGTERM, SIG_IGN) == SIG_ERR)) {
+		ERROR("Failed blocking SIGTERM, we may receive spurious signals: %s",
+		      fr_syserror(errno));
+	}
 
 	/*
 	 *  Unprotect global memory
 	 */
 	if (do_mprotect) {
-		if (mprotect(pool_page_start, (uintptr_t)pool_page_end - (uintptr_t)pool_page_start,
+		if (mprotect(pool_page_start, pool_page_len,
 			     PROT_READ | PROT_WRITE) < 0) {
-			PERROR("Unprotecting global memory failed: %s", fr_syserror(errno));
+			ERROR("Unprotecting global memory failed: %s", fr_syserror(errno));
 			EXIT_WITH_FAILURE;
 		}
 		DEBUG("Global memory unprotected");
@@ -965,21 +1053,26 @@ int main(int argc, char *argv[])
 	 *   Fire signal and stop triggers after ignoring SIGTERM, so handlers are
 	 *   not killed with the rest of the process group, below.
 	 */
-	if (status == 2) trigger_exec(NULL, NULL, NULL, "server.signal.term", true, NULL);
-	trigger_exec(NULL, NULL, NULL, "server.stop", false, NULL);
+	if (status == 2) trigger(NULL, NULL, NULL, "server.signal.term", true, NULL, NULL);
+	trigger(NULL, NULL, NULL, "server.stop", false, NULL, NULL);
 
 	/*
 	 *  Stop the scheduler, this signals the network and worker threads
 	 *  to exit gracefully.  fr_schedule_destroy only returns once all
 	 *  threads have been joined.
 	 */
-	(void) fr_schedule_destroy(&sc);
+	if (unlikely(fr_schedule_destroy(&sc) < 0)) {
+		EXIT_WITH_PERROR;
+	}
 
 	/*
 	 *  We're exiting, so we can delete the PID file.
 	 *  (If it doesn't exist, we can ignore the error returned by unlink)
 	 */
-	if (config->daemonize) unlink(config->pid_file);
+	if (config->daemonize) {
+		DEBUG3("Unlinking PID file %s", config->pid_file);
+		unlink(config->pid_file);
+	}
 
 	/*
 	 *  Free memory in an explicit and consistent order
@@ -996,7 +1089,7 @@ int main(int argc, char *argv[])
 		fr_event_loop_exit(el, 1);
 	}
 
-	main_loop_free();		/* Free the requests */
+	main_loop_free();
 
 	/*
 	 *  Send a TERM signal to all associated processes
@@ -1004,10 +1097,26 @@ int main(int argc, char *argv[])
 	 *
 	 *  This _shouldn't_ be needed, but may help with
 	 *  processes created by the exec code or triggers.
+	 *
+	 *  Only do this when we lead the process group, i.e. when
+	 *  we daemonized (setsid), or a supervisor such as systemd
+	 *  or a container runtime gave us our own group.  When run
+	 *  in the foreground from a shell the group belongs to the
+	 *  shell, and signalling it would take out the shell and
+	 *  its terminal along with our children.
 	 */
-	if (config->spawn_workers) {
+	if (config->spawn_workers && (getpgid(0) == radius_pid)) {
 		INFO("All threads have exited, sending SIGTERM to remaining children");
-		kill(-radius_pid, SIGTERM);
+
+		/*
+		 *	If pid is negative, but not -1, sig
+		 *	shall be sent to all processes
+		 *	(excluding an unspecified set of system processes)
+		 *	whose process group ID is equal to the absolute value
+		 *	of pid, and for which the process has permission
+		 *	to send a signal.
+		 */
+		kill(-getpgid(radius_pid), SIGTERM);
 	}
 
 	/*
@@ -1021,31 +1130,69 @@ int main(int argc, char *argv[])
 
 cleanup:
 	/*
+	 *	If we're told to just exit without cleaning up memory,
+	 *	then do so.
+	 */
+	if (config && config->talloc_skip_cleanup) {
+		fr_atexit_global_disarm_all();
+		exit(ret);
+	}
+
+	/*
 	 *	This may not have been done earlier if we're
 	 *	exiting due to a startup error.
 	 */
 	(void) fr_schedule_destroy(&sc);
 
 	/*
-	 *  Frees request specific logging resources which is OK
-	 *  because all the requests will have been stopped.
+	 *	Threads not managed by the schedule (e.g. librdkafka's
+	 *	bg threads) hold a `_Thread_local fr_log_pool` we can't
+	 *	clear from this thread.  `fr_atexit_thread_trigger_all`
+	 *	below frees the underlying chunks, leaving those slots
+	 *	dangling.  Flip the logger into pool-less mode first so
+	 *	any log line that races the trigger - or fires after it -
+	 *	goes through `talloc_new(NULL)` instead of dereferencing
+	 *	a freed pool.
 	 */
-	log_global_free();
+	fr_log_disable_pools();
 
-	fr_snmp_free();
+	/*
+	 *	Ensure all thread local memory is cleaned up
+	 *	before we start cleaning up global resources.
+	 *	This is necessary for single threaded mode
+	 *	to ensure that thread local resources that
+	 *	depend on global resources are freed at the
+	 *	appropriate time.
+	 */
+	fr_atexit_thread_trigger_all();
 
 	server_free();
 
-	/*
-	 *	Free any resources used by the unlang interpreter.
-	 */
-	unlang_free_global();
-
-#ifdef HAVE_OPENSSL_CRYPTO_H
+#ifdef WITH_TLS
 	fr_openssl_free();		/* Cleanup any memory alloced by OpenSSL and placed into globals */
 #endif
 
 	if (config) talloc_memory_report = config->talloc_memory_report;	/* Grab this before we free the config */
+
+	/*
+	 *	Virtual servers need to be freed before modules
+	 *	as state entries containing data with module-specific
+	 *	destructors may exist.
+	 */
+	virtual_servers_free();
+
+	/*
+	 *	Free modules, this needs to be done explicitly
+	 *	because some libraries used by modules use atexit
+	 *	handlers registered after ours, and they may deinit
+	 *	themselves before we free the modules and cause
+	 *	crashes on exit.
+	 */
+	modules_rlm_free();
+
+#ifdef WITH_TLS
+	fr_tls_dict_free();
+#endif
 
 	/*
 	 *  And now nothing should be left anywhere except the
@@ -1054,27 +1201,11 @@ cleanup:
 	main_config_free(&config);
 
 	/*
-	 *	Free the modules that we loaded.
-	 */
-	if (dl_modules) talloc_free(dl_modules);
-
-	/*
-	 *	Complain in debug builds about dictionaries
-	 *	that haven't been freed.
-	 */
-	if (fr_dict_global_ctx_free(dict_gctx) < 0) {
-#ifndef NDEBUG
-		fr_perror("radiusd");
-		ret = EXIT_FAILURE;
-#endif
-	}
-
-	/*
 	 *  Cleanup everything else
 	 */
 	if (talloc_free(global_ctx) < 0) {
 #ifndef NDEBUG
-		fr_perror("radiusd");
+		fr_perror("program");
 		ret = EXIT_FAILURE;
 #endif
 	}
@@ -1092,21 +1223,27 @@ cleanup:
 	if (!rad_suid_is_down_permanent() && (fr_get_lsan_state() == 1)) rad_suid_up();
 	fr_strerror_clear();	/* clear error buffer */
 
+	/*
+	 *	Ensure our atexit handlers run before any other
+	 *	atexit handlers registered by third party libraries.
+	 */
+	fr_atexit_global_trigger_all();
+
 	return ret;
 }
 
 /*
  *  Display the syntax for starting this program.
  */
-static NEVER_RETURNS void usage(main_config_t const *config, int status)
+static NEVER_RETURNS void usage(int status)
 {
 	FILE *output = status ? stderr : stdout;
 
-	fprintf(output, "Usage: %s [options]\n", config->name);
+	fprintf(output, "Usage: %s [options]\n", program);
 	fprintf(output, "Options:\n");
 	fprintf(output, "  -C            Check configuration and exit.\n");
-	fprintf(stderr, "  -d <raddb>    Set configuration directory (defaults to " RADDBDIR ").\n");
-	fprintf(stderr, "  -D <dictdir>  Set main dictionary directory (defaults to " DICTDIR ").\n");
+	fprintf(output, "  -d <confdir>  Configuration file directory (defaults to " CONFDIR ").\n");
+	fprintf(output, "  -D <dictdir>  Set main dictionary directory (defaults to " DICTDIR ").\n");
 #ifndef NDEBUG
 	fprintf(output, "  -e <seconds>  Exit after the specified number of seconds.  Useful for diagnosing \"crash-on-exit\" issues.\n");
 #endif
@@ -1116,13 +1253,15 @@ static NEVER_RETURNS void usage(main_config_t const *config, int status)
 #ifndef NDEBUG
 	fprintf(output, "  -L <size>     When running in memory debug mode, set a hard limit on talloced memory\n");
 #endif
-	fprintf(output, "  -n <name>     Read raddb/name.conf instead of raddb/radiusd.conf.\n");
-	fprintf(output, "  -m            Allow multiple processes reading the same radiusd.conf to exist simultaneously.\n");
+	fprintf(output, "  -n <name>     Read ${confdir}/name.conf instead of ${confdir}/%s.conf.\n", program);
+	fprintf(output, "  -m            Allow multiple processes reading the same %s.conf to exist simultaneously.\n", program);
 #ifndef NDEBUG
 	fprintf(output, "  -M            Enable talloc memory debugging, and issue a memory report when the server terminates\n");
 #endif
 	fprintf(output, "  -P            Always write out PID, even with -f.\n");
-	fprintf(output, "  -s            Do not spawn child processes to handle requests (same as -ft).\n");
+	fprintf(output, "  -s            Disable threads and run in the foreground (same as -ft).\n");
+
+	fprintf(output, "  -S <flag>     Set a value in the configuration if the form '<path>=<value>'.  Useful for overriding specific config values at launch.\n");
 	fprintf(output, "  -t            Disable threads.\n");
 	fprintf(output, "  -T            Prepend timestamps to  log messages.\n");
 	fprintf(output, "  -v            Print server version information.\n");
@@ -1137,7 +1276,22 @@ static NEVER_RETURNS void usage(main_config_t const *config, int status)
  */
 static void sig_fatal(int sig)
 {
+	static volatile sig_atomic_t last_sig;
+
 	if (getpid() != radius_pid) _exit(sig);
+
+	/*
+	 *	Suppress duplicate signals.
+	 *
+	 *	For some reason on macOS we get multiple signals
+	 *	for the same event (SIGINT).
+	 *
+	 *	...this also fixes the problem of the user hammering
+	 *	Ctrl-C and causing ungraceful exits as we try and
+	 *	write out signals to a pipe that's already closed.
+	 */
+	if (sig == last_sig) return;
+	last_sig = sig;
 
 	switch (sig) {
 	case SIGTERM:

@@ -20,20 +20,8 @@ mibdir		= @mibdir@
 logdir		= @logdir@
 includedir	= @includedir@
 
-#
-#  In some systems, we don't want to over-write ANY configuration.
-#  So we do:
-#
-#	$./configure
-#	$ make
-#	$ make -Draddbdir=/tmp/garbage install
-#
-#  and all of the configuration files go into /tmp/garbage
-#
-ifeq "${raddbdir}" ""
-raddbdir	= @raddbdir@
-endif
-modconfdir	= @modconfdir@
+confdir		= @confdir@
+modconfdir	= ${confdir}/mods-config
 radacctdir	= @radacctdir@
 top_builddir	= @abs_top_builddir@
 top_build_prefix=@abs_top_builddir@/
@@ -46,19 +34,39 @@ MAKE		= @MAKE@
 # flags set on the command line and the environmental variables
 MAKEFLAGS	= @FR_MAKEFLAGS@
 
+BUILD_SYSTEM	= @BUILD_SYSTEM@
+BUILD_CC	= @BUILD_CC@
+BUILD_RANLIB	= @BUILD_RANLIB@
+BUILD_EXE_EXT	= @BUILD_EXE_EXT@
+BUILD_LIB_EXT	= @BUILD_LIB_EXT@
+
 TARGET_SYSTEM	= @TARGET_SYSTEM@
-CC		= @CC@
-RANLIB		= @RANLIB@
+TARGET_CC       = @TARGET_CC@
+TARGET_RANLIB   = @TARGET_RANLIB@
+TARGET_EXE_EXT	= @TARGET_EXE_EXT@
+TARGET_LIB_EXT	= @TARGET_LIB_EXT@
+
+# Lazy alias seeing as it's used everywhere
+L		= .$(TARGET_LIB_EXT)
+
+ifneq "${TARGET_EXE_EXT}" ""
+E		= .$(TARGET_EXE_EXT)
+else
+E		=
+endif
+
+ifneq (,$(findstring wasm,${TARGET_SYSTEM}))
+TARGET_IS_WASM  = yes
+endif
+
 INCLUDE		= -I. -Isrc \
 		  -include src/freeradius-devel/autoconf.h \
 		  -include src/freeradius-devel/build.h \
 		  -include src/freeradius-devel/features.h \
 		  -include src/freeradius-devel/radpaths.h
-CFLAGS		= $(INCLUDE) -fno-strict-aliasing @CFLAGS@
+CFLAGS		= $(INCLUDE) -fno-strict-aliasing @CFLAGS@ $(TALLOC_CFLAGS)
 CPPFLAGS	= @CPPFLAGS@
 LIBPREFIX	= @LIBPREFIX@
-LIBRARY_EXT	= @LIBRARY_EXT@
-EXEEXT		= @EXEEXT@
 
 LIBTOOL		= JLIBTOOL
 ACLOCAL		= @ACLOCAL@
@@ -69,6 +77,11 @@ INSTALL_PROGRAM	= ${INSTALL}
 INSTALL_DATA	= ${INSTALL} -m 644
 INSTALL_SCRIPT	= ${INSTALL_PROGRAM}
 INSTALLSTRIP	= @INSTALLSTRIP@
+
+#
+#  For clang16+.  Shut up a bunch of C++ complaints which are fine for C.b
+#
+# CFLAGS += -Wno-reserved-identifier -Wno-c2x-extensions -Wno-cast-function-type-strict -Wno-extra-semi-stmt -Wno-unsafe-buffer-usage
 
 #
 #  Linker arguments for libraries searched for by the main
@@ -106,7 +119,7 @@ LIBS		= $(OPENSSL_LIBS) $(TALLOC_LIBS) $(KQUEUE_LIBS) @LIBS@
 LDFLAGS		= $(OPENSSL_LDFLAGS) $(TALLOC_LDFLAGS) $(KQUEUE_LDFLAGS) @LDFLAGS@
 
 LOGDIR		= ${logdir}
-RADDBDIR	= ${raddbdir}
+CONFDIR		= ${confdir}
 RUNDIR		= ${localstatedir}/run/radiusd
 SBINDIR		= ${sbindir}
 RADIR		= ${radacctdir}
@@ -124,7 +137,13 @@ endif
 #
 #  Version to use for packaging and other Make related things
 #
-RADIUSD_VERSION_STRING = @RADIUSD_VERSION_STRING@
+RADIUSD_VERSION = @RADIUSD_VERSION@
+
+RADIUSD_VERSION_MAJOR = @RADIUSD_VERSION_MAJOR@
+RADIUSD_VERSION_MINOR = @RADIUSD_VERSION_MINOR@
+RADIUSD_VERSION_INCRM = @RADIUSD_VERSION_INCRM@
+RADIUSD_VERSION_COMMIT = @RADIUSD_VERSION_COMMIT@
+RADIUSD_DOC_VERSION = @RADIUSD_DOC_VERSION@
 
 #
 #  This allows dlopen to do runtime checks for version mismatches
@@ -150,6 +169,8 @@ LIBFREERADIUS_SERVER	:= libfreeradius-internal.a libfreeradius-tls.a
 endif
 LIBFREERADIUS_SERVER	+= libfreeradius-server.a libfreeradius-unlang.a
 
+WITH_BACKTRACE  = @WITH_BACKTRACE@
+
 ifneq ($(WITH_OPENSSL_MD5),)
 WITH_OPENSSL_DIGEST = 1
 CFLAGS += -DWITH_OPENSSL_MD5
@@ -166,6 +187,13 @@ $(error OPENSSL_LIBS must be define in order to use WITH_OPENSSL_*)
 endif
 endif
 
+#
+#  Definitions for the generic logging framework
+#
+LOG_ID_LIB := 0
+LOG_ID_SECTION := 0
+CFLAGS += -DLOG_ID_LIB=$(LOG_ID_LIB) -DLOG_ID_SECTION=$(LOG_ID_SECTION)
+
 # Path to clang, setting this enables the 'scan.*' build targets
 # which perform static analysis on various server components.
 ANALYZE.c       := @clang_path@
@@ -173,8 +201,19 @@ ANALYZE.c       := @clang_path@
 #
 #  Have wrappers for the test tools, so that they run.
 #
-TEST_BIN_DIR = ./$(BUILD_DIR)/bin/local
-TEST_BIN    =  $(JLIBTOOL) --quiet --mode=execute $(TEST_BIN_DIR)
+#  We have a default maximum execution time of 300 seconds.
+#  When running under sanitizers, allow 600 seconds due to
+#  the additional overhead.
+#
+ifneq "$(findstring sanitize,$(CFLAGS))" ""
+TEST_TIMEOUT        := 600
+else
+TEST_TIMEOUT        := 300
+endif
+
+TEST_BIN_DIR        = ./$(BUILD_DIR)/bin/local
+TEST_BIN            = $(JLIBTOOL) $(if ${VERBOSE},--debug,--silent) --timeout=$(TEST_TIMEOUT) --mode=execute $(TEST_BIN_DIR)
+TEST_BIN_NO_TIMEOUT = $(JLIBTOOL) $(if ${VERBOSE},--debug,--silent) --mode=execute $(TEST_BIN_DIR)
 
 #
 #  For creating documentation via doc/all.mk

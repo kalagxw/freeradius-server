@@ -1,5 +1,5 @@
 /*
- * @copyright (c) 2016, Network RADIUS SARL (license@networkradius.com)
+ * @copyright (c) 2016, Network RADIUS SAS (license@networkradius.com)
  *  All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -9,7 +9,7 @@
  *    * Redistributions in binary form must reproduce the above copyright
  *      notice, this list of conditions and the following disclaimer in the
  *      documentation and/or other materials provided with the distribution.
- *    * Neither the name of Network RADIUS SARL nor the
+ *    * Neither the name of Network RADIUS SAS nor the
  *      names of its contributors may be used to endorse or promote products
  *      derived from this software without specific prior written permission.
  *
@@ -54,17 +54,16 @@
  *
  * @author Arran Cudbard-Bell
  *
- * @copyright 2016 Network RADIUS SARL (license@networkradius.com)
+ * @copyright 2016 Network RADIUS SAS (license@networkradius.com)
  */
-#define LOG_PREFIX "rlm_sigtran - "
+#define LOG_PREFIX "sigtran"
 
 #include <osmocom/core/talloc.h>
 
 #include <freeradius-devel/server/base.h>
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/io/schedule.h>
-#include <unistd.h>
 #include <semaphore.h>
+#include <signal.h>
 
 #include <osmocom/core/logging.h>
 #include <osmocom/sccp/sccp_types.h>
@@ -175,7 +174,7 @@ static int sigtran_m3ua_route_from_conf(UNUSED TALLOC_CTX *ctx,
  *
  * @note The final version needs to be much more complex.  We can only have one
  *	event loop per instance of rlm_sigtran, so we need to record link references
- *	and re-use existing SCTP/MTP3 connections where appropriate.
+ *	and reuse existing SCTP/MTP3 connections where appropriate.
  *
  * @param[in] ctx	to allocate connection data in.
  * @param[out] out	where to write the new sigtran connection.
@@ -291,7 +290,7 @@ int sigtran_event_submit(struct osmo_fd *ofd, sigtran_transaction_t *txn)
 
 		slen = write(ofd->fd, p, end - p);
 		if (slen > 0) {
-			p += slen;
+			p += slen - 1; /* -1 because of p++ in for loop */
 			continue;
 		}
 
@@ -479,9 +478,18 @@ static void *sigtran_event_loop(UNUSED void *instance)
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, ctrl_pipe) < 0) {
 		ERROR("osmocom thread - Failed creating ctrl_pipe: %s", fr_syserror(errno));
+		talloc_free(ctx);
+		sem_post(&event_thread_running);
 		return NULL;
 	}
-	if (!ofd_create(ctx, ctrl_pipe[1], event_process_request, ctx)) return NULL;
+	if (!ofd_create(ctx, ctrl_pipe[1], event_process_request, ctx)) {
+		close(ctrl_pipe[0]);
+		close(ctrl_pipe[1]);
+		ctrl_pipe[0] = ctrl_pipe[1] = -1;
+		talloc_free(ctx);
+		sem_post(&event_thread_running);
+		return NULL;
+	}
 
 	DEBUG2("osmocom thread - Entering event loop, listening on fd %i (client fd %i)", ctrl_pipe[1], ctrl_pipe[0]);
 
@@ -523,6 +531,11 @@ static void *sigtran_event_loop(UNUSED void *instance)
  */
 int sigtran_event_start(void)
 {
+    	sigset_t sigmask;
+
+	sigemptyset(&sigmask);
+	sigaddset(&sigmask, SIGCHLD);
+
 	sem_init(&event_thread_running, 0, 0);
 
 	if (sigtran_sccp_global_init() < 0) {
@@ -530,12 +543,28 @@ int sigtran_event_start(void)
 		return -1;
 	}
 
-	if (fr_schedule_pthread_create(&event_thread, sigtran_event_loop, NULL) < 0) {
+	/*
+	 *	Reset the signal mask some of the
+	 *	osmocom code seems to mess with it.
+	 *
+	 *	This is so that old Linux kernels
+	 *	and libkqueue posix/proc work
+	 *	correctly.
+	 */
+	pthread_sigmask(SIG_BLOCK, &sigmask, NULL);
+
+	if (fr_thread_create(&event_thread, sigtran_event_loop, NULL) < 0) {
 		ERROR("main thread - Failed spawning thread for multiplexer event loop: %s", fr_syserror(errno));
 		return -1;
 	}
 
 	sem_wait(&event_thread_running);
+
+	if (ctrl_pipe[0] < 0) {
+		ERROR("main thread - Event thread failed to initialize");
+		pthread_join(event_thread, NULL);
+		return -1;
+	}
 
 #ifndef NDEBUG
 	{

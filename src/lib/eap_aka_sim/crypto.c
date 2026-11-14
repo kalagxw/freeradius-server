@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -39,9 +39,8 @@ RCSID("$Id$")
 #include <freeradius-devel/sim/common.h>
 #include <freeradius-devel/sim/milenage.h>
 #include <freeradius-devel/tls/base.h>
-#include <freeradius-devel/tls/log.h>
+#include <freeradius-devel/tls/strerror.h>
 #include <freeradius-devel/util/atexit.h>
-#include <freeradius-devel/util/proto.h>
 #include <freeradius-devel/util/rand.h>
 #include <freeradius-devel/util/sha1.h>
 #include <openssl/evp.h>
@@ -56,9 +55,10 @@ RCSID("$Id$")
  */
 static _Thread_local EVP_CIPHER_CTX *evp_chipher_ctx;
 
-static void _evp_cipher_ctx_free_on_exit(void *arg)
+static int _evp_cipher_ctx_free_on_exit(void *arg)
 {
 	EVP_CIPHER_CTX_free(arg);
+	return 0;
 }
 
 /** Allocate and reset a resumable EVP_CIPHER_CTX for each thread
@@ -85,7 +85,7 @@ EVP_CIPHER_CTX *aka_sim_crypto_cipher_ctx(void)
  */
 void aka_sim_crypto_cipher_ctx_free(void)
 {
-	fr_atexit_trigger(_evp_cipher_ctx_free_on_exit);
+	fr_atexit_trigger(false, _evp_cipher_ctx_free_on_exit, NULL);
 	evp_chipher_ctx = NULL;
 }
 
@@ -120,13 +120,13 @@ int fr_aka_sim_crypto_init_checkcode(TALLOC_CTX *ctx, fr_aka_sim_checkcode_t **c
 
 	(*checkcode)->md_ctx = EVP_MD_CTX_create();
 	if (!(*checkcode)->md_ctx) {
-		fr_tls_log_strerror_printf("Failed creating MD ctx");
+		fr_tls_strerror_printf("Failed creating MD ctx");
 	error:
 		TALLOC_FREE(*checkcode);
 		return -1;
 	}
 	if (EVP_DigestInit_ex((*checkcode)->md_ctx, md, NULL) != 1) {
-		fr_tls_log_strerror_printf("Failed intialising MD ctx");
+		fr_tls_strerror_printf("Failed initialising MD ctx");
 		goto error;
 	}
 
@@ -151,7 +151,7 @@ int fr_aka_sim_crypto_init_checkcode(TALLOC_CTX *ctx, fr_aka_sim_checkcode_t **c
 int fr_aka_sim_crypto_update_checkcode(fr_aka_sim_checkcode_t *checkcode, eap_packet_t *eap_packet)
 {
 	uint16_t		packet_len;
-	eap_packet_raw_t	eap_hdr;
+	eap_packet_hdr_t	eap_hdr;
 
 	eap_hdr.code = eap_packet->code;
 	eap_hdr.id = eap_packet->id;
@@ -165,7 +165,7 @@ int fr_aka_sim_crypto_update_checkcode(fr_aka_sim_checkcode_t *checkcode, eap_pa
 	 *	Digest the header
 	 */
 	if (EVP_DigestUpdate(checkcode->md_ctx, &eap_hdr, sizeof(eap_hdr)) != 1) {
-		fr_tls_log_strerror_printf("Failed digesting EAP header");
+		fr_tls_strerror_printf("Failed digesting EAP header");
 		return -1;
 	}
 
@@ -175,7 +175,7 @@ int fr_aka_sim_crypto_update_checkcode(fr_aka_sim_checkcode_t *checkcode, eap_pa
 	 *	Digest the packet
 	 */
 	if (EVP_DigestUpdate(checkcode->md_ctx, eap_packet->type.data, eap_packet->type.length) != 1) {
-		fr_tls_log_strerror_printf("Failed digesting packet data");
+		fr_tls_strerror_printf("Failed digesting packet data");
 		return -1;
 	}
 
@@ -194,15 +194,33 @@ int fr_aka_sim_crypto_update_checkcode(fr_aka_sim_checkcode_t *checkcode, eap_pa
  */
 ssize_t fr_aka_sim_crypto_finalise_checkcode(TALLOC_CTX *ctx, uint8_t **out, fr_aka_sim_checkcode_t *checkcode)
 {
-	size_t	len;
-	uint8_t	*buff;
+	size_t		len;
+	uint8_t		*buff;
+	EVP_MD_CTX	*md_ctx;
 
-	len = (size_t)EVP_MD_CTX_size((*checkcode).md_ctx);
-	MEM(buff = talloc_array(ctx, uint8_t, len));
-	if (EVP_DigestFinal_ex((*checkcode).md_ctx, buff, NULL) != 1) {
-		fr_tls_log_strerror_printf("Failed finalising checkcode digest");
+	/*
+	  *	Don't call EVP_DigestFinal_ex() twice on the same EVP_MD_CTX.
+	 *
+	 *	The server calculates the checkcode twice, once for `AT_CHECKCODE`
+	 *	in the AKA-Challenge request, and once to verify `AT_CHECKCODE` in
+	 *	the response.
+	 */
+	md_ctx = EVP_MD_CTX_create();
+	if (!md_ctx || (EVP_MD_CTX_copy_ex(md_ctx, checkcode->md_ctx) != 1)) {
+		fr_tls_strerror_printf("Failed copying checkcode digest");
+		if (md_ctx) EVP_MD_CTX_destroy(md_ctx);
 		return -1;
 	}
+
+	len = (size_t)EVP_MD_CTX_size(md_ctx);
+	MEM(buff = talloc_array(ctx, uint8_t, len));
+	if (EVP_DigestFinal_ex(md_ctx, buff, NULL) != 1) {
+		fr_tls_strerror_printf("Failed finalising checkcode digest");
+		EVP_MD_CTX_destroy(md_ctx);
+		talloc_free(buff);
+		return -1;
+	}
+	EVP_MD_CTX_destroy(md_ctx);
 	*out = buff;
 
 	return (size_t)len;
@@ -227,10 +245,15 @@ static int fr_aka_sim_find_mac(uint8_t const **out, uint8_t *data, size_t data_l
 
 	p += 3;	/* Skip header */
 	while ((p + 2) < end) {
+		if (!p[1]) {
+			fr_strerror_const("Malformed field - length zero is invalid");
+			return -1;
+		}
+
 		if (p[0] == FR_MAC) {
 			len = p[1] << 2;
 			if ((p + len) > end) {
-				fr_strerror_printf("Malformed AT_MAC: Length (%zu) exceeds buffer (%zu)", len, end - p);
+				fr_strerror_printf("Malformed AT_MAC: Length (%zu) exceeds buffer (%zu)", len, (size_t) (end - p));
 				return -1;
 			}
 
@@ -243,6 +266,7 @@ static int fr_aka_sim_find_mac(uint8_t const **out, uint8_t *data, size_t data_l
 
 			return 0;
 		}
+
 		p += p[1] << 2;		/* Advance */
 	}
 
@@ -289,11 +313,11 @@ ssize_t fr_aka_sim_crypto_sign_packet(uint8_t out[static AKA_SIM_MAC_DIGEST_SIZE
 	EVP_PKEY		*pkey;
 
 	uint8_t			digest[SHA256_DIGEST_LENGTH];
-	size_t			digest_len = 0;
+	size_t			digest_len = sizeof(digest);
 	uint8_t	const		*mac;
 	uint8_t			*p = eap_packet->type.data, *end = p + eap_packet->type.length;
 
-	eap_packet_raw_t	eap_hdr;
+	eap_packet_hdr_t	eap_hdr;
 	uint16_t		packet_len;
 
 	if (unlikely(!eap_packet)) {
@@ -312,9 +336,9 @@ ssize_t fr_aka_sim_crypto_sign_packet(uint8_t out[static AKA_SIM_MAC_DIGEST_SIZE
 	}
 
 	FR_PROTO_HEX_DUMP(key, key_len, "MAC key");
-	pkey = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, NULL, key, key_len);
+	pkey = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, NULL, key, (int)key_len);
 	if (!pkey) {
-		fr_tls_log_strerror_printf("Failed creating HMAC signing key");
+		fr_tls_strerror_printf("Failed creating HMAC signing key");
 	error:
 		if (pkey) EVP_PKEY_free(pkey);
 		if (md_ctx) EVP_MD_CTX_destroy(md_ctx);
@@ -323,12 +347,12 @@ ssize_t fr_aka_sim_crypto_sign_packet(uint8_t out[static AKA_SIM_MAC_DIGEST_SIZE
 
 	md_ctx = EVP_MD_CTX_create();
 	if (!md_ctx) {
-		fr_tls_log_strerror_printf("Failed creating HMAC ctx");
+		fr_tls_strerror_printf("Failed creating HMAC ctx");
 		goto error;
 	}
 
 	if (EVP_DigestSignInit(md_ctx, NULL, md, NULL, pkey) != 1) {
-		fr_tls_log_strerror_printf("Failed initialising digest");
+		fr_tls_strerror_printf("Failed initialising digest");
 		goto error;
 	}
 
@@ -345,7 +369,7 @@ ssize_t fr_aka_sim_crypto_sign_packet(uint8_t out[static AKA_SIM_MAC_DIGEST_SIZE
 
 	FR_PROTO_HEX_DUMP((uint8_t *)&eap_hdr, sizeof(eap_hdr), "MAC digest input (eap header)");
 	if (EVP_DigestSignUpdate(md_ctx, &eap_hdr, sizeof(eap_hdr)) != 1) {
-		fr_tls_log_strerror_printf("Failed digesting EAP data");
+		fr_tls_strerror_printf("Failed digesting EAP data");
 		goto error;
 	}
 
@@ -368,7 +392,7 @@ ssize_t fr_aka_sim_crypto_sign_packet(uint8_t out[static AKA_SIM_MAC_DIGEST_SIZE
 			 *	AT_MAC header and reserved bytes.
 			 */
 			if (EVP_DigestSignUpdate(md_ctx, p, mac - p) != 1) {
-				fr_tls_log_strerror_printf("Failed digesting packet data (before MAC)");
+				fr_tls_strerror_printf("Failed digesting packet data (before MAC)");
 				goto error;
 			}
 			p += mac - p;
@@ -380,7 +404,7 @@ ssize_t fr_aka_sim_crypto_sign_packet(uint8_t out[static AKA_SIM_MAC_DIGEST_SIZE
 			 *	simulated the zeroed out Mac.
 			 */
 			if (EVP_DigestSignUpdate(md_ctx, zero, sizeof(zero)) != 1) {
-				fr_tls_log_strerror_printf("Failed digesting zeroed MAC");
+				fr_tls_strerror_printf("Failed digesting zeroed MAC");
 				goto error;
 			}
 			p += sizeof(zero);
@@ -403,7 +427,7 @@ ssize_t fr_aka_sim_crypto_sign_packet(uint8_t out[static AKA_SIM_MAC_DIGEST_SIZE
 		 *	Digest the rest of the packet.
 		 */
 		if (EVP_DigestSignUpdate(md_ctx, p, end - p) != 1) {
-			fr_tls_log_strerror_printf("Failed digesting packet data");
+			fr_tls_strerror_printf("Failed digesting packet data");
 			goto error;
 		}
 	}
@@ -417,13 +441,13 @@ ssize_t fr_aka_sim_crypto_sign_packet(uint8_t out[static AKA_SIM_MAC_DIGEST_SIZE
 	if (hmac_extra) {
 		FR_PROTO_HEX_DUMP(hmac_extra, hmac_extra_len, "MAC digest input (extra)");
 		if (EVP_DigestSignUpdate(md_ctx, hmac_extra, hmac_extra_len) != 1) {
-			fr_tls_log_strerror_printf("Failed digesting HMAC extra data");
+			fr_tls_strerror_printf("Failed digesting HMAC extra data");
 			goto error;
 		}
 	}
 
 	if (EVP_DigestSignFinal(md_ctx, digest, &digest_len) != 1) {
-		fr_tls_log_strerror_printf("Failed finalising digest");
+		fr_tls_strerror_printf("Failed finalising digest");
 		goto error;
 	}
 
@@ -628,7 +652,7 @@ int fr_aka_sim_crypto_umts_kdf_0(fr_aka_sim_keys_t *keys)
 	Key = CK || IK
 	FC = 0x20
 	P0 = access network identity (3GPP TS 24.302)
-	L0 = length of acceess network identity (2 octets, big endian)
+	L0 = length of access network identity (2 octets, big endian)
 	P1 = SQN xor AK (if AK is not used, AK is treated as 000..0
 	L1 = 0x00 0x06
  @endverbatim
@@ -644,7 +668,7 @@ int fr_aka_sim_crypto_umts_kdf_0(fr_aka_sim_keys_t *keys)
 static int ck_ik_prime_derive(fr_aka_sim_keys_t *keys)
 {
 	uint8_t		digest[sizeof(keys->ik_prime) + sizeof(keys->ck_prime)];
-	size_t		len;
+	size_t		digest_len = sizeof(digest);
 
 	uint8_t		sqn_ak_buff[MILENAGE_SQN_SIZE];
 	uint16_t	l0, l1;
@@ -711,7 +735,7 @@ static int ck_ik_prime_derive(fr_aka_sim_keys_t *keys)
 
 	pkey = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, NULL, k, sizeof(k));
 	if (!pkey) {
-		fr_tls_log_strerror_printf("Failed creating HMAC signing key");
+		fr_tls_strerror_printf("Failed creating HMAC signing key");
 	error:
 		if (pkey) EVP_PKEY_free(pkey);
 		if (md_ctx) EVP_MD_CTX_destroy(md_ctx);
@@ -720,17 +744,17 @@ static int ck_ik_prime_derive(fr_aka_sim_keys_t *keys)
 
 	md_ctx = EVP_MD_CTX_create();
 	if (!md_ctx) {
-		fr_tls_log_strerror_printf("Failed creating HMAC ctx");
+		fr_tls_strerror_printf("Failed creating HMAC ctx");
 		goto error;
 	}
 
 	if (EVP_DigestSignInit(md_ctx, NULL, EVP_sha256(), NULL, pkey) != 1) {
-		fr_tls_log_strerror_printf("Failed initialising digest");
+		fr_tls_strerror_printf("Failed initialising digest");
 		goto error;
 	}
 
 	if (EVP_DigestSignUpdate(md_ctx, s, s_len) != 1) goto error;
-	if (EVP_DigestSignFinal(md_ctx, digest, &len) != 1) goto error;
+	if (EVP_DigestSignFinal(md_ctx, digest, &digest_len) != 1) goto error;
 
 	memcpy(keys->ik_prime, digest, sizeof(keys->ik_prime));
 	memcpy(keys->ck_prime, digest + sizeof(keys->ik_prime), sizeof(keys->ck_prime));
@@ -738,7 +762,7 @@ static int ck_ik_prime_derive(fr_aka_sim_keys_t *keys)
 	FR_PROTO_HEX_DUMP(keys->ck_prime, sizeof(keys->ck_prime), "CK'");
 	FR_PROTO_HEX_DUMP(keys->ik_prime, sizeof(keys->ik_prime), "IK'");
 
-	EVP_MD_CTX_destroy(md_ctx);;
+	EVP_MD_CTX_destroy(md_ctx);
 	EVP_PKEY_free(pkey);
 
 	return 0;
@@ -778,9 +802,9 @@ static int aka_prime_prf(uint8_t *out, size_t outlen,
 	EVP_PKEY	*pkey;
 	EVP_MD_CTX	*md_ctx = NULL;
 
-	pkey = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, NULL, key, key_len);
+	pkey = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, NULL, key, (int)key_len);
 	if (!pkey) {
-		fr_tls_log_strerror_printf("Failed creating HMAC signing key");
+		fr_tls_strerror_printf("Failed creating HMAC signing key");
 	error:
 		if (pkey) EVP_PKEY_free(pkey);
 		if (md_ctx) EVP_MD_CTX_destroy(md_ctx);
@@ -789,17 +813,17 @@ static int aka_prime_prf(uint8_t *out, size_t outlen,
 
 	md_ctx = EVP_MD_CTX_create();
 	if (!md_ctx) {
-		fr_tls_log_strerror_printf("Failed creating HMAC ctx");
+		fr_tls_strerror_printf("Failed creating HMAC ctx");
 		goto error;
 	}
 
 	if (EVP_DigestSignInit(md_ctx, NULL, EVP_sha256(), NULL, pkey) != 1) {
-		fr_tls_log_strerror_printf("Failed initialising digest");
+		fr_tls_strerror_printf("Failed initialising digest");
 		goto error;
 	}
 
 	while (p < end) {
-		size_t len;
+		size_t digest_len = sizeof(digest);
 		size_t copy;
 
 		c++;
@@ -808,16 +832,16 @@ static int aka_prime_prf(uint8_t *out, size_t outlen,
 		if ((p != out) && EVP_DigestSignUpdate(md_ctx, digest, sizeof(digest)) != 1) goto error;/* Ingest last round */
 		if (EVP_DigestSignUpdate(md_ctx, in, in_len) != 1) goto error;				/* Ingest s */
 		if (EVP_DigestSignUpdate(md_ctx, &c, sizeof(c)) != 1) goto error;			/* Ingest round number */
-		if (EVP_DigestSignFinal(md_ctx, digest, &len) != 1) goto error;				/* Output T(i) */
+		if (EVP_DigestSignFinal(md_ctx, digest, &digest_len) != 1) goto error;			/* Output T(i) */
 
 		copy = end - p;
-		if (copy > SHA256_DIGEST_LENGTH) copy = SHA256_DIGEST_LENGTH;
+		if (copy > digest_len) copy = digest_len;
 
 		memcpy(p, digest, copy);
 		p += copy;
 	}
 
-	EVP_MD_CTX_destroy(md_ctx);;
+	EVP_MD_CTX_destroy(md_ctx);
 	EVP_PKEY_free(pkey);
 
 	return 0;
@@ -850,7 +874,13 @@ int fr_aka_sim_crypto_umts_kdf_1(fr_aka_sim_keys_t *keys)
 	uint8_t *p = s;
 	size_t	s_len;
 
-	ck_ik_prime_derive(keys);
+	/*
+	 *	Normally we derive CK'/IK' from CK/IK here.  If they were supplied
+	 *	pre-transformed (e.g. fetched from a 3GPP HSS over SWx, which
+	 *	performs the transform itself per TS 33.402 Annex A), skip the
+	 *	local derivation and use the values as-is.
+	 */
+	if (!keys->ck_ik_prime_provided && (ck_ik_prime_derive(keys) < 0)) return -1;
 
 	if (!fr_cond_assert(keys->vector_type == AKA_SIM_VECTOR_UMTS)) return -1;
 
@@ -1077,24 +1107,24 @@ int fr_aka_sim_crypto_kdf_0_reauth(fr_aka_sim_keys_t *keys)
 	 */
 	md_ctx = EVP_MD_CTX_create();
 	if (!md_ctx) {
-		fr_tls_log_strerror_printf("Failed creating MD ctx");
+		fr_tls_strerror_printf("Failed creating MD ctx");
 	error:
 		EVP_MD_CTX_destroy(md_ctx);
 		return -1;
 	}
 
 	if (EVP_DigestInit_ex(md_ctx, EVP_sha1(), NULL) != 1) {
-		fr_tls_log_strerror_printf("Failed initialising digest");
+		fr_tls_strerror_printf("Failed initialising digest");
 		goto error;
 	}
 
 	if (EVP_DigestUpdate(md_ctx, buf, p - buf) != 1) {
-		fr_tls_log_strerror_printf("Failed digesting crypto data");
+		fr_tls_strerror_printf("Failed digesting crypto data");
 		goto error;
 	}
 
 	if (EVP_DigestFinal_ex(md_ctx, keys->reauth.xkey_prime, &len) != 1) {
-		fr_tls_log_strerror_printf("Failed finalising digest");
+		fr_tls_strerror_printf("Failed finalising digest");
 		goto error;
 	}
 
@@ -1242,11 +1272,11 @@ void fr_aka_sim_crypto_keys_log(request_t *request, fr_aka_sim_keys_t *keys)
 
 		for (i = 0; i < keys->gsm.num_vectors; i++) {
 			RHEXDUMP_INLINE3(keys->gsm.vector[i].rand, AKA_SIM_VECTOR_GSM_RAND_SIZE,
-					 "[%i] RAND    :", i);
+					 "[%u] RAND    :", i);
 			RHEXDUMP_INLINE3(keys->gsm.vector[i].sres, AKA_SIM_VECTOR_GSM_SRES_SIZE,
-					 "[%i] SRES    :", i);
+					 "[%u] SRES    :", i);
 			RHEXDUMP_INLINE3(keys->gsm.vector[i].kc, AKA_SIM_VECTOR_GSM_KC_SIZE,
-					 "[%i] KC      :", i);
+					 "[%u] KC      :", i);
 		}
 	}
 		break;
@@ -1332,9 +1362,7 @@ void fr_aka_sim_crypto_keys_log(request_t *request, fr_aka_sim_keys_t *keys)
 /*
  *  cc crypto.c fips186prf.c -g3 -Wall -DHAVE_DLFCN_H -DTESTING_SIM_CRYPTO -DWITH_TLS -I../../../../ -I../../../ -I ../base/ -I /usr/local/opt/openssl/include/ -include ../include/build.h -L /usr/local/opt/openssl/lib/ -l ssl -l crypto -l talloc -L ../../../../../build/lib/local/.libs/ -lfreeradius-server -lfreeradius-tls -lfreeradius-util -o test_sim_crypto && ./test_sim_crypto
  */
-#include <stddef.h>
-#include <stdbool.h>
-#include <freeradius-devel/util/acutest.h>
+#include <freeradius-devel/util/test/acutest.h>
 
 /*
  *	EAP-SIM (RFC4186) GSM authentication vectors
@@ -1649,6 +1677,37 @@ static void test_eap_aka_kdf_1_umts(void)
 	TEST_CHECK(memcmp(&rfc5448_vector0_out.emsk, keys.emsk, sizeof(keys.emsk)) == 0);
 }
 
+static void test_eap_aka_kdf_1_umts_external_prime(void)
+{
+	fr_aka_sim_keys_t	keys;
+	int		ret;
+
+	/*
+	 *	CK'/IK' supplied directly (as a 3GPP HSS does over SWx) rather
+	 *	than derived locally.  Corrupt the raw CK/IK: if the local
+	 *	derivation were (wrongly) still run, the resulting keys would
+	 *	not match the RFC 5448 expected output.  With ck_ik_prime_provided
+	 *	set, the derivation is skipped and the supplied CK'/IK' are used.
+	 */
+	memcpy(&keys, &rfc5448_vector0_in, sizeof(keys));
+	memset(keys.umts.vector.ck, 0xff, sizeof(keys.umts.vector.ck));
+	memset(keys.umts.vector.ik, 0xff, sizeof(keys.umts.vector.ik));
+
+	memcpy(keys.ck_prime, rfc5448_vector0_out.ck_prime, sizeof(keys.ck_prime));
+	memcpy(keys.ik_prime, rfc5448_vector0_out.ik_prime, sizeof(keys.ik_prime));
+	keys.ck_ik_prime_provided = true;
+
+	ret = fr_aka_sim_crypto_umts_kdf_1(&keys);
+	TEST_CHECK(ret == 0);
+
+	TEST_CHECK(memcmp(&rfc5448_vector0_out.k_encr, keys.k_encr, sizeof(keys.k_encr)) == 0);
+	TEST_CHECK(rfc5448_vector0_out.k_aut_len == keys.k_aut_len);
+	TEST_CHECK(memcmp(&rfc5448_vector0_out.k_aut, keys.k_aut, keys.k_aut_len) == 0);
+	TEST_CHECK(memcmp(&rfc5448_vector0_out.k_re, keys.k_re, sizeof(keys.k_re)) == 0);
+	TEST_CHECK(memcmp(&rfc5448_vector0_out.msk, keys.msk, sizeof(keys.msk)) == 0);
+	TEST_CHECK(memcmp(&rfc5448_vector0_out.emsk, keys.emsk, sizeof(keys.emsk)) == 0);
+}
+
 static void test_eap_aka_derive_ck_ik(void)
 {
 
@@ -1767,6 +1826,7 @@ TEST_LIST = {
 	 *	EAP-AKA'
 	 */
 	{ "test_eap_aka_kdf_1_umts",		test_eap_aka_kdf_1_umts		},
+	{ "test_eap_aka_kdf_1_umts_external_prime",	test_eap_aka_kdf_1_umts_external_prime	},
 	{ "test_eap_aka_derive_ck_ik",		test_eap_aka_derive_ck_ik	},
 	{ "test_eap_aka_kdf_1_reauth",		test_eap_aka_kdf_1_reauth	},
 

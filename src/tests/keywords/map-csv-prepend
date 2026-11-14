@@ -1,24 +1,22 @@
 #
-#  PRE: update map
+#  PRE: map
 #
 
-update control {
-	&Tmp-String-0 := "fail"
+control.Filter-Id := "fail"
+
+map csv User-Name {
+	control.Filter-Id ^= 'field3'
 }
 
-map csv &User-Name {
-	&control.Tmp-String-0 ^= 'field3'
-}
-
-if ("%{control.Tmp-String-0[0]}" != 'success') {
+if (!(control.Filter-Id[0] == 'success')) {
 	test_fail
 }
 
-if ("%{control.Tmp-String-0[1]}" != "fail") {
+if (!(control.Filter-Id[1] == "fail")) {
 	test_fail
 }
 
-if ("%{control.Tmp-String-0[#]}" != 2) {
+if (!(%{control.Filter-Id[#]} == 2)) {
 	test_fail
 }
 

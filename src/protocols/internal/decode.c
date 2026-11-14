@@ -29,11 +29,7 @@
 #include <freeradius-devel/internal/internal.h>
 #include <freeradius-devel/io/pair.h>
 #include <freeradius-devel/io/test_point.h>
-#include <freeradius-devel/util/dbuff.h>
-#include <freeradius-devel/util/dict.h>
-#include <freeradius-devel/util/net.h>
 #include <freeradius-devel/util/proto.h>
-#include <freeradius-devel/util/talloc.h>
 
 static ssize_t internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_dict_attr_t const *parent_da,
 				    fr_dbuff_t *dbuff, void *decode_ctx);
@@ -55,65 +51,13 @@ static ssize_t internal_decode_pair_value(TALLOC_CTX *ctx, fr_pair_list_t *head,
 	/*
 	 *	Zero length is fine here
 	 */
-	slen = fr_value_box_from_network_dbuff(vp, &vp->data, vp->da->type, vp->da,
-					       &work_dbuff, fr_dbuff_len(&work_dbuff), tainted);
+	slen = fr_value_box_from_network(vp, &vp->data, vp->vp_type, vp->da,
+					 &work_dbuff, fr_dbuff_len(&work_dbuff), tainted);
 	if (slen < 0) {
 		talloc_free(vp);
 		return slen;
 	}
-	fr_pair_append(head, vp);
-
-	return fr_dbuff_set(dbuff, &work_dbuff);
-}
-
-/** Decode a TLV as a group type attribute
- *
- */
-static ssize_t internal_decode_tlv(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_dict_attr_t const *parent_da,
-				   fr_dbuff_t *dbuff, void *decode_ctx)
-{
-
-	ssize_t		slen;
-	fr_pair_list_t	children;
-	fr_dcursor_t	cursor;
-	fr_dbuff_t	work_dbuff = FR_DBUFF(dbuff);
-
-	FR_PROTO_TRACE("Decoding TLV - %s (%zu bytes)", parent_da->name, fr_dbuff_len(&work_dbuff));
-
-	fr_pair_list_init(&children);
-
-	/*
-	 *	Decode all the children of this TLV
-	 */
-	while (fr_dbuff_extend(&work_dbuff)) {
-		FR_PROTO_HEX_MARKER(fr_dbuff_start(&work_dbuff), fr_dbuff_len(&work_dbuff),
-				    fr_dbuff_remaining(&work_dbuff), "Decoding child");
-
-		slen = internal_decode_pair(ctx, &children, parent_da, &work_dbuff, decode_ctx);
-		if (slen <= 0) return slen;
-	}
-
-	/*
-	 *	If decoding produced more than one child
-	 *	we need to do an intermediary TLV
-	 *	VP to retain the nesting structure.
-	 */
-	if (fr_dcursor_init(&cursor, &children) && fr_dcursor_next(&cursor)) {
-		fr_pair_t	*tlv;
-
-		tlv = fr_pair_afrom_da(ctx, parent_da);
-		if (!tlv) return PAIR_DECODE_OOM;
-
-		while (fr_dcursor_head(&cursor)) {
-		     	FR_PROTO_TRACE("Moving %s into %s",
-		     		       ((fr_pair_t *)fr_dcursor_head(&cursor))->da->name, tlv->da->name);
-			fr_pair_append(&tlv->vp_group, talloc_reparent(ctx, tlv, fr_dcursor_remove(&cursor)));
-		}
-
-		fr_pair_append(head, tlv);
-	} else {
-		fr_pair_append(head, fr_dcursor_head(&cursor));
-	}
+	FR_PAIR_APPEND(head, vp);
 
 	return fr_dbuff_set(dbuff, &work_dbuff);
 }
@@ -121,8 +65,8 @@ static ssize_t internal_decode_tlv(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_dic
 /** Decode a group
  *
  */
-static ssize_t internal_decode_group(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_dict_attr_t const *parent_da,
-				     fr_dbuff_t *dbuff, void *decode_ctx)
+static ssize_t internal_decode_structural(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_dict_attr_t const *parent_da,
+					  fr_dbuff_t *dbuff, void *decode_ctx)
 {
 	fr_pair_t	*vp;
 	ssize_t		slen;
@@ -146,12 +90,12 @@ static ssize_t internal_decode_group(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_d
 			return slen;
 		}
 	}
-	fr_pair_append(head, vp);
+	FR_PAIR_APPEND(head, vp);
 
 	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
-static ssize_t internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_dict_attr_t const *parent_da,
+static ssize_t internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr_t const *parent_da,
 				    fr_dbuff_t *dbuff, void *decode_ctx)
 {
 	ssize_t			slen = 0;
@@ -174,7 +118,7 @@ static ssize_t internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_di
 	 *                           field (allows for future extensions).
 	 *
 	 * 0                   1                   2                   3
-	 * 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1kk
+	 * 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 	 * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 	 * |tlen |llen |t|e|   Type (min)  |  Length (min) | value...
 	 * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -204,7 +148,7 @@ static ssize_t internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_di
 		fr_strerror_printf("%s: Encoding byte invalid, fields overrun input data. "
 				   "%zu byte(s) remaining, need %zu byte(s)",
 				   __FUNCTION__, remaining, needed);
-		return 0;
+		return -needed;
 	}
 
 	/*
@@ -238,6 +182,10 @@ static ssize_t internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_di
 	}
 
 	FR_DBUFF_OUT_UINT64V_RETURN(&type, &work_dbuff, type_field_size);
+	if (type > UINT32_MAX) {
+		fr_strerror_printf("%s: Attribute number %" PRIu64 " is larger than 32 bits", __FUNCTION__, type);
+		return PAIR_DECODE_FATAL_ERROR;
+	}
 
 	/*
 	 *	This is the length of the start *after* the flags and
@@ -259,7 +207,7 @@ static ssize_t internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_di
 	 *	so it's fine to swap the parent_da.
 	 */
 	if (internal) {
-		if (!parent_da->flags.is_root) {
+		if (!parent_da->flags.is_root && !(parent_da->type == FR_TYPE_GROUP)) {
 			fr_strerror_printf("%s: Internal flag can only be set on top level attribute", __FUNCTION__);
 			return PAIR_DECODE_FATAL_ERROR;
 		}
@@ -269,13 +217,12 @@ static ssize_t internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_di
 	if (unknown || parent_da->flags.is_unknown) {
 	unknown:
 		FR_PROTO_TRACE("Unknown attribute %" PRIu64, type);
-		da = fr_dict_unknown_attr_afrom_num(ctx, parent_da, type);
+		da = fr_dict_attr_unknown_raw_afrom_num(ctx, parent_da, (unsigned int) type);
+		if (!da) return PAIR_DECODE_FATAL_ERROR;
+		unknown = true;
 	} else {
-		da = fr_dict_attr_child_by_num(parent_da, type);
-		if (!da) {
-			unknown = true;	/* Be kind, someone may have messed with the dictionaries */
-			goto unknown;
-		}
+		da = fr_dict_attr_child_by_num(parent_da, (unsigned int) type);
+		if (!da) goto unknown;
 	}
 
 	FR_PROTO_TRACE("decode context changed %s -> %s", da->parent->name, da->name);
@@ -288,49 +235,30 @@ static ssize_t internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_di
 
 	switch (da->type) {
 	/*
-	 *	This just changes the lookup context, we don't
-	 *	actually need to allocate anything for it.
-	 */
-	case FR_TYPE_VSA:		/* An attribute holding vendor definitions */
-		if (unlikely(unknown)) {
-			fr_strerror_printf("%s: %s can't be marked as unknown", __FUNCTION__,
-					   fr_table_str_by_value(fr_value_box_type_table, da->type, "?Unknown?"));
-			fr_dbuff_set(&work_dbuff, &ext_field);
-			goto error;
-		}
-	FALL_THROUGH;
-
-	case FR_TYPE_VENDOR:		/* A vendor definition */
-		if (unlikely(tainted)) {
-		bad_tainted:
-			fr_strerror_printf("%s: %s can't be marked as tainted", __FUNCTION__,
-					   fr_table_str_by_value(fr_value_box_type_table, da->type, "?Unknown?"));
-			fr_dbuff_set(&work_dbuff, &enc_field);
-		error:
-			if (unknown) fr_dict_unknown_free(&da);
-			return fr_pair_decode_slen(slen, fr_dbuff_start(&work_dbuff), fr_dbuff_current(&work_dbuff));
-		}
-
-		FR_PROTO_TRACE("Decoding %s - %s", da->name,
-			       fr_table_str_by_value(fr_value_box_type_table, da->type, "?Unknown?"));
-
-		slen = internal_decode_pair(ctx, head, parent_da, &work_dbuff, decode_ctx);
-		if (slen <= 0) goto error;
-		break;
-
-	/*
 	 *	Structural types
+	 *
+	 *	STRUCTs are encoded as TLVs, because the struct
+	 *	packing only applies to the original protocol, and not
+	 *	to our internal encoding.
 	 */
-	case FR_TYPE_TLV:
-		if (unlikely(tainted)) goto bad_tainted;
-
-		slen = internal_decode_tlv(ctx, head, da, &work_dbuff, decode_ctx);
-		if (slen <= 0) goto error;
-		break;
-
-	case FR_TYPE_GROUP:
-		slen = internal_decode_group(ctx, head, da, &work_dbuff, decode_ctx);
-		if (slen <= 0) goto error;
+	 case FR_TYPE_STRUCTURAL:
+	 	if (fr_type_is_vsa(da->type)) {
+			if (unlikely(unknown)) {
+				fr_strerror_printf("%s: %s can't be marked as unknown", __FUNCTION__,
+						fr_type_to_str(da->type));
+				fr_dbuff_set(&work_dbuff, &ext_field);
+			error:
+				if (unknown) fr_dict_attr_unknown_free(&da);
+				return fr_pair_decode_slen(slen, fr_dbuff_start(&work_dbuff), fr_dbuff_current(&work_dbuff));
+			}
+		}
+		/*
+		 *	It's ok for this function to return 0
+		 *	we can have empty groups (i.e. groups
+		 *	with no children)
+		 */
+		slen = internal_decode_structural(ctx, out, da, &work_dbuff, decode_ctx);
+		if (slen < 0) goto error;
 		break;
 
 	default:
@@ -338,7 +266,7 @@ static ssize_t internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_di
 		 *	It's ok for this function to return 0
 		 *	we can have zero length strings.
 		 */
-		slen = internal_decode_pair_value(ctx, head, da, &work_dbuff, tainted, decode_ctx);
+		slen = internal_decode_pair_value(ctx, out, da, &work_dbuff, tainted, decode_ctx);
 		if (slen < 0) goto error;
 	}
 
@@ -348,29 +276,56 @@ static ssize_t internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *head, fr_di
 /** Create a single fr_pair_t and all its nesting
  *
  */
-ssize_t fr_internal_decode_pair(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+ssize_t fr_internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *list, fr_dict_attr_t const *parent,
 				uint8_t const *data, size_t data_len, void *decode_ctx)
 {
-	return fr_internal_decode_pair_dbuff(ctx, cursor, dict, &FR_DBUFF_TMP(data, data_len), decode_ctx);
+	return fr_internal_decode_pair_dbuff(ctx, list, parent, &FR_DBUFF_TMP(data, data_len), decode_ctx);
 }
 
-ssize_t fr_internal_decode_pair_dbuff(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+ssize_t fr_internal_decode_pair_dbuff(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr_t const *parent,
 				fr_dbuff_t *dbuff, void *decode_ctx)
 {
-	fr_pair_list_t	list;
-	fr_dcursor_t	tmp_cursor;
+	fr_pair_list_t	tmp;
 	ssize_t		slen;
 	fr_dbuff_t	work_dbuff = FR_DBUFF(dbuff);
 
-	fr_pair_list_init(&list);
+	fr_pair_list_init(&tmp);
 
-	slen = internal_decode_pair(ctx, &list, fr_dict_root(dict), &work_dbuff, decode_ctx);
-	if (slen <= 0) return slen;
+	slen = internal_decode_pair(ctx, &tmp, parent, &work_dbuff, decode_ctx);
+	if (slen <= 0) {
+		fr_pair_list_free(&tmp);
+		return slen;
+	}
 
-	fr_dcursor_init(&tmp_cursor, &list);
-	fr_dcursor_merge(cursor, &tmp_cursor);
+	fr_pair_list_append(out, &tmp);
 
 	return fr_dbuff_set(dbuff, &work_dbuff);
+}
+
+/** Retrieve all pairs from the dbuff
+ *
+ * @param ctx		to create new pairs in
+ * @param out		list to append pairs to
+ * @param parent	attribute within which which to decode
+ * @param dbuff		to parse
+ * @param decode_ctx	to pass to decoder function
+ * @return
+ *	- bytes of dbuff consumed
+ *	- < 0 on error
+ */
+ssize_t fr_internal_decode_list_dbuff(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr_t const *parent,
+					  fr_dbuff_t *dbuff, void *decode_ctx)
+{
+	ssize_t		ret, len = 0;
+
+	while (fr_dbuff_remaining(dbuff)) {
+		ret = fr_internal_decode_pair_dbuff(ctx, out, parent, dbuff, decode_ctx);
+		if (ret < 0) return ret;
+		if (ret == 0) break;
+		len += ret;
+	}
+
+	return len;
 }
 
 /*

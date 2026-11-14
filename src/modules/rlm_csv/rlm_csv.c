@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -25,14 +25,13 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/util/htrie.h>
 #include <freeradius-devel/util/debug.h>
 
-#include <freeradius-devel/server/map_proc.h>
 
-static rlm_rcode_t mod_map_proc(void *mod_inst, UNUSED void *proc_inst, request_t *request,
-				fr_value_box_list_t *key, fr_map_list_t const *maps);
+static unlang_action_t mod_map_proc(unlang_result_t *p_result, map_ctx_t const *mpctx, request_t *request,
+				    fr_value_box_list_t *key, map_list_t const *maps);
 
 /*
  *	Define a structure for our module configuration.
@@ -42,7 +41,6 @@ static rlm_rcode_t mod_map_proc(void *mod_inst, UNUSED void *proc_inst, request_
  *	be used as the instance handle.
  */
 typedef struct {
-	char const	*name;
 	char const	*filename;
 	char const	*delimiter;
 	char const	*fields;
@@ -65,7 +63,7 @@ typedef struct {
 	tmpl_t		*key;
 	fr_type_t	key_data_type;
 
-	fr_map_list_t	map;		//!< if there is an "update" section in the configuration.
+	map_list_t	map;		//!< if there is an "update" section in the configuration.
 } rlm_csv_t;
 
 typedef struct rlm_csv_entry_s rlm_csv_entry_t;
@@ -79,14 +77,14 @@ struct rlm_csv_entry_s {
 /*
  *	A mapping of configuration file names to internal variables.
  */
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_INPUT | FR_TYPE_REQUIRED | FR_TYPE_NOT_EMPTY, rlm_csv_t, filename) },
-	{ FR_CONF_OFFSET("delimiter", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_NOT_EMPTY, rlm_csv_t, delimiter), .dflt = "," },
-	{ FR_CONF_OFFSET("fields", FR_TYPE_STRING , rlm_csv_t, fields) },
-	{ FR_CONF_OFFSET("header", FR_TYPE_BOOL, rlm_csv_t, header) },
-	{ FR_CONF_OFFSET("allow_multiple_keys", FR_TYPE_BOOL, rlm_csv_t, allow_multiple_keys) },
-	{ FR_CONF_OFFSET("index_field", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_NOT_EMPTY, rlm_csv_t, index_field_name) },
-	{ FR_CONF_OFFSET("key", FR_TYPE_TMPL, rlm_csv_t, key) },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("filename", CONF_FLAG_FILE_READABLE | CONF_FLAG_REQUIRED | CONF_FLAG_NOT_EMPTY, rlm_csv_t, filename) },
+	{ FR_CONF_OFFSET_FLAGS("delimiter", CONF_FLAG_NOT_EMPTY, rlm_csv_t, delimiter), .dflt = "," },
+	{ FR_CONF_OFFSET("fields", rlm_csv_t, fields) },
+	{ FR_CONF_OFFSET("header", rlm_csv_t, header) },
+	{ FR_CONF_OFFSET("allow_multiple_keys", rlm_csv_t, allow_multiple_keys) },
+	{ FR_CONF_OFFSET_FLAGS("index_field", CONF_FLAG_REQUIRED | CONF_FLAG_NOT_EMPTY, rlm_csv_t, index_field_name) },
+	{ FR_CONF_OFFSET("key", rlm_csv_t, key) },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -162,7 +160,7 @@ static bool buf2entry(rlm_csv_t *inst, char *buf, char **out)
 }
 
 
-static int8_t csv_cmp(void const *one, void const *two)
+static fr_cmp_ret_t csv_cmp(void const *one, void const *two)
 {
 	rlm_csv_entry_t const *a = (rlm_csv_entry_t const *) one; /* may not be talloc'd! */
 	rlm_csv_entry_t const *b = (rlm_csv_entry_t const *) two; /* may not be talloc'd! */
@@ -192,7 +190,7 @@ static bool insert_entry(CONF_SECTION *conf, rlm_csv_t *inst, rlm_csv_entry_t *e
 
 	fr_assert(e != NULL);
 
-	old = fr_htrie_find(inst->trie, e);
+	fr_htrie_find((void **)&old, inst->trie, e);
 	if (old) {
 		if (!inst->allow_multiple_keys && !inst->multiple_index_fields) {
 			cf_log_err(conf, "%s[%d]: Multiple entries are disallowed", inst->filename, lineno);
@@ -208,7 +206,7 @@ static bool insert_entry(CONF_SECTION *conf, rlm_csv_t *inst, rlm_csv_entry_t *e
 		return true;
 	}
 
-	if (!fr_htrie_insert(inst->trie, e)) {
+	if (fr_htrie_insert(inst->trie, e) != 0) {
 		cf_log_err(conf, "Failed inserting entry for file %s line %d: %s",
 			   inst->filename, lineno, fr_strerror());
 fail:
@@ -230,10 +228,14 @@ static bool duplicate_entry(CONF_SECTION *conf, rlm_csv_t *inst, rlm_csv_entry_t
 						     sizeof(*e) + (inst->used_fields * sizeof(e->data[0]))));
 	talloc_set_type(e, rlm_csv_entry_t);
 
-	e->key = talloc_zero(e, fr_value_box_t);
-	if (fr_value_box_from_str(e->key, e->key, type, NULL, p, -1, 0, false) < 0) {
+	e->key = fr_value_box_alloc_null(e);
+	if (!e->key) goto fail;
+
+	if (fr_value_box_from_str(e->key, e->key, type, NULL, p, strlen(p), NULL) < 0) {
 		cf_log_err(conf, "Failed parsing key field in file %s line %d - %s", inst->filename, lineno,
 			   fr_strerror());
+	fail:
+		talloc_free(e);
 		return false;
 	}
 
@@ -241,7 +243,7 @@ static bool duplicate_entry(CONF_SECTION *conf, rlm_csv_t *inst, rlm_csv_entry_t
 	 *	Copy the other fields;
 	 */
 	for (i = 0; i < inst->used_fields; i++) {
-		if (old->data[i]) e->data[i] = old->data[i]; /* no need to dup it, it's never freed... */
+		if (old->data[i]) e->data[i] = talloc_reference(e, old->data[i]);
 	}
 
 	return insert_entry(conf, inst, e, lineno);
@@ -263,14 +265,14 @@ static bool file2csv(CONF_SECTION *conf, rlm_csv_t *inst, int lineno, char *buff
 	for (p = buffer, i = 0; p != NULL; p = q, i++) {
 		if (!buf2entry(inst, p, &q)) {
 			cf_log_err(conf, "Malformed entry in file %s line %d", inst->filename, lineno);
-			return false;
+			goto fail;
 		}
 
 		if (q) *(q++) = '\0';
 
 		if (i >= inst->num_fields) {
 			cf_log_err(conf, "Too many fields at file %s line %d", inst->filename, lineno);
-			return false;
+			goto fail;
 		}
 
 		/*
@@ -304,7 +306,6 @@ static bool file2csv(CONF_SECTION *conf, rlm_csv_t *inst, int lineno, char *buff
 
 					if (!duplicate_entry(conf, inst, e, p, lineno)) goto fail;
 
-					if (!l) break;
 					p = l + 1;
 					l = strchr(p, ',');
 				}
@@ -313,8 +314,11 @@ static bool file2csv(CONF_SECTION *conf, rlm_csv_t *inst, int lineno, char *buff
 			/*
 			 *	Set the last entry to use 'e'
 			 */
-			e->key = talloc_zero(e, fr_value_box_t);
-			if (fr_value_box_from_str(e->key, e->key, type, NULL, p, -1, 0, false) < 0) {
+			e->key = fr_value_box_alloc_null(e);
+			if (!e->key) goto fail;
+
+			if (fr_value_box_from_str(e->key, e->key, type, NULL,
+						  p, strlen(p), NULL) < 0) {
 				cf_log_err(conf, "Failed parsing key field in file %s line %d - %s", inst->filename, lineno,
 					   fr_strerror());
 			fail:
@@ -336,7 +340,8 @@ static bool file2csv(CONF_SECTION *conf, rlm_csv_t *inst, int lineno, char *buff
 			fr_value_box_t box;
 			fr_type_t type = inst->field_types[i];
 
-			if (fr_value_box_from_str(e, &box, type, NULL, p, -1, 0, false) < 0) {
+			if (fr_value_box_from_str(e, &box, type, NULL,
+						  p, strlen(p), NULL) < 0) {
 				cf_log_err(conf, "Failed parsing field '%s' in file %s line %d - %s", inst->field_names[i],
 					   inst->filename, lineno, fr_strerror());
 				goto fail;
@@ -345,7 +350,7 @@ static bool file2csv(CONF_SECTION *conf, rlm_csv_t *inst, int lineno, char *buff
 			fr_value_box_clear(&box);
 		}
 
-		MEM(e->data[inst->field_offsets[i]] = talloc_typed_strdup(e, p));
+		MEM(e->data[inst->field_offsets[i]] = talloc_strdup(e, p));
 	}
 
 	if (i < inst->num_fields) {
@@ -384,7 +389,7 @@ static int fieldname2offset(rlm_csv_t const *inst, char const *field_name, int *
  */
 static int csv_map_verify(map_t *map, void *instance)
 {
-	rlm_csv_t *inst = instance;
+	rlm_csv_t *inst = talloc_get_type_abort(instance, rlm_csv_t);
 	int offset;
 	fr_type_t type = FR_TYPE_NULL;
 
@@ -394,19 +399,16 @@ static int csv_map_verify(map_t *map, void *instance)
 	 */
 	switch (map->lhs->type) {
 	case TMPL_TYPE_ATTR:
-		type = tmpl_da(map->lhs)->type;
-		break;
-
-	case TMPL_TYPE_LIST:
+		type = tmpl_attr_tail_da(map->lhs)->type;
 		break;
 
 	case TMPL_TYPE_ATTR_UNRESOLVED:
-		cf_log_err(map->ci, "Unknown attribute %s", tmpl_attr_unresolved(map->lhs));
+		cf_log_err(map->ci, "Unknown attribute %s", tmpl_attr_tail_unresolved(map->lhs));
 		return -1;
 
 	default:
 		cf_log_err(map->ci, "Left hand side of map must be an attribute or list, not a %s",
-			   fr_table_str_by_value(tmpl_type_table, map->lhs->type, "<INVALID>"));
+			   tmpl_type_to_str(map->lhs->type));
 		return -1;
 	}
 
@@ -415,7 +417,7 @@ static int csv_map_verify(map_t *map, void *instance)
 	 *	we're retrieving from LDAP.
 	 */
 	switch (map->rhs->type) {
-	case TMPL_TYPE_UNRESOLVED:
+	case TMPL_TYPE_DATA_UNRESOLVED:
 		offset = -1;
 		if (fieldname2offset(inst, map->rhs->name, &offset) < 0) {
 			cf_log_err(map->ci, "Unknown field '%s'", map->rhs->name);
@@ -442,12 +444,12 @@ static int csv_map_verify(map_t *map, void *instance)
 		break;
 
 	case TMPL_TYPE_ATTR_UNRESOLVED:
-		cf_log_err(map->ci, "Unknown attribute %s", tmpl_attr_unresolved(map->rhs));
+		cf_log_err(map->ci, "Unknown attribute %s", tmpl_attr_tail_unresolved(map->rhs));
 		return -1;
 
 	default:
 		cf_log_err(map->ci, "Right hand side of map must be a field name, not a %s",
-			   fr_table_str_by_value(tmpl_type_table, map->rhs->type, "<INVALID>"));
+			   tmpl_type_to_str(map->rhs->type));
 		return -1;
 	}
 
@@ -457,8 +459,8 @@ static int csv_map_verify(map_t *map, void *instance)
 	switch (map->op) {
 	case T_OP_SET:
 	case T_OP_EQ:
-	case T_OP_SUB:
-	case T_OP_ADD:
+	case T_OP_SUB_EQ:
+	case T_OP_ADD_EQ:
 	case T_OP_PREPEND:
 	case T_OP_LT:
 	case T_OP_GT:
@@ -478,8 +480,8 @@ static int csv_map_verify(map_t *map, void *instance)
 /*
  *	Verify the result of the map.
  */
-static int csv_maps_verify(CONF_SECTION *cs, void *mod_inst, UNUSED void *proc_inst,
-			  tmpl_t const *src, fr_map_list_t const *maps)
+static int csv_maps_verify(CONF_SECTION *cs, void const *mod_inst, UNUSED void *proc_inst,
+			  tmpl_t const *src, map_list_t const *maps)
 {
 	map_t const *map = NULL;
 
@@ -489,11 +491,11 @@ static int csv_maps_verify(CONF_SECTION *cs, void *mod_inst, UNUSED void *proc_i
 		return -1;
 	}
 
-	while ((map = fr_dlist_next(maps, map))) {
+	while ((map = map_list_next(maps, map))) {
 		/*
 		 *	This function doesn't change the map, so it's OK.
 		 */
-		if (csv_map_verify(UNCONST(map_t *, map), mod_inst) < 0) return -1;
+		if (csv_map_verify(UNCONST(map_t *, map), UNCONST(void *, mod_inst)) < 0) return -1;
 	}
 
 	return 0;
@@ -509,17 +511,15 @@ static int csv_maps_verify(CONF_SECTION *cs, void *mod_inst, UNUSED void *proc_i
  *	that must be referenced in later calls, store a handle to it
  *	in *instance otherwise put a null pointer there.
  */
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
+static int mod_bootstrap(module_inst_ctx_t const *mctx)
 {
-	rlm_csv_t *inst = instance;
-	int i;
-	char const *p;
-	char *q;
-	char *fields;
+	rlm_csv_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_csv_t);
+	CONF_SECTION	*conf = mctx->mi->conf;
+	int		i;
+	char const	*p;
+	char		*q;
+	char		*fields;
 	fr_htrie_type_t	htype;
-
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) inst->name = cf_section_name1(conf);
 
 	if (inst->delimiter[1]) {
 		cf_log_err(conf, "'delimiter' must be one character long");
@@ -539,7 +539,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 
 		default:
 			cf_log_err(conf, "Invalid key data type '%s'",
-				   fr_table_str_by_value(fr_value_box_type_table, inst->key_data_type, "<INVALID>"));
+				   fr_type_to_str(inst->key_data_type));
 			return -1;
 		}
 	} else {
@@ -552,7 +552,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 	htype = fr_htrie_hint(inst->key_data_type);
 	if (htype == FR_HTRIE_INVALID) {
 		cf_log_err(conf, "Invalid data type '%s' used for CSV file.",
-			   fr_table_str_by_value(fr_value_box_type_table, inst->key_data_type, "???"));
+			   fr_type_to_str(inst->key_data_type));
 		return -1;
 	}
 
@@ -635,7 +635,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 	/*
 	 *	Get a writable copy of the fields definition
 	 */
-	MEM(fields = talloc_typed_strdup(inst, inst->fields));
+	MEM(fields = talloc_strdup(inst, inst->fields));
 
 	/*
 	 *	Mark up the field names.  Note that they can be empty,
@@ -666,7 +666,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 				break;
 			}
 
-			if (isspace((int) *q)) {
+			if (isspace((uint8_t) *q)) {
 				cf_log_err(conf, "Field %d name cannot have spaces.",
 					   i + 1);
 				return -1;
@@ -690,7 +690,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 		 *	map to which entries.
 		 *
 		 *	Some fields are unused, so there isn't a 1-1
-		 *	mapping betweeen CSV file fields, and fields
+		 *	mapping between CSV file fields, and fields
 		 *	in the map.
 		 */
 		if (last_field && (*p == ',') && (strcmp(p + 1, inst->index_field_name) == 0)) {
@@ -736,34 +736,35 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 	/*
 	 *	And register the `map csv <key> { ... }` function.
 	 */
-	map_proc_register(inst, inst->name, mod_map_proc, csv_maps_verify, 0);
+	map_proc_register(inst, inst, mctx->mi->name, mod_map_proc, csv_maps_verify, 0, FR_VALUE_BOX_SAFE_FOR_ANY);
 
 	return 0;
 }
-
 
 /** Instantiate the module
  *
  * Creates a new instance of the module reading parameters from a configuration section.
  *
- * @param conf to parse.
- * @param instance configuration data.
+ * @param[in] mctx	configuration data.
  * @return
  *	- 0 on success.
  *	- < 0 on failure.
  */
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_csv_t *inst = instance;
-	CONF_SECTION *cs;
-	int lineno;
-	FILE *fp;
+	rlm_csv_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_csv_t);
+	CONF_SECTION	*conf = mctx->mi->conf;
+	CONF_SECTION	*cs;
+	int		lineno;
+	FILE		*fp;
 	tmpl_rules_t	parse_rules = {
-		.allow_foreign = true	/* Because we don't know where we'll be called */
+		.attr = {
+			.allow_foreign = true	/* Because we don't know where we'll be called */
+		}
 	};
 	char buffer[8192];
 
-	fr_map_list_init(&inst->map);
+	map_list_init(&inst->map);
 	/*
 	 *	"update" without "key" is invalid, as we can't run the
 	 *	module.
@@ -844,7 +845,7 @@ static int csv_map_getvalue(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *req
 	fr_assert(ctx != NULL);
 
 	if (tmpl_is_attr(map->lhs)) {
-		da = tmpl_da(map->lhs);
+		da = tmpl_attr_tail_da(map->lhs);
 
 	} else {
 		char *attr;
@@ -855,9 +856,10 @@ static int csv_map_getvalue(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *req
 		}
 
 
-		da = fr_dict_attr_by_name(NULL, fr_dict_root(request->dict), attr);
+		da = fr_dict_attr_by_name(NULL, fr_dict_root(request->local_dict), attr);
 		if (!da) {
 			RWDEBUG("No such attribute '%s'", attr);
+			talloc_free(attr);
 			return -1;
 		}
 
@@ -867,15 +869,14 @@ static int csv_map_getvalue(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *req
 	vp = fr_pair_afrom_da(ctx, da);
 	fr_assert(vp);
 
-	if (fr_pair_value_from_str(vp, str, talloc_array_length(str) - 1, '\0', true) < 0) {
+	if (fr_pair_value_from_str(vp, str, talloc_strlen(str), NULL, true) < 0) {
 		RPWDEBUG("Failed parsing value \"%pV\" for attribute %s", fr_box_strvalue_buffer(str),
-			tmpl_da(map->lhs)->name);
+			tmpl_attr_tail_da(map->lhs)->name);
 		talloc_free(vp);
 
 		return -1;
 	}
 
-	vp->op = map->op;
 	fr_pair_append(out, vp);
 
 	return 0;
@@ -894,13 +895,13 @@ static int csv_map_getvalue(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *req
  *	- #RLM_MODULE_FAIL if an error occurred.
  */
 static rlm_rcode_t mod_map_apply(rlm_csv_t const *inst, request_t *request,
-				fr_value_box_t const *key, fr_map_list_t const *maps)
+				fr_value_box_t const *key, map_list_t const *maps)
 {
 	rlm_rcode_t		rcode = RLM_MODULE_UPDATED;
 	rlm_csv_entry_t		*e;
 	map_t const		*map = NULL;
 
-	e = fr_htrie_find(inst->trie, &(rlm_csv_entry_t) { .key = UNCONST(fr_value_box_t *, key) } );
+	fr_htrie_find((void **)&e, inst->trie, &(rlm_csv_entry_t) { .key = UNCONST(fr_value_box_t *, key) } );
 	if (!e) {
 		rcode = RLM_MODULE_NOOP;
 		goto finish;
@@ -908,14 +909,14 @@ static rlm_rcode_t mod_map_apply(rlm_csv_t const *inst, request_t *request,
 
 redo:
 	RINDENT();
-	while ((map = fr_dlist_next(maps, map))) {
+	while ((map = map_list_next(maps, map))) {
 		int field;
 		char *field_name;
 
 		/*
 		 *	Avoid memory allocations if possible.
 		 */
-		if (!tmpl_is_unresolved(map->rhs)) {
+		if (!tmpl_is_data_unresolved(map->rhs)) {
 			if (tmpl_aexpand(request, &field_name, request, map->rhs, NULL, NULL) < 0) {
 				REXDENT();
 				REDEBUG("Failed expanding RHS at %s", map->lhs->name);
@@ -952,6 +953,7 @@ redo:
 
 	if (e->next) {
 		e = e->next;
+		map = NULL;
 		goto redo;
 	}
 
@@ -962,55 +964,58 @@ finish:
 
 /** Perform a search and map the result of the search to server attributes
  *
- * @param[in] mod_inst	#rlm_csv_t.
- * @param[in] proc_inst	mapping map entries to field numbers.
+* @param[out] p_result	Result of applying map:
+ *			- #RLM_MODULE_NOOP no rows were returned.
+ *			- #RLM_MODULE_UPDATED if one or more #fr_pair_t were added to the #request_t.
+ *			- #RLM_MODULE_FAIL if an error occurred.
+ * @param[in] mpctx	#map_ctx_t, which contains the module and map instances.
  * @param[in,out]	request The current request.
  * @param[in] key	key to look for
  * @param[in] maps	Head of the map list.
- * @return
- *	- #RLM_MODULE_NOOP no rows were returned.
- *	- #RLM_MODULE_UPDATED if one or more #fr_pair_t were added to the #request_t.
- *	- #RLM_MODULE_FAIL if an error occurred.
+ * @return UNLANG_ACTION_CALCULATE_RESULT
  */
-static rlm_rcode_t mod_map_proc(void *mod_inst, UNUSED void *proc_inst, request_t *request,
-				fr_value_box_list_t *key, fr_map_list_t const *maps)
+static unlang_action_t mod_map_proc(unlang_result_t *p_result, map_ctx_t const *mpctx, request_t *request,
+				    fr_value_box_list_t *key, map_list_t const *maps)
 {
-	rlm_csv_t		*inst = talloc_get_type_abort(mod_inst, rlm_csv_t);
-	fr_value_box_t		*key_head = fr_dlist_head(key);
+	rlm_csv_t const		*inst = talloc_get_type_abort_const(mpctx->moi, rlm_csv_t);
+	fr_value_box_t		*key_head = fr_value_box_list_head(key);
 
 	if (!key_head) {
 		REDEBUG("CSV key cannot be (null)");
-		return RLM_MODULE_FAIL;
+		RETURN_UNLANG_FAIL;
 	}
 
 	if ((inst->key_data_type == FR_TYPE_OCTETS) || (inst->key_data_type == FR_TYPE_STRING)) {
-		if (fr_value_box_list_concat(request, key_head, key, inst->key_data_type, true) < 0) {
+		if (fr_value_box_list_concat_in_place(request,
+						      key_head, key, inst->key_data_type,
+						      FR_VALUE_BOX_LIST_FREE, true,
+						      SIZE_MAX) < 0) {
 			REDEBUG("Failed parsing key");
-			return RLM_MODULE_FAIL;
+			RETURN_UNLANG_FAIL;
 		}
 	}
 
-	return mod_map_apply(inst, request, key_head, maps);
+	RETURN_UNLANG_RCODE(mod_map_apply(inst, request, key_head, maps));
 }
 
 
-static unlang_action_t CC_HINT(nonnull) mod_process(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_process(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_csv_t const *inst = talloc_get_type_abort_const(mctx->instance, rlm_csv_t);
+	rlm_csv_t const *inst = talloc_get_type_abort_const(mctx->mi->data, rlm_csv_t);
 	rlm_rcode_t rcode;
 	ssize_t slen;
 	fr_value_box_t *key;
 
-	if (fr_dlist_empty(&inst->map) || !inst->key) RETURN_MODULE_NOOP;
+	if (map_list_empty(&inst->map) || !inst->key) RETURN_UNLANG_NOOP;
 
 	/*
 	 *	Expand the key to whatever it is.  For attributes,
 	 *	this usually just means copying the value box.
 	 */
-	slen = tmpl_aexpand_type(request, &key, FR_TYPE_VALUE_BOX, request, inst->key, NULL, NULL);
+	slen = tmpl_aexpand_type(request, &key, FR_TYPE_VALUE_BOX, request, inst->key);
 	if (slen < 0) {
-		DEBUG("Failed expanding key '%s'", inst->key->name);
-		RETURN_MODULE_FAIL;
+		REDEBUG("Failed expanding key '%s'", inst->key->name);
+		RETURN_UNLANG_FAIL;
 	}
 
 	/*
@@ -1020,15 +1025,20 @@ static unlang_action_t CC_HINT(nonnull) mod_process(rlm_rcode_t *p_result, modul
 	if (key->type != inst->key_data_type) {
 		fr_value_box_t tmp;
 
-		fr_value_box_copy(request, &tmp, key);
+		if (unlikely(fr_value_box_copy(request, &tmp, key) < 0)) {
+			talloc_free(key);
+			REDEBUG("Failed copying %pV to data type '%s'",
+				&key, fr_type_to_str(inst->key_data_type));
+			RETURN_UNLANG_FAIL;
+		}
 
 		slen = fr_value_box_cast(request, key, inst->key_data_type, NULL, &tmp);
 		fr_value_box_clear(&tmp);
 		if (slen < 0) {
 			talloc_free(key);
-			DEBUG("Failed casting %pV to data type '%s'",
-			      &key, fr_table_str_by_value(tmpl_type_table, inst->key_data_type, "<INVALID>"));
-			RETURN_MODULE_FAIL;
+			REDEBUG("Failed casting %pV to data type '%s'",
+				&key, fr_type_to_str(inst->key_data_type));
+			RETURN_UNLANG_FAIL;
 		}
 	}
 
@@ -1038,22 +1048,24 @@ static unlang_action_t CC_HINT(nonnull) mod_process(rlm_rcode_t *p_result, modul
 	REXDENT();
 
 	talloc_free(key);
-	RETURN_MODULE_RCODE(rcode);
+	RETURN_UNLANG_RCODE(rcode);
 }
 
-extern module_t rlm_csv;
-module_t rlm_csv = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "csv",
-	.type		= 0,
-	.inst_size	= sizeof(rlm_csv_t),
-	.config		= module_config,
-	.bootstrap	= mod_bootstrap,
-	.instantiate	= mod_instantiate,
-
-	.method_names = (module_method_names_t[]){
-		{ .name1 = CF_IDENT_ANY,	.name2 = CF_IDENT_ANY,	.method = mod_process },
-
-		MODULE_NAME_TERMINATOR
+extern module_rlm_t rlm_csv;
+module_rlm_t rlm_csv = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "csv",
+		.flags		= MODULE_TYPE_DYNAMIC_UNSAFE,
+		.inst_size	= sizeof(rlm_csv_t),
+		.config		= module_config,
+		.bootstrap	= mod_bootstrap,
+		.instantiate	= mod_instantiate,
+	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME(CF_IDENT_ANY, CF_IDENT_ANY), .method = mod_process },
+			MODULE_BINDING_TERMINATOR
+		}
 	}
 };

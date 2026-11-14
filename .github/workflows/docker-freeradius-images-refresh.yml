@@ -1,0 +1,72 @@
+name: Docker FreeRADIUS images refresh
+
+#
+#  This workflow rebuilds and publishes the
+#  `freeradius4-{crossbuild,radenv-profiling-deps,service}` images.  Only the
+#  multi-server tests, `docker-crossbuild.yml` and `docker-service.yml` read
+#  the 'freeradius4' images.  The pipeline's build legs never read the
+#  'freeradius4' images.  Keeping this stage in a separate workflow lets the
+#  pipeline gate each leg on the refresh stage that the leg actually reads.
+#  A build leg therefore does not wait for the slowest images in the registry.
+#
+#  `ci-pipeline.yml` calls this workflow when a commit changes the images.
+#  `docker-ci-images-refresh.yml` calls this workflow on the nightly schedule
+#  and on `workflow_dispatch`.  The registry must already hold the
+#  `self-hosted-docker-{dind,cli}` job containers under the ref's tag, which
+#  both callers guarantee by running the earlier stages of
+#  `docker-ci-images-refresh.yml` first.
+#
+#  The workflow rebuilds the images one family of distributions at a time.
+#  `common_vars.yml` reports which families this ref changes.  A family that
+#  this ref does not change is copied from `latest` to this ref's tag instead
+#  of rebuilt, because every job reads one tag for every image.
+#  `docker-freeradius-images-build.yml` builds or copies each family, and
+#  takes the family's distributions as an input.
+#
+on:
+  workflow_call:
+    inputs:
+      rebuild_all:
+        description: "Rebuild every family, whatever this ref changes"
+        type: boolean
+        #  The nightly and hand-started refreshes pass no inputs, and
+        #  rebuild every family.
+        default: true
+
+concurrency:
+  #
+  #  Only one refresh of the 'freeradius4' images runs at a time.
+  #  `cancel-in-progress: false` lets an in-flight run finish rather than
+  #  having a push cancel the run.  An interrupted refresh leaves the
+  #  registry partially updated, whereas a queued second run re-publishes
+  #  everything cleanly after the first run finishes.
+  #
+  group: docker-freeradius-images-refresh
+  cancel-in-progress: false
+
+jobs:
+  #
+  #  The `common_vars` job determines which registry holds the continuous
+  #  integration (CI) images.  See `.github/workflows/common_vars.yml`.
+  #
+  common_vars:
+    name: Common vars
+    uses: ./.github/workflows/common_vars.yml
+
+  freeradius-images-deb:
+    name: "Debian and Ubuntu"
+    needs: common_vars
+    uses: ./.github/workflows/docker-freeradius-images-build.yml
+    with:
+      rebuild: ${{ inputs.rebuild_all || needs.common_vars.outputs.images_deb == 'true' }}
+      images: '["ubuntu24", "ubuntu26", "debian13", "debiansid"]'
+    secrets: inherit
+
+  freeradius-images-rpm:
+    name: "Rocky"
+    needs: common_vars
+    uses: ./.github/workflows/docker-freeradius-images-build.yml
+    with:
+      rebuild: ${{ inputs.rebuild_all || needs.common_vars.outputs.images_rpm == 'true' }}
+      images: '["rocky9", "rocky10"]'
+    secrets: inherit

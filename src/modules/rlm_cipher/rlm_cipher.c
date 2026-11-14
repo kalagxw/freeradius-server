@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -28,39 +28,42 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/tls/base.h>
-#include <freeradius-devel/tls/log.h>
 #include <freeradius-devel/tls/cert.h>
-#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/tls/log.h>
+#include <freeradius-devel/tls/utils.h>
+#include <freeradius-devel/tls/strerror.h>
+#include <freeradius-devel/unlang/xlat_func.h>
 
 #include <openssl/crypto.h>
 #include <openssl/pem.h>
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
-#include <openssl/x509.h>
 
 static int digest_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *parent,
-			     CONF_ITEM *ci, UNUSED CONF_PARSER const *rule);
+			     CONF_ITEM *ci, UNUSED conf_parser_t const *rule);
 static int cipher_rsa_padding_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *parent,
-					 CONF_ITEM *ci, UNUSED CONF_PARSER const *rule);
+					 CONF_ITEM *ci, UNUSED conf_parser_t const *rule);
 static int cipher_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *parent,
-			     CONF_ITEM *ci, UNUSED CONF_PARSER const *rule);
+			     CONF_ITEM *ci, UNUSED conf_parser_t const *rule);
 
 static int cipher_rsa_private_key_file_load(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *parent,
-					    CONF_ITEM *ci, UNUSED CONF_PARSER const *rule);
+					    CONF_ITEM *ci, UNUSED conf_parser_t const *rule);
 static int cipher_rsa_certificate_file_load(TALLOC_CTX *ctx, void *out, UNUSED void *parent,
-					    CONF_ITEM *ci, UNUSED CONF_PARSER const *rule);
+					    CONF_ITEM *ci, UNUSED conf_parser_t const *rule);
 
-typedef enum {
+typedef enum : uint8_t {
 	RLM_CIPHER_TYPE_INVALID = 0,
 	RLM_CIPHER_TYPE_RSA = 1,
+	RLM_CIPHER_TYPE_SYMMETRIC = 2				//!< Any symmetric cipher available via
+								///< OpenSSL's EVP interface.
 } cipher_type_t;
 
 /** Certificate validation modes
  *
  */
-typedef enum {
+typedef enum : uint8_t {
 	CIPHER_CERT_VERIFY_INVALID = 0,
 
 	CIPHER_CERT_VERIFY_HARD,				//!< Fail if the certificate isn't valid.
@@ -69,7 +72,7 @@ typedef enum {
 								///< notBefore or notAfter.
 } cipher_cert_verify_mode_t;
 
-typedef enum {
+typedef enum : uint8_t {
 	CIPHER_CERT_ATTR_UNKNOWN = 0,				//!< Unrecognised attribute.
 	CIPHER_CERT_ATTR_SERIAL,				//!< Certificate's serial number.
 	CIPHER_CERT_ATTR_FINGERPRINT,				//!< Dynamically calculated fingerprint.
@@ -95,20 +98,20 @@ static fr_table_num_sorted_t const cipher_rsa_padding[] = {
 	{ L("none"),	RSA_NO_PADDING		},
 	{ L("oaep"),	RSA_PKCS1_OAEP_PADDING	},		/* PKCS OAEP padding */
 	{ L("pkcs"),	RSA_PKCS1_PADDING	},		/* PKCS 1.5 */
-	{ L("ssl"),	RSA_SSLV23_PADDING	},
 	{ L("x931"),	RSA_X931_PADDING	}
 };
 static size_t cipher_rsa_padding_len = NUM_ELEMENTS(cipher_rsa_padding);
 
 static fr_table_num_sorted_t const cipher_type[] = {
-	{ L("rsa"),	RLM_CIPHER_TYPE_RSA	}
+	{ L("rsa"),		RLM_CIPHER_TYPE_RSA		},
+	{ L("symmetric"),	RLM_CIPHER_TYPE_SYMMETRIC	}
 };
 static size_t cipher_type_len = NUM_ELEMENTS(cipher_type);
 
 static fr_table_num_sorted_t const cipher_cert_verify_mode_table[] = {
 	{ L("hard"),	CIPHER_CERT_VERIFY_HARD	},
-	{ L("none"),	CIPHER_CERT_VERIFY_SOFT	},
-	{ L("soft"),	CIPHER_CERT_VERIFY_NONE	}
+	{ L("none"),	CIPHER_CERT_VERIFY_NONE	},
+	{ L("soft"),	CIPHER_CERT_VERIFY_SOFT	}
 };
 static size_t cipher_cert_verify_mode_table_len = NUM_ELEMENTS(cipher_cert_verify_mode_table);
 
@@ -174,7 +177,6 @@ typedef struct {
  *
  */
 typedef struct {
-	char const		*xlat_name;			//!< Name of xlat we registered.
 	cipher_type_t		type;				//!< Type of encryption to use.
 
 	/** Supported cipher types
@@ -188,10 +190,10 @@ typedef struct {
 /** Configuration for the RSA-PCKS1-OAEP padding scheme
  *
  */
-static const CONF_PARSER rsa_oaep_config[] = {
-	{ FR_CONF_OFFSET("oaep_digest", FR_TYPE_VOID | FR_TYPE_NOT_EMPTY, cipher_rsa_oaep_t, oaep_digest), .func = digest_type_parse, .dflt = "sha256" },
-	{ FR_CONF_OFFSET("mgf1_digest", FR_TYPE_VOID | FR_TYPE_NOT_EMPTY, cipher_rsa_oaep_t, mgf1_digest), .func = digest_type_parse, .dflt = "sha256" },
-	{ FR_CONF_OFFSET("label", FR_TYPE_STRING, cipher_rsa_oaep_t, label) },
+static const conf_parser_t rsa_oaep_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("oaep_digest", FR_TYPE_VOID, CONF_FLAG_NOT_EMPTY, cipher_rsa_oaep_t, oaep_digest), .func = digest_type_parse, .dflt = "sha256" },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("mgf1_digest", FR_TYPE_VOID, CONF_FLAG_NOT_EMPTY, cipher_rsa_oaep_t, mgf1_digest), .func = digest_type_parse, .dflt = "sha256" },
+	{ FR_CONF_OFFSET("label", cipher_rsa_oaep_t, label) },
 
 	CONF_PARSER_TERMINATOR
 };
@@ -199,27 +201,27 @@ static const CONF_PARSER rsa_oaep_config[] = {
 /** Configuration for the RSA cipher type
  *
  */
-static const CONF_PARSER rsa_config[] = {
-	{ FR_CONF_OFFSET("verify_mode", FR_TYPE_VOID, cipher_rsa_t, verify_mode),
-			 .func = cf_table_parse_int,
+static const conf_parser_t rsa_config[] = {
+	{ FR_CONF_OFFSET("verify_mode", cipher_rsa_t, verify_mode),
+			 .func = cf_table_parse_uint8,
 			 .uctx = &(cf_table_parse_ctx_t){
 			 	.table = cipher_cert_verify_mode_table,
 			 	.len = &cipher_cert_verify_mode_table_len
 			 },
 			 .dflt = "hard" }, /* Must come before certificate file */
 
-	{ FR_CONF_OFFSET("private_key_password", FR_TYPE_STRING | FR_TYPE_SECRET, cipher_rsa_t, private_key_password) },	/* Must come before private_key */
-	{ FR_CONF_OFFSET("private_key_file", FR_TYPE_VOID | FR_TYPE_NOT_EMPTY, cipher_rsa_t, private_key_file), .func = cipher_rsa_private_key_file_load },
-	{ FR_CONF_OFFSET("certificate_file", FR_TYPE_VOID | FR_TYPE_NOT_EMPTY, cipher_rsa_t, certificate_file), .func = cipher_rsa_certificate_file_load },
+	{ FR_CONF_OFFSET_FLAGS("private_key_password", CONF_FLAG_SECRET, cipher_rsa_t, private_key_password) },	/* Must come before private_key */
+	{ FR_CONF_OFFSET_TYPE_FLAGS("private_key_file", FR_TYPE_VOID, CONF_FLAG_NOT_EMPTY, cipher_rsa_t, private_key_file), .func = cipher_rsa_private_key_file_load },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("certificate_file", FR_TYPE_VOID, CONF_FLAG_NOT_EMPTY, cipher_rsa_t, certificate_file), .func = cipher_rsa_certificate_file_load },
 
-	{ FR_CONF_OFFSET("random_file", FR_TYPE_STRING, cipher_rsa_t, random_file) },
+	{ FR_CONF_OFFSET("random_file", cipher_rsa_t, random_file) },
 
-	{ FR_CONF_OFFSET("signature_digest", FR_TYPE_VOID | FR_TYPE_NOT_EMPTY, cipher_rsa_t, sig_digest), .func = digest_type_parse, .dflt = "sha256" },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("signature_digest", FR_TYPE_VOID, CONF_FLAG_NOT_EMPTY, cipher_rsa_t, sig_digest), .func = digest_type_parse, .dflt = "sha256" },
 
-	{ FR_CONF_OFFSET("padding_type", FR_TYPE_VOID | FR_TYPE_NOT_EMPTY, cipher_rsa_t, padding), .func = cipher_rsa_padding_type_parse, .dflt = "pkcs" },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("padding_type", FR_TYPE_VOID, CONF_FLAG_NOT_EMPTY, cipher_rsa_t, padding), .func = cipher_rsa_padding_type_parse, .dflt = "pkcs" },
 
-	{ FR_CONF_OFFSET("oaep", FR_TYPE_SUBSECTION, cipher_rsa_t, oaep),
-			 .subcs_size = sizeof(cipher_rsa_oaep_t), .subcs_type = "cipher_rsa_oaep_t", .subcs = (void const *) rsa_oaep_config },
+	{ FR_CONF_OFFSET_SUBSECTION("oaep", 0, cipher_rsa_t, oaep, rsa_oaep_config),
+			 .subcs_size = sizeof(cipher_rsa_oaep_t), .subcs_type = "cipher_rsa_oaep_t" },
 
 	CONF_PARSER_TERMINATOR
 };
@@ -227,15 +229,13 @@ static const CONF_PARSER rsa_config[] = {
 /*
  *	A mapping of configuration file names to internal variables.
  */
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("type", FR_TYPE_VOID | FR_TYPE_NOT_EMPTY, rlm_cipher_t, type), .func = cipher_type_parse, .dflt = "rsa" },
-	{ FR_CONF_OFFSET("rsa", FR_TYPE_SUBSECTION, rlm_cipher_t, rsa),
-			 .subcs_size = sizeof(cipher_rsa_t), .subcs_type = "cipher_rsa_t", .subcs = (void const *) rsa_config },
-
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("type", FR_TYPE_VOID, CONF_FLAG_NOT_EMPTY, rlm_cipher_t, type), .func = cipher_type_parse, .dflt = "rsa" },
+	{ FR_CONF_OFFSET_SUBSECTION("rsa", 0, rlm_cipher_t, rsa, rsa_config), .subcs_size = sizeof(cipher_rsa_t), .subcs_type = "cipher_rsa_t" },
 	CONF_PARSER_TERMINATOR
 };
 
-/** Calls EVP_get_digestbyname() to covert the digest type
+/** Calls EVP_get_digestbyname() to convert the digest type
  *
  * @param[in] ctx	to allocate data in.
  * @param[out] out	EVP_MD representing the OpenSSL digest type.
@@ -247,7 +247,7 @@ static const CONF_PARSER module_config[] = {
  *	- -1 on failure.
  */
 static int digest_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *parent,
-			     CONF_ITEM *ci, UNUSED CONF_PARSER const *rule)
+			     CONF_ITEM *ci, UNUSED conf_parser_t const *rule)
 {
 	EVP_MD const	*md;
 	char const	*type_str;
@@ -276,7 +276,7 @@ static int digest_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *par
  *	- -1 on failure.
  */
 static int cipher_rsa_padding_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *parent,
-					 CONF_ITEM *ci, UNUSED CONF_PARSER const *rule)
+					 CONF_ITEM *ci, UNUSED conf_parser_t const *rule)
 {
 	int		type;
 	char const	*type_str;
@@ -304,7 +304,7 @@ static int cipher_rsa_padding_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUS
  *	- 0 on success.
  *	- -1 on failure.
  */
-static int cipher_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *parent, CONF_ITEM *ci, UNUSED CONF_PARSER const *rule)
+static int cipher_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *parent, CONF_ITEM *ci, UNUSED conf_parser_t const *rule)
 {
 	cipher_type_t	type;
 	char const	*type_str;
@@ -315,6 +315,7 @@ static int cipher_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *par
 	case RLM_CIPHER_TYPE_RSA:
 		break;
 
+	case RLM_CIPHER_TYPE_SYMMETRIC:
 	case RLM_CIPHER_TYPE_INVALID:
 		cf_log_err(ci, "Invalid cipher type \"%s\"", type_str);
 		return -1;
@@ -323,39 +324,6 @@ static int cipher_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *par
 	*((cipher_type_t *)out) = type;
 
 	return 0;
-}
-
-/** Return the static private key password we have configured
- *
- * @param[out] buf	Where to write the password to.
- * @param[in] size	The length of buf.
- * @param[in] rwflag
- *			- 0 if password used for decryption.
- *			- 1 if password used for encryption.
- * @param[in] u		The static password.
- * @return
- *	- 0 on error.
- *	- >0 on success (the length of the password).
- */
-static int _get_private_key_password(char *buf, int size, UNUSED int rwflag, void *u)
-{
-	char		*pass;
-	size_t		len;
-
-	if (!u) {
-		ERROR("Certificate encrypted but no private_key_password configured");
-		return 0;
-	}
-
- 	pass = talloc_get_type_abort(u, char);
-	len = talloc_array_length(pass);	/* Len includes \0 */
-	if (len > (size_t)size) {
-		ERROR("Password too long.  Maximum length is %i bytes", size - 1);
-		return -1;
-	}
-	memcpy(buf, pass, len);			/* Copy complete password including \0 byte */
-
-	return len - 1;
 }
 
 /** Talloc destructor for freeing an EVP_PKEY (representing a certificate)
@@ -397,7 +365,7 @@ static int _x509_cert_free(X509 *cert)
  *	- 0 on success.
  */
 static int cipher_rsa_private_key_file_load(TALLOC_CTX *ctx, void *out, void *parent,
-					    CONF_ITEM *ci, UNUSED CONF_PARSER const *rule)
+					    CONF_ITEM *ci, UNUSED conf_parser_t const *rule)
 {
 	FILE		*fp;
 	char const	*filename;
@@ -413,12 +381,12 @@ static int cipher_rsa_private_key_file_load(TALLOC_CTX *ctx, void *out, void *pa
 		return -1;
 	}
 
-	pkey = PEM_read_PrivateKey(fp, (EVP_PKEY **)out, _get_private_key_password,
+	pkey = PEM_read_PrivateKey(fp, (EVP_PKEY **)out, fr_utils_get_private_key_password,
 				   UNCONST(void *, rsa_inst->private_key_password));
 	fclose(fp);
 
 	if (!pkey) {
-		fr_tls_log_strerror_printf(NULL);
+		fr_tls_strerror_printf(NULL);
 		cf_log_perr(ci, "Error loading private certificate file \"%s\"", filename);
 
 		return -1;
@@ -456,7 +424,7 @@ static int cipher_rsa_private_key_file_load(TALLOC_CTX *ctx, void *out, void *pa
  *	- 0 on success.
  */
 static int cipher_rsa_certificate_file_load(TALLOC_CTX *ctx, void *out, void *parent,
-					    CONF_ITEM *ci, UNUSED CONF_PARSER const *rule)
+					    CONF_ITEM *ci, UNUSED conf_parser_t const *rule)
 {
 	FILE		*fp;
 	char const	*filename;
@@ -481,7 +449,7 @@ static int cipher_rsa_certificate_file_load(TALLOC_CTX *ctx, void *out, void *pa
 	fclose(fp);
 
 	if (!cert) {
-		fr_tls_log_strerror_printf(NULL);
+		fr_tls_strerror_printf(NULL);
 		cf_log_perr(ci, "Error loading certificate file \"%s\"", filename);
 
 		return -1;
@@ -501,7 +469,7 @@ static int cipher_rsa_certificate_file_load(TALLOC_CTX *ctx, void *out, void *pa
 	 */
 	pkey = X509_get_pubkey(cert);
 	if (!pkey) {
-		fr_tls_log_strerror_printf(NULL);
+		fr_tls_strerror_printf(NULL);
 		cf_log_perr(ci, "Failed extracting public key from certificate");
 
 		return -1;
@@ -544,7 +512,7 @@ static int cipher_rsa_certificate_file_load(TALLOC_CTX *ctx, void *out, void *pa
 		case CIPHER_CERT_VERIFY_NONE:
 			break;
 
-		case CIPHER_CERT_ATTR_UNKNOWN:
+		case CIPHER_CERT_VERIFY_INVALID:
 			fr_assert(0);
 			break;
 		}
@@ -560,10 +528,9 @@ static int cipher_rsa_certificate_file_load(TALLOC_CTX *ctx, void *out, void *pa
 	return 0;
 }
 
-static xlat_arg_parser_t const cipher_rsa_encrypt_xlat_arg = {
-	.required = true,
-	.concat = true,
-	.type = FR_TYPE_STRING
+static xlat_arg_parser_t const cipher_rsa_encrypt_xlat_arg[] = {
+	{ .required = true, .concat = true, .type = FR_TYPE_STRING },
+	XLAT_ARG_PARSER_TERMINATOR
 };
 
 /** Encrypt input data
@@ -571,7 +538,7 @@ static xlat_arg_parser_t const cipher_rsa_encrypt_xlat_arg = {
  * Arguments are @verbatim(<plaintext>...)@endverbatim
  *
 @verbatim
-%{<inst>_encrypt:<plaintext>...}
+%<inst>.encrypt(<plaintext>...)
 @endverbatim
  *
  * If multiple arguments are provided they will be concatenated.
@@ -579,11 +546,10 @@ static xlat_arg_parser_t const cipher_rsa_encrypt_xlat_arg = {
  * @ingroup xlat_functions
  */
 static xlat_action_t cipher_rsa_encrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
-					     request_t *request, UNUSED void const *xlat_inst, void *xlat_thread_inst,
-					     fr_value_box_list_t *in)
+					     xlat_ctx_t const *xctx,
+					     request_t *request, fr_value_box_list_t *in)
 {
-	rlm_cipher_rsa_thread_inst_t	*xt = talloc_get_type_abort(*((void **)xlat_thread_inst),
-								    rlm_cipher_rsa_thread_inst_t);
+	rlm_cipher_rsa_thread_inst_t	*t = talloc_get_type_abort(xctx->mctx->thread, rlm_cipher_rsa_thread_inst_t);
 
 	char const			*plaintext;
 	size_t				plaintext_len;
@@ -592,7 +558,7 @@ static xlat_action_t cipher_rsa_encrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	size_t				ciphertext_len;
 
 	fr_value_box_t			*vb;
-	fr_value_box_t			*in_head = fr_dlist_head(in);
+	fr_value_box_t			*in_head = fr_value_box_list_head(in);
 
 	plaintext = in_head->vb_strvalue;
 	plaintext_len = in_head->vb_length;
@@ -601,17 +567,17 @@ static xlat_action_t cipher_rsa_encrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	 *	Figure out the buffer we need
 	 */
 	RHEXDUMP3((uint8_t const *)plaintext, plaintext_len, "Plaintext (%zu bytes)", plaintext_len);
-	if (EVP_PKEY_encrypt(xt->evp_encrypt_ctx, NULL, &ciphertext_len,
+	if (EVP_PKEY_encrypt(t->evp_encrypt_ctx, NULL, &ciphertext_len,
 			     (unsigned char const *)plaintext, plaintext_len) <= 0) {
-		fr_tls_log_error(request, "Failed getting length of encrypted plaintext");
+		RPERROR_SSL("Failed getting length of encrypted plaintext");
 		return XLAT_ACTION_FAIL;
 	}
 
 	MEM(vb = fr_value_box_alloc_null(ctx));
 	MEM(fr_value_box_mem_alloc(vb, &ciphertext, vb, NULL, ciphertext_len, false) == 0);
-	if (EVP_PKEY_encrypt(xt->evp_encrypt_ctx, ciphertext, &ciphertext_len,
+	if (EVP_PKEY_encrypt(t->evp_encrypt_ctx, ciphertext, &ciphertext_len,
 			     (unsigned char const *)plaintext, plaintext_len) <= 0) {
-		fr_tls_log_error(request, "Failed encrypting plaintext");
+		RPERROR_SSL("Failed encrypting plaintext");
 		talloc_free(vb);
 		return XLAT_ACTION_FAIL;
 	}
@@ -623,10 +589,9 @@ static xlat_action_t cipher_rsa_encrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 }
 
 
-static xlat_arg_parser_t const cipher_rsa_sign_xlat_arg = {
-	.required = true,
-	.concat = true,
-	.type = FR_TYPE_STRING,
+static xlat_arg_parser_t const cipher_rsa_sign_xlat_arg[] = {
+	{ .required = true, .concat = true, .type = FR_TYPE_STRING },
+	XLAT_ARG_PARSER_TERMINATOR
 };
 
 /** Sign input data
@@ -634,7 +599,7 @@ static xlat_arg_parser_t const cipher_rsa_sign_xlat_arg = {
  * Arguments are @verbatim(<plaintext>...)@endverbatim
  *
 @verbatim
-%{<inst>_sign:<plaintext>...}
+%<inst>.sign(<plaintext>...)
 @endverbatim
  *
  * If multiple arguments are provided they will be concatenated.
@@ -642,13 +607,11 @@ static xlat_arg_parser_t const cipher_rsa_sign_xlat_arg = {
  * @ingroup xlat_functions
  */
 static xlat_action_t cipher_rsa_sign_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
-					  request_t *request, void const *xlat_inst, void *xlat_thread_inst,
-					  fr_value_box_list_t *in)
+					  xlat_ctx_t const *xctx,
+					  request_t *request, fr_value_box_list_t *in)
 {
-	rlm_cipher_t const		*inst = talloc_get_type_abort_const(*((void const * const *)xlat_inst),
-									    rlm_cipher_t);
-	rlm_cipher_rsa_thread_inst_t	*xt = talloc_get_type_abort(*((void **)xlat_thread_inst),
-								    rlm_cipher_rsa_thread_inst_t);
+	rlm_cipher_t const		*inst = talloc_get_type_abort_const(xctx->mctx->mi->data, rlm_cipher_t);
+	rlm_cipher_rsa_thread_inst_t	*t = talloc_get_type_abort(xctx->mctx->thread, rlm_cipher_rsa_thread_inst_t);
 
 	char const			*msg;
 	size_t				msg_len;
@@ -659,7 +622,7 @@ static xlat_action_t cipher_rsa_sign_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	unsigned int			digest_len = 0;
 
 	fr_value_box_t			*vb;
-	fr_value_box_t			*in_head = fr_dlist_head(in);
+	fr_value_box_t			*in_head = fr_value_box_list_head(in);
 
 	msg = in_head->vb_strvalue;
 	msg_len = in_head->vb_length;
@@ -667,34 +630,34 @@ static xlat_action_t cipher_rsa_sign_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	/*
 	 *	First produce a digest of the message
 	 */
-	if (unlikely(EVP_DigestInit_ex(xt->evp_md_ctx, inst->rsa->sig_digest, NULL) <= 0)) {
-		fr_tls_log_error(request, "Failed initialising message digest");
+	if (unlikely(EVP_DigestInit_ex(t->evp_md_ctx, inst->rsa->sig_digest, NULL) <= 0)) {
+		RPERROR_SSL("Failed initialising message digest");
 		return XLAT_ACTION_FAIL;
 	}
 
-	if (EVP_DigestUpdate(xt->evp_md_ctx, msg, msg_len) <= 0) {
-		fr_tls_log_error(request, "Failed ingesting message");
+	if (EVP_DigestUpdate(t->evp_md_ctx, msg, msg_len) <= 0) {
+		RPERROR_SSL("Failed ingesting message");
 		return XLAT_ACTION_FAIL;
 	}
 
-	if (EVP_DigestFinal_ex(xt->evp_md_ctx, xt->digest_buff, &digest_len) <= 0) {
-		fr_tls_log_error(request, "Failed finalising message digest");
+	if (EVP_DigestFinal_ex(t->evp_md_ctx, t->digest_buff, &digest_len) <= 0) {
+		RPERROR_SSL("Failed finalising message digest");
 		return XLAT_ACTION_FAIL;
 	}
-	fr_assert((size_t)digest_len == talloc_array_length(xt->digest_buff));
+	fr_assert((size_t)digest_len == talloc_array_length(t->digest_buff));
 
 	/*
 	 *	Then sign the digest
 	 */
-	if (EVP_PKEY_sign(xt->evp_sign_ctx, NULL, &sig_len, xt->digest_buff, (size_t)digest_len) <= 0) {
-		fr_tls_log_error(request, "Failed getting length of digest");
+	if (EVP_PKEY_sign(t->evp_sign_ctx, NULL, &sig_len, t->digest_buff, (size_t)digest_len) <= 0) {
+		RPERROR_SSL("Failed getting length of digest");
 		return XLAT_ACTION_FAIL;
 	}
 
 	MEM(vb = fr_value_box_alloc_null(ctx));
 	MEM(fr_value_box_mem_alloc(vb, &sig, vb, NULL, sig_len, false) == 0);
-	if (EVP_PKEY_sign(xt->evp_sign_ctx, sig, &sig_len, xt->digest_buff, (size_t)digest_len) <= 0) {
-		fr_tls_log_error(request, "Failed signing message digest");
+	if (EVP_PKEY_sign(t->evp_sign_ctx, sig, &sig_len, t->digest_buff, (size_t)digest_len) <= 0) {
+		RPERROR_SSL("Failed signing message digest");
 		talloc_free(vb);
 		return XLAT_ACTION_FAIL;
 	}
@@ -704,10 +667,9 @@ static xlat_action_t cipher_rsa_sign_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	return XLAT_ACTION_DONE;
 }
 
-static xlat_arg_parser_t const cipher_rsa_decrypt_xlat_arg = {
-	.required = true,
-	.concat = true,
-	.type = FR_TYPE_OCTETS
+static xlat_arg_parser_t const cipher_rsa_decrypt_xlat_arg[] = {
+	{ .required = true, .concat = true, .type = FR_TYPE_OCTETS },
+	XLAT_ARG_PARSER_TERMINATOR
 };
 
 /** Decrypt input data
@@ -715,7 +677,7 @@ static xlat_arg_parser_t const cipher_rsa_decrypt_xlat_arg = {
  * Arguments are @verbatim(<ciphertext\>...)@endverbatim
  *
 @verbatim
-%{<inst>_decrypt:<ciphertext>...}
+%<inst>.decrypt(<ciphertext>...)
 @endverbatim
  *
  * If multiple arguments are provided they will be concatenated.
@@ -723,11 +685,10 @@ static xlat_arg_parser_t const cipher_rsa_decrypt_xlat_arg = {
  * @ingroup xlat_functions
  */
 static xlat_action_t cipher_rsa_decrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
-					     request_t *request, UNUSED void const *xlat_inst, void *xlat_thread_inst,
-					     fr_value_box_list_t *in)
+					     xlat_ctx_t const *xctx,
+					     request_t *request, fr_value_box_list_t *in)
 {
-	rlm_cipher_rsa_thread_inst_t	*xt = talloc_get_type_abort(*((void **)xlat_thread_inst),
-								    rlm_cipher_rsa_thread_inst_t);
+	rlm_cipher_rsa_thread_inst_t	*t = talloc_get_type_abort(xctx->mctx->thread, rlm_cipher_rsa_thread_inst_t);
 
 	uint8_t	const			*ciphertext;
 	size_t				ciphertext_len;
@@ -736,7 +697,7 @@ static xlat_action_t cipher_rsa_decrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	size_t				plaintext_len;
 
 	fr_value_box_t			*vb;
-	fr_value_box_t			*in_head = fr_dlist_head(in);
+	fr_value_box_t			*in_head = fr_value_box_list_head(in);
 
 	ciphertext = in_head->vb_octets;
 	ciphertext_len = in_head->vb_length;
@@ -745,16 +706,16 @@ static xlat_action_t cipher_rsa_decrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	 *	Decrypt the ciphertext
 	 */
 	RHEXDUMP3(ciphertext, ciphertext_len, "Ciphertext (%zu bytes)", ciphertext_len);
-	if (EVP_PKEY_decrypt(xt->evp_decrypt_ctx, NULL, &plaintext_len, ciphertext, ciphertext_len) <= 0) {
-		fr_tls_log_error(request, "Failed getting length of cleartext");
+	if (EVP_PKEY_decrypt(t->evp_decrypt_ctx, NULL, &plaintext_len, ciphertext, ciphertext_len) <= 0) {
+		RPERROR_SSL("Failed getting length of cleartext");
 		return XLAT_ACTION_FAIL;
 	}
 
 	MEM(vb = fr_value_box_alloc_null(ctx));
 	MEM(fr_value_box_bstr_alloc(vb, &plaintext, vb, NULL, plaintext_len, true) == 0);
-	if (EVP_PKEY_decrypt(xt->evp_decrypt_ctx, (unsigned char *)plaintext, &plaintext_len,
+	if (EVP_PKEY_decrypt(t->evp_decrypt_ctx, (unsigned char *)plaintext, &plaintext_len,
 			     ciphertext, ciphertext_len) <= 0) {
-		fr_tls_log_error(request, "Failed decrypting ciphertext");
+		RPERROR_SSL("Failed decrypting ciphertext");
 		talloc_free(vb);
 		return XLAT_ACTION_FAIL;
 	}
@@ -766,10 +727,9 @@ static xlat_action_t cipher_rsa_decrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 }
 
 static xlat_arg_parser_t const cipher_rsa_verify_xlat_arg[] = {
-	{ .required = true, .concat = false, .single = true, .variadic = false, .type = FR_TYPE_VOID,
-	  .func = NULL, .uctx = NULL },
-	{ .required = true, .concat = true, .single = false, .variadic = true, .type = FR_TYPE_STRING,
-	  .func = NULL, .uctx = NULL },
+	{ .required = true, .concat = false, .single = true, .type = FR_TYPE_VOID },
+	{ .required = true, .concat = true, .type = FR_TYPE_STRING },
+	{ .variadic = XLAT_ARG_VARIADIC_EMPTY_SQUASH, .concat = true,  .type = FR_TYPE_STRING },
 	XLAT_ARG_PARSER_TERMINATOR
 };
 
@@ -778,7 +738,7 @@ static xlat_arg_parser_t const cipher_rsa_verify_xlat_arg[] = {
  * Arguments are @verbatim(<signature>, <plaintext>...)@endverbatim
  *
 @verbatim
-%(<inst>_verify:<signature> <plaintext>...)
+%<inst>.verify(<signature>, <plaintext>...)
 @endverbatim
  *
  * If multiple arguments are provided (after @verbatim<signature>@endverbatim)
@@ -787,13 +747,11 @@ static xlat_arg_parser_t const cipher_rsa_verify_xlat_arg[] = {
  * @ingroup xlat_functions
  */
 static xlat_action_t cipher_rsa_verify_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
-					    request_t *request, void const *xlat_inst, void *xlat_thread_inst,
-					    fr_value_box_list_t *in)
+				 	    xlat_ctx_t const *xctx,
+					    request_t *request, fr_value_box_list_t *in)
 {
-	rlm_cipher_t const		*inst = talloc_get_type_abort_const(*((void const * const *)xlat_inst),
-									    rlm_cipher_t);
-	rlm_cipher_rsa_thread_inst_t	*xt = talloc_get_type_abort(*((void **)xlat_thread_inst),
-								    rlm_cipher_rsa_thread_inst_t);
+	rlm_cipher_t const		*inst = talloc_get_type_abort_const(xctx->mctx->mi->data, rlm_cipher_t);
+	rlm_cipher_rsa_thread_inst_t	*t = talloc_get_type_abort(xctx->mctx->thread, rlm_cipher_rsa_thread_inst_t);
 
 	uint8_t	const			*sig;
 	size_t				sig_len;
@@ -804,8 +762,10 @@ static xlat_action_t cipher_rsa_verify_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	unsigned int			digest_len = 0;
 
 	fr_value_box_t			*vb;
-	fr_value_box_t			*in_head = fr_dlist_pop_head(in);
+	fr_value_box_t			*in_head = fr_value_box_list_pop_head(in);
 	fr_value_box_t			*args;
+
+	fr_assert(in_head);
 
 	/*
 	 *	Don't auto-cast to octets if the signature
@@ -814,9 +774,9 @@ static xlat_action_t cipher_rsa_verify_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	 */
 	if (in_head->type != FR_TYPE_OCTETS) {
 		REDEBUG("Signature argument wrong type, expected %s, got %s.  "
-			"Use %%{base64_decode:<text>} or %%{hex_decode:<text>} if signature is armoured",
-			fr_table_str_by_value(fr_value_box_type_table, FR_TYPE_OCTETS, "?Unknown?"),
-			fr_table_str_by_value(fr_value_box_type_table, in_head->type, "?Unknown?"));
+			"Use %%base64.decode(<text>) or %%hex_decode(<text>) if signature is armoured",
+			fr_type_to_str(FR_TYPE_OCTETS),
+			fr_type_to_str(in_head->type));
 		return XLAT_ACTION_FAIL;
 	}
 	sig = in_head->vb_octets;
@@ -825,8 +785,11 @@ static xlat_action_t cipher_rsa_verify_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	/*
 	 *	Concat (...) args to get message data
 	 */
-	args = fr_dlist_head(in);
-	if (fr_value_box_list_concat(ctx, args, in, FR_TYPE_STRING, true) < 0) {
+	args = fr_value_box_list_head(in);
+	if (fr_value_box_list_concat_in_place(ctx,
+					      args, in, FR_TYPE_STRING,
+					      FR_VALUE_BOX_LIST_FREE, true,
+					      SIZE_MAX) < 0) {
 		REDEBUG("Failed concatenating arguments to form plaintext");
 		return XLAT_ACTION_FAIL;
 	}
@@ -841,40 +804,40 @@ static xlat_action_t cipher_rsa_verify_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	/*
 	 *	First produce a digest of the message
 	 */
-	if (unlikely(EVP_DigestInit_ex(xt->evp_md_ctx, inst->rsa->sig_digest, NULL) <= 0)) {
-		fr_tls_log_error(request, "Failed initialising message digest");
+	if (unlikely(EVP_DigestInit_ex(t->evp_md_ctx, inst->rsa->sig_digest, NULL) <= 0)) {
+		RPERROR_SSL("Failed initialising message digest");
 		return XLAT_ACTION_FAIL;
 	}
 
-	if (EVP_DigestUpdate(xt->evp_md_ctx, msg, msg_len) <= 0) {
-		fr_tls_log_error(request, "Failed ingesting message");
+	if (EVP_DigestUpdate(t->evp_md_ctx, msg, msg_len) <= 0) {
+		RPERROR_SSL("Failed ingesting message");
 		return XLAT_ACTION_FAIL;
 	}
 
-	if (EVP_DigestFinal_ex(xt->evp_md_ctx, xt->digest_buff, &digest_len) <= 0) {
-		fr_tls_log_error(request, "Failed finalising message digest");
+	if (EVP_DigestFinal_ex(t->evp_md_ctx, t->digest_buff, &digest_len) <= 0) {
+		RPERROR_SSL("Failed finalising message digest");
 		return XLAT_ACTION_FAIL;
 	}
-	fr_assert((size_t)digest_len == talloc_array_length(xt->digest_buff));
+	fr_assert((size_t)digest_len == talloc_array_length(t->digest_buff));
 
 	/*
 	 *	Now check the signature matches what we expected
 	 */
-	switch (EVP_PKEY_verify(xt->evp_verify_ctx, sig, sig_len, xt->digest_buff, (size_t)digest_len)) {
+	switch (EVP_PKEY_verify(t->evp_verify_ctx, sig, sig_len, t->digest_buff, (size_t)digest_len)) {
 	case 1:		/* success (signature valid) */
-		MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_BOOL, NULL, false));
+		MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_BOOL, NULL));
 		vb->vb_bool = true;
 		fr_dcursor_append(out, vb);
 		break;
 
 	case 0:		/* failure (signature not valid) */
-		MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_BOOL, NULL, false));
+		MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_BOOL, NULL));
 		vb->vb_bool = false;
 		fr_dcursor_append(out, vb);
 		break;
 
 	default:
-		fr_tls_log_error(request, "Failed validating signature");
+		RPERROR_SSL("Failed validating signature");
 		return XLAT_ACTION_FAIL;
 	}
 
@@ -882,8 +845,8 @@ static xlat_action_t cipher_rsa_verify_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 }
 
 static xlat_arg_parser_t const cipher_certificate_xlat_args[] = {
-	{ .required = true, .concat = false, .single = true, .variadic = false, .type = FR_TYPE_STRING },
-	{ .required = false, .concat = false, .single = true, .variadic = false, .type = FR_TYPE_STRING }, /* Optional hash for fingerprint mode */
+	{ .required = true, .concat = false, .single = true, .type = FR_TYPE_STRING },
+	{ .required = false, .concat = false, .single = true, .type = FR_TYPE_STRING }, /* Optional hash for fingerprint mode */
 	XLAT_ARG_PARSER_TERMINATOR
 };
 
@@ -892,31 +855,35 @@ static xlat_arg_parser_t const cipher_certificate_xlat_args[] = {
  * Arguments are @verbatim(<digest>)@endverbatim
  *
 @verbatim
-%(<inst>_certificate:fingerprint <digest>)
+%<inst>.certificate(fingerprint, <digest>)
 @endverbatim
  *
  * @ingroup xlat_functions
  */
 static xlat_action_t cipher_fingerprint_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
-					     request_t *request, void const *xlat_inst, UNUSED void *xlat_thread_inst,
-					     fr_value_box_list_t *in)
+				 	     xlat_ctx_t const *xctx,
+					     request_t *request, fr_value_box_list_t *in)
 {
-	rlm_cipher_t const	*inst = talloc_get_type_abort_const(*((void const * const *)xlat_inst), rlm_cipher_t);
-	char const		*md_name;
-	EVP_MD const		*md;
-	size_t			md_len;
-	fr_value_box_t		*vb;
-	uint8_t			*digest;
+	rlm_cipher_t const		*inst = talloc_get_type_abort_const(xctx->mctx->mi->data, rlm_cipher_t);
+	char const			*md_name;
+	EVP_MD const			*md;
+	unsigned int			md_len;
+	fr_value_box_t			*vb;
+	uint8_t				*digest;
 
-	if (!fr_dlist_next(in, fr_dlist_head(in))) {
-		REDEBUG("Missing digest argument");
-		return XLAT_ACTION_FAIL;
+	{
+		fr_value_box_t *digest_vb = fr_value_box_list_next(in, fr_value_box_list_head(in));
+
+		if (!digest_vb || fr_type_is_null(digest_vb->type)) {
+			REDEBUG("Missing digest argument");
+			return XLAT_ACTION_FAIL;
+		}
+
+		/*
+		 *	Second arg...
+		 */
+		md_name = digest_vb->vb_strvalue;
 	}
-
-	/*
-	 *	Second arg...
-	 */
-	md_name = ((fr_value_box_t *)fr_dlist_next(in, fr_dlist_head(in)))->vb_strvalue;
 	md = EVP_get_digestbyname(md_name);
 	if (!md) {
 		REDEBUG("Specified digest \"%s\" is not a valid digest type", md_name);
@@ -927,8 +894,8 @@ static xlat_action_t cipher_fingerprint_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	MEM(vb = fr_value_box_alloc_null(ctx));
 	MEM(fr_value_box_mem_alloc(vb, &digest, vb, NULL, md_len, false) == 0);
 
-	if (X509_digest(inst->rsa->x509_certificate_file, md, digest, (unsigned int *)&md_len) != 1) {
-		fr_tls_log_error(request, "Failed calculating certificate fingerprint");
+	if (X509_digest(inst->rsa->x509_certificate_file, md, digest, &md_len) != 1) {
+		RPERROR_SSL("Failed calculating certificate fingerprint");
 		talloc_free(vb);
 		return XLAT_ACTION_FAIL;
 	}
@@ -941,27 +908,27 @@ static xlat_action_t cipher_fingerprint_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 /** Return the serial of the public certificate
  *
 @verbatim
-%(<inst>_certificate:serial)
+%<inst>.certificate(serial)
 @endverbatim
  *
  * @ingroup xlat_functions
  */
 static xlat_action_t cipher_serial_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
-					request_t *request, void const *xlat_inst, UNUSED void *xlat_thread_inst,
-					UNUSED fr_value_box_list_t *in)
+				 	xlat_ctx_t const *xctx,
+					request_t *request, UNUSED fr_value_box_list_t *in)
 {
-	rlm_cipher_t const	*inst = talloc_get_type_abort_const(*((void const * const *)xlat_inst), rlm_cipher_t);
+	rlm_cipher_t const	*inst = talloc_get_type_abort_const(xctx->mctx->mi->data, rlm_cipher_t);
 	ASN1_INTEGER const	*serial;
     	fr_value_box_t		*vb;
 
 	serial = X509_get0_serialNumber(inst->rsa->x509_certificate_file);
 	if (!serial) {
-		fr_tls_log_error(request, "Failed retrieving certificate serial");
+		RPERROR_SSL("Failed retrieving certificate serial");
 		return XLAT_ACTION_FAIL;
 	}
 
 	MEM(vb = fr_value_box_alloc_null(ctx));
-	MEM(fr_value_box_memdup(vb, vb, NULL, serial->data, serial->length, true) == 0);
+	MEM(fr_value_box_memdup(vb, vb, NULL, ASN1_STRING_get0_data(serial), fr_tls_asn1_string_length(serial), true) == 0);
 
 	fr_dcursor_append(out, vb);
 
@@ -969,11 +936,11 @@ static xlat_action_t cipher_serial_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 }
 
 static xlat_action_t cipher_certificate_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
-					     request_t *request, void const *xlat_inst, void *xlat_thread_inst,
-					     fr_value_box_list_t *in)
+				 	     xlat_ctx_t const *xctx,
+					     request_t *request, fr_value_box_list_t *in)
 {
-	rlm_cipher_t const	*inst = talloc_get_type_abort_const(*((void const * const *)xlat_inst), rlm_cipher_t);
-	char const		*attribute = ((fr_value_box_t *)fr_dlist_head(in))->vb_strvalue;
+	rlm_cipher_t const	*inst = talloc_get_type_abort_const(xctx->mctx->mi->data, rlm_cipher_t);
+	char const		*attribute = fr_value_box_list_head(in)->vb_strvalue;
     	fr_value_box_t		*vb;
 
 	switch (fr_table_value_by_str(cert_attributes, attribute, CIPHER_CERT_ATTR_UNKNOWN)) {
@@ -982,20 +949,22 @@ static xlat_action_t cipher_certificate_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 		return XLAT_ACTION_FAIL;
 
 	case CIPHER_CERT_ATTR_FINGERPRINT:
-		return cipher_fingerprint_xlat(ctx, out, request, xlat_inst, xlat_thread_inst, in);
+		return cipher_fingerprint_xlat(ctx, out, xctx, request, in);
 
 	case CIPHER_CERT_ATTR_SERIAL:
-		return cipher_serial_xlat(ctx, out, request, xlat_inst, xlat_thread_inst, in);
+		return cipher_serial_xlat(ctx, out, xctx, request, in);
 
 	case CIPHER_CERT_ATTR_NOT_BEFORE:
-		MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_DATE, NULL, true));
+		MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_DATE, NULL));
 		vb->vb_date = inst->rsa->not_before;
+		vb->tainted = true;
 		fr_dcursor_append(out, vb);
 		return XLAT_ACTION_DONE;
 
 	case CIPHER_CERT_ATTR_NOT_AFTER:
-		MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_DATE, NULL, true));
+		MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_DATE, NULL));
 		vb->vb_date = inst->rsa->not_after;
+		vb->tainted = true;
 		fr_dcursor_append(out, vb);
 		return XLAT_ACTION_DONE;
 	}
@@ -1025,34 +994,10 @@ static int _evp_md_ctx_free(EVP_MD_CTX *evp_md_ctx)
 	return 0;
 }
 
-/** Boilerplate to copy the pointer to the main module thread instance into xlat thread instance data
- *
- */
-static int cipher_xlat_thread_instantiate(UNUSED void *xlat_inst, void *xlat_thread_inst,
-					  UNUSED xlat_exp_t const *exp, void *uctx)
-{
-	rlm_cipher_t			*inst = talloc_get_type_abort(uctx, rlm_cipher_t);
-
-	*((rlm_cipher_rsa_thread_inst_t **)xlat_thread_inst) =
-		talloc_get_type_abort(module_thread_by_data(inst)->data, rlm_cipher_rsa_thread_inst_t);
-
-	return 0;
-}
-
-/** Boilerplate to copy the pointer to the main module config into the xlat instance data
- *
- */
-static int cipher_xlat_instantiate(void *xlat_inst, UNUSED xlat_exp_t const *exp, void *uctx)
-{
-	*((rlm_cipher_t **)xlat_inst) = talloc_get_type_abort(uctx, rlm_cipher_t);
-
-	return 0;
-}
-
 static int cipher_rsa_padding_params_set(EVP_PKEY_CTX *evp_pkey_ctx, cipher_rsa_t const *rsa_inst)
 {
 	if (unlikely(EVP_PKEY_CTX_set_rsa_padding(evp_pkey_ctx, rsa_inst->padding)) <= 0) {
-		fr_tls_log_strerror_printf(NULL);
+		fr_tls_strerror_printf(NULL);
 		PERROR("%s: Failed setting RSA padding type", __FUNCTION__);
 		return -1;
 	}
@@ -1060,7 +1005,6 @@ static int cipher_rsa_padding_params_set(EVP_PKEY_CTX *evp_pkey_ctx, cipher_rsa_
 	switch (rsa_inst->padding) {
 	case RSA_NO_PADDING:
 	case RSA_X931_PADDING:
-	case RSA_SSLV23_PADDING:
 	case RSA_PKCS1_PADDING:
 		return 0;
 
@@ -1069,20 +1013,20 @@ static int cipher_rsa_padding_params_set(EVP_PKEY_CTX *evp_pkey_ctx, cipher_rsa_
 	 */
 	case RSA_PKCS1_OAEP_PADDING:
 		if (unlikely(EVP_PKEY_CTX_set_rsa_oaep_md(evp_pkey_ctx, rsa_inst->oaep->oaep_digest) <= 0)) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed setting OAEP digest", __FUNCTION__);
 			return -1;
 		}
 
 		if (unlikely(EVP_PKEY_CTX_set_rsa_mgf1_md(evp_pkey_ctx, rsa_inst->oaep->mgf1_digest) <= 0)) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed setting MGF1 digest", __FUNCTION__);
 			return -1;
 		}
 
 		if (rsa_inst->oaep->label) {
 			char	*label;
-			size_t	label_len = talloc_array_length(rsa_inst->oaep->label) - 1;
+			size_t	label_len = talloc_strlen(rsa_inst->oaep->label);
 
 			/*
 			 *	OpenSSL does not duplicate the label when
@@ -1092,8 +1036,8 @@ static int cipher_rsa_padding_params_set(EVP_PKEY_CTX *evp_pkey_ctx, cipher_rsa_
 			 *	idiots...
 			 */
 			MEM(label = talloc_bstrndup(evp_pkey_ctx, rsa_inst->oaep->label, label_len));
-		    	if (unlikely(EVP_PKEY_CTX_set0_rsa_oaep_label(evp_pkey_ctx, label, label_len) <= 0)) {
-	   			fr_tls_log_strerror_printf(NULL);
+		    	if (unlikely(EVP_PKEY_CTX_set0_rsa_oaep_label(evp_pkey_ctx, label, (int)label_len) <= 0)) {
+	   			fr_tls_strerror_printf(NULL);
 				PERROR("%s: Failed setting OAEP padding label", __FUNCTION__);
 				OPENSSL_free(label);
 				return -1;
@@ -1116,11 +1060,10 @@ static int cipher_rsa_padding_params_set(EVP_PKEY_CTX *evp_pkey_ctx, cipher_rsa_
  *
  * @return 0.
  */
-static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *instance,
-					 UNUSED fr_event_list_t *el, void *thread)
+static int cipher_rsa_thread_instantiate(module_thread_inst_ctx_t const *mctx)
 {
-	rlm_cipher_t const		*inst = talloc_get_type_abort(instance, rlm_cipher_t);
-	rlm_cipher_rsa_thread_inst_t	*ti = thread;
+	rlm_cipher_t const		*inst = talloc_get_type_abort(mctx->mi->data, rlm_cipher_t);
+	rlm_cipher_rsa_thread_inst_t	*ti = talloc_get_type_abort(mctx->thread, rlm_cipher_rsa_thread_inst_t);
 
 	/*
 	 *	Pre-allocate different contexts for the different operations
@@ -1134,7 +1077,7 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 		 */
 		ti->evp_encrypt_ctx = EVP_PKEY_CTX_new(inst->rsa->certificate_file, NULL);
 		if (!ti->evp_encrypt_ctx) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed allocating encrypt EVP_PKEY_CTX", __FUNCTION__);
 			return -1;
 		}
@@ -1146,9 +1089,9 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 		 *	Configure encrypt
 		 */
 		if (unlikely(EVP_PKEY_encrypt_init(ti->evp_encrypt_ctx) <= 0)) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed initialising encrypt EVP_PKEY_CTX", __FUNCTION__);
-			return XLAT_ACTION_FAIL;
+			return -1;
 		}
 		if (unlikely(cipher_rsa_padding_params_set(ti->evp_encrypt_ctx, inst->rsa) < 0)) {
 			ERROR("%s: Failed setting padding for encrypt EVP_PKEY_CTX", __FUNCTION__);
@@ -1160,7 +1103,7 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 		 */
 		ti->evp_verify_ctx = EVP_PKEY_CTX_new(inst->rsa->certificate_file, NULL);
 		if (!ti->evp_verify_ctx) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed allocating verify EVP_PKEY_CTX", __FUNCTION__);
 			return -1;
 		}
@@ -1172,9 +1115,9 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 		 *	Configure verify
 		 */
 		if (unlikely(EVP_PKEY_verify_init(ti->evp_verify_ctx) <= 0)) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed initialising verify EVP_PKEY_CTX", __FUNCTION__);
-			return XLAT_ACTION_FAIL;
+			return -1;
 		}
 
 		/*
@@ -1188,9 +1131,9 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 		}
 
 		if (unlikely(EVP_PKEY_CTX_set_signature_md(ti->evp_verify_ctx, inst->rsa->sig_digest)) <= 0) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed setting signature digest type", __FUNCTION__);
-			return XLAT_ACTION_FAIL;
+			return -1;
 		}
 	}
 
@@ -1200,7 +1143,7 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 		 */
 		ti->evp_decrypt_ctx = EVP_PKEY_CTX_new(inst->rsa->private_key_file, NULL);
 		if (!ti->evp_decrypt_ctx) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed allocating decrypt EVP_PKEY_CTX", __FUNCTION__);
 			return -1;
 		}
@@ -1212,9 +1155,9 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 		 *	Configure decrypt
 		 */
 		if (unlikely(EVP_PKEY_decrypt_init(ti->evp_decrypt_ctx) <= 0)) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed initialising decrypt EVP_PKEY_CTX", __FUNCTION__);
-			return XLAT_ACTION_FAIL;
+			return -1;
 		}
 		if (unlikely(cipher_rsa_padding_params_set(ti->evp_decrypt_ctx, inst->rsa) < 0)) {
 			ERROR("%s: Failed setting padding for decrypt EVP_PKEY_CTX", __FUNCTION__);
@@ -1226,7 +1169,7 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 		 */
 		ti->evp_sign_ctx = EVP_PKEY_CTX_new(inst->rsa->private_key_file, NULL);
 		if (!ti->evp_sign_ctx) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed allocating sign EVP_PKEY_CTX", __FUNCTION__);
 			return -1;
 		}
@@ -1238,9 +1181,9 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 		 *	Configure sign
 		 */
 		if (unlikely(EVP_PKEY_sign_init(ti->evp_sign_ctx) <= 0)) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed initialising sign EVP_PKEY_CTX", __FUNCTION__);
-			return XLAT_ACTION_FAIL;
+			return -1;
 		}
 
 		/*
@@ -1254,9 +1197,9 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 		}
 
 		if (unlikely(EVP_PKEY_CTX_set_signature_md(ti->evp_sign_ctx, inst->rsa->sig_digest)) <= 0) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed setting signature digest type", __FUNCTION__);
-			return XLAT_ACTION_FAIL;
+			return -1;
 		}
 
 		/*
@@ -1264,7 +1207,7 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 		 */
 		ti->evp_md_ctx = EVP_MD_CTX_create();
 		if (!ti->evp_md_ctx) {
-			fr_tls_log_strerror_printf(NULL);
+			fr_tls_strerror_printf(NULL);
 			PERROR("%s: Failed allocating EVP_MD_CTX", __FUNCTION__);
 			return -1;
 		}
@@ -1277,16 +1220,16 @@ static int cipher_rsa_thread_instantiate(UNUSED CONF_SECTION const *conf, void *
 	return 0;
 }
 
-static int mod_thread_instantiate(CONF_SECTION const *conf, void *instance,
-				  fr_event_list_t *el, void *thread)
+static int mod_thread_instantiate(module_thread_inst_ctx_t const *mctx)
 {
-	rlm_cipher_t	*inst = talloc_get_type_abort(instance, rlm_cipher_t);
+	rlm_cipher_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_cipher_t);
 
 	switch (inst->type) {
 	case RLM_CIPHER_TYPE_RSA:
-		talloc_set_type(thread, rlm_cipher_rsa_thread_inst_t);
-		return cipher_rsa_thread_instantiate(conf, instance, el, thread);
+		talloc_set_type(mctx->thread, rlm_cipher_rsa_thread_inst_t);
+		return cipher_rsa_thread_instantiate(mctx);
 
+	case RLM_CIPHER_TYPE_SYMMETRIC:
 	case RLM_CIPHER_TYPE_INVALID:
 		fr_assert(0);
 	}
@@ -1300,12 +1243,10 @@ static int mod_thread_instantiate(CONF_SECTION const *conf, void *instance,
  *	to external databases, read configuration files, set up
  *	dictionary entries, etc.
  */
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
+static int mod_bootstrap(module_inst_ctx_t const *mctx)
 {
-	rlm_cipher_t	*inst = talloc_get_type_abort(instance, rlm_cipher_t);
-
-	inst->xlat_name = cf_section_name2(conf);
-	if (!inst->xlat_name) inst->xlat_name = cf_section_name1(conf);
+	rlm_cipher_t const	*inst = talloc_get_type_abort(mctx->mi->data, rlm_cipher_t);
+	CONF_SECTION		*conf = mctx->mi->conf;
 
 	switch (inst->type) {
 	case RLM_CIPHER_TYPE_RSA:
@@ -1321,46 +1262,22 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 		}
 
 		if (inst->rsa->private_key_file) {
-			char *xlat_name;
 			xlat_t *xlat;
 
 			/*
 			 *	Register decrypt xlat
 			 */
-			xlat_name = talloc_asprintf(inst, "%s_decrypt", inst->xlat_name);
-			xlat = xlat_register(inst, xlat_name, cipher_rsa_decrypt_xlat, false);
-			xlat_func_mono(xlat, &cipher_rsa_decrypt_xlat_arg);
-			xlat_async_instantiate_set(xlat, cipher_xlat_instantiate,
-						   rlm_cipher_t *,
-						   NULL,
-						   inst);
-			xlat_async_thread_instantiate_set(xlat,
-							  cipher_xlat_thread_instantiate,
-							  rlm_cipher_rsa_thread_inst_t *,
-							  NULL,
-							  inst);
-			talloc_free(xlat_name);
+			xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, "decrypt", cipher_rsa_decrypt_xlat, FR_TYPE_STRING);
+			xlat_func_args_set(xlat, cipher_rsa_decrypt_xlat_arg);
 
 			/*
 			 *	Verify sign xlat
 			 */
-			xlat_name = talloc_asprintf(inst, "%s_verify", inst->xlat_name);
-			xlat = xlat_register(inst, xlat_name, cipher_rsa_verify_xlat, false);
-			xlat_func_args(xlat, cipher_rsa_verify_xlat_arg);
-			xlat_async_instantiate_set(xlat, cipher_xlat_instantiate,
-						   rlm_cipher_t *,
-						   NULL,
-						   inst);
-			xlat_async_thread_instantiate_set(xlat,
-							  cipher_xlat_thread_instantiate,
-							  rlm_cipher_rsa_thread_inst_t *,
-							  NULL,
-							  inst);
-			talloc_free(xlat_name);
+			xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, "verify", cipher_rsa_verify_xlat, FR_TYPE_BOOL);
+			xlat_func_args_set(xlat, cipher_rsa_verify_xlat_arg);
 		}
 
 		if (inst->rsa->certificate_file) {
-			char *xlat_name;
 			xlat_t *xlat;
 
 			/*
@@ -1373,7 +1290,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 			if (inst->rsa->private_key_file && inst->rsa->x509_certificate_file) {
 				if (X509_check_private_key(inst->rsa->x509_certificate_file,
 							   inst->rsa->private_key_file) == 0) {
-					fr_tls_log_strerror_printf(NULL);
+					fr_tls_strerror_printf(NULL);
 					cf_log_perr(conf, "Private key does not match the certificate public key");
 					return -1;
 				}
@@ -1382,48 +1299,21 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 			/*
 			 *	Register encrypt xlat
 			 */
-			xlat_name = talloc_asprintf(inst, "%s_encrypt", inst->xlat_name);
-			xlat = xlat_register(inst, xlat_name, cipher_rsa_encrypt_xlat, false);
-			xlat_func_mono(xlat, &cipher_rsa_encrypt_xlat_arg);
-			xlat_async_instantiate_set(xlat, cipher_xlat_instantiate,
-						   rlm_cipher_t *,
-						   NULL,
-						   inst);
-			xlat_async_thread_instantiate_set(xlat, cipher_xlat_thread_instantiate,
-							  rlm_cipher_rsa_thread_inst_t *,
-							  NULL,
-							  inst);
-			talloc_free(xlat_name);
+			xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, "encrypt", cipher_rsa_encrypt_xlat, FR_TYPE_OCTETS);
+			xlat_func_args_set(xlat, cipher_rsa_encrypt_xlat_arg);
 
 			/*
 			 *	Register sign xlat
 			 */
-			xlat_name = talloc_asprintf(inst, "%s_sign", inst->xlat_name);
-			xlat = xlat_register(inst, xlat_name, cipher_rsa_sign_xlat, false);
-			xlat_func_mono(xlat, &cipher_rsa_sign_xlat_arg);
-			xlat_async_instantiate_set(xlat, cipher_xlat_instantiate,
-						   rlm_cipher_t *,
-						   NULL,
-						   inst);
-			xlat_async_thread_instantiate_set(xlat, cipher_xlat_thread_instantiate,
-							  rlm_cipher_rsa_thread_inst_t *,
-							  NULL,
-							  inst);
-			talloc_free(xlat_name);
+			xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, "sign", cipher_rsa_sign_xlat, FR_TYPE_OCTETS);
+			xlat_func_args_set(xlat, cipher_rsa_sign_xlat_arg);
 
-			xlat_name = talloc_asprintf(inst, "%s_certificate", inst->xlat_name);
-			xlat = xlat_register(inst, xlat_name, cipher_certificate_xlat, false);
-			xlat_func_args(xlat, cipher_certificate_xlat_args);
-			xlat_async_instantiate_set(xlat, cipher_xlat_instantiate,
-						   rlm_cipher_t *,
-						   NULL,
-						   inst);
-			xlat_async_thread_instantiate_set(xlat,
-							  cipher_xlat_thread_instantiate,
-							  rlm_cipher_rsa_thread_inst_t *,
-							  NULL,
-							  inst);
-			talloc_free(xlat_name);
+			/*
+			 *	FIXME: These should probably be split into separate xlats
+			 *	so we can optimise for return types.
+			 */
+			xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, "certificate", cipher_certificate_xlat, FR_TYPE_VOID);
+			xlat_func_args_set(xlat, cipher_certificate_xlat_args);
 		}
 		break;
 
@@ -1434,7 +1324,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 	default:
 		fr_assert(0);
 		return -1;
-	};
+	}
 
 	return 0;
 }
@@ -1444,18 +1334,19 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern module_t rlm_cipher;
-module_t rlm_cipher = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "cipher",
-	.type			= RLM_TYPE_THREAD_SAFE,
-	.inst_size		= sizeof(rlm_cipher_t),
-	.thread_inst_size	= sizeof(rlm_cipher_rsa_thread_inst_t),
-	.config			= module_config,
-	.bootstrap		= mod_bootstrap,
-	.thread_instantiate	= mod_thread_instantiate,
+extern module_rlm_t rlm_cipher;
+module_rlm_t rlm_cipher = {
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "cipher",
+		.inst_size		= sizeof(rlm_cipher_t),
+		.thread_inst_size	= sizeof(rlm_cipher_rsa_thread_inst_t),
+		.config			= module_config,
+		.bootstrap		= mod_bootstrap,
+		.thread_instantiate	= mod_thread_instantiate
+	}
 };

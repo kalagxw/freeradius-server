@@ -1,5 +1,5 @@
 /*
- * @copyright (c) 2016, Network RADIUS SARL (license@networkradius.com)
+ * @copyright (c) 2016, Network RADIUS SAS (license@networkradius.com)
  *  All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -9,7 +9,7 @@
  *    * Redistributions in binary form must reproduce the above copyright
  *      notice, this list of conditions and the following disclaimer in the
  *      documentation and/or other materials provided with the distribution.
- *    * Neither the name of Network RADIUS SARL nor the
+ *    * Neither the name of Network RADIUS SAS nor the
  *      names of its contributors may be used to endorse or promote products
  *      derived from this software without specific prior written permission.
  *
@@ -24,14 +24,12 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-#define LOG_PREFIX "rlm_sigtran - "
+#define LOG_PREFIX "sigtran"
 
 #include <freeradius-devel/server/base.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/protocol/eap/aka-sim/dictionary.h>
-#include <freeradius-devel/protocol/eap/aka-sim/dictionary.h>
-#include <freeradius-devel/unlang/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 
 #include "attrs.h"
 #include "sigtran.h"
@@ -178,7 +176,7 @@ int sigtran_client_thread_register(fr_event_list_t *el)
 	 *	and resume requests which are
 	 *	waiting.
 	 */
-	if (fr_event_fd_insert(NULL, el, req_pipe[0], _sigtran_pipe_read, NULL, _sigtran_pipe_error, NULL) < 0) {
+	if (fr_event_fd_insert(NULL, NULL, el, req_pipe[0], _sigtran_pipe_read, NULL, _sigtran_pipe_error, NULL) < 0) {
 		ERROR("worker - Failed listening on osmocom pipe");
 		goto error;
 	}
@@ -270,23 +268,17 @@ int sigtran_client_link_down(sigtran_conn_t const **conn)
 	return 0;
 }
 
-static void sigtran_client_signal(UNUSED module_ctx_t const *mctx, UNUSED request_t *request,
-				  void *rctx, fr_state_signal_t action)
+static void sigtran_client_signal(module_ctx_t const *mctx, UNUSED request_t *request, UNUSED fr_signal_t action)
 {
-	sigtran_transaction_t	*txn = talloc_get_type_abort(rctx, sigtran_transaction_t);
-
-	/*
-	 *	Ignore DUP signals, along with all others.
-	 */
-	if (action != FR_SIGNAL_CANCEL) return;
+	sigtran_transaction_t	*txn = talloc_get_type_abort(mctx->rctx, sigtran_transaction_t);
 
 	txn->ctx.defunct = true;	/* Mark the transaction up as needing to be freed */
 	txn->ctx.request = NULL;	/* remove the link to the (now dead) request */
 }
 
-static unlang_action_t sigtran_client_map_resume(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request, void *rctx)
+static unlang_action_t sigtran_client_map_resume(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	sigtran_transaction_t			*txn = talloc_get_type_abort(rctx, sigtran_transaction_t);
+	sigtran_transaction_t			*txn = talloc_get_type_abort(mctx->rctx, sigtran_transaction_t);
 	rlm_rcode_t				rcode;
 	fr_assert(request == txn->ctx.request);
 
@@ -314,19 +306,19 @@ static unlang_action_t sigtran_client_map_resume(rlm_rcode_t *p_result, UNUSED m
 				MEM(vp = fr_pair_afrom_da(request->control_ctx, attr_eap_aka_sim_rand));
 				MEM(fr_pair_value_memdup_buffer(vp, vec->sim.rand, true) == 0);
 				TALLOC_FREE(vec->sim.rand);
-				RDEBUG2("&control.%pP", vp);
+				RDEBUG2("control.%pP", vp);
 				fr_pair_append(&request->control_pairs, vp);
 
 				MEM(vp = fr_pair_afrom_da(request->control_ctx, attr_eap_aka_sim_sres));
 				MEM(fr_pair_value_memdup_buffer(vp, vec->sim.sres, true) == 0);
 				TALLOC_FREE(vec->sim.sres);
-				RDEBUG2("&control.%pP", vp);
+				RDEBUG2("control.%pP", vp);
 				fr_pair_append(&request->control_pairs, vp);
 
 				MEM(vp = fr_pair_afrom_da(request->control_ctx, attr_eap_aka_sim_kc));
 				MEM(fr_pair_value_memdup_buffer(vp, vec->sim.kc, true) == 0);
 				TALLOC_FREE(vec->sim.kc);
-				RDEBUG2("&control.%pP", vp);
+				RDEBUG2("control.%pP", vp);
 				fr_pair_append(&request->control_pairs, vp);
 				REXDENT();
 
@@ -345,31 +337,31 @@ static unlang_action_t sigtran_client_map_resume(rlm_rcode_t *p_result, UNUSED m
 				MEM(vp = fr_pair_afrom_da(request->control_ctx, attr_eap_aka_sim_rand));
 				MEM(fr_pair_value_memdup_buffer(vp, vec->umts.rand, true) == 0);
 				TALLOC_FREE(vec->umts.rand);
-				RDEBUG2("&control.%pP", vp);
+				RDEBUG2("control.%pP", vp);
 				fr_pair_append(&request->control_pairs, vp);
 
 				MEM(vp = fr_pair_afrom_da(request->control_ctx, attr_eap_aka_sim_xres));
 				MEM(fr_pair_value_memdup_buffer(vp, vec->umts.xres, true) == 0);
 				TALLOC_FREE(vec->umts.xres);
-				RDEBUG2("&control.%pP", vp);
+				RDEBUG2("control.%pP", vp);
 				fr_pair_append(&request->control_pairs, vp);
 
 				MEM(vp = fr_pair_afrom_da(request->control_ctx, attr_eap_aka_sim_ck));
 				MEM(fr_pair_value_memdup_buffer(vp, vec->umts.ck, true) == 0);
 				TALLOC_FREE(vec->umts.ck);
-				RDEBUG2("&control.%pP", vp);
+				RDEBUG2("control.%pP", vp);
 				fr_pair_append(&request->control_pairs, vp);
 
 				MEM(vp = fr_pair_afrom_da(request->control_ctx, attr_eap_aka_sim_ik));
 				MEM(fr_pair_value_memdup_buffer(vp, vec->umts.ik, true) == 0);
 				TALLOC_FREE(vec->umts.ik);
-				RDEBUG2("&control.%pP", vp);
+				RDEBUG2("control.%pP", vp);
 				fr_pair_append(&request->control_pairs, vp);
 
 				MEM(vp = fr_pair_afrom_da(request->control_ctx, attr_eap_aka_sim_autn));
 				MEM(fr_pair_value_memdup_buffer(vp, vec->umts.authn, true) == 0);
 				TALLOC_FREE(vec->umts.authn);
-				RDEBUG2("&control.%pP", vp);
+				RDEBUG2("control.%pP", vp);
 				fr_pair_append(&request->control_pairs, vp);
 				REXDENT();
 
@@ -399,7 +391,7 @@ static unlang_action_t sigtran_client_map_resume(rlm_rcode_t *p_result, UNUSED m
 	}
 	talloc_free(txn);
 
-	RETURN_MODULE_RCODE(rcode);
+	RETURN_UNLANG_RCODE(rcode);
 }
 
 /** Create a MAP_SEND_AUTH_INFO request
@@ -410,7 +402,7 @@ static unlang_action_t sigtran_client_map_resume(rlm_rcode_t *p_result, UNUSED m
  * @param conn		current connection.
  * @param fd		file descriptor on which the transaction is done
  */
-unlang_action_t sigtran_client_map_send_auth_info(rlm_rcode_t *p_result, rlm_sigtran_t const *inst, request_t *request,
+unlang_action_t sigtran_client_map_send_auth_info(unlang_result_t *p_result, rlm_sigtran_t const *inst, request_t *request,
 				  		  sigtran_conn_t const *conn, int fd)
 {
 	sigtran_transaction_t			*txn;
@@ -430,7 +422,7 @@ unlang_action_t sigtran_client_map_send_auth_info(rlm_rcode_t *p_result, rlm_sig
 		ERROR("Failed retrieving version");
 	error:
 		talloc_free(txn);
-		RETURN_MODULE_FAIL;
+		RETURN_UNLANG_FAIL;
 	}
 
 	switch (req->version) {
@@ -451,7 +443,7 @@ unlang_action_t sigtran_client_map_send_auth_info(rlm_rcode_t *p_result, rlm_sig
 		goto error;
 	}
 
-	len = talloc_array_length(imsi) - 1;
+	len = talloc_strlen(imsi);
 	if ((len != 16) && (len != 15)) {
 		REDEBUG("IMSI must be 15 or 16 digits got %zu digits", len);
 		goto error;
@@ -462,11 +454,11 @@ unlang_action_t sigtran_client_map_send_auth_info(rlm_rcode_t *p_result, rlm_sig
 		goto error;
 	}
 
-	if (RDEBUG_ENABLED2) {
-		RDEBUG2("Sending MAPv%u request with IMSI \"%pV\"", req->version, fr_box_strvalue_buffer(imsi));
-	} else if (RDEBUG_ENABLED3){
+	if (RDEBUG_ENABLED3) {
 		RDEBUG3("Sending MAPv%u request with IMSI \"%pV\" (TBCD %pV)",
 			req->version, fr_box_strvalue_buffer(imsi), fr_box_octets_buffer(req->imsi));
+	} else if (RDEBUG_ENABLED2) {
+		RDEBUG2("Sending MAPv%u request with IMSI \"%pV\"", req->version, fr_box_strvalue_buffer(imsi));
 	}
 
 	/*
@@ -477,5 +469,5 @@ unlang_action_t sigtran_client_map_send_auth_info(rlm_rcode_t *p_result, rlm_sig
 		goto error;
 	}
 
-	return unlang_module_yield(request, sigtran_client_map_resume, sigtran_client_signal, txn);
+	return unlang_module_yield(request, sigtran_client_map_resume, sigtran_client_signal, FR_SIGNAL_ALLOW(FR_SIGNAL_CANCEL), txn);
 }

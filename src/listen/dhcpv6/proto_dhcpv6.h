@@ -21,7 +21,7 @@
  * @file proto_dhcpv6.h
  * @brief Structures for the DHCPV6 protocol
  *
- * @copyright 2020 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2020 Network RADIUS SAS (legal@networkradius.com)
  */
 #include <freeradius-devel/io/master.h>
 #include <freeradius-devel/dhcpv6/dhcpv6.h>
@@ -32,7 +32,11 @@
 typedef struct {
 	fr_io_instance_t		io;				//!< wrapper for IO abstraction
 
-	char				**allowed_types;		//!< names for for 'type = ...'
+	char const			*server_id_str;			//!< string value
+	fr_pair_t			*server_id_pair;		//!< value-pair of the server ID
+	uint8_t const			*server_id;			//!< encoded value
+
+	char const			**allowed_types;		//!< names for for 'type = ...'
 	bool				allowed[FR_DHCPV6_CODE_MAX];	//!< indexed by value
 
 	uint32_t			max_packet_size;		//!< for message ring buffer.

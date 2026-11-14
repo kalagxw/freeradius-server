@@ -22,6 +22,7 @@ CREATE TABLE radacct (
 	nasportid		VARCHAR(32),
 	nasporttype		VARCHAR(32),
 	acctstarttime		TIMESTAMP WITH TIME ZONE,
+	acctupdatetime		TIMESTAMP WITH TIME ZONE,
 	acctstoptime		TIMESTAMP WITH TIME ZONE,
 	acctsessiontime		NUMERIC(19),
 	acctauthentic		VARCHAR(32),
@@ -39,8 +40,6 @@ CREATE TABLE radacct (
 	framedipv6prefix	VARCHAR(45),
 	framedinterfaceid	VARCHAR(44),
 	delegatedipv6prefix	VARCHAR(45),
-	acctstartdelay		NUMERIC(12),
-	acctstopdelay		NUMERIC(12),
 	class 			VARCHAR(64)
 );
 
@@ -77,6 +76,7 @@ CREATE TABLE radcheck (
 	op		VARCHAR(2) NOT NULL,
 	value		VARCHAR(40)
 );
+CREATE INDEX radcheck_idx1 ON radcheck(username);
 CREATE SEQUENCE radcheck_seq START WITH 1 INCREMENT BY 1;
 
 -- Trigger to emulate a serial # on the primary key
@@ -100,31 +100,55 @@ CREATE TABLE radgroupcheck (
 	op		CHAR(2) NOT NULL,
 	value		VARCHAR(40)
 );
+CREATE INDEX radgroupcheck_idx1 ON radgroupcheck(groupname);
 CREATE SEQUENCE radgroupcheck_seq START WITH 1 INCREMENT BY 1;
+
+-- Trigger to emulate a serial # on the primary key
+CREATE OR REPLACE TRIGGER radgroupcheck_serialnumber
+	BEFORE INSERT OR UPDATE OF id ON radgroupcheck
+	FOR EACH ROW
+	BEGIN
+		if ( :new.id = 0 or :new.id is null ) then
+			SELECT radgroupcheck_seq.nextval into :new.id from dual;
+		end if;
+	END;
+/
 
 --
 -- Table structure for table 'radgroupreply'
 --
 CREATE TABLE radgroupreply (
 	id		INT PRIMARY KEY,
-	GroupName	VARCHAR(20) UNIQUE NOT NULL,
-	Attribute	VARCHAR(64),
+	groupname	VARCHAR(20) UNIQUE NOT NULL,
+	attribute	VARCHAR(64),
 	op		CHAR(2) NOT NULL,
-	Value		VARCHAR(40)
+	value		VARCHAR(40)
 );
+CREATE INDEX radgroupreply_idx1 ON radgroupreply(groupname);
 CREATE SEQUENCE radgroupreply_seq START WITH 1 INCREMENT BY 1;
+
+-- Trigger to emulate a serial # on the primary key
+CREATE OR REPLACE TRIGGER radgroupreply_serialnumber
+	BEFORE INSERT OR UPDATE OF id ON radgroupreply
+	FOR EACH ROW
+	BEGIN
+		if ( :new.id = 0 or :new.id is null ) then
+			SELECT radgroupreply_seq.nextval into :new.id from dual;
+		end if;
+	END;
+/
 
 --
 -- Table structure for table 'radreply'
 --
 CREATE TABLE radreply (
 	id		INT PRIMARY KEY,
-	UserName	VARCHAR(30) NOT NULL,
-	Attribute	VARCHAR(64),
+	username	VARCHAR(30) NOT NULL,
+	attribute	VARCHAR(64),
 	op		CHAR(2) NOT NULL,
-	Value		VARCHAR(40)
+	value		VARCHAR(40)
 );
-CREATE INDEX radreply_idx1 ON radreply(UserName);
+CREATE INDEX radreply_idx1 ON radreply(username);
 CREATE SEQUENCE radreply_seq START WITH 1 INCREMENT BY 1;
 
 --
@@ -145,9 +169,11 @@ CREATE OR REPLACE TRIGGER radreply_serialnumber
 --
 CREATE TABLE radusergroup (
 	id		INT PRIMARY KEY,
-	UserName	VARCHAR(30) UNIQUE NOT NULL,
-	GroupName	VARCHAR(30)
+	username	VARCHAR(30) NOT NULL,
+	groupname	VARCHAR(30),
+	priority	INT
 );
+CREATE INDEX radusergroup_idx1 ON radusergroup(username);
 CREATE SEQUENCE radusergroup_seq START WITH 1 INCREMENT BY 1;
 
 --
@@ -164,51 +190,13 @@ CREATE OR REPLACE TRIGGER radusergroup_serialnumber
 /
 
 
---
--- Table structure for table 'realmgroup'
---
-CREATE TABLE realmgroup (
-	id 		INT PRIMARY KEY,
-	RealmName	VARCHAR(30) UNIQUE NOT NULL,
-	GroupName	VARCHAR(30)
-);
-CREATE SEQUENCE realmgroup_seq START WITH 1 INCREMENT BY 1;
-
-CREATE TABLE realms (
-	id		INT PRIMARY KEY,
-	realmname	VARCHAR(64),
-	nas		VARCHAR(128),
-	authport	INT,
-	options		VARCHAR(128)
-);
-CREATE SEQUENCE realms_seq START WITH 1 INCREMENT BY 1;
-
-CREATE TABLE radhuntgroup (
-	id              INT PRIMARY KEY,
-	GroupName VARCHAR(64) NOT NULL,
-	Nasipaddress VARCHAR(15) UNIQUE NOT NULL,
-	NASPortID VARCHAR(15)
-);
-
-CREATE SEQUENCE radhuntgroup_seq START WITH 1 INCREMENT BY 1;
-
-CREATE OR REPLACE TRIGGER radhuntgroup_serialnumber
-	BEFORE INSERT OR UPDATE OF id ON radhuntgroup
-	FOR EACH ROW
-	BEGIN
-		if ( :new.id = 0 or :new.id is null ) then
-			SELECT radhuntgroup_seq.nextval into :new.id from dual;
-		end if;
-	END;
-/
-
 CREATE TABLE radpostauth (
-	  id            INT PRIMARY KEY,
-	  UserName      VARCHAR(64) NOT NULL,
-	  Pass          VARCHAR(64),
-	  Reply         VARCHAR(64),
-	  AuthDate 	TIMESTAMP(6) WITH TIME ZONE,
-	  Class         VARCHAR(64)
+	id		INT PRIMARY KEY,
+	username	VARCHAR(64) NOT NULL,
+	pass		VARCHAR(64),
+	reply		VARCHAR(64),
+	authdate	TIMESTAMP(6) WITH TIME ZONE,
+	class		VARCHAR(64)
 );
 
 CREATE SEQUENCE radpostauth_seq START WITH 1 INCREMENT BY 1;
@@ -239,7 +227,20 @@ CREATE TABLE nas (
 	secret          VARCHAR(60),
 	server          VARCHAR(64),
 	community       VARCHAR(50),
-	description     VARCHAR(200)
+	description     VARCHAR(200),
+	require_ma	VARCHAR(4),
+	limit_proxy_state	VARCHAR(4)
 );
 CREATE SEQUENCE nas_seq START WITH 1 INCREMENT BY 1;
+
+-- Trigger to emulate a serial # on the primary key
+CREATE OR REPLACE TRIGGER nas_serialnumber
+	BEFORE INSERT OR UPDATE OF id ON nas
+	FOR EACH ROW
+	BEGIN
+		if ( :new.id = 0 or :new.id is null ) then
+			SELECT nas_seq.nextval into :new.id from dual;
+		end if;
+	END;
+/
 

@@ -56,11 +56,16 @@ typedef struct {
 } fr_fast_rand_t;
 
 void		fr_isaac(fr_randctx *ctx);
-void		fr_rand_init(fr_randctx *ctx, int flag);
+void		fr_isaac_init(fr_randctx *ctx);
+/** @hidecallergraph */
 uint32_t	fr_rand(void);	/* like rand(), but better. */
+
+void		fr_rand_init(void);
+void		fr_rand_seed(uint64_t seed);
+
 void		fr_rand_buffer(void *start, size_t length) CC_HINT(nonnull);
 void		fr_rand_str(uint8_t *out, size_t len, char class);
-void		fr_rand_seed(void const *, size_t ); /* seed the random pool */
+void		fr_rand_mixin(void const *, size_t ) CC_HINT(nonnull);
 uint32_t	fr_fast_rand(fr_fast_rand_t *ctx);
 
 #ifdef __cplusplus

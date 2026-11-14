@@ -1,0 +1,449 @@
+= Editing Lists and Attributes
+
+Editing a list or attribute is done by starting an `unlang` policy
+line with the `&` character.  This character indicates that the
+following text should be interpreted as commands to edit lists and/or
+attributes.
+
+.Syntax
+[source,unlang]
+----
+attribute := <expression>
+attribute = <expression>
+attribute += <expression>
+attribute -= <expression>
+...
+
+list1 := list2
+list1 += { attribute = value, ... }
+list1 += " attribute = value, ... "
+list1 ^= { attribute = value, ... }
+...
+----
+
+In version 4, the `update` statement has been deprecated and no longer
+used. The `update` sections can't process nested attributes that are
+now supported in version 4.
+
+Unlike version 3, attribute editing can result in a `fail` return
+code.  That is, edits either return `noop` on success, or `fail` on
+failure.
+
+In most cases, an edit failure will result in the processing section
+exiting, and returning `fail`.  This behaviour can be overridden with
+a xref:unlang/transaction.adoc[transaction], or a
+xref:unlang/try.adoc[try] / xref:unlang/catch.adoc[catch] block.
+
+An edit statement has the following standard syntax:
+
+.Syntax
+[source,unlang]
+----
+<lhs> <op> <rhs>
+----
+
+Where we have:
+
+_<lhs>_:: An xref:reference:unlang/attr.adoc[attribute reference],
+such as the name of a list or an attribute.
+
+_<op>_:: The operator such as `=`, `:=`, etc.
+
+_<rhs>_:: The value which is assigned to the attribute.  This value
+can sometimes be an "in-place" list, in which case it is delimited by
+brackets, as in `{...}`.
+
+The _<rhs>_ may be value such as `192.0.2.1, or `5`, or an expression
+such as `1 + 2`, or `"foo" + "bar"`.
+
+[NOTE]
+====
+Despite the edit statements having syntax similar to `update`
+sections, the meaning of the operators have changed significantly. You
+_cannot_ convert an `update` section to the new syntax simply by
+removing the `update` keyword.
+====
+
+== Assignment Failures
+
+If the right side of an edit fails, then the assignment does nothing,
+and the variable named on the left hand side is not updated.
+
+For mathematical expressions, the server tracks overflows, underflows,
+and division by zero.  These issues are caught, and cause the
+problematic calculation to fail.
+
+For example, if an attribute is of type `uint8`, then it can only
+contain 8-bit integers.  Any attempt to overflow the value to more
+than `255`, or underflow it to lower than zero (`0`), or to divide by
+zero, will cause the edit operation to fail.
+
+Nothing bad will happen to the server, it will just encounter a
+run-time failure while editing the attribute, and the edit operation
+will not succeed.  All other packet processing will continue
+processing as normal.
+
+In short, failed edit operations are effectively a "noop" operation,
+and do not result in any changes.
+
+=== Grouping Edits
+
+Multiple attributes may be grouped into a set by using the
+xref:unlang/transaction.adoc[transaction] keyword.  When changes are
+done in a `transaction`, then either all of the changes are applied,
+or none of them are applied.  This functionality is best used to
+conditionally apply attribute changes, generally when retrieving data
+from a database.
+
+== List Editing
+
+.Syntax
+[source,unlang]
+----
+<list> <op> <rhs>
+----
+
+List editing can be done for the usual
+xref:reference:unlang/list.adoc[lists] such as `request`, `reply`,
+`control`, etc.  However, as version 4 also supports "nested" and
+"grouped" attributes, list editing _also_ applies to nested
+attributes.
+
+The operation to be performed depends on the operator, as given in the
+table below.  These operations are based on _set theory_, which is a
+mathematical system which gives consistency to the operations.  All of
+the list operations are simple, and well defined.
+
+[#list-editing-ops]
+.List Editing Operators
+[options="header"]
+[cols="10%,90%"]
+|=====
+| Operator | Description
+| =        | Set the list to the contents of the _<rhs>_, if the _<list>_ does not exist.  If the list already exists, nothing is done.  If the list does not exist, it is created, and the contents set to the value of the _<rhs>_
+| :=       | Override the list to the contents with the _<rhs>_.  If the list already exists, its value is over-written.  If the list does not exist, it is created, and the contents set to the value of the _<rhs>_
+| +=       | Perform list append operation.  The contents of the _<rhs>_ are appended to the _<list>_.  The resulting list is _<list><rhs>_.
+| ^=       | Perform a list prepend operation.  The contents of the _<rhs>_ are prepended to the _<list>_.  The resulting list is _<rhs><list>_.
+| -=       | Remove attributes from the _<list>_ which match the _<rhs>_ attribute or list.
+| \|=      | Perform a list union.  The resulting list has all of the contents of the original _<list>_, and the _<rhs>_ list.
+| &=       | Perform a list intersection.  The resulting list has only the attributes which are in both the original _<list>_, and the _<rhs>_ list.
+| >=       | Perform a priority merge of two lists. The resulting list has all of the contents of the original _<list>_, and of all _<rhs>_ list attributes which are not already in _<list>_.
+| \<=       | Perform a priority merge of two lists. The resulting list has all of the contents of the original _<rhs>_, and of all _<list>_ list attributes which are not in _<rhs>_ are left alone..
+|=====
+
+[NOTE]
+====
+Operations on lists are generally performed recursively on sub-lists.
+For example, the `\|=` operator will perform the union of not only two
+lists, but also will recurse to perform a union of any sub-lists.
+====
+
+The _<rhs>_ can be a reference to another list (e.g. `request`,
+`reply`), or to a nested / grouped attribute.
+
+The _<rhs>_ can also be an "in-place" list, which has syntax similar
+to the `update` section.  However, for "in-place" lists, _the only
+operator which is permitted is `=`.  The server *will not start* if
+any other operator is used._
+
+[NOTE]
+====
+If the right-hand side of an assignment is a list, then the *only*
+operator allowed inside of the right-hand side list is `=`.
+====
+
+If the _<rhs>_ is an "in-place" list, then all of the
+xref:xlat/index.adoc[dynamic expansions] are valid, just as are
+xref:reference:unlang/attr.adoc[attribute references].
+
+As a special case, the _<rhs>_ can also be a string, or a
+xref:xlat/index.adoc[dynamic expansion].  If so, the string is
+interpreted as a set of attribute definitions, as if it was an
+"in-place" list.  For example, `"Filter-Id = foo"`
+
+This functionality is complex, so some examples should make this
+clearer.
+
+=== Clearing a list
+
+A lists contents can be removed by creating an empty list, and
+assigning the empty list to the destination.
+
+.Clearing a list contents, or creating an empty list.
+====
+[source,unlang]
+----
+reply := {}
+----
+====
+
+In most other contexts, the empty list is ignored.  i.e. Appending an
+empty list to `request` does nothing.
+
+=== Adding an attribute to a list
+
+Attributes (or lists of attributes) can be added using the `+=`
+operator.
+
+The following example appends the `Filter-Id` attribute to the tail of
+the `reply` list.  Note again that the operator associated with the
+`Filter-Id` attribute is simply `=`.
+
+This operation can best be understood as a two-step process:
+
+1. Create a temporary "in-place" list from the _<rhs>_ of the edit
+   operation.  This "in-place" list is not associated with any
+   previous list, but instead exists on its own, independent of
+   anything else.  As such, there is no need to use operators for the
+   _<rhs>_ list. Instead, the attributes for this list are created in
+   order, exactly as they are given.
+
+2. Perform the `+=` ("list append") operation, in which case the
+   "in-place" list is appended to the `reply` list.
+
+.Appending the `Filter-Id` attribute to the `reply` list
+====
+[source,unlang]
+----
+reply += {
+	Filter-Id = "foo"
+}
+----
+====
+
+As a special case, where the right side is an
+xref:reference:unlang/attr.adoc[attribute reference], it is possible
+to use `+=`.  In that case, a copy of the referenced attribute is
+appended to the list.
+
+.Appending the `User-Name` attribute from the `request` list, to the `reply` list.
+====
+[source,unlang]
+----
+reply += request.User-Name
+----
+====
+
+=== Override the contents of a list
+
+The `:=` (override) operator will delete the contents of a list.  We
+note that the empty list example above is just a special case of
+overriding the contents of a list.
+
+.Set the contents of the `reply` list to the `Filter-Id` attribute.
+====
+[source,unlang]
+----
+reply := {
+	Filter-Id = "foo"
+}
+----
+====
+
+After this operation, the contents of the `reply` list will be one
+attribute: `Filter-Id`.
+
+=== Remove attributes from a list
+
+Attributes can be removed from a list using the `-=` (remove)
+operator.
+
+.Remove the _first_ instance of `Filter-Id` from the `reply` list.
+====
+[source,unlang]
+----
+reply -= Filter-Id
+----
+====
+
+.Remove _all_ instances of `Filter-Id` from the `reply` list.
+====
+[source,unlang]
+----
+reply -= Filter-Id[*]
+----
+====
+
+.Remove instance of `Filter-Id` which have value `bar`
+====
+[source,unlang]
+----
+reply -= {
+    Filter-Id == "bar"
+}
+----
+====
+
+Multiple attributes can be specified in the _<rhs>_ list.  All
+attributes which match the comparison are removed.
+
+This syntax is clearer and more consistent than the old `!* ANY`
+hacks.
+
+.List Removal Operators
+[options="header"]
+[cols="10%,90%"]
+|=====
+| Operator | Description
+| ==       | attributes matching the value exactly
+| <        | attributes having value less than the given one
+| \<=      | attributes having value less than or equal to the given one
+| >        | attributes having value greater than the given one
+| >=       | attributes having value greater than or equal to the given one
+| !=       | attributes values do not match each other
+|=====
+
+For now, regular expression operators are not supported.
+
+=== List to List Operations
+
+Lists can also be copied using the operators.
+
+.Remove all existing attributes in the `reply` list, and
+copies all of the `request` list contents to the `reply` list.
+====
+[source,unlang]
+----
+reply := request
+----
+====
+
+.Append the contents of the `request` list to the `reply` list.
+====
+[source,unlang]
+----
+reply += request
+----
+====
+
+=== Parsing strings as lists
+
+It is also possible to have strings on the _<rhs>_ of a list
+assignment.  This functionality is most useful for putting attribute
+lists into a database, and then reading them back when a request is
+processed.
+
+Note that the pairs in the string _cannot_ have list qualifiers.  That
+is, `reply += "request.foo ..."` is not allowed.
+
+.Assigning attributes taken from a string
+====
+[source,unlang]
+----
+reply += "Filter-Id = 'foo'"
+----
+====
+
+The above example has the same result as the earlier example of adding
+`Filter-Id` to the `reply`, using an "in-place" list.
+
+.Append pairs read from SQL to the reply
+====
+[source,unlang]
+----
+reply += "sql("SELECT pairs FROM pair_table WHERE username = '%{User-Name}'")
+----
+====
+
+In this example, the `pair_table` could contain two columns:
+`username` and `pairs`.  The `pairs` column could have free-form text
+strings, such as `Filter-Id = "foo"`.
+
+== Attribute Editing
+
+.Syntax
+[source,unlang]
+----
+<attribute> <op> <rhs>
+----
+
+Attribute editing can be done for any
+xref:reference:unlang/attr.adoc[attribute] such as
+`request.User-Name`, etc.  However, as version 4 also supports
+"nested" and "grouped" attributes, attribute editing _also_ can be
+done for nested attributes.
+
+The operation to be performed depends on the operator, as given in the
+table below.  Unlike the list operations above, attribute operations
+change the attribute _value_.
+
+.Attribute Editing Operators
+[options="header"]
+[cols="10%,90%"]
+|=====
+| Operator | Description
+| =        | Set the attribute to the contents of the _<rhs>_, if the _<attribute>_ does not exist.  If the attribute already exists, nothing is done.  If the attribute does not exist, it is created, and the contents set to the value of the _<rhs>_
+| :=       | Delete all existing copies of the named attribute, and create a new attribute with the contents set to the value of the _<rhs>_
+| +=       | Perform addition.  The contents of the _<rhs>_ are added to the value of the _<attribute>_.
+| -=       | Perform subtraction. The contents of the _<rhs>_ are subtracted from the value of the _<attribute>_.
+| *=       | Perform multiplication.  The value of the _<attribute>_ is multiplied by the contents of the _<rhs>_.
+| /=       | Perform division. The value of the _<attribute>_ is divided by the contents of the _<rhs>_.
+| \|=      | Perform logical "or".  The value of the _<attribute>_ is "or"ed with the contents of the _<rhs>_.
+| &=       | Perform logical "and".  The value of the _<attribute>_ is "and"ed with the contents of the _<rhs>_.
+| <\<=     | Perform left shift.  The value of the _<attribute>_ is shifted left by the value of _<rhs>_
+| >>=      | Perform right shift.  The value of the _<attribute>_ is shifted right by the value of _<rhs>_
+|=====
+
+There are also _filtering_operators.  These operators ensure that the
+value of the attribute passes the filter.  If the attribute being
+checked does not exist, it is created.
+
+.Attribute Filtering Operators
+[options="header"]
+[cols="10%,90%"]
+|=====
+| Operator | Description
+| <        | Ensure that the _<lhs>_ attribute exists, and has value less than the _<rhs>_
+| <=       | Ensure that the _<lhs>_ attribute exists, and has value less than or equal to the _<rhs>_
+| >        | Ensure that the _<lhs>_ attribute exists, and has value greater than the _<rhs>_
+| >=       | Ensure that the _<lhs>_ attribute exists, and has value greater than than or equal to the _<rhs>_
+|=====
+
+The _<rhs>_ can be a reference to another attribute (e.g.
+`request.Filter-Id`).  If the field is a double-quoted string, it
+undergoes xref:xlat/index.adoc[dynamic expansion], and the resulting
+value is processed as described above.
+
+In most cases, the edit operations "do the right thing".  For example,
+adding a number to an `ipv4prefix` results in an `ipv4addr` data type.
+Similarly, subtracting two 'ipv4addr' data types results in a
+numerical value.  Adding a `time_delta` or `integer` to a `date` will
+result in a `date`.
+
+Similarly, assignments and/or modifications can be done across
+differing data types.  Adding a `uint8` value to an `uint16` value
+will "just work", as the data types will be automatically converted
+before assignments or operations are done.
+
+=== Operations on `string` and `octet` Data Types
+
+The operators also apply to variable-sized values.
+
+.Attribute Editing Operators for `string` and `octet`
+[options="header"]
+[cols="10%,90%"]
+|=====
+| Operator | Description
+| =        | Set the attribute to the contents of the _<rhs>_, if the _<attribute>_ does not exist.  If the attribute already exists, nothing is done.  If the attribute does not exist, it is created, and the contents set to the value of the _<rhs>_
+| :=       | Override the attribute with the contents with the _<rhs>_.  If the attribute already exists, its value is over-written.  If the attribute does not exist, it is created, and the contents set to the value of the _<rhs>_
+| +=       | Perform string append.  The contents of the _<rhs>_ are appended to the _<attribute>_.
+| -=       | Inverse of string append. The contents of the _<rhs>_ are deleted from the _<attribute>_, if the `_<rhs>_` is a suffix of _<attribute>_
+| *=       | Repeat a string or octets the given number of times.  The _<rhs>_ must be a positive integer.
+| ^=       | For `string`, performs a "prepend" operation.  The contents of the _<rhs>_ are prepended to the _<attribute>_.  This is the opposite of `+=`.
+|          | For `octets`, perform logical "xor".  The value of the _<attribute>_ is "xor"ed with the contents of the _<rhs>_.  Both strings must be of the same length.
+| \|=      | Perform logical "or".  The value of the _<attribute>_ is "or"ed with the contents of the _<rhs>_.  Both strings must be of the same length.
+| &=       | Perform logical "and".  The value of the _<attribute>_ is "and"ed with the contents of the _<rhs>_.  Both strings must be of the same length.
+| <\<=     | Perform left shift / truncation.  The first _<rhs>_ bytes of _<attribute>_ are dropped. i.e. shifted off of the start of the string.
+| >>=      | Perform right shift / truncation.  The last _<rhs>_ bytes of _<attribute>_ are dropped. i.e. shifted off of the end of the string.
+|=====
+
+[NOTE]
+====
+The `^=` operator behaves differently for `string` and `octets`.  The
+output of "xor"ing two strings is likely to be binary data, and
+therefore not a printable string.  As a result, it is more useful for
+strings to have `^=` be a "prepend" operation.
+====
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

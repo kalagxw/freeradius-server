@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -25,36 +25,41 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
-#include <freeradius-devel/unlang/base.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/server/map_proc.h>
-#include <freeradius-devel/util/time.h>
+#include <freeradius-devel/unlang/xlat_func.h>
 
 typedef struct {
-	char const	*xlat_name;		//!< Name of our xlat function.
-	tmpl_t	*delay;			//!< How long we delay for.
+	tmpl_t		*delay;			//!< How long we delay for.
 	bool		relative;		//!< Whether the delay is relative to the start of request processing.
 	bool		force_reschedule;	//!< Whether we should force rescheduling of the request.
+	rlm_rcode_t	rcode;			//!< The return code to use when the delay is complete.
 } rlm_delay_t;
 
 /*
  *	A mapping of configuration file names to internal variables.
  */
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("delay", FR_TYPE_TMPL, rlm_delay_t, delay) },
-	{ FR_CONF_OFFSET("relative", FR_TYPE_BOOL, rlm_delay_t, relative), .dflt = "no" },
-	{ FR_CONF_OFFSET("force_reschedule", FR_TYPE_BOOL, rlm_delay_t, force_reschedule), .dflt = "no" },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET_HINT_TYPE("delay", FR_TYPE_TIME_DELTA, rlm_delay_t, delay) },
+	{ FR_CONF_OFFSET("relative", rlm_delay_t, relative), .dflt = "no" },
+	{ FR_CONF_OFFSET("force_reschedule", rlm_delay_t, force_reschedule), .dflt = "no" },
+	{ FR_CONF_OFFSET("rcode", rlm_delay_t, rcode),
+			 .func = cf_table_parse_uint8, .uctx = &(cf_table_parse_ctx_t){ .table = rcode_table, .len = &rcode_table_len }, .dflt = "notset" },
 	CONF_PARSER_TERMINATOR
 };
+
+typedef struct {
+	fr_retry_config_t	retry_cfg;
+	fr_time_t		when;
+} rlm_delay_retry_t;
 
 /** Called when the timeout has expired
  *
  * Marks the request as resumable, and prints the delayed delay time.
  */
-static void _delay_done(UNUSED module_ctx_t const *mctx, request_t *request, void *rctx, fr_time_t fired)
+static void _delay_done(module_ctx_t const *mctx, request_t *request, fr_retry_t const *retry)
 {
-	fr_time_t *yielded = talloc_get_type_abort(rctx, fr_time_t);
+	rlm_delay_retry_t *yielded = talloc_get_type_abort(mctx->rctx, rlm_delay_retry_t);
 
 	RDEBUG2("Delay done");
 
@@ -62,15 +67,12 @@ static void _delay_done(UNUSED module_ctx_t const *mctx, request_t *request, voi
 	 *	timeout should never be *before* the scheduled time,
 	 *	if it is, something is very broken.
 	 */
-	if (!fr_cond_assert(fired >= *yielded)) REDEBUG("Unexpected resume time");
-
-	unlang_interpret_mark_runnable(request);
+	if (!fr_cond_assert(fr_time_gteq(retry->updated, yielded->when))) REDEBUG("Unexpected resume time");
 }
 
-static void _xlat_delay_done(request_t *request,
-			     UNUSED void *xlat_inst, UNUSED void *xlat_thread_inst, void *rctx, fr_time_t fired)
+static void _xlat_delay_done(xlat_ctx_t const *xctx, request_t *request, fr_time_t fired)
 {
-	fr_time_t *yielded = talloc_get_type_abort(rctx, fr_time_t);
+	fr_time_t *yielded = talloc_get_type_abort(xctx->rctx, fr_time_t);
 
 	RDEBUG2("Delay done");
 
@@ -78,35 +80,35 @@ static void _xlat_delay_done(request_t *request,
 	 *	timeout should never be *before* the scheduled time,
 	 *	if it is, something is very broken.
 	 */
-	if (!fr_cond_assert(fired > *yielded)) REDEBUG("Unexpected resume time");
+	if (!fr_cond_assert(fr_time_gt(fired, *yielded))) REDEBUG("Unexpected resume time");
 
 	unlang_interpret_mark_runnable(request);
 }
 
 static int delay_add(request_t *request, fr_time_t *resume_at, fr_time_t now,
-		     fr_time_t delay, bool force_reschedule, bool relative)
+		     fr_time_delta_t delay, bool force_reschedule, bool relative)
 {
 	/*
 	 *	Delay is zero (and reschedule is not forced)
 	 */
-	if (!force_reschedule && (delay == 0)) return 1;
+	if (!force_reschedule && !fr_time_delta_ispos(delay)) return 1;
 
 	/*
 	 *	Process the delay relative to the start of packet processing
 	 */
 	if (relative) {
-		*resume_at = request->packet->timestamp + delay;
+		*resume_at = fr_time_add(request->packet->timestamp, delay);
 	} else {
-		*resume_at = now + delay;
+		*resume_at = fr_time_add(now, delay);
 	}
 
 	/*
 	 *	If resume_at is in the past (and reschedule is not forced), just return noop
 	 */
-	if (!force_reschedule && (*resume_at <= now)) return 1;
+	if (!force_reschedule && fr_time_lteq(*resume_at, now)) return 1;
 
-	if (*resume_at > now) {
-		RDEBUG2("Delaying request by ~%pVs", fr_box_time_delta(*resume_at - now));
+	if (fr_time_gt(*resume_at, now)) {
+		RDEBUG2("Delaying request by ~%pVs", fr_box_time_delta(fr_time_sub(*resume_at, now)));
 	} else {
 		RDEBUG2("Rescheduling request");
 	}
@@ -117,84 +119,97 @@ static int delay_add(request_t *request, fr_time_t *resume_at, fr_time_t now,
 /** Called resume_at the delay is complete, and we're running from the interpreter
  *
  */
-static unlang_action_t mod_delay_return(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx,
-					request_t *request, void *rctx)
+static unlang_action_t mod_delay_return(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	fr_time_t *yielded = talloc_get_type_abort(rctx, fr_time_t);
+	rlm_delay_retry_t *yielded = talloc_get_type_abort(mctx->rctx, rlm_delay_retry_t);
+	rlm_delay_t const *inst = talloc_get_type_abort_const(mctx->mi->data, rlm_delay_t);
 
 	/*
 	 *	Print how long the delay *really* was.
 	 */
-	RDEBUG3("Request delayed by %pV", fr_box_time_delta(fr_time() - *yielded));
+	RDEBUG3("Request delayed by %pV", fr_box_time_delta(fr_time_sub(fr_time(), yielded->when)));
 	talloc_free(yielded);
 
-	RETURN_MODULE_OK;
+	/*
+	 *	Be transparent, don't alter the rcode
+	 */
+	if (inst->rcode == RLM_MODULE_NOT_SET) return UNLANG_ACTION_EXECUTE_NEXT;
+	RETURN_UNLANG_RCODE(inst->rcode);
 }
 
-static void mod_delay_cancel(UNUSED module_ctx_t const *mctx, request_t *request, void *rctx,
-			     fr_state_signal_t action)
+static unlang_action_t CC_HINT(nonnull) mod_delay(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	if (action != FR_SIGNAL_CANCEL) return;
-
-	RDEBUG2("Cancelling delay");
-
-	(void) unlang_module_timeout_delete(request, rctx);
-}
-
-static unlang_action_t CC_HINT(nonnull) mod_delay(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
-{
-	rlm_delay_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_delay_t);
+	rlm_delay_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_delay_t);
 	fr_time_delta_t		delay;
-	fr_time_t		resume_at, *yielded_at;
+	rlm_delay_retry_t	*yielded;
+	fr_time_t		resume_at;
 
 	if (inst->delay) {
 		if (tmpl_aexpand_type(request, &delay, FR_TYPE_TIME_DELTA,
-				      request, inst->delay, NULL, NULL) < 0) RETURN_MODULE_FAIL;
+				      request, inst->delay) < 0) {
+			RPEDEBUG("Failed parsing %s as delay time", inst->delay->name);
+			RETURN_UNLANG_FAIL;
+		}
+
+		/*
+		 *	Cap delays.  So that no matter what crazy
+		 *	thing the admin does, it doesn't cause an
+		 *	issue.
+		 */
+		if (fr_time_delta_cmp(delay, fr_time_delta_from_sec(0)) < 0) {
+			RWDEBUG("Delay is too small.  Limiting to 0s");
+			delay = fr_time_delta_wrap(0);
+
+		} else if (fr_time_delta_cmp(delay, fr_time_delta_from_sec(30)) > 0) {
+			RWDEBUG("Delay is too large.  Limiting to 30s");
+			delay = fr_time_delta_from_sec(30);
+		}
+
 	} else {
-		delay = 0;
+		delay = fr_time_delta_wrap(0);
 	}
 
 	/*
 	 *	Record the time that we yielded the request
 	 */
-	MEM(yielded_at = talloc(request, fr_time_t));
-	*yielded_at = fr_time();
+	MEM(yielded = talloc(unlang_interpret_frame_talloc_ctx(request), rlm_delay_retry_t));
+	yielded->when = fr_time();
 
 	/*
 	 *	Setup the delay for this request
 	 */
-	if (delay_add(request, &resume_at, *yielded_at, delay,
-		      inst->force_reschedule, inst->delay) != 0) {
-		RETURN_MODULE_NOOP;
+	if (delay_add(request, &resume_at, yielded->when, delay,
+		      inst->force_reschedule, inst->relative) != 0) {
+		RETURN_UNLANG_NOOP;
 	}
+
+	RDEBUG3("Current time %pVs, resume time %pVs",
+		fr_box_time(yielded->when), fr_box_time(resume_at));
 
 	/*
-	 *	FIXME - Should print wallclock time
+	 *
 	 */
-	RDEBUG3("Current time %pVs, resume time %pVs",
-		fr_box_time_delta(*yielded_at), fr_box_time_delta(resume_at));
+	yielded->retry_cfg = (fr_retry_config_t) {
+		.mrd = delay,
+		.mrc = 1,
+	};
 
-	if (unlang_module_timeout_add(request, _delay_done, yielded_at, resume_at) < 0) {
-		RPEDEBUG("Adding event failed");
-		RETURN_MODULE_FAIL;
-	}
-
-	return unlang_module_yield(request, mod_delay_return, mod_delay_cancel, yielded_at);
+	return unlang_module_yield_to_retry(request, mod_delay_return, _delay_done, NULL, FR_SIGNAL_NONE,
+					    yielded, &yielded->retry_cfg);
 }
 
 static xlat_action_t xlat_delay_resume(TALLOC_CTX *ctx, fr_dcursor_t *out,
-				       request_t *request,
-				       UNUSED void const *xlat_inst, UNUSED void *xlat_thread_inst,
-				       UNUSED fr_value_box_list_t *in, void *rctx)
+				       xlat_ctx_t const *xctx,
+				       request_t *request, UNUSED fr_value_box_list_t *in)
 {
-	fr_time_t	*yielded_at = talloc_get_type_abort(rctx, fr_time_t);
-	fr_time_t	delayed;
+	fr_time_t	*yielded_at = talloc_get_type_abort(xctx->rctx, fr_time_t);
+	fr_time_delta_t	delayed;
 	fr_value_box_t	*vb;
 
-	delayed = fr_time() - *yielded_at;
+	delayed = fr_time_sub(fr_time(), *yielded_at);
 	talloc_free(yielded_at);
 
-	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_TIME_DELTA, NULL, false));
+	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_TIME_DELTA, NULL));
 	vb->vb_time_delta = delayed;
 
 	RDEBUG3("Request delayed by %pVs", vb);
@@ -204,11 +219,8 @@ static xlat_action_t xlat_delay_resume(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	return XLAT_ACTION_DONE;
 }
 
-static void xlat_delay_cancel(request_t *request, UNUSED void *instance, UNUSED void *thread,
-			      UNUSED void *rctx, fr_state_signal_t action)
+static void xlat_delay_cancel(UNUSED xlat_ctx_t const *xctx, request_t *request, UNUSED fr_signal_t action)
 {
-	if (action != FR_SIGNAL_CANCEL) return;
-
 	RDEBUG2("Cancelling delay");
 }
 
@@ -221,23 +233,18 @@ static xlat_arg_parser_t const xlat_delay_args[] = {
  *
  * Example (delay 2 seconds):
 @verbatim
-"%(delay:2)"
+%delay(2)
 @endverbatim
  *
  * @ingroup xlat_functions
  */
 static xlat_action_t xlat_delay(UNUSED TALLOC_CTX *ctx, UNUSED fr_dcursor_t *out,
-				request_t *request, void const *xlat_inst, UNUSED void *xlat_thread_inst,
-				fr_value_box_list_t *in)
+				xlat_ctx_t const *xctx,
+				request_t *request, fr_value_box_list_t *in)
 {
-	rlm_delay_t const	*inst;
-	void			*instance;
+	rlm_delay_t const	*inst = talloc_get_type_abort(xctx->mctx->mi->data, rlm_delay_t);
 	fr_time_t		resume_at, *yielded_at;
-	fr_value_box_t		*delay = fr_dlist_head(in);
-
-	memcpy(&instance, xlat_inst, sizeof(instance));	/* Stupid const issues */
-
-	inst = talloc_get_type_abort(instance, rlm_delay_t);
+	fr_value_box_t		*delay = fr_value_box_list_head(in);
 
 	/*
 	 *	Record the time that we yielded the request
@@ -251,7 +258,7 @@ static xlat_action_t xlat_delay(UNUSED TALLOC_CTX *ctx, UNUSED fr_dcursor_t *out
 	 *	This is very useful for testing.
 	 */
 	if (!delay) {
-		if (!fr_cond_assert(delay_add(request, &resume_at, *yielded_at, 0, true, true) == 0)) {
+		if (!fr_cond_assert(delay_add(request, &resume_at, *yielded_at, fr_time_delta_wrap(0), true, true) == 0)) {
 			return XLAT_ACTION_FAIL;
 		}
 		goto yield;
@@ -265,50 +272,39 @@ static xlat_action_t xlat_delay(UNUSED TALLOC_CTX *ctx, UNUSED fr_dcursor_t *out
 	}
 
 yield:
-	/*
-	 *	FIXME - Should print wallclock time
-	 */
-	RDEBUG3("Current time %pVs, resume time %pVs", fr_box_time_delta(*yielded_at), fr_box_time_delta(resume_at));
+	RDEBUG3("Current time %pVs, resume time %pVs", fr_box_time(*yielded_at), fr_box_time(resume_at));
 
-	if (unlang_xlat_event_timeout_add(request, _xlat_delay_done, yielded_at, resume_at) < 0) {
+	if (unlang_xlat_timeout_add(request, _xlat_delay_done, yielded_at, resume_at) < 0) {
 		RPEDEBUG("Adding event failed");
 		return XLAT_ACTION_FAIL;
 	}
 
-	return unlang_xlat_yield(request, xlat_delay_resume, xlat_delay_cancel, yielded_at);
+	return unlang_xlat_yield(request, xlat_delay_resume, xlat_delay_cancel, FR_SIGNAL_ALLOW(FR_SIGNAL_CANCEL), yielded_at);
 }
 
-static int mod_xlat_instantiate(void *xlat_inst, UNUSED xlat_exp_t const *exp, void *uctx)
+static int mod_bootstrap(module_inst_ctx_t const *mctx)
 {
-	*((void **)xlat_inst) = talloc_get_type_abort(uctx, rlm_delay_t);
-	return 0;
-}
-
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
-{
-	rlm_delay_t	*inst = instance;
 	xlat_t		*xlat;
 
-	inst->xlat_name = cf_section_name2(conf);
-	if (!inst->xlat_name) inst->xlat_name = cf_section_name1(conf);
-
-	xlat = xlat_register(inst, inst->xlat_name, xlat_delay, true);
-	xlat_func_args(xlat, xlat_delay_args);
-	xlat_async_instantiate_set(xlat, mod_xlat_instantiate, rlm_delay_t *, NULL, inst);
+	xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, NULL, xlat_delay, FR_TYPE_TIME_DELTA);
+	xlat_func_args_set(xlat, xlat_delay_args);
 	return 0;
 }
 
-extern module_t rlm_delay;
-module_t rlm_delay = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "delay",
-	.type		= 0,
-	.inst_size	= sizeof(rlm_delay_t),
-	.config		= module_config,
-	.bootstrap	= mod_bootstrap,
-	.methods = {
-		[MOD_PREACCT]		= mod_delay,
-		[MOD_AUTHORIZE]		= mod_delay,
-		[MOD_POST_AUTH]		= mod_delay,
+extern module_rlm_t rlm_delay;
+module_rlm_t rlm_delay = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "delay",
+		.flags		= MODULE_TYPE_NONE,
+		.inst_size	= sizeof(rlm_delay_t),
+		.config		= module_config,
+		.bootstrap	= mod_bootstrap
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME(CF_IDENT_ANY, CF_IDENT_ANY), .method = mod_delay },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

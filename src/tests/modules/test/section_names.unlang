@@ -1,0 +1,52 @@
+#
+#	.method_group = {
+#		.bindings = (module_method_binding_t[]){
+#			{ .section = SECTION_NAME("recv", "Access-Challenge"),		.method = mod_return },
+#			{ .section = SECTION_NAME("name1_null",	NULL),			.method = mod_return },
+#			{ .section = SECTION_NAME("send", CF_IDENT_ANY),		.method = mod_return },
+#			{ .section = SECTION_NAME("retry", NULL),			.method = mod_retry },
+#
+#			MODULE_BINDING_TERMINATOR
+#		}
+#	}
+
+noop
+test
+if (!ok) {
+	test_fail
+}
+
+noop
+test.authorize
+if (!ok) {
+	test_fail
+}
+
+noop
+test.accounting
+if (!ok) {
+	test_fail
+}
+
+noop
+test.recv.Access-Challenge
+if (!ok) {
+	test_fail
+}
+
+noop
+test.send
+if (!ok) {
+	test_fail
+}
+
+noop
+test.send.vroom
+if (!ok) {
+	test_fail
+}
+
+# Same thing but as a policy
+section_names
+
+test_pass

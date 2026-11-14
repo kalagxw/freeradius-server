@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -26,8 +26,9 @@ USES_APPLE_DEPRECATED_API
 
 #include <freeradius-devel/server/base.h>
 
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/unlang/xlat_func.h>
 
 #include <ctype.h>
 
@@ -35,41 +36,36 @@ USES_APPLE_DEPRECATED_API
  *	Define a structure for our module configuration.
  */
 typedef struct {
-	char const *xlat_name;
 	char const *allowed_chars;
 } rlm_escape_t;
 
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("safe_characters", FR_TYPE_STRING, rlm_escape_t, allowed_chars), .dflt = "@abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_: /" },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET("safe_characters", rlm_escape_t, allowed_chars), .dflt = "@abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_: /" },
 	CONF_PARSER_TERMINATOR
 };
 
 static char const hextab[] = "0123456789abcdef";
 
-static int mod_xlat_instantiate(void *xlat_inst, UNUSED xlat_exp_t const *exp, void *uctx)
-{
-	*((void **)xlat_inst) = talloc_get_type_abort(uctx, rlm_escape_t);
-	return 0;
-}
-
-static xlat_arg_parser_t const escape_xlat_arg = { .required = true, .concat = true, .type = FR_TYPE_STRING };
+static xlat_arg_parser_t const escape_xlat_arg[] = {
+	{ .required = true, .concat = true, .type = FR_TYPE_STRING },
+	XLAT_ARG_PARSER_TERMINATOR
+};
 
 /** Equivalent to the old safe_characters functionality in rlm_sql but with utf8 support
  *
  * Example:
 @verbatim
-"%{escape:<img>foo.jpg</img>}" == "=60img=62foo.jpg=60/img=62"
+%escape('<img>foo.jpg</img>') == "=60img=62foo.jpg=60/img=62"
 @endverbatim
  *
  * @ingroup xlat_functions
  */
-static xlat_action_t escape_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-				 void const *xlat_inst, UNUSED void *xlat_thread_inst,
-				 fr_value_box_list_t *in)
+static xlat_action_t escape_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
+				 xlat_ctx_t const *xctx,
+				 request_t *request, fr_value_box_list_t *in)
 {
-	rlm_escape_t const	*inst;
-	void			*instance;
-	fr_value_box_t		*arg = fr_dlist_head(in);
+	rlm_escape_t const	*inst = talloc_get_type_abort(xctx->mctx->mi->data, rlm_escape_t);
+	fr_value_box_t		*arg = fr_value_box_list_head(in);
 	char const		*p = arg->vb_strvalue;
 	size_t			len;
 	fr_value_box_t		*vb;
@@ -77,9 +73,7 @@ static xlat_action_t escape_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *
 	fr_sbuff_uctx_talloc_t	sbuff_ctx;
 	int			i;
 
-	memcpy(&instance, xlat_inst, sizeof(instance));
-	inst = talloc_get_type_abort(instance, rlm_escape_t);
-	len = talloc_array_length(inst->allowed_chars) - 1;
+	len = talloc_strlen(inst->allowed_chars);
 
 	MEM(vb = fr_value_box_alloc_null(ctx));
 	/*
@@ -88,7 +82,7 @@ static xlat_action_t escape_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *
 	 *	as a starting point.  The maximum length would be 12
 	 *	times the original if every character is 4 byte UTF8.
 	 */
-	if (!fr_sbuff_init_talloc(vb, &sbuff, &sbuff_ctx, arg->length * 2, arg->length * 12)) {
+	if (!fr_sbuff_init_talloc(vb, &sbuff, &sbuff_ctx, arg->vb_length * 2, arg->vb_length * 12)) {
 	error:
 		RPEDEBUG("Failed to allocated buffer for escaped string");
 		talloc_free(vb);
@@ -126,54 +120,58 @@ static xlat_action_t escape_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *
 	return XLAT_ACTION_DONE;
 }
 
-static xlat_arg_parser_t const unescape_xlat_arg = { .required = true, .concat = true, .type = FR_TYPE_STRING };
+static xlat_arg_parser_t const unescape_xlat_arg[] = {
+	{ .required = true, .concat = true, .type = FR_TYPE_STRING },
+	XLAT_ARG_PARSER_TERMINATOR
+};
 
 /** Equivalent to the old safe_characters functionality in rlm_sql
  *
  * Example:
 @verbatim
-"%{unescape:=60img=62foo.jpg=60/img=62}" == "<img>foo.jpg</img>"
+%unescape('=60img=62foo.jpg=60/img=62') == "<img>foo.jpg</img>"
 @endverbatim
  *
  * @ingroup xlat_functions
  */
-static xlat_action_t unescape_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-				   UNUSED void const *xlat_inst, UNUSED void *xlat_thread_inst,
-				   fr_value_box_list_t *in)
+static xlat_action_t unescape_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
+				   UNUSED xlat_ctx_t const *xctx,
+				   request_t *request, fr_value_box_list_t *in)
 {
-	fr_value_box_t	*arg = fr_dlist_head(in);
+	fr_value_box_t	*arg = fr_value_box_list_head(in);
 	char const	*p, *end;
 	char		*out_p;
-	char		*c1, *c2, c3;
+	char const	*c1, *c2;
+	char		c3;
 	fr_sbuff_t	sbuff;
 	fr_value_box_t	*vb;
 
 	MEM(vb = fr_value_box_alloc_null(ctx));
-	if (fr_value_box_bstr_alloc(ctx, &out_p, vb, NULL, arg->length, arg->tainted) < 0) {
+	if (fr_value_box_bstr_alloc(ctx, &out_p, vb, NULL, arg->vb_length, arg->tainted) < 0) {
 		talloc_free(vb);
 		RPEDEBUG("Failed allocating space for unescaped string");
 		return XLAT_ACTION_FAIL;
 	}
-	sbuff = FR_SBUFF_IN(out_p, arg->length);
+	sbuff = FR_SBUFF_OUT(out_p, talloc_array_length(out_p));
 
 	p = arg->vb_strvalue;
-	end = p + arg->length;
+	end = p + arg->vb_length;
 	while (*p) {
 		if (*p != '=') {
 		next:
 
-			fr_sbuff_in_char(&sbuff, *p++);
+			(void) fr_sbuff_in_char(&sbuff, *p++);
 			continue;
 		}
 
 		/* Is a = char */
 
 		if (((end - p) < 2) ||
-		    !(c1 = memchr(hextab, tolower(*(p + 1)), 16)) ||
-		    !(c2 = memchr(hextab, tolower(*(p + 2)), 16))) goto next;
+		    !(c1 = memchr(hextab, tolower((uint8_t) *(p + 1)), 16)) ||
+		    !(c2 = memchr(hextab, tolower((uint8_t) *(p + 2)), 16))) goto next;
 		c3 = ((c1 - hextab) << 4) + (c2 - hextab);
 
-		fr_sbuff_in_char(&sbuff, c3);
+		(void) fr_sbuff_in_char(&sbuff, c3);
 		p += 3;
 	}
 
@@ -193,25 +191,17 @@ static xlat_action_t unescape_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t
  *	that must be referenced in later calls, store a handle to it
  *	in *instance otherwise put a null pointer there.
  */
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
+static int mod_bootstrap(module_inst_ctx_t const *mctx)
 {
-	rlm_escape_t	*inst = instance;
-	char		*unescape;
 	xlat_t		*xlat;
 
-	inst->xlat_name = cf_section_name2(conf);
-	if (!inst->xlat_name) {
-		inst->xlat_name = cf_section_name1(conf);
-	}
+	xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, "escape", escape_xlat, FR_TYPE_STRING);
+	xlat_func_args_set(xlat, escape_xlat_arg);
+	xlat_func_flags_set(xlat, XLAT_FUNC_FLAG_PURE);
 
-	MEM(unescape = talloc_asprintf(NULL, "un%s", inst->xlat_name));
-	xlat = xlat_register(NULL, inst->xlat_name, escape_xlat, false);
-	xlat_func_mono(xlat, &escape_xlat_arg);
-	xlat_async_instantiate_set(xlat, mod_xlat_instantiate, rlm_escape_t *, NULL, inst);
-
-	xlat = xlat_register(NULL, unescape, unescape_xlat, false);
-	xlat_func_mono(xlat, &unescape_xlat_arg);
-	talloc_free(unescape);
+	xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, "unescape", unescape_xlat, FR_TYPE_STRING);
+	xlat_func_args_set(xlat, unescape_xlat_arg);
+	xlat_func_flags_set(xlat, XLAT_FUNC_FLAG_PURE);
 
 	return 0;
 }
@@ -221,15 +211,17 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern module_t rlm_escape;
-module_t rlm_escape = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "escape",
-	.inst_size	= sizeof(rlm_escape_t),
-	.config		= module_config,
-	.bootstrap	= mod_bootstrap,
+extern module_rlm_t rlm_escape;
+module_rlm_t rlm_escape = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "escape",
+		.inst_size	= sizeof(rlm_escape_t),
+		.config		= module_config,
+		.bootstrap	= mod_bootstrap
+	}
 };

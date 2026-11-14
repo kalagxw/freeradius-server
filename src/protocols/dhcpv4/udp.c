@@ -27,21 +27,9 @@
 #include "attrs.h"
 
 #include <freeradius-devel/util/pair.h>
-#include <freeradius-devel/util/types.h>
 #include <freeradius-devel/util/proto.h>
 #include <freeradius-devel/util/udpfromto.h>
 #include <freeradius-devel/util/syserror.h>
-#include <freeradius-devel/util/talloc.h>
-
-#include <stdint.h>
-#include <stddef.h>
-
-#ifdef HAVE_SYS_SOCKET_H
-#  include <sys/socket.h>
-#endif
-#ifdef HAVE_SYS_TYPES_H
-#  include <sys/types.h>
-#endif
 
 /** Send DHCP packet using a connectionless UDP socket
  *
@@ -50,9 +38,9 @@
  *	- >= 0 if successful.
  *	- < 0 if failed.
  */
-int fr_dhcpv4_udp_packet_send(fr_radius_packet_t *packet)
+ssize_t fr_dhcpv4_udp_packet_send(fr_packet_t *packet)
 {
-	int ret;
+	ssize_t ret;
 	struct sockaddr_storage	dst;
 	socklen_t		sizeof_dst;
 	struct sockaddr_storage	src;
@@ -80,16 +68,16 @@ int fr_dhcpv4_udp_packet_send(fr_radius_packet_t *packet)
  *
  * @param sockfd handle.
  * @return
- *	- pointer to fr_radius_packet_t if successful.
+ *	- pointer to fr_packet_t if successful.
  *	- NULL if failed.
  */
-fr_radius_packet_t *fr_dhcpv4_udp_packet_recv(int sockfd)
+fr_packet_t *fr_dhcpv4_udp_packet_recv(int sockfd)
 {
 	struct sockaddr_storage	src;
 	struct sockaddr_storage	dst;
 	socklen_t		sizeof_src;
 	socklen_t		sizeof_dst;
-	fr_radius_packet_t		*packet;
+	fr_packet_t		*packet;
 	uint8_t			*data;
 	ssize_t			data_len;
 	fr_ipaddr_t		src_ipaddr, dst_ipaddr;
@@ -112,13 +100,14 @@ fr_radius_packet_t *fr_dhcpv4_udp_packet_recv(int sockfd)
 
 	if (data_len <= 0) {
 		fr_strerror_printf("Failed reading data from DHCP socket: %s", fr_syserror(errno));
+	error:
 		talloc_free(data);
 		return NULL;
 	}
 
+	/* Bounds check for tainted scalar (Coverity) */
 	if (!fr_cond_assert(data_len <= (ssize_t)talloc_array_length(data))) {
-		talloc_free(data);	/* Bounds check for tainted scalar (Coverity) */
-		return NULL;
+		goto error;
 	}
 	sizeof_dst = sizeof(dst);
 
@@ -127,17 +116,16 @@ fr_radius_packet_t *fr_dhcpv4_udp_packet_recv(int sockfd)
 	 */
 	if (getsockname(sockfd, (struct sockaddr *) &dst, &sizeof_dst) < 0) {
 		fr_strerror_printf("getsockname failed: %s", fr_syserror(errno));
-		talloc_free(data);
-		return NULL;
+		goto error;
 	}
 
 	fr_ipaddr_from_sockaddr(&dst_ipaddr, &dst_port, &dst, sizeof_dst);
 	fr_ipaddr_from_sockaddr(&src_ipaddr, &src_port, &src, sizeof_src);
 
-	if (!fr_dhcpv4_ok(data, data_len, NULL, NULL)) return NULL;
+	if (!fr_dhcpv4_ok(data, data_len, NULL, NULL)) goto error;
 
 	packet = fr_dhcpv4_packet_alloc(data, data_len);
-	if (!packet) return NULL;
+	if (!packet) goto error;
 
 	fr_socket_addr_init_inet(&packet->socket, IPPROTO_UDP, ifindex, &src_ipaddr, src_port, &dst_ipaddr, dst_port);
 
@@ -148,4 +136,3 @@ fr_radius_packet_t *fr_dhcpv4_udp_packet_recv(int sockfd)
 	packet->timestamp = when;
 	return packet;
 }
-

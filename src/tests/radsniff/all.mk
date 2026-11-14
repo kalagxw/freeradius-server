@@ -17,7 +17,7 @@ PCAP_IN := $(BUILD_DIR)/tests/radsniff/radius-auth+acct+coa-100pkts.pcap
 
 ifeq "$(GIT_HAS_LFS)" "no"
 test.radsniff:
-	$(Q)echo "WARNING: Can't execute 'test.radsniff' without 'git lfs' installed. ignoring."
+	${Q}echo "WARNING: Can't execute 'test.radsniff' without 'git lfs' installed. ignoring."
 else
 
 #
@@ -34,51 +34,62 @@ $(eval $(call TEST_BOOTSTRAP))
 #
 .PRECIOUS: $(OUTPUT)/%.pcap
 $(OUTPUT)/%.pcap: $(DIR)/%.pcap.gz
-	$(Q)gunzip -c $< > $@
+	${Q}mkdir -p $(@D)
+	${Q}gunzip -c $< > $@
 
 #
 #	Run the radsniff commands
 #
+RADSNIFF_CMD = \
+	TZ=UTC \
+	$(TEST_BIN)/radsniff \
+	$(ARGV) \
+	-I $(call SHELL_QUOTE,$(PCAP_IN)) \
+	-D share/dictionary
+
 $(OUTPUT)/%.txt: $(DIR)/%.txt $(TEST_BIN_DIR)/radsniff $(PCAP_IN)
-	$(eval TARGET   := $(notdir $@))
+	$(eval TARGET   := $(notdir $@)$(E))
 	$(eval FOUND    := $(patsubst %.txt,%.out,$@))
 	$(eval CMD_TEST := $(patsubst %.txt,%.cmd,$<))
 	$(eval EXPECTED := $<)
 	$(eval ARGV     := $(shell grep "^#.*ARGV:" $< | cut -f2 -d ':'))
 
-	$(Q)echo "RADSNIFF-TEST INPUT=$(TARGET) ARGV=\"$(ARGV)\""
+	${Q}echo "RADSNIFF-TEST INPUT=$(TARGET) ARGV=\"$(ARGV)\""
 #
 # 	We need that 'TZ=UTC ...' to libpcap pass the same timestamp in anywhere.
 #
-	$(Q)if ! TZ='UTC' $(TEST_BIN)/radsniff $(ARGV) -I $(PCAP_IN) -D share/dictionary 1> $(FOUND); then     \
+	${Q}if ! $(RADSNIFF_CMD) 1> $(FOUND); then \
 		echo "FAILED";                                                                                \
 		cat $(FOUND);                                                                                 \
-		echo "RADSNIFF: TZ='UTC' $(TEST_BIN)/radsniff $(ARGV) -I $(PCAP_IN) -D share/dictionary" -xx;  \
+		echo $(call SHELL_QUOTE,$(RADSNIFF_CMD)); \
 		rm -f $@;										      \
 		exit 1;                                                                                       \
 	fi
-	$(Q)if [ -e "$(EXPECTED)" ]; then                                                                     \
-		grep -v "^#" $(EXPECTED) > $(FOUND).result || true;                                           \
-		if ! cmp $(FOUND) $(FOUND).result; then                                                       \
+	${Q}if [ -e "$(EXPECTED)" ]; then                                                                     \
+		grep -v "^#" $(EXPECTED) > $(EXPECTED).simple || true;                                           \
+		sed -i.bak -e '$${/Executing: /d;}' $(FOUND);                                                 \
+		if ! cmp $(EXPECTED).simple $(FOUND); then                                                       \
 			echo "RADSNIFF FAILED $@";                                                                \
-			echo "RADSNIFF: $(TEST_BIN)/radsniff $(ARGV) -I $(PCAP_IN) -D share/dictionary -xx";        \
-			echo "ERROR: File $(FOUND).result is not the same as $(EXPECTED)";                        \
-			echo "If you did some update on the radsniff code, please be sure to update the unit tests."; \
+			echo $(call SHELL_QUOTE,$(RADSNIFF_CMD)); \
+			echo "ERROR: File $(FOUND) is not the same as $(EXPECTED).simple";                        \
+			echo "If radsniff has been modified, please update the unit tests."; \
 			echo "e.g: $(EXPECTED)";                                                                      \
-			diff $(FOUND) $(FOUND).result;                                                                \
+			diff $(EXPECTED).simple $(FOUND);                                                             \
+			echo "diff $(EXPECTED).simple $(FOUND)";                                                      \
 			rm -f $@;										      \
 			exit 1;                                                                                       \
 		fi; \
 	elif [ -e "$(CMD_TEST)" ] && ! $(SHELL) $(CMD_TEST); then                                             \
 		echo "RADSNIFF FAILED $@";                                                                    \
-		echo "RADSNIFF:   $(RADIUSD_RUN)";                                                            \
+		echo $(call SHELL_QUOTE,$(RADSNIFF_CMD)); \
 		echo "ERROR: The script $(CMD_TEST) can't validate the content of $(FOUND)";                  \
-		echo "If you did some update on the radsniff code, please be sure to update the unit tests."; \
+		echo "If radsniff has been modified, please update the unit tests."; \
 		rm -f $@;										      \
 		exit 1;                                                                                       \
 	else                                                                                                  \
 		echo "ERROR! We should have at least one .txt or .cmd test";                                  \
 		exit 1;                                                                                       \
 	fi
-	$(Q)touch $@
+	${Q}rm -f ${EXPECTED}.simple
+	${Q}touch $@
 endif

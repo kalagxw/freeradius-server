@@ -1,1 +1,1 @@
-control                       namespace = control
+control-socket-server         namespace = internal

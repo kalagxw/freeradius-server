@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -82,5 +82,7 @@ ATTRIBUTE	HS20-Deauthentication-Request		4	octets
 #  extend the session.
 #
 ATTRIBUTE	HS20-Session-Information-URL		5	octets
+ATTRIBUTE	HS20-Roaming-Consortium			6	octets
 
 END-VENDOR    WiFi-Alliance
+ALIAS		WiFi-Alliance				Vendor-Specific.WiFi-Alliance

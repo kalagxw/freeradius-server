@@ -7,17 +7,19 @@ return
 ----
 
 The `return` statement is used to exit a processing section such as
-`recv Access-Request`.  It behaves similarly to the
-xref:unlang/break.adoc[break] statement, except that it is not limited to
-being used inside of a xref:unlang/foreach.adoc[foreach] loop.
+`recv Access-Request`.  Unlike the xref:unlang/break.adoc[break]
+statement, which only exits the current
+xref:unlang/foreach.adoc[foreach] loop, `return` unwinds past any
+enclosing `foreach` loop and exits the entire processing section or
+policy.
 
 The `return` statement is not strictly necessary.  It is mainly used
 to simplify the layout of `unlang` policies.  If the `return`
-statement did not exist, then every xref:unlang/if.adoc[if] statement might need
-to have a matching xref:unlang/else.adoc[else] statement.
+statement did not exist, then every xref:unlang/if.adoc[if] statement
+might need to have a matching xref:unlang/else.adoc[else] statement.
 
 The `return` statement will also exit a policy which is defined in the
-`policy { ... } ` subsection.  This behavior allows policies to be
+`policy { ... } ` subsection.  This behaviour allows policies to be
 treated as a function call.  Any `return` inside of the policy section
 will only return from that policy.  The `return` will _not_ return
 from the enclosing processing section which called the policy.
@@ -26,11 +28,11 @@ from the enclosing processing section which called the policy.
 [source,unlang]
 ----
 sql
-if (&reply.Filter-Id == "hello") {
+if (reply.Filter-Id == "hello") {
     return
 }
 ...
 ----
 
-// Copyright (C) 2021 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
-// Development of this documentation was sponsored by Network RADIUS SAS.
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

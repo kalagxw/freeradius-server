@@ -31,7 +31,7 @@ RCSIDH(process_h, "$Id$")
 extern "C" {
 #endif
 
-typedef enum {
+typedef enum : uint8_t {
 	RADIUS_SIGNAL_SELF_NONE		= (0),
 	RADIUS_SIGNAL_SELF_HUP		= (1 << 0),
 	RADIUS_SIGNAL_SELF_TERM		= (1 << 1),
@@ -40,7 +40,6 @@ typedef enum {
 } radius_signal_t;
 
 #include <freeradius-devel/server/client.h>
-#include <freeradius-devel/server/listen.h>
 #include <freeradius-devel/server/signal.h>
 
 fr_event_list_t		*main_loop_event_list(void);

@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2024 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -46,11 +46,11 @@ ATTRIBUTE	Next-Shortest-Prefix			502	bool
 #		Attribute lists
 #
 ATTRIBUTE	Root					1	group
-ATTRIBUTE	Request					2	group
-ATTRIBUTE	Reply					3	group
-ATTRIBUTE	Control					4	group
-ATTRIBUTE	Session-State				5	group
-
+ATTRIBUTE	request					2	group
+ATTRIBUTE	reply					3	group
+ATTRIBUTE	control					4	group
+ATTRIBUTE	session-State				5	group
+ATTRIBUTE	local-variables				6	group
 
 #
 #	Range:	11 - 19
@@ -65,63 +65,25 @@ ATTRIBUTE	Auth-Type				12	integer
 #
 ATTRIBUTE	Load-Balance-Key			20	string
 ATTRIBUTE	Proxy-To-Realm				21	string
-# 22 - was Replicate-To-Realm
-ATTRIBUTE	Virtual-Server				23	string virtual
-ATTRIBUTE	Module-Return-Code			24	integer virtual
-
-VALUE	Module-Return-Code		reject			0
-VALUE	Module-Return-Code		fail			1
-VALUE	Module-Return-Code		ok			2
-VALUE	Module-Return-Code		handled			3
-VALUE	Module-Return-Code		invalid			4
-VALUE	Module-Return-Code		disallow		5
-VALUE	Module-Return-Code		notfound		6
-VALUE	Module-Return-Code		noop			7
-VALUE	Module-Return-Code		updated			8
-
-#
-#	Cannonical definition of all available module methods
-#
-#	This is defined centrally to ensure that typos are
-#	caught early and that methods are reused.
-#
-#	Module may define additional methods in their "load"
-#	callbacks, but it is not recommended except for
-#	proprietary or extremely specialised modules.
-#
-ATTRIBUTE	Module-Method				25	integer
-
-# General packet processing
-VALUE	Module-Method			authorize		1
-VALUE	Module-Method			authenticate		2
-VALUE	Module-Method			preacct			3
-VALUE	Module-Method			accounting		4
-
-# Resource allocation
-VALUE	Module-Method			alloc			10
-VALUE	Module-Method			renew			11
-VALUE	Module-Method			release			12
-VALUE	Module-Method			bulk-release		13
-
-# Storage modules
-VALUE	Module-Method			load			21
-VALUE	Module-Method			store			22
-VALUE	Module-Method			clear			23
-VALUE	Module-Method			refresh			24
-
-ATTRIBUTE	Request-Processing-Stage		26	string virtual
+# 22 was Replicate-To-Realm
+# 23 was Virtual-Server
+# 24 was Module-Return-Code
+# 25 was Module-Method
+# 26 was Request-Processing-Stage
 
 #
 #	Range:	50 - 99
 #		Packet attributes
 #
-ATTRIBUTE	Packet-Src-IP-Address			50	ipaddr virtual
-ATTRIBUTE	Packet-Dst-IP-Address			51	ipaddr virtual
-ATTRIBUTE	Packet-Src-IPv6-Address			52	ipv6addr virtual
-ATTRIBUTE	Packet-Dst-IPv6-Address			53	ipv6addr virtual
-ATTRIBUTE	Packet-Src-Port				54	short virtual
-ATTRIBUTE	Packet-Dst-Port				55	short virtual
 ATTRIBUTE	Packet-Original-Timestamp		56	date
+
+ATTRIBUTE	Net					60	tlv
+ATTRIBUTE	Src					.1	tlv
+ATTRIBUTE	IP					.1.1	combo-ip
+ATTRIBUTE	Port					.1.2	uint16
+ATTRIBUTE	Dst					.2	auto clone=.Src
+ATTRIBUTE	Timestamp				.3	date
+ATTRIBUTE	Interface				.4	string
 
 #
 #
@@ -143,21 +105,20 @@ ATTRIBUTE	Stripped-User-Domain			1001	string
 # Connext-Rate, Add-Prefix, Add-Suffix
 ATTRIBUTE	Expiration				1010	date
 
-ATTRIBUTE	Client-Shortname			1011	string virtual
+# 1011 was Client-Shortname.  Use %client(shortname) instead
 
-# Was Raw-Attribute.  No longer supported
+# 1012 Was Raw-Attribute.  No longer supported
 ATTRIBUTE	User-Category				1013	string
 
 ATTRIBUTE	Pam-Auth				1014	string
-ATTRIBUTE	Login-Time				1015	string
+# 1015 was Current-Time
 
-ATTRIBUTE	Current-Time				1016	string
 ATTRIBUTE	Realm					1017	string
 # 1018 was No-Such-Attribute
 
 ATTRIBUTE	Acct-Session-Start-Time			1019	date
 ATTRIBUTE	Acct-Unique-Session-Id			1020	string
-ATTRIBUTE	Client-IP-Address			1021	ipaddr virtual
+# 1021 was Client-IP-Address.  Just use Net.Src.IP
 ATTRIBUTE	LDAP-UserDN				1022	string
 ATTRIBUTE	SQL-User-Name				1023	string
 
@@ -171,11 +132,16 @@ ATTRIBUTE	Module-Failure-Message			1038	string
 ATTRIBUTE	Rewrite-Rule				1039	string
 # 1040 was Digest-HA1
 
-ATTRIBUTE	MS-CHAP-Use-NTLM-Auth			1041	bool
+ATTRIBUTE	MS-CHAP-Use-NTLM-Auth			1041	uint8
+
+VALUE	MS-CHAP-Use-NTLM-Auth		No			0
+VALUE	MS-CHAP-Use-NTLM-Auth		Yes			1
+VALUE	MS-CHAP-Use-NTLM-Auth		Auto			2
+
 ATTRIBUTE	NTLM-User-Name				1042	string
 ATTRIBUTE	MS-CHAP-User-Name			1043	string
 
-ATTRIBUTE	Time-Of-Day				1089	string
+# 1089 was Time-Of-Day
 
 ATTRIBUTE	SQL-Table-Name				1110	string
 ATTRIBUTE	Home-Server-Pool			1111	string
@@ -188,11 +154,24 @@ ATTRIBUTE	FreeRADIUS-Client-IP-Address		1120	ipaddr
 ATTRIBUTE	FreeRADIUS-Client-IPv6-Address		1121	ipv6addr
 
 # The rest of the FreeRADIUS-Client-* attributes are at 1150...
-ATTRIBUTE	FreeRADIUS-Client-Require-MA		1122	bool
-ATTRIBUTE	FreeRADIUS-Client-Secret		1123	string
-ATTRIBUTE	FreeRADIUS-Client-Shortname		1124	string
-ATTRIBUTE	FreeRADIUS-Client-NAS-Type		1125	string
-ATTRIBUTE	FreeRADIUS-Client-Virtual-Server	1126	string
+ATTRIBUTE	FreeRADIUS-Client-Require-MA		1122	uint8
+
+# Ordering is important here, as the values are a bitmask.
+VALUE	FreeRADIUS-Client-Require-MA		No			0
+VALUE	FreeRADIUS-Client-Require-MA		Yes			1
+VALUE	FreeRADIUS-Client-Require-MA		Auto			2
+
+ATTRIBUTE	FreeRADIUS-Client-Limit-Proxy-State	1123	uint8
+
+# Ordering is important here, as the values are a bitmask.
+VALUE	FreeRADIUS-Client-Limit-Proxy-State	No			0
+VALUE	FreeRADIUS-Client-Limit-Proxy-State	Yes			1
+VALUE	FreeRADIUS-Client-Limit-Proxy-State	Auto			2
+
+ATTRIBUTE	FreeRADIUS-Client-Secret		1124	string
+ATTRIBUTE	FreeRADIUS-Client-Shortname		1125	string
+ATTRIBUTE	FreeRADIUS-Client-NAS-Type		1126	string
+ATTRIBUTE	FreeRADIUS-Client-Virtual-Server	1127	string
 
 #
 #	For send/recv CoA packets (like Auth-Type, Acct-Type, etc.)
@@ -209,8 +188,13 @@ ATTRIBUTE	MS-CHAP-New-NT-Password			1137	octets
 
 ATTRIBUTE	Called-Station-SSID			1139	string
 
-ATTRIBUTE	Acct-Input-Octets64			1148	integer64
-ATTRIBUTE	Acct-Output-Octets64			1149	integer64
+ATTRIBUTE	Called-Station-MAC			1140	octets
+ATTRIBUTE	Pre-Shared-Key				1141	string
+ATTRIBUTE	Pairwise-Master-Key			1142	octets
+ATTRIBUTE	PSK-Identity				1143	string
+
+ATTRIBUTE	Acct-Input-Octets64			1148	uint64
+ATTRIBUTE	Acct-Output-Octets64			1149	uint64
 
 ATTRIBUTE	FreeRADIUS-Client-IP-Prefix		1150	ipv4prefix
 ATTRIBUTE	FreeRADIUS-Client-IPv6-Prefix		1151	ipv6prefix
@@ -250,18 +234,6 @@ ATTRIBUTE	Session-State-User-Name			1189	string
 
 ATTRIBUTE	Exec-Export				1190	string
 
-ATTRIBUTE	LDAP-Sync				1193	tlv
-BEGIN-TLV	LDAP-Sync
-ATTRIBUTE	Cookie					1	octets
-ATTRIBUTE	DN					2	string
-ATTRIBUTE	Filter					3	string
-ATTRIBUTE	Attr					4	string
-ATTRIBUTE	Scope					5	integer
-ATTRIBUTE	Entry-State				6	integer
-ATTRIBUTE	Entry-DN				7	string
-ATTRIBUTE	Entry-UUID				8	octets
-END-TLV		LDAP-Sync
-
 #
 #  Server-side "listen type = foo"
 #
@@ -281,10 +253,13 @@ VALUE	Listen-Socket-Type		coa			8
 
 ATTRIBUTE	Outer-Realm-Name			1251	string
 ATTRIBUTE	Inner-Realm-Name			1252	string
-ATTRIBUTE	Request-Lifetime			1253	integer
+ATTRIBUTE	Proto					1254	tlv
+
+# Used for worker <-> coordinator communication
+ATTRIBUTE	Worker-Id				1255	int32
 
 #
-#	Range:	1254 - 1699
+#	Range:	1256 - 1699
 #		Unused
 #
 
@@ -358,39 +333,89 @@ ATTRIBUTE	Tmp-Date-7				1757	date
 ATTRIBUTE	Tmp-Date-8				1758	date
 ATTRIBUTE	Tmp-Date-9				1759	date
 
+ATTRIBUTE	Tmp-uint64-0				1760	uint64
+ATTRIBUTE	Tmp-uint64-1				1761	uint64
+ATTRIBUTE	Tmp-uint64-2				1762	uint64
+ATTRIBUTE	Tmp-uint64-3				1763	uint64
+ATTRIBUTE	Tmp-uint64-4				1764	uint64
+ATTRIBUTE	Tmp-uint64-5				1765	uint64
+ATTRIBUTE	Tmp-uint64-6				1766	uint64
+ATTRIBUTE	Tmp-uint64-7				1767	uint64
+ATTRIBUTE	Tmp-uint64-8				1768	uint64
+ATTRIBUTE	Tmp-uint64-9				1769	uint64
+
+ATTRIBUTE	Tmp-int64-0				1770	int64
+ATTRIBUTE	Tmp-int64-1				1771	int64
+ATTRIBUTE	Tmp-int64-2				1772	int64
+ATTRIBUTE	Tmp-int64-3				1773	int64
+ATTRIBUTE	Tmp-int64-4				1774	int64
+ATTRIBUTE	Tmp-int64-5				1775	int64
+ATTRIBUTE	Tmp-int64-6				1776	int64
+ATTRIBUTE	Tmp-int64-7				1777	int64
+ATTRIBUTE	Tmp-int64-8				1778	int64
+ATTRIBUTE	Tmp-int64-9				1779	int64
+
+ATTRIBUTE	Tmp-Signed-0				1780	signed
+ATTRIBUTE	Tmp-Signed-1				1781	signed
+ATTRIBUTE	Tmp-Signed-2				1782	signed
+ATTRIBUTE	Tmp-Signed-3				1783	signed
+ATTRIBUTE	Tmp-Signed-4				1784	signed
+ATTRIBUTE	Tmp-Signed-5				1785	signed
+ATTRIBUTE	Tmp-Signed-6				1786	signed
+ATTRIBUTE	Tmp-Signed-7				1787	signed
+ATTRIBUTE	Tmp-Signed-8				1788	signed
+ATTRIBUTE	Tmp-Signed-9				1789	signed
+
+ATTRIBUTE	Tmp-Ethernet-0				1790	ether
+ATTRIBUTE	Tmp-Ethernet-1				1791	ether
+ATTRIBUTE	Tmp-Ethernet-2				1792	ether
+ATTRIBUTE	Tmp-Ethernet-3				1793	ether
+ATTRIBUTE	Tmp-Ethernet-4				1794	ether
+ATTRIBUTE	Tmp-Ethernet-5				1795	ether
+ATTRIBUTE	Tmp-Ethernet-6				1796	ether
+ATTRIBUTE	Tmp-Ethernet-7				1797	ether
+ATTRIBUTE	Tmp-Ethernet-8				1798	ether
+ATTRIBUTE	Tmp-Ethernet-9				1799	ether
+
+ATTRIBUTE	Tmp-Time-Delta-0			1800	time_delta
+ATTRIBUTE	Tmp-Time-Delta-1			1801	time_delta
+ATTRIBUTE	Tmp-Time-Delta-2			1802	time_delta
+ATTRIBUTE	Tmp-Time-Delta-3			1803	time_delta
+ATTRIBUTE	Tmp-Time-Delta-4			1804	time_delta
+ATTRIBUTE	Tmp-Time-Delta-5			1805	time_delta
+ATTRIBUTE	Tmp-Time-Delta-6			1806	time_delta
+ATTRIBUTE	Tmp-Time-Delta-7			1807	time_delta
+ATTRIBUTE	Tmp-Time-Delta-8			1808	time_delta
+ATTRIBUTE	Tmp-Time-Delta-9			1809	time_delta
+
+ATTRIBUTE	Tmp-TLV-0				1810	tlv
+ATTRIBUTE	a					.1	uint32
+ATTRIBUTE	b					.2	uint32
+ATTRIBUTE	c					.3	string
+ATTRIBUTE	d					.4	ipaddr
+
+ATTRIBUTE	Tmp-Flat-Group				1811	group	flat
+
+
 #
-#  Attributes 1850 through 1850 + FR_TYPE_MAX are reserved.
+#  1812 - 1879 - unused
 #
-
-ATTRIBUTE	Tmp-Integer64-0				1760	integer64
-ATTRIBUTE	Tmp-Integer64-1				1761	integer64
-ATTRIBUTE	Tmp-Integer64-2				1762	integer64
-ATTRIBUTE	Tmp-Integer64-3				1763	integer64
-ATTRIBUTE	Tmp-Integer64-4				1764	integer64
-ATTRIBUTE	Tmp-Integer64-5				1765	integer64
-ATTRIBUTE	Tmp-Integer64-6				1766	integer64
-ATTRIBUTE	Tmp-Integer64-7				1767	integer64
-ATTRIBUTE	Tmp-Integer64-8				1768	integer64
-ATTRIBUTE	Tmp-Integer64-9				1769	integer64
-
-ATTRIBUTE	Tmp-Signed-0				1770	signed
-ATTRIBUTE	Tmp-Signed-1				1771	signed
-ATTRIBUTE	Tmp-Signed-2				1772	signed
-ATTRIBUTE	Tmp-Signed-3				1773	signed
-ATTRIBUTE	Tmp-Signed-4				1774	signed
-ATTRIBUTE	Tmp-Signed-5				1775	signed
-ATTRIBUTE	Tmp-Signed-6				1776	signed
-ATTRIBUTE	Tmp-Signed-7				1777	signed
-ATTRIBUTE	Tmp-Signed-8				1778	signed
-ATTRIBUTE	Tmp-Signed-9				1779	signed
-
-ATTRIBUTE	Tmp-Ethernet-0				1780	ether
-ATTRIBUTE	Tmp-Ethernet-1				1781	ether
-ATTRIBUTE	Tmp-Ethernet-2				1782	ether
-ATTRIBUTE	Tmp-Ethernet-3				1783	ether
-ATTRIBUTE	Tmp-Ethernet-4				1784	ether
 
 ATTRIBUTE	Tmp-Float-0				1880	float32
+ATTRIBUTE	Tmp-Float-1				1881	float32
+ATTRIBUTE	Tmp-Float-2				1882	float32
+ATTRIBUTE	Tmp-Float-3				1883	float32
+ATTRIBUTE	Tmp-Float-4				1884	float32
+ATTRIBUTE	Tmp-Float-5				1885	float32
+ATTRIBUTE	Tmp-Float-6				1886	float32
+ATTRIBUTE	Tmp-Float-7				1887	float32
+ATTRIBUTE	Tmp-Float-8				1888	float32
+ATTRIBUTE	Tmp-Float-9				1889	float32
+
+#  Used by xlat expressions to print true/false instead of yes/no
+ATTRIBUTE	Expr-Bool-Enum				1890	bool
+VALUE	Expr-Bool-Enum			true			1
+VALUE	Expr-Bool-Enum			false			0
 
 ATTRIBUTE	Log-Message				1894	string
 ATTRIBUTE	Log-Level				1895	integer
@@ -407,7 +432,7 @@ ATTRIBUTE	Log-Type				1896	integer
 ATTRIBUTE	WiMAX-MN-NAI				1900	string
 
 ATTRIBUTE	TLS-Certificate				1901	tlv
-BEGIN-TLV	TLS-Certificate
+BEGIN		TLS-Certificate
 ATTRIBUTE	Serial					1	octets
 ATTRIBUTE	Signature				2	octets
 ATTRIBUTE	Signature-Algorithm			3	string
@@ -425,11 +450,17 @@ ATTRIBUTE	X509v3-Extended-Key-Usage		14	string
 ATTRIBUTE	X509v3-Subject-Key-Identifier		15	string
 ATTRIBUTE	X509v3-Authority-Key-Identifier		16	string
 ATTRIBUTE	X509v3-Basic-Constraints		17	string
-END-TLV		TLS-Certificate
+ATTRIBUTE	X509v3-CRL-Distribution-Points		18	string
+ATTRIBUTE	OCSP-URI				19	string
+ATTRIBUTE	OCSP-Cert-Id				20	octets
+END		TLS-Certificate
+
+ATTRIBUTE	TLS-Certificate-Chain-Depth		1902	uint32
 
 ATTRIBUTE	TLS-PSK-Identity			1933	string
 ATTRIBUTE	TLS-Session-Certificate-File		1934	string
 ATTRIBUTE	TLS-Session-Require-Client-Certificate	1935	bool
+ATTRIBUTE	TLS-PSK-Key				1936	octets	secret
 
 # Set and retrieved by EAP-TLS code
 ATTRIBUTE	TLS-OCSP-Cert-Valid			1943	integer
@@ -441,18 +472,8 @@ VALUE	TLS-OCSP-Cert-Valid		no			0
 # Number of seconds before new OCSP status information will be available
 ATTRIBUTE	TLS-OCSP-Next-Update			1944	integer
 ATTRIBUTE	TLS-OCSP-Response			1945	octets
-#
-#	Range:	1951-2099
-#		Free
-#
-#	Range:	2100-2199
-#	SoH attributes; FIXME: these should really be protocol attributes
-#	so that the SoH radius request can be proxied, but from which
-#	vendor? Sigh...
-#
 
 ATTRIBUTE	TLS-Client-Error-Code			1946	uint8
-
 VALUE	TLS-Client-Error-Code		Close-Notify		0
 VALUE	TLS-Client-Error-Code		End-Of-Early-Data	1
 VALUE	TLS-Client-Error-Code		Unexpected-Message	10
@@ -491,32 +512,132 @@ VALUE	TLS-Client-Error-Code		No-Application-Protocol	120
 
 ATTRIBUTE	TLS-Session-Version			1947	string
 ATTRIBUTE	TLS-Session-Cipher-Suite		1948	string
+ATTRIBUTE	TLS-Session-Resume-Type			1949	integer
 
-ATTRIBUTE	SoH-MS-Machine-OS-vendor		2100	integer
-VALUE	SoH-MS-Machine-OS-vendor	Microsoft		311
+VALUE	TLS-Session-Resume-Type		stateful		1
+VALUE	TLS-Session-Resume-Type		stateless		2
 
-ATTRIBUTE	SoH-MS-Machine-OS-version		2101	integer
-ATTRIBUTE	SoH-MS-Machine-OS-release		2102	integer
-ATTRIBUTE	SoH-MS-Machine-OS-build			2103	integer
-ATTRIBUTE	SoH-MS-Machine-SP-version		2104	integer
-ATTRIBUTE	SoH-MS-Machine-SP-release		2105	integer
+#
+#  Attributes for casting
+#
+ATTRIBUTE	Cast-Time-Res-Sec			1950	time_delta	precision=seconds
+ATTRIBUTE	Cast-Time-Res-Min			1951	time_delta	precision=minutes
+ATTRIBUTE	Cast-Time-Res-Hour			1952	time_delta	precision=hours
+ATTRIBUTE	Cast-Time-Res-Day			1953	time_delta	precision=days
+ATTRIBUTE	Cast-Time-Res-Week			1954	time_delta	precision=weeks
+ATTRIBUTE	Cast-Time-Res-Month			1955	time_delta	precision=months
+ATTRIBUTE	Cast-Time-Res-Year			1956	time_delta	precision=years
+ATTRIBUTE	Cast-Time-Res-Centi-Sec			1957	time_delta	precision=centiseconds
+ATTRIBUTE	Cast-Time-Res-Milli-Sec			1958	time_delta	precision=milliseconds
+ATTRIBUTE	Cast-Time-Res-Micro-Sec			1959	time_delta	precision=microseconds
+ATTRIBUTE	Cast-Time-Res-Nano-Sec			1960	time_delta	precision=nanoseconds
 
-ATTRIBUTE	SoH-MS-Machine-Processor		2106	integer
-VALUE	SoH-MS-Machine-Processor	x86			0
-VALUE	SoH-MS-Machine-Processor	i64			6
-VALUE	SoH-MS-Machine-Processor	x86_64			9
+ATTRIBUTE	TLS-Client-Hello			1961	tlv
+ATTRIBUTE	TLS-Version				.1	uint16
+VALUE	TLS-Version		TLS1.0				0x0301
+VALUE	TLS-Version		TLS1.1				0x0302
+VALUE	TLS-Version		TLS1.2				0x0303
+VALUE	TLS-Version		TLS1.3				0x0304
 
-ATTRIBUTE	SoH-MS-Machine-Name			2107	string
-ATTRIBUTE	SoH-MS-Correlation-Id			2108	octets
-ATTRIBUTE	SoH-MS-Machine-Role			2109	integer
-VALUE	SoH-MS-Machine-Role		client			1
-VALUE	SoH-MS-Machine-Role		dc			2
-VALUE	SoH-MS-Machine-Role		server			3
+ATTRIBUTE	Cipher					.2	string
 
-ATTRIBUTE	SoH-Supported				2119	bool
+ATTRIBUTE	Signature-Algorithm			.3	uint16
+VALUE	Signature-Algorithm	rsa_pkcs1_sha1			0x0201
+VALUE	Signature-Algorithm	dsa_sha1			0x0202
+VALUE	Signature-Algorithm	ecdsa_sha1			0x0203
+VALUE	Signature-Algorithm	rsa_pkcs1_sha224		0x0301
+VALUE	Signature-Algorithm	dsa_sha224			0x0302
+VALUE	Signature-Algorithm	ecdsa_sha224			0x0303
+VALUE	Signature-Algorithm	rsa_pkcs1_sha256		0x0401
+VALUE	Signature-Algorithm	dsa_sha256			0x0402
+VALUE	Signature-Algorithm	ecdsa_secp256r1_sha256		0x0403
+VALUE	Signature-Algorithm	rsa_pkcs1_sha384		0x0501
+VALUE	Signature-Algorithm	dsa_sha384			0x0502
+VALUE	Signature-Algorithm	ecdsa_secp384r1_sha384		0x0503
+VALUE	Signature-Algorithm	rsa_pkcs1_sha512		0x0601
+VALUE	Signature-Algorithm	dsa_sha512			0x0602
+VALUE	Signature-Algorithm	ecdsa_secp521r1_sha512		0x0603
+VALUE	Signature-Algorithm	rsa_pss_rsae_sha256		0x0804
+VALUE	Signature-Algorithm	rsa_pss_rsae_sha384		0x0805
+VALUE	Signature-Algorithm	rsa_pss_rsae_sha512		0x0806
+VALUE	Signature-Algorithm	ed25519				0x0807
+VALUE	Signature-Algorithm	ed448				0x0808
+VALUE	Signature-Algorithm	rsa_pss_pss_sha256		0x0809
+VALUE	Signature-Algorithm	rsa_pss_pss_sha384		0x080a
+VALUE	Signature-Algorithm	rsa_pss_pss_sha512 		0x080b
+VALUE	Signature-Algorithm	ecdsa_brainpoolP256r1_sha256	0x081a
+VALUE	Signature-Algorithm	ecdsa_brainpoolP384r1_sha384	0x081b
+VALUE	Signature-Algorithm	ecdsa_brainpoolP512r1_sha512	0x081c
+VALUE	Signature-Algorithm	gost2012_256_intrinsic		0x0840
+VALUE	Signature-Algorithm	gost2012_512_intrinsic		0x0841
+VALUE	Signature-Algorithm	gost2001_gost94			0xeded
+VALUE	Signature-Algorithm	gost2012_256_gost2012		0xeeee
+VALUE	Signature-Algorithm	gost2012_512_gost2012		0xefef
 
-ATTRIBUTE	SoH-MS-Windows-Health-Status		2120	string
-ATTRIBUTE	SoH-MS-Health-Other			2129	string
+ATTRIBUTE	Supported-Group				.4	uint16
+VALUE	Supported-Group		sect163k1			1
+VALUE	Supported-Group		sect163r1			2
+VALUE	Supported-Group		sect163r2			3
+VALUE	Supported-Group		sect193r1			4
+VALUE	Supported-Group		sect193r2			5
+VALUE	Supported-Group		sect233k1			6
+VALUE	Supported-Group		sect233r1			7
+VALUE	Supported-Group		sect239k1			8
+VALUE	Supported-Group		sect283k1			9
+VALUE	Supported-Group		sect283r1			10
+VALUE	Supported-Group		sect409k1			11
+VALUE	Supported-Group		sect409r1			12
+VALUE	Supported-Group		sect571k1			13
+VALUE	Supported-Group		sect571r1			14
+VALUE	Supported-Group		secp160k1			15
+VALUE	Supported-Group		secp160r1			16
+VALUE	Supported-Group		secp160r2			17
+VALUE	Supported-Group		secp192k1			18
+VALUE	Supported-Group		secp192r1			19
+VALUE	Supported-Group		secp224k1			20
+VALUE	Supported-Group		secp224r1			21
+VALUE	Supported-Group		secp256k1			22
+VALUE	Supported-Group		secp256r1			23
+VALUE	Supported-Group		secp384r1			24
+VALUE	Supported-Group		secp521r1			25
+VALUE	Supported-Group		brainpoolP256r1			26
+VALUE	Supported-Group		brainpoolP384r1			27
+VALUE	Supported-Group		brainpoolP512r1			28
+VALUE	Supported-Group		ecdh_x25519			29
+VALUE	Supported-Group		ecdh_x448			30
+VALUE	Supported-Group		brainpoolP256r1tls13		31
+VALUE	Supported-Group		brainpoolP384r1tls13		32
+VALUE	Supported-Group		brainpoolP512r1tls13		33
+VALUE	Supported-Group		GC256A				34
+VALUE	Supported-Group		GC256B				35
+VALUE	Supported-Group		GC256C				36
+VALUE	Supported-Group		GC256D				37
+VALUE	Supported-Group		GC512A				38
+VALUE	Supported-Group		GC512B				39
+VALUE	Supported-Group		GC512C				40
+VALUE	Supported-Group		ffdhe2048			256
+VALUE	Supported-Group		ffdhe3072			257
+VALUE	Supported-Group		ffdhe4096			258
+VALUE	Supported-Group		ffdhe6144			259
+VALUE	Supported-Group		ffdhe8192			260
+VALUE	Supported-Group		X25519Kyber768Draft00		25497
+VALUE	Supported-Group		SecP256r1Kyber768Draft00	25498
+VALUE	Supported-Group		arbitrary_explicit_prime_curves	0xFF01
+VALUE	Supported-Group		arbitrary_explicit_char2_curves	0xFF02
+
+ATTRIBUTE	EC-Point-Format				.5	uint8
+VALUE	EC-Point-Format		uncompressed			0
+VALUE	EC-Point-Format		ansiX962_compressed_prime	1
+Value	EC-Point-Format		ansiX962_compressed_char2	2
+
+ATTRIBUTE	PSK-Key-Mode				.6	uint8
+VALUE	PSK-Key-Mode		psk_ke				0
+VALUE	PSK-Key-Mode		psk_ke_dhe			1
+
+#
+#	Range:	1962-2199
+#		Free
+#
 
 #
 #	Range:	2200-2219
@@ -524,14 +645,20 @@ ATTRIBUTE	SoH-MS-Health-Other			2129	string
 #
 ATTRIBUTE	Radclient-Test-Name			2200	string
 ATTRIBUTE	Request-Authenticator			2201	octets
+ATTRIBUTE	Radclient-CoA-Filename			2202	string
+ATTRIBUTE	Radclient-CoA-Filter			2203	string
 
 #
 #	Range:  2220-2259
 #		 Attributes used as trigger arguments
 #
-ATTRIBUTE	Connection-Pool-Server			2220	string
-ATTRIBUTE	Connection-Pool-Port			2221	short
+ATTRIBUTE	Trigger-Name				2220	string
+ATTRIBUTE	Connection-Pool-Server			2221	string
+ATTRIBUTE	Connection-Pool-Port			2222	short
 ATTRIBUTE	Exfile-Name				2223	string
+ATTRIBUTE	LDAP-Sync-Base-DN			2224	string
+ATTRIBUTE	Module-Name				2225	string
+ATTRIBUTE	Module-Instance				2226	string
 
 #
 #	Range:	2261-2299
@@ -573,4 +700,3 @@ VALUE	Auth-Type			Accept			254
 #
 VALUE	Strip-User-Name			No			0
 VALUE	Strip-User-Name			Yes			1
-

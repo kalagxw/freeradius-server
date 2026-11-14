@@ -1,6 +1,6 @@
 #pragma once
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -36,7 +36,7 @@ extern "C" {
  *
  * Derived from processing the provided identity.
  */
-typedef enum {
+typedef enum : uint8_t {
 	AKA_SIM_METHOD_HINT_UNKNOWN = 0,		//!< We don't know what method the identity hints at.
 	AKA_SIM_METHOD_HINT_SIM,			//!< The identity hints the supplicant wants to use
 							///< EAP-SIM.
@@ -50,7 +50,7 @@ typedef enum {
  *
  * Derived from the processing the provided identity.
  */
-typedef enum {
+typedef enum : uint8_t {
 	AKA_SIM_ID_TYPE_UNKNOWN	= 0,			//!< We don't know what type of identity this is.
 	AKA_SIM_ID_TYPE_PERMANENT,			//!< This is a permanent identity (the IMSI of the SIM).
 	AKA_SIM_ID_TYPE_PSEUDONYM,			//!< This is a custom pseudonym.
@@ -58,7 +58,7 @@ typedef enum {
 	AKA_SIM_ID_TYPE_MAX
 } fr_aka_sim_id_type_t;
 
-typedef enum {
+typedef enum : uint8_t {
 	ID_TAG_SIM_PERMANENT			= '1',  //!< IMSI, and hint that client wants to do EAP-SIM
 	ID_TAG_SIM_PSEUDONYM			= '3',	//!< Pseudonym, continue EAP-SIM
 	ID_TAG_SIM_FASTAUTH			= '5',	//!< Fastauth, continue EAP-SIM
@@ -74,8 +74,9 @@ typedef enum {
 
 /** Identity request types
  */
-typedef enum {
-	AKA_SIM_NO_ID_REQ = 0,			//!< We're not requesting any ID.
+typedef enum : uint8_t {
+	AKA_SIM_INIT_ID_REQ = 0,		//!< We've requested no ID.  This is used for last_id_req.
+	AKA_SIM_NO_ID_REQ,			//!< We're not requesting any ID.
 	AKA_SIM_ANY_ID_REQ,			//!< Request IMSI, Pseudonym or Fast-reauth.
 	AKA_SIM_FULLAUTH_ID_REQ,		//!< Request IMSI or Pseudonym.
 	AKA_SIM_PERMANENT_ID_REQ,		//!< Request IMSI.
@@ -115,7 +116,7 @@ uint8_t		fr_aka_sim_id_3gpp_pseudonym_tag(char const encr_id[AKA_SIM_3GPP_PSEUDO
 
 uint8_t		fr_aka_sim_id_3gpp_pseudonym_key_index(char const encr_id[AKA_SIM_3GPP_PSEUDONYM_LEN]);
 
-int		fr_aka_sim_id_3gpp_pseudonym_decrypt(char out[AKA_SIM_IMSI_MAX_LEN],
+int		fr_aka_sim_id_3gpp_pseudonym_decrypt(char out[AKA_SIM_IMSI_MAX_LEN + 1],
 				     		     char const encr_id[AKA_SIM_3GPP_PSEUDONYM_LEN],
 				     		     uint8_t const key[16]);
 

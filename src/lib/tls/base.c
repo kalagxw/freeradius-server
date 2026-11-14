@@ -17,32 +17,40 @@
 /**
  * $Id$
  *
- * @file tls/base.c
+ * @file src/lib/tls/base.c
  * @brief Initialise OpenSSL
  *
- * @copyright 2001 hereUare Communications, Inc. (raghud@hereuare.com)
- * @copyright 2003 Alan DeKok (aland@freeradius.org)
- * @copyright 2006-2016 The FreeRADIUS server project
+ * @copyright 2026 Network RADIUS SAS (legal@networkradius.com)
  */
 RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #ifdef WITH_TLS
-#define LOG_PREFIX "tls - "
+#define LOG_PREFIX "tls"
 
+#include "log.h"
+#include "bio.h"
+#include "dtls.h"
+
+#include <sys/mman.h>
 #include <openssl/conf.h>
+#include <openssl/provider.h>
 
 #include <freeradius-devel/server/base.h>
 #include <freeradius-devel/tls/attrs.h>
 #include <freeradius-devel/tls/base.h>
-#include <freeradius-devel/tls/engine.h>
 #include <freeradius-devel/util/atexit.h>
 #include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/math.h>
+#include <freeradius-devel/util/syserror.h>
+#include <freeradius-devel/util/md5.h>
+#include <freeradius-devel/util/md4.h>
 
-#include "log.h"
-#include "bio.h"
+static uint32_t openssl_instance_count = 0;
 
-static uint32_t instance_count = 0;
+/** How big of a stack we allocate, taken from the default thread stack size
+ */
+static size_t			openssl_stack_size;
 
 /** The context which holds any memory OpenSSL allocates
  *
@@ -55,16 +63,23 @@ _Thread_local TALLOC_CTX 	*ssl_talloc_ctx;
  */
 static _Thread_local bool	*async_pool_init;
 
+static OSSL_PROVIDER *openssl_default_provider = NULL;
+static OSSL_PROVIDER *openssl_legacy_provider = NULL;
+
+static uint32_t tls_instance_count = 0;
+
 fr_dict_t const *dict_freeradius;
 fr_dict_t const *dict_radius;
 fr_dict_t const *dict_tls;
+fr_dict_t const	*dict_der;
 
 extern fr_dict_autoload_t tls_dict[];
 fr_dict_autoload_t tls_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
-	{ .out = &dict_radius, .proto = "radius" },
 	{ .out = &dict_tls, .proto = "tls" },
-	{ NULL }
+	{ .out = &dict_der, .proto = "der" },
+
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 fr_dict_attr_t const *attr_allow_session_resumption;
@@ -89,25 +104,47 @@ fr_dict_attr_t const *attr_tls_certificate_x509v3_extended_key_usage;
 fr_dict_attr_t const *attr_tls_certificate_x509v3_subject_key_identifier;
 fr_dict_attr_t const *attr_tls_certificate_x509v3_authority_key_identifier;
 fr_dict_attr_t const *attr_tls_certificate_x509v3_basic_constraints;
+fr_dict_attr_t const *attr_tls_certificate_x509v3_crl_distribution_points;
+fr_dict_attr_t const *attr_tls_certificate_ocsp_uri;
+fr_dict_attr_t const *attr_tls_certificate_ocsp_cert_id;
 
+fr_dict_attr_t const *attr_tls_certificate_chain_depth;
 fr_dict_attr_t const *attr_tls_client_error_code;
 fr_dict_attr_t const *attr_tls_ocsp_cert_valid;
 fr_dict_attr_t const *attr_tls_ocsp_next_update;
 fr_dict_attr_t const *attr_tls_ocsp_response;
 fr_dict_attr_t const *attr_tls_psk_identity;
+fr_dict_attr_t const *attr_tls_psk_key;
 
 fr_dict_attr_t const *attr_tls_session_cert_file;
 fr_dict_attr_t const *attr_tls_session_require_client_cert;
 fr_dict_attr_t const *attr_tls_session_cipher_suite;
 fr_dict_attr_t const *attr_tls_session_version;
+fr_dict_attr_t const *attr_tls_session_resume_type;
 
-fr_dict_attr_t const *attr_framed_mtu;
+fr_dict_attr_t const *attr_tls_client_hello;
+fr_dict_attr_t const *attr_tls_client_hello_tls_version;
+fr_dict_attr_t const *attr_tls_client_hello_cipher;
+fr_dict_attr_t const *attr_tls_client_hello_sig_algo;
+fr_dict_attr_t const *attr_tls_client_hello_supported_group;
+fr_dict_attr_t const *attr_tls_client_hello_ec_point_format;
+fr_dict_attr_t const *attr_tls_client_hello_psk_key_mode;
+
+fr_dict_attr_t const *attr_module_failure_message;
+
+fr_dict_attr_t const *attr_tls_error;
+fr_dict_attr_t const *attr_tls_alert;
+fr_dict_attr_t const *attr_tls_alert_level;
+fr_dict_attr_t const *attr_tls_alert_description;
+fr_dict_attr_t const *attr_tls_alpn;
 
 fr_dict_attr_t const *attr_tls_packet_type;
 fr_dict_attr_t const *attr_tls_session_data;
 fr_dict_attr_t const *attr_tls_session_id;
 fr_dict_attr_t const *attr_tls_session_resumed;
 fr_dict_attr_t const *attr_tls_session_ttl;
+
+fr_dict_attr_t const *attr_der_certificate;
 
 extern fr_dict_attr_autoload_t tls_dict_attr[];
 fr_dict_attr_autoload_t tls_dict_attr[] = {
@@ -133,29 +170,52 @@ fr_dict_attr_autoload_t tls_dict_attr[] = {
 	{ .out = &attr_tls_certificate_x509v3_subject_key_identifier, .name = "TLS-Certificate.X509v3-Subject-Key-Identifier", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 	{ .out = &attr_tls_certificate_x509v3_authority_key_identifier, .name = "TLS-Certificate.X509v3-Authority-Key-Identifier", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 	{ .out = &attr_tls_certificate_x509v3_basic_constraints, .name = "TLS-Certificate.X509v3-Basic-Constraints", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
+	{ .out = &attr_tls_certificate_x509v3_crl_distribution_points, .name = "TLS-Certificate.X509v3-CRL-Distribution-Points", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
+	{ .out = &attr_tls_certificate_ocsp_uri, .name = "TLS-Certificate.OCSP-URI", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
+	{ .out = &attr_tls_certificate_ocsp_cert_id, .name = "TLS-Certificate.OCSP-Cert-Id", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
 
+	{ .out = &attr_tls_certificate_chain_depth, .name = "TLS-Certificate-Chain-Depth", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
 	{ .out = &attr_tls_client_error_code, .name = "TLS-Client-Error-Code", .type = FR_TYPE_UINT8, .dict = &dict_freeradius },
 	{ .out = &attr_tls_ocsp_cert_valid, .name = "TLS-OCSP-Cert-Valid", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
 	{ .out = &attr_tls_ocsp_next_update, .name = "TLS-OCSP-Next-Update", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
 	{ .out = &attr_tls_ocsp_response, .name = "TLS-OCSP-Response", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
 	{ .out = &attr_tls_psk_identity, .name = "TLS-PSK-Identity", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
+	{ .out = &attr_tls_psk_key, .name = "TLS-PSK-Key", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
 
 	{ .out = &attr_tls_session_cert_file, .name = "TLS-Session-Certificate-File", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 	{ .out = &attr_tls_session_require_client_cert, .name = "TLS-Session-Require-Client-Certificate", .type = FR_TYPE_BOOL, .dict = &dict_freeradius },
 	{ .out = &attr_tls_session_cipher_suite, .name = "TLS-Session-Cipher-Suite", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 	{ .out = &attr_tls_session_version, .name = "TLS-Session-Version", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
+	{ .out = &attr_tls_session_resume_type, .name = "TLS-Session-Resume-Type", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
 
-	{ .out = &attr_framed_mtu, .name = "Framed-MTU", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ .out = &attr_tls_client_hello, .name = "TLS-Client-Hello", .type = FR_TYPE_TLV, .dict = &dict_freeradius },
+	{ .out = &attr_tls_client_hello_tls_version, .name = "TLS-Client-Hello.TLS-Version", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
+	{ .out = &attr_tls_client_hello_cipher, .name = "TLS-Client-Hello.Cipher", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
+	{ .out = &attr_tls_client_hello_sig_algo, .name = "TLS-Client-Hello.Signature-Algorithm", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
+	{ .out = &attr_tls_client_hello_supported_group, .name = "TLS-Client-Hello.Supported-Group", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
+	{ .out = &attr_tls_client_hello_ec_point_format, .name = "TLS-Client-Hello.EC-Point-Format", .type = FR_TYPE_UINT8, .dict = &dict_freeradius },
+	{ .out = &attr_tls_client_hello_psk_key_mode, .name = "TLS-Client-Hello.PSK-Key-Mode", .type = FR_TYPE_UINT8, .dict = &dict_freeradius },
+
+	{ .out = &attr_module_failure_message, .name = "Module-Failure-Message", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 
 	/*
 	 *	Eventually all TLS attributes will be in the TLS dictionary
 	 */
+	{ .out = &attr_tls_error, .name = "Error", .type = FR_TYPE_UINT32, .dict = &dict_tls },
+	{ .out = &attr_tls_alert, .name = "Alert", .type = FR_TYPE_STRUCT, .dict = &dict_tls },
+	{ .out = &attr_tls_alert_level, .name = "Alert.Level", .type = FR_TYPE_UINT8, .dict = &dict_tls },
+	{ .out = &attr_tls_alert_description, .name = "Alert.Description", .type = FR_TYPE_UINT8, .dict = &dict_tls },
+	{ .out = &attr_tls_alpn, .name = "ALPN", .type = FR_TYPE_STRING, .dict = &dict_tls },
+
 	{ .out = &attr_tls_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_tls },
 	{ .out = &attr_tls_session_data, .name = "Session-Data", .type = FR_TYPE_OCTETS, .dict = &dict_tls },
 	{ .out = &attr_tls_session_id, .name = "Session-Id", .type = FR_TYPE_OCTETS, .dict = &dict_tls },
 	{ .out = &attr_tls_session_resumed, .name = "Session-Resumed", .type = FR_TYPE_BOOL, .dict = &dict_tls },
 	{ .out = &attr_tls_session_ttl, .name = "Session-TTL", .type = FR_TYPE_TIME_DELTA, .dict = &dict_tls },
-	{ NULL }
+
+	{ .out = &attr_der_certificate, .name = "Certificate", .type = FR_TYPE_TLV, .dict = &dict_der },
+
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 /*
@@ -165,6 +225,12 @@ fr_value_box_t const	*enum_tls_packet_type_load_session;
 fr_value_box_t const	*enum_tls_packet_type_store_session;
 fr_value_box_t const	*enum_tls_packet_type_clear_session;
 fr_value_box_t const	*enum_tls_packet_type_verify_certificate;
+fr_value_box_t const	*enum_tls_packet_type_new_session;
+fr_value_box_t const	*enum_tls_packet_type_establish_session;
+fr_value_box_t const	*enum_tls_packet_type_fail_session;
+fr_value_box_t const	*enum_tls_packet_type_encode_session;
+fr_value_box_t const	*enum_tls_packet_type_decode_session;
+fr_value_box_t const	*enum_tls_packet_type_load_psk;
 
 /*
  *	response types
@@ -173,17 +239,33 @@ fr_value_box_t const	*enum_tls_packet_type_success;
 fr_value_box_t const	*enum_tls_packet_type_failure;
 fr_value_box_t const	*enum_tls_packet_type_notfound;
 
+/*
+ *	session resumption
+ */
+fr_value_box_t const	*enum_tls_session_resumed_stateful;
+fr_value_box_t const	*enum_tls_session_resumed_stateless;
+
 extern fr_dict_enum_autoload_t tls_dict_enum[];
 fr_dict_enum_autoload_t tls_dict_enum[] = {
 	{ .out = &enum_tls_packet_type_load_session, .name = "Load-Session", .attr = &attr_tls_packet_type },
 	{ .out = &enum_tls_packet_type_store_session, .name = "Store-Session", .attr = &attr_tls_packet_type },
 	{ .out = &enum_tls_packet_type_clear_session, .name = "Clear-Session", .attr = &attr_tls_packet_type },
 	{ .out = &enum_tls_packet_type_verify_certificate, .name = "Verify-Certificate", .attr = &attr_tls_packet_type },
+	{ .out = &enum_tls_packet_type_new_session, .name = "New-Session", .attr = &attr_tls_packet_type },
+	{ .out = &enum_tls_packet_type_establish_session, .name = "Establish-Session", .attr = &attr_tls_packet_type },
+	{ .out = &enum_tls_packet_type_fail_session, .name = "Fail-Session", .attr = &attr_tls_packet_type },
+	{ .out = &enum_tls_packet_type_encode_session, .name = "Encode-Session", .attr = &attr_tls_packet_type },
+	{ .out = &enum_tls_packet_type_decode_session, .name = "Decode-Session", .attr = &attr_tls_packet_type },
+	{ .out = &enum_tls_packet_type_load_psk, .name = "Load-PSK", .attr = &attr_tls_packet_type },
 
 	{ .out = &enum_tls_packet_type_success, .name = "Success", .attr = &attr_tls_packet_type },
 	{ .out = &enum_tls_packet_type_failure, .name = "Failure", .attr = &attr_tls_packet_type },
 	{ .out = &enum_tls_packet_type_notfound, .name = "Notfound", .attr = &attr_tls_packet_type },
-	{ NULL }
+
+	{ .out = &enum_tls_session_resumed_stateful, .name = "stateful", .attr = &attr_tls_session_resume_type },
+	{ .out = &enum_tls_session_resumed_stateless, .name = "stateless", .attr = &attr_tls_session_resume_type },
+
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 /*
@@ -191,110 +273,54 @@ fr_dict_enum_autoload_t tls_dict_enum[] = {
  */
 int fr_tls_max_threads = 1;
 
-#ifdef ENABLE_OPENSSL_VERSION_CHECK
-typedef struct {
-	uint64_t	high;		//!< The last version number this defect affected.
-	uint64_t	low;		//!< The first version this defect affected.
-
-	char const	*id;		//!< CVE (or other ID)
-	char const	*name;		//!< As known in the media...
-	char const	*comment;	//!< Where to get more information.
-} fr_openssl_defect_t;
-
-#undef VM
-#undef Vm
-#define VM(_a,_b,_c) (((((_a) << 24) | ((_b) << 16) | ((_c) << 8)) << 4) | 0x0f)
-#define Vm(_a,_b,_c,_d) (((((_a) << 24) | ((_b) << 16) | ((_c) << 8) | ((_d) - 'a' + 1)) << 4) | 0x0f)
-
-/* Record critical defects in libssl here, new versions of OpenSSL to older versions of OpenSSL.  */
-static fr_openssl_defect_t fr_openssl_defects[] =
-{
-	{
-		.low		= Vm(1,1,0,'a'),		/* 1.1.0a */
-		.high		= Vm(1,1,0,'a'),		/* 1.1.0a */
-		.id		= "CVE-2016-6309",
-		.name		= "OCSP status request extension",
-		.comment	= "For more information see https://www.openssl.org/news/secadv/20160926.txt"
-	},
-	{
-		.low		= VM(1,1,0),			/* 1.1.0  */
-		.high		= VM(1,1,0),			/* 1.1.0  */
-		.id		= "CVE-2016-6304",
-		.name		= "OCSP status request extension",
-		.comment	= "For more information see https://www.openssl.org/news/secadv/20160922.txt"
-	}
-};
-#endif /* ENABLE_OPENSSL_VERSION_CHECK */
-
-#ifdef ENABLE_OPENSSL_VERSION_CHECK
-/** Check for vulnerable versions of libssl
- *
- * @param acknowledged The highest CVE number a user has confirmed is not present in the system's
- *	libssl.
- * @return 0 if the CVE specified by the user matches the most recent CVE we have, else -1.
- */
-int fr_openssl_version_check(char const *acknowledged)
-{
-	uint64_t v;
-	bool bad = false;
-	size_t i;
-
-	/*
-	 *	Didn't get passed anything, that's an error.
-	 */
-	if (!acknowledged || !*acknowledged) {
-		ERROR("Refusing to start until 'allow_vulnerable_openssl' is given a value");
-		return -1;
-	}
-
-	if (strcmp(acknowledged, "yes") == 0) return 0;
-
-	/* Check for bad versions */
-	v = (uint64_t) SSLeay();
-
-	for (i = 0; i < (NUM_ELEMENTS(fr_openssl_defects)); i++) {
-		fr_openssl_defect_t *defect = &fr_openssl_defects[i];
-
-		if ((v >= defect->low) && (v <= defect->high)) {
-			/*
-			 *	If the CVE is acknowledged, allow it.
-			 */
-			if (!bad && (strcmp(acknowledged, defect->id) == 0)) return 0;
-
-			ERROR("Refusing to start with libssl version %s (in range %s)",
-			      ssl_version(), ssl_version_range(defect->low, defect->high));
-			ERROR("Security advisory %s (%s)", defect->id, defect->name);
-			ERROR("%s", defect->comment);
-
-			/*
-			 *	Only warn about the first one...
-			 */
-			if (!bad) {
-				INFO("Once you have verified libssl has been correctly patched, "
-				     "set security.allow_vulnerable_openssl = '%s'", defect->id);
-				bad = true;
-			}
-		}
-	}
-
-	if (bad) return -1;
-
-	return 0;
-}
-#endif
-
 /** Allocate memory for OpenSSL in the NULL context
  *
  * @param len to alloc.
  * @return realloc.
  */
-static void *fr_openssl_talloc(size_t len, NDEBUG_UNUSED char const *file, NDEBUG_UNUSED int line)
+static void *fr_openssl_talloc(size_t len, char const *file, NDEBUG_UNUSED int line)
 {
+	static char const *async_file;
 	void *chunk;
+
+	if (!file) {
+		chunk = talloc_array(ssl_talloc_ctx, uint8_t, len);
+
+#ifndef NDEBUG
+		talloc_set_name(chunk, "fr_openssl_talloc");
+#endif
+		return chunk;
+	}
+
+	/*
+	 *	Cache the filename pointer for the async_posix.c
+	 *	source file, so we can figure out when we're
+	 *	being asked for stack memory.
+	 *
+	 *	This is terrible, we're basically guessing at the
+	 *	stack size.  OpenSSL 3.1.0 will have proper
+	 *	allocation functions so we can something more
+	 *	sensible.
+	 */
+	if (!async_file) {
+		char const *sep;
+
+		sep = strrchr(file, '/');
+		if (!sep) {
+			sep = file;
+		} else {
+			sep++;
+		}
+		if (strcmp(sep, "async_posix.c") == 0) {
+			async_file = file;
+		alloc_stack:
+			len *= 4;
+		}
+	} else if (file == async_file) goto alloc_stack;
 
 	chunk = talloc_array(ssl_talloc_ctx, uint8_t, len);
 #ifndef NDEBUG
-	talloc_set_name(chunk, "%s:%u", file, line);
+	talloc_set_name(chunk, "%s:%d", file, line);
 #endif
 	return chunk;
 }
@@ -311,7 +337,7 @@ static void *fr_openssl_talloc_realloc(void *old, size_t len, NDEBUG_UNUSED char
 
 	chunk = talloc_realloc_size(ssl_talloc_ctx, old, len);
 #ifndef NDEBUG
-	talloc_set_name(chunk, "%s:%u", file, line);
+	talloc_set_name(chunk, "%s:%d", file, line);
 #endif
 	return chunk;
 }
@@ -342,10 +368,10 @@ static void fr_openssl_talloc_free(void *to_free, char const *file, int line)
 /** Cleanup async pools if the thread exits
  *
  */
-static void _openssl_thread_free(void *init)
+static int _openssl_thread_free(void *init)
 {
 	ASYNC_cleanup_thread();
-	talloc_free(init);
+	return talloc_free(init);
 }
 
 /** Perform thread-specific initialisation for OpenSSL
@@ -369,7 +395,7 @@ int fr_openssl_thread_init(size_t async_pool_size_init, size_t async_pool_size_m
 		bool *init = talloc_zero(NULL, bool);
 
 		if (ASYNC_init_thread(async_pool_size_max, async_pool_size_init) != 1) {
-			fr_tls_log_error(NULL, "Failed initialising OpenSSL async context pool");
+			fr_openssl_log_perror(NULL, "Failed initialising OpenSSL async context pool");
 			return -1;
 		}
 
@@ -388,29 +414,90 @@ int fr_openssl_thread_init(size_t async_pool_size_init, size_t async_pool_size_m
  */
 void fr_openssl_free(void)
 {
-	if (--instance_count > 0) return;
-
-	fr_tls_engine_free_all();
-
-	OPENSSL_cleanup();
-
-	fr_dict_autofree(tls_dict);
+	if (--openssl_instance_count > 0) return;
 
 	fr_tls_log_free();
 
 	fr_tls_bio_free();
+
+	fr_md5_openssl_free();
+	fr_md4_openssl_free();
 }
+
+#if OPENSSL_VERSION_NUMBER < 0x40000000L
+static void _openssl_provider_free(void)
+{
+	if (openssl_default_provider && !OSSL_PROVIDER_unload(openssl_default_provider)) {
+		fr_openssl_log_perror(NULL, "Failed unloading default provider");
+	}
+	openssl_default_provider = NULL;
+
+	if (openssl_legacy_provider && !OSSL_PROVIDER_unload(openssl_legacy_provider)) {
+		fr_openssl_log_perror(NULL, "Failed unloading legacy provider");
+	}
+	openssl_legacy_provider = NULL;
+}
+#endif
+
+static int fr_openssl_cleanup(UNUSED void *uctx)
+{
+	OPENSSL_cleanup();
+	return 0;
+}
+
+#ifdef HAVE_ASYNC_SET_MEM_FUNCTIONS
+
+static void *fr_openssl_stack_alloc(size_t *len)
+{
+	void *stack;
+
+	/*
+	 *	Use mmap to sparsely allocate the stack
+	 */
+#if defined(__linux__) || defined(__FreeBSD__)
+	stack = mmap(NULL, openssl_stack_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_STACK, -1, 0);
+#else
+	stack = mmap(NULL, openssl_stack_size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+#endif
+	if (stack == MAP_FAILED) {
+		fr_openssl_log_perror(NULL, "Failed allocating OpenSSL stack: %s", fr_syserror(errno));
+		return NULL;
+	}
+	*len = openssl_stack_size;
+
+	return stack;
+}
+
+static void fr_openssl_stack_free(void *stack)
+{
+	munmap(stack, openssl_stack_size);
+}
+#endif
 
 /** Add all the default ciphers and message digests to our context.
  *
  * This should be called exactly once from main, before reading the main config
  * or initialising any modules.
  */
+int fr_tls_session_ex_index = -1;
+
 int fr_openssl_init(void)
 {
-	if (instance_count > 0) {
-		instance_count++;
+	int rcode;
+	pthread_attr_t tattr;
+
+	if (openssl_instance_count > 0) {
+		openssl_instance_count++;
 		return 0;
+	}
+
+	pthread_attr_init(&tattr);
+	rcode = pthread_attr_getstacksize(&tattr, &openssl_stack_size);
+	pthread_attr_destroy(&tattr);
+
+	if (rcode != 0) {
+		fr_openssl_log_perror(NULL, "Failed getting stack size");
+		return -1;
 	}
 
 	/*
@@ -418,9 +505,70 @@ int fr_openssl_init(void)
 	 *	by OpenSSL.
 	 */
 	if (CRYPTO_set_mem_functions(fr_openssl_talloc, fr_openssl_talloc_realloc, fr_openssl_talloc_free) != 1) {
-		fr_tls_log_error(NULL, "Failed to set OpenSSL memory allocation functions.  fr_openssl_init() called too late");
+		fr_openssl_log_perror(NULL, "Failed to set OpenSSL memory allocation functions.  fr_openssl_init() called too late");
 		return -1;
 	}
+
+	/*
+	 *	Setup custom memory allocators for allocating greenthread
+	 *	stacks, so we can add guard pages.
+	 */
+#ifdef HAVE_ASYNC_SET_MEM_FUNCTIONS
+	if (ASYNC_set_mem_functions(fr_openssl_stack_alloc, fr_openssl_stack_free) != 1) {
+		fr_openssl_log_perror(NULL, "Failed to set OpenSSL async stack allocation functions");
+		return -1;
+	}
+#endif
+
+	/*
+	 *	NO_ATEXIT has no effect if init is done after
+	 *	loading providers, and we need to control the
+	 *	exit handler as it needs to be executed last
+	 *	after all the EVP_MD ctx have been called, as
+	 *      they may unload elements of providers once all
+	 *	the contexts have been cleaned up.
+	 */
+	if (OPENSSL_init_ssl(OPENSSL_INIT_NO_ATEXIT | OPENSSL_INIT_LOAD_CONFIG, NULL) != 1) {
+		fr_openssl_log_perror(NULL, "Failed calling OPENSSL_init_crypto()");
+		return -1;
+	}
+
+	/*
+	 *	Load the default provider for most algorithms
+	 */
+	openssl_default_provider = OSSL_PROVIDER_load(NULL, "default");
+	if (!openssl_default_provider) {
+		fr_openssl_log_perror(NULL, "Failed loading default provider");
+		return -1;
+	}
+
+	/*
+	 *	Needed for MD4
+	 *
+	 *	https://www.openssl.org/docs/man3.0/man7/migration_guide.html#Legacy-Algorithms
+	 */
+	openssl_legacy_provider = OSSL_PROVIDER_load(NULL, "legacy");
+	if (!openssl_legacy_provider) {
+		fr_openssl_log_perror(NULL, "Failed loading legacy provider");
+		return -1;
+	}
+
+#if OPENSSL_VERSION_NUMBER < 0x40000000L
+	/*
+	 *	Unload the providers from OpenSSL's cleanup
+	 *	stack, which runs inside OPENSSL_cleanup() after
+	 *	this thread's OpenSSL state is freed and before
+	 *	the library itself is torn down.
+	 */
+	OPENSSL_atexit(_openssl_provider_free);
+#else
+	/*
+	 *	OpenSSL 4.0 removed OPENSSL_atexit(), and
+	 *	OPENSSL_cleanup() now defers the teardown to a
+	 *	library destructor, which deactivates and frees
+	 *	every loaded provider itself at that point.
+	 */
+#endif
 
 	/*
 	 *	SHA256 is in all versions of OpenSSL, but isn't
@@ -429,19 +577,76 @@ int fr_openssl_init(void)
 	 */
 	EVP_add_digest(EVP_sha256());
 
-	OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, NULL);
-
 	/*
-	 *	FIXME - This should be done _after_
-	 *	running any engine controls.
+	 *	Allocate an index via the OpenSSL API.  This tells
+	 *	OpenSSL that the ex_data pointer can be duplicated
+	 *	when the SSL_SESSION is duplicated.
+	 *
+	 *	No callbacks are needed: the default is to copy the
+	 *	pointer, which is what we need.  The #fr_tls_session_t
+	 *	outlives every SSL_SESSION which points to it.
 	 */
-	fr_tls_engine_load_builtin();
+	fr_tls_session_ex_index = SSL_SESSION_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+	if (fr_tls_session_ex_index < 0) {
+		fr_openssl_log_perror(NULL, "Failed allocating an SSL_SESSION ex_data index");
+		return -1;
+	}
 
 	fr_tls_log_init();
 
 	fr_tls_bio_init();
 
-	instance_count++;
+	/*
+	 *	The key every DTLS cookie is generated with, see
+	 *	fr_dtls_cookie_generate_cb().
+	 */
+	if (fr_dtls_cookie_init() < 0) {
+		fr_openssl_log_perror(NULL, "Failed generating the DTLS cookie key");
+		return -1;
+	}
+
+	fr_md5_openssl_init();
+	fr_md4_openssl_init();
+
+	/*
+	 *	Use an atexit handler to try and ensure
+	 *	that OpenSSL gets freed last.
+	 *
+	 *	All EVP_*ctxs need to be freed before we
+	 *	de-initialise the libraries else we get
+	 *	crashes (at least with OpenSSL 3.0.1).
+	 */
+	fr_atexit_global(fr_openssl_cleanup, NULL);
+
+	openssl_instance_count++;
+
+	return 0;
+}
+
+/** Enable or disable fips mode
+ *
+ * @param[in] enabled		If true enable fips mode if false disable fips mode.
+ * @return
+ *	- 0 on success.
+ *      - -1 on failure
+ */
+int fr_openssl_fips_mode(bool enabled)
+{
+	if (!EVP_set_default_properties(NULL, enabled ? "fips=yes" : "-fips")) {
+		fr_openssl_log_perror(NULL, "Failed %s OpenSSL FIPS mode", enabled ? "enabling" : "disabling");
+		return -1;
+	}
+
+	/*
+	 *	Swap the MD4 / MD5 functions as appropriate.
+	 */
+	if (enabled) {
+		fr_md5_openssl_init();
+		fr_md4_openssl_init();
+	} else {
+		fr_md5_openssl_free();
+		fr_md4_openssl_free();
+	}
 
 	return 0;
 }
@@ -457,23 +662,38 @@ int fr_openssl_init(void)
  */
 int fr_tls_dict_init(void)
 {
+	if (tls_instance_count > 0) {
+		tls_instance_count++;
+		return 0;
+	}
+
+	tls_instance_count++;
+
 	if (fr_dict_autoload(tls_dict) < 0) {
 		PERROR("Failed initialising protocol library");
+	fail:
+		tls_instance_count--;
 		fr_openssl_free();
 		return -1;
 	}
 
 	if (fr_dict_attr_autoload(tls_dict_attr) < 0) {
 		PERROR("Failed resolving attributes");
-		fr_openssl_free();
-		return -1;
+		goto fail;
 	}
 
 	if (fr_dict_enum_autoload(tls_dict_enum) < 0) {
 		PERROR("Failed resolving enums");
-		fr_openssl_free();
-		return -1;
+		goto fail;
 	}
+
 	return 0;
+}
+
+void fr_tls_dict_free(void)
+{
+	if (--tls_instance_count > 0) return;
+
+	fr_dict_autofree(tls_dict);
 }
 #endif /* WITH_TLS */

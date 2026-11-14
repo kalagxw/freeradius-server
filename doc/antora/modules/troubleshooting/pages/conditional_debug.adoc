@@ -1,0 +1,238 @@
+= Conditional Debugging Logs
+
+In FreeRADIUS version 3, `radmin` allowed an administrator to gather
+debug log output for only the requests that matched a chosen
+condition. Filtering requests in this way can help diagnose specific
+problems without the noise of seeing all of other requests in
+progress.  Debug logging with `radmin` does not require restarting the
+server into debug mode.
+
+FreeRADIUS version 4 has no direct equivalent to the version 3 `radmin
+debug_condition` filter, but the same results can be gathered in a
+different way. Conditional debugging is built directly into `unlang`
+and can be used in virtual servers with far more flexibility than was
+available in the version 3 `radmin` tool.
+
+== Log destinations
+
+FreeRADIUS can log to more than one destination at once. Each log
+destination has its own options, such as sending to a file, to syslog,
+adding a timestamp to each entry, or colourising the output. A running
+server can change a log destination's filename and log level at any
+time, using an `unlang` dynamic expansion,
+xref:reference:xlat/interpreter.adoc[%debug()]
+
+The following configuration adds a new log destination named `debug`.
+It should be added to the
+xref:reference:raddb/radiusd.conf.adoc[`radiusd.conf`] file. This
+`debug` destination writes timestamped entries to `default.log`, and
+is only used when an `unlang` policy tells the server to use it.
+
+----
+log debug {
+    destination = file
+    file = ${logdir}/debug/default.log
+    timestamp = yes
+}
+----
+
+[NOTE]
+====
+Create the destination log directory before starting FreeRADIUS.
+FreeRADIUS does not create the directory automatically.
+====
+
+=== Using a different log destination
+
+To send log messages to the new log destination, call the
+xref:reference:xlat/log.adoc#_log_destinationstring_uint32_filename[`%log.destination`]
+expansion. This expansion sets the destination name, and optionally
+also the log level and filename.
+
+To log all messages to the new log destination, edit a virtual server
+(such as the default virtual server,
+xref:reference:raddb/sites-available/default.adoc[`sites-enabled/default`])
+as shown below.
+
+----
+...
+recv Access-Request {
+    ...
+    %log.destination("debug")
+    %pairs.debug("request")
+...
+----
+
+The example above, combined with the `log debug {}` setting shown
+earlier, writes every log message to `${logdir}/debug/default.log` at
+log level 2 by default. The virtual server enables debug logging only
+after the request arrives, so the virtual server also calls
+`%pairs.debug` to record the contents of the incoming request. Without
+the `%pairs.debug` call, the incoming request's attributes would not
+appear in the debug log.
+
+The `%log.destination` expansion can also change the log level or the
+log file. `%log.destination("debug", 3)` changes only the log level.
+`%log.destination("debug", 3, "${logdir}/debug/alternative.log")`
+changes the log level and writes to a different file than the one
+which was configured in the `log debug {}` section.
+
+Unlike v3, the `%log.destination()` call does not have to be used
+during entire request processing!  You can debug a portion of a policy
+by setting it at the start of a policy or `unlang` section.  Then, et
+the log level back via `%log.destination("debug", 0)` at the end of
+the policy, to stop the extra logging.
+
+== One log per user
+
+The filename argument to `%log.destination` is itself an expansion, so
+a virtual server can create one log file per user:
+
+----
+...
+recv Access-Request {
+    %log.destination("debug", 2, "${logdir}/debug/%{User-Name}.log")
+    %pairs.debug("request")
+...
+----
+
+The configuration above generates one log file for each `User-Name`
+value seen. Separate per-user log files may be convenient on a small
+system with only a few users.  The default configuration of the server
+does not deleted these debug log files automatically.  You will need
+to manually delete the debug log files regularly, or else they could
+fill up the disk.
+
+== Conditional logs
+
+Combining the above methods with a few more dynamic expansions gives
+further options. An administrator can keep a full per-user log, as
+shown above, and turn logging on or off at runtime with `radmin`.
+Alternatively, the virtual server can create a log only when a chosen
+condition matches.
+
+=== Toggling debug logs on and off
+
+Debug logs enabled for every user, all the time, rapidly use up disk
+space and can affect server performance. The
+xref:reference:raddb/mods-available/always.adoc[`always`] module
+provides one method to turn log collection on or off at runtime.
+
+Configure an instance of the `always` module that returns `noop` by
+default, for example in `mods-enabled/always`:
+
+----
+always debug_logs {
+    rcode = noop
+}
+----
+
+Make the `%log.destination` call conditional on the `debug_logs`
+module result:
+
+----
+...
+recv Access-Request {
+    debug_logs
+    if (ok) {
+        %log.destination("debug", 2, "${logdir}/debug/%{User-Name}.log")
+        %pairs.debug("request")
+    }
+...
+----
+
+The debug logs will be disabled by default. To enable them use
+`radmin`:
+
+----
+# radmin
+radmin> set module debug_logs status ok
+----
+
+The server now writes per-user debug logs. Disable them with:
+
+----
+# radmin
+radmin> set module debug_logs status noop
+----
+
+== Debugging with dynamic conditions
+
+The above examples use conditions which are fixed in the server
+configuration.  This is useful but still not as capable as the `debug
+condition` option in FreeRADIUS version 3's `radmin`.
+
+An arbitrary condition needs three steps:
+
+1. Read the condition from somewhere outside the server configuration.
+2. Evaluate the condition.
+3. Write debug logs only when the condition matches.
+
+One possibility is to write the condition to a file. The presence of
+the file determines whether the virtual server writes debug logs.
+
+Create a new file at `${logdir}/debug/condition`, containing, for
+example:
+
+----
+User-Name == "bob"
+----
+
+FreeRADIUS restricts which files dynamic expansions can read. Check
+that the
+xref:reference:raddb/radiusd.conf.adoc#_security_configuration[security
+limits] in the `radiusd.conf` allow the server to read the new file:
+
+----
+...
+security {
+    limit {
+        files {
+            allow = ${logdir}/debug
+            ...
+        }
+    }
+}
+...
+----
+
+The following unlang code checks whether the `condition` file exists.
+If the file exists, the code reads the condition from the first line,
+evaluates it, and enables logging when the condition matches. This
+would normally be added to the top of the `recv Access-Request`
+section.
+
+----
+...
+recv Access-Request {
+    if (%file.exists("${logdir}/debug/condition")) {
+       string condition
+
+       condition = %file.head("${logdir}/debug/condition")
+
+       if (condition && %eval(condition)) {
+           %log.destination("debug", 2, "${logdir}/debug/debug.log")
+           %pairs.debug("request")
+       }
+    }
+
+    ... policy to debug ...
+
+    # turn extra debugging off
+    %log.destination('')
+...
+----
+
+The server will now write debug logs to `${logdir}/debug/debug.log`
+when `User-Name` matches `bob`. The `condition` file can be modified
+while the server is running to change the matching rule.
+
+To stop the extra debugging, just delete the
+`${logdir}/debug/condition` file.  There is no need to restart the
+server.
+
+The above examples can be extended with arbitrary conditions to build
+debug logging tailored to any local requirements.
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

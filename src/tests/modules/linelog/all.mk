@@ -1,3 +1,4 @@
 #
-#  Test the "files" module
+#  Test the "linelog" module
 #
+$(eval $(call TEST_PARALLEL))

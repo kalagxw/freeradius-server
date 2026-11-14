@@ -1,0 +1,75 @@
+server inner-tunnel {
+	namespace = radius
+
+recv Access-Request {
+	copy_request_to_tunnel
+	filter_username
+	filter_inner_identity
+
+	split_username_nai
+	control.Password.Cleartext := Stripped-User-Name
+
+	chap
+	mschap
+	eap {
+		ok = return
+	}
+
+	files
+
+	pap
+}
+
+authenticate pap {
+	pap
+}
+
+authenticate chap {
+	chap
+}
+
+authenticate mschap {
+	mschap
+}
+
+authenticate eap {
+	eap
+}
+
+send Access-Accept {
+	parent.session-state += request.User-Name
+	ok
+}
+
+send Access-Reject {
+	ok
+}
+}
+
+server resume-inner-tunnel {
+	namespace = radius
+
+recv Access-Request {
+	if (User-Name) {
+		accept
+	}
+	reject
+}
+}
+
+server tls-session {
+	namespace = tls
+
+	load session {
+		cache_tls_session
+	}
+
+	store session {
+		cache_tls_session
+	}
+
+	clear session {
+		cache_tls_session
+	}
+}
+

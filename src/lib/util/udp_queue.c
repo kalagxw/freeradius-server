@@ -27,6 +27,7 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/syserror.h>
 
 #include <freeradius-devel/util/socket.h>
 #include <freeradius-devel/util/udp_queue.h>
@@ -37,9 +38,8 @@ struct fr_udp_queue_s {
 
 	fr_event_list_t		*el;
 	int			fd;
+	int			port;
 	bool			blocked;		//!< are we blocked?
-
-	// @todo - timers, IO callbacks, etc.
 
 	fr_udp_queue_resume_t	resume;
 };
@@ -61,9 +61,9 @@ typedef struct {
 
 static int _udp_queue_free(fr_udp_queue_t *uq)
 {
-	fr_dlist_foreach_safe(&uq->queue, fr_udp_queue_entry_t, entry) {
+	fr_dlist_foreach(&uq->queue, fr_udp_queue_entry_t, entry) {
 		talloc_free(entry);
-	}}
+	}
 
 	close(uq->fd);
 
@@ -82,21 +82,83 @@ static int _udp_queue_entry_free(fr_udp_queue_entry_t *entry)
 	return 0;
 }
 
-
-fr_udp_queue_t *fr_udp_queue_alloc(TALLOC_CTX *ctx, fr_udp_queue_config_t *config, fr_event_list_t *el,
+/** Allocate an outbound UDP queue.
+ *
+ * @param ctx	where the structure will be allocated.
+ * @param config containing the IPs, ports, etc
+ * @param el	the event list for adding events to see if the socket is writable
+ * @param resume the function to call after a delayed packet has been written
+ * @return
+ *	- NULL on error
+ *	- !NULL on success
+ */
+fr_udp_queue_t *fr_udp_queue_alloc(TALLOC_CTX *ctx, fr_udp_queue_config_t const *config, fr_event_list_t *el,
 				   fr_udp_queue_resume_t resume)
 {
-	fr_udp_queue_t *uq;
-	int fd;
+	fr_udp_queue_t	*uq;
+	int		fd;
+	fr_ipaddr_t	ipaddr = config->ipaddr;
+	uint16_t	port = config->port;
 
 	/*
 	 *	Open the socket.
 	 */
-	fd = fr_socket_server_udp(&config->ipaddr, &config->port, NULL, true);
+	fd = fr_socket_server_udp(&config->ipaddr, &port, NULL, false);
 	if (fd < 0) return NULL;
+
+	/*
+	 *	Set SO_REUSEPORT if we're binding to a specific port
+	 *	(e.g. DHCP), so that multiple threads can use the same
+	 *	port.
+	 */
+	if (config->port != 0) {
+		int on = 1;
+
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
+			fr_strerror_printf("SO_REUSEPORT said %s", fr_syserror(errno));
+			goto error;
+		}
+	}
+
+	/*
+	 *	Bind to the given interface.
+	 */
+	if (config->interface &&
+	    (fr_socket_bind(fd, config->interface, &ipaddr, &port) < 0)) goto error;
+
+#ifdef SO_SNDBUF
+	/*
+	 *	Set SO_SNDBUF size, if configured to do so.
+	 */
+	if (config->send_buff_is_set) {
+		int opt;
+
+		opt = config->send_buff;
+
+		if (opt < 65536) opt = 65536;
+		if (opt > (1 << 30)) opt = 1<<30;
+
+		(void) setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &opt, sizeof(int));
+	}
+#endif
+
+#ifdef SO_RCVBUF
+	/*
+	 *	Set SO_RECVBUFF to 4K, so that the kernel will quickly
+	 *	drop incoming packets.  We don't expect replies, and
+	 *	we never check the socket for readability, so this is
+	 *	fine.
+	 */
+	{
+		int opt = 4096;
+
+		(void) setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &opt, sizeof(int));
+	}
+#endif
 
 	uq = talloc_zero(ctx, fr_udp_queue_t);
 	if (!uq) {
+	error:
 		close(fd);
 		return NULL;
 	}
@@ -105,6 +167,7 @@ fr_udp_queue_t *fr_udp_queue_alloc(TALLOC_CTX *ctx, fr_udp_queue_config_t *confi
 		.config = config,
 		.el = el,
 		.fd = fd,
+		.port = port,
 		.resume = resume,
 	};
 
@@ -115,13 +178,17 @@ fr_udp_queue_t *fr_udp_queue_alloc(TALLOC_CTX *ctx, fr_udp_queue_config_t *confi
 	return uq;
 }
 
+/** If the socket is writable, then flush packets until either it
+ * returns EWOULDBLOCK, or there are no more packets to write.
+ *
+ */
 static void udp_queue_writable(UNUSED fr_event_list_t *el, UNUSED int fd,
 			       UNUSED int flags, void *uctx)
 {
-	fr_udp_queue_t *uq = talloc_get_type_abort(uctx, fr_udp_queue_t);
-	fr_time_t now = fr_time();
+	fr_udp_queue_t	*uq = talloc_get_type_abort(uctx, fr_udp_queue_t);
+	fr_time_t	now = fr_time();
 
-	fr_dlist_foreach_safe(&uq->queue, fr_udp_queue_entry_t, entry) {
+	fr_dlist_foreach(&uq->queue, fr_udp_queue_entry_t, entry) {
 		ssize_t rcode;
 		int retries = 0;
 
@@ -129,7 +196,7 @@ static void udp_queue_writable(UNUSED fr_event_list_t *el, UNUSED int fd,
 		 *	If the entry is expired, tell the caller that
 		 *	it wasn't written to the socket.
 		 */
-		if (now >= entry->expires) {
+		if (fr_time_gteq(now, entry->expires)) {
 			void *rctx = entry->rctx;
 
 			talloc_free(entry);
@@ -159,7 +226,7 @@ static void udp_queue_writable(UNUSED fr_event_list_t *el, UNUSED int fd,
 			if (errno != EWOULDBLOCK) return;
 #endif
 		}
-	}}
+	}
 
 	/*
 	 *	Nothing more to write, delete the IO handler so that we don't get extraneous signals.
@@ -171,6 +238,12 @@ static void udp_queue_writable(UNUSED fr_event_list_t *el, UNUSED int fd,
 }
 
 /** Write packet to socket, OR enqueue it if we get EAGAIN
+ *
+ *  In most cases, the packet will get written to the socket immediately.
+ *
+ *  However, if the socket is blocked, then the packet is added to an
+ *  outbound queue.  When the socket becomes unblocked, the packets
+ *  will be sent.
  *
  * @param ctx	the talloc context for this packet to be saved in, usually request_t
  * @param uq	the local queue to write it to
@@ -218,7 +291,7 @@ retry:
 
 		/*
 		 */
-		if (fr_event_fd_insert(uq, uq->el, uq->fd, NULL,
+		if (fr_event_fd_insert(uq, NULL, uq->el, uq->fd, NULL,
 				       udp_queue_writable, NULL, uq) < 0) {
 			return -1;
 		}
@@ -244,7 +317,7 @@ retry:
 		.sockaddr = sockaddr,
 		.socklen = socklen,
 		.uq = uq,
-		.expires = fr_time() + uq->config->max_queued_time,
+		.expires = fr_time_add(fr_time(), uq->config->max_queued_time),
 		.rctx = rctx,
 		.packet_len = packet_len,
 	};

@@ -31,14 +31,11 @@ extern "C" {
 #include <freeradius-devel/util/sbuff.h>
 #include <freeradius-devel/util/dbuff.h>
 
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <sys/types.h>
 
-extern char const fr_base16_alphabet_encode_lc[UINT8_MAX];
-extern char const fr_base16_alphabet_encode_uc[UINT8_MAX];
-extern uint8_t const fr_base16_alphabet_decode_mc[UINT8_MAX];	/* mixed case */
+extern char const fr_base16_alphabet_encode_lc[SBUFF_CHAR_CLASS];
+extern char const fr_base16_alphabet_encode_uc[SBUFF_CHAR_CLASS];
+extern uint8_t const fr_base16_alphabet_decode_mc[SBUFF_CHAR_CLASS];	/* mixed case */
 
 /** Check if char is in base16 alphabet
  *
@@ -48,12 +45,29 @@ extern uint8_t const fr_base16_alphabet_decode_mc[UINT8_MAX];	/* mixed case */
  *	- true if c is a character from the base32 alphabet.
  *	- false if character is not in the base32 alphabet.
  */
-static inline bool fr_is_base16_nstd(char c, uint8_t const alphabet[static UINT8_MAX])
+static inline bool fr_is_base16_nstd(char c, uint8_t const alphabet[static SBUFF_CHAR_CLASS])
 {
 	return alphabet[(uint8_t)c] < 16;
 }
 
-ssize_t		fr_base16_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in, char const alphabet[static UINT8_MAX]);
+/** Encode a single byte as two hex digits
+ *
+ * @param[out] out	Where to write the two digits.
+ * @param[in] byte	to encode.
+ * @param[in] alphabet	to use.
+ * @return
+ *	- 2 on success.
+ *	- < 0 the number of additional bytes out needed.
+ */
+static inline fr_slen_t fr_base16_encode_byte_nstd(fr_sbuff_t *out, uint8_t byte,
+						   char const alphabet[static SBUFF_CHAR_CLASS])
+{
+	return fr_sbuff_in_char(out, alphabet[(uint8_t)(byte >> 4)], alphabet[(uint8_t)(byte & 0x0f)]);
+}
+#define		fr_base16_encode_byte(_out, _byte) \
+		fr_base16_encode_byte_nstd(_out, _byte, fr_base16_alphabet_encode_lc)
+
+fr_slen_t	fr_base16_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in, char const alphabet[static SBUFF_CHAR_CLASS]);
 #define		fr_base16_encode(_out, _in) \
 		fr_base16_encode_nstd(_out, _in, fr_base16_alphabet_encode_lc)
 
@@ -68,7 +82,7 @@ ssize_t		fr_base16_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in, char const alpha
  *	- >=0 the number of bytes written to out.
  *	- <0 number of bytes we would have needed to print the next hexit.
  */
-static inline ssize_t fr_base16_aencode(TALLOC_CTX *ctx, char **out, fr_dbuff_t *in)
+static inline fr_slen_t fr_base16_aencode(TALLOC_CTX *ctx, char **out, fr_dbuff_t *in)
 {
 	fr_sbuff_t		sbuff;
 	fr_sbuff_uctx_talloc_t	tctx;
@@ -79,10 +93,10 @@ static inline ssize_t fr_base16_aencode(TALLOC_CTX *ctx, char **out, fr_dbuff_t 
 			     SIZE_MAX);
 
 	slen = fr_base16_encode(&sbuff, in);
-	if (slen <= 0) {
-		fr_sbuff_trim_talloc(&sbuff, 0);
+	if (slen < 0) {
+		(void)fr_sbuff_trim_talloc(&sbuff, 0);
 		*out = sbuff.buff;
-		return 0;
+		return slen;
 	}
 
 	*out = sbuff.buff;
@@ -90,8 +104,8 @@ static inline ssize_t fr_base16_aencode(TALLOC_CTX *ctx, char **out, fr_dbuff_t 
 	return (size_t)slen;
 }
 
-ssize_t		fr_base16_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_sbuff_t *in,
-				      bool no_trailing, uint8_t const alphabet[static UINT8_MAX]);
+fr_slen_t	fr_base16_decode_nstd(fr_sbuff_err_t *err, fr_dbuff_t *out, fr_sbuff_t *in,
+				      bool no_trailing, uint8_t const alphabet[static SBUFF_CHAR_CLASS]);
 #define		fr_base16_decode(_err, _out, _in, _no_trailing) \
 		fr_base16_decode_nstd(_err, _out, _in, _no_trailing, fr_base16_alphabet_decode_mc)
 

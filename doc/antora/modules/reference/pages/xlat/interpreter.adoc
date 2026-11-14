@@ -1,0 +1,119 @@
+= Interpreter
+
+The following functions allow inspection and/or manipulation of the
+`unlang` interpreter as it is running.
+
+<<debug_xlat>>
+
+== Debug Functions
+
+The following functions allow changing the debug level, or printing
+out specific lists of attributes.
+
+== %debug(<level>)
+
+Dynamically change the debug level to something high, recording the
+old level.
+
+.Return: _string_
+
+.Example
+
+[source,unlang]
+----
+recv Access-Request {
+    if (request.User-Name == "bob") {
+        "%debug(4)"
+    } else {
+        "%debug(0)"
+    }
+    ...
+}
+----
+
+.Output (_extra information only for that condition_)
+
+----
+...
+(0)  recv Access-Request {
+(0)    if (request.User-Name == "bob") {
+(0)      EXPAND %debug(4)
+(0)        --> 2
+(0)    } # if (request.User-Name == "bob") (...)
+(0)    filter_username {
+(0)      if (State) {
+(0)        ...
+(0)      }
+...
+----
+
+== State
+
+The state of the interpreter can be queried via the
+`%interpreter(<name>)` expansion.  The individual expansions are
+documented below.
+
+Each expansion given here can be prefixed with one or more dot (`.`)
+characters.  These dots allow the expansion to refer to the current
+request via a `name`, or the parent request via `.name`.  If there is
+no parent, the expansion returns the string `<underflow>`.
+
+For example `'filename'` is the name of the current file being
+executed, while `'..filename'` is the filename of the parent request.
+
+== %interpreter('filename')
+
+Which filename is currently being executed.
+
+== %interpreter('line')
+
+The line number in the current file being executed.
+
+== %interpreter('module')
+
+The current module being executed.  If the expansions is done in an
+`unlang` statement and outside of any module, it returns the name of
+the previous module which was executed.
+
+== %interpreter('processing_stage')
+
+Which section of a virtual server is processing the request.
+
+== %interpreter('rcode')
+
+Return the current interpreter xref:unlang/return_codes.adoc[rcode],
+e.g. `handled`, or `ok`, etc.
+
+== %interpreter('server')
+
+The name of the virtual server which is running the request.
+
+== %interpreter.module.force('name', 'noop')
+
+Force a module xref:unlang/return_codes.adoc[rcode], e.g. `handled` or
+`ok`, etc
+
+A module can be "un-forced" by not passing a second argument.
+
+== %client(<key>)
+
+Refers to a variable that was defined in the client section for the
+current client. See the sections `client { ... }` in `clients.conf`.
+
+.Return: _string_
+
+.Example
+
+[source,unlang]
+----
+"The client ipaddr is %client(ipaddr)"
+----
+
+.Output
+
+----
+The client ipaddr is 192.168.5.9
+----
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

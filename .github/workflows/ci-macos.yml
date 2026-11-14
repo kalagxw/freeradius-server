@@ -1,0 +1,221 @@
+name: CI macOS
+
+on:
+  workflow_call:
+
+env:
+  ASAN_OPTIONS: symbolize=1 detect_leaks=0 detect_stack_use_after_return=1
+  LSAN_OPTIONS: fast_unwind_on_malloc=0:malloc_context_size=50
+  UBSAN_OPTIONS: print_stacktrace=1
+  M_PERTURB: "0x42"
+  PANIC_ACTION: "lldb --batch -o 'bt all' -p %p"
+  ANALYZE_C_DUMP: 1
+  FR_GLOBAL_POOL: 4M
+  TEST_CERTS: yes
+  NO_PERFORMANCE_TESTS: yes
+  DO_BUILD: yes
+  HOSTAPD_BUILD_DIR: eapol_test.ci
+  HOSTAPD_GIT_TAG: hostap_2_12
+  DEBIAN_FRONTEND: noninteractive
+  CI: 1
+  GH_ACTIONS: 1
+
+jobs:
+  #
+  #  The `common_vars` job provides the compiler versions.  See
+  #  `.github/workflows/common_vars.yml`.
+  #
+  common_vars:
+    name: Common vars
+    uses: ./.github/workflows/common_vars.yml
+
+  ci:
+    needs: common_vars
+    timeout-minutes: 90
+
+    runs-on: ${{ matrix.env.OS }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        env:
+          - { CC: clang, BUILD_CFLAGS: "",         LIBS_OPTIONAL: yes, TEST_TYPE: macos,    OS: macos-15,     NAME: macos-clang         }
+
+    env: ${{ matrix.env }}
+
+    #  Branch protection can require status checks by name.  When you add
+    #  matrix entries or change the name format, update the status check
+    #  names.
+    name: "master-${{ matrix.env.NAME }}"
+
+    steps:
+
+    # Checkout, but defer pulling Git Large File Storage (LFS) objects until
+    # we have restored the cache
+    - uses: actions/checkout@v6
+      id: checkout
+      with:
+        lfs: false
+
+    - name: Create LFS file list as cache key
+      run: git lfs ls-files -l | cut -d' ' -f1 | sort > .lfs-assets-id
+
+    - name: Restore LFS cache
+      uses: actions/cache@v5
+      id: lfs-cache
+      with:
+        path: .git/lfs
+        key: ${{ runner.os }}-lfs-${{ hashFiles('.lfs-assets-id') }}-v1
+
+    # If we hit the cache then the LFS pull is local.  Otherwise the LFS
+    # pull is remote
+    - name: Git LFS pull
+      run: git lfs pull
+
+    - name: Restore eapol_test build directory from cache
+      uses: actions/cache@v5
+      id: hostapd-cache
+      with:
+        path: ${{ env.HOSTAPD_BUILD_DIR }}
+        key: hostapd-${{ runner.os }}-${{ env.HOSTAPD_GIT_TAG }}-v4
+
+    - name: Install dependencies (macOS)
+      run: |
+        #  The runner image includes the Homebrew tap `aws/tap`, and Homebrew
+        #  warns on every invocation while the tap is untrusted.  Nothing
+        #  installed below comes from the tap, so drop the tap rather than
+        #  grant the tap blanket trust.
+        brew untap aws/tap || true
+
+        brew install \
+          cassandra-cpp-driver \
+          gperftools \
+          hiredis \
+          json-c \
+          libidn \
+          libmemcached \
+          libyubikey \
+          luajit \
+          mariadb \
+          make \
+          mruby \
+          openssl \
+          python@3.10 \
+          talloc
+        ln -s `brew --prefix`/opt/make/bin/gmake /usr/local/bin/make
+        echo "#! /bin/sh"               >> /usr/local/bin/nproc
+        echo "sysctl -n hw.physicalcpu" >> /usr/local/bin/nproc
+        chmod +x /usr/local/bin/nproc
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: 1
+        HOMEBREW_NO_INSTALL_CLEANUP: 1
+        HOMEBREW_CLEANUP_PERIODIC_FULL_DAYS: 3650
+
+    - name: Install tacacs_plus
+      run: |
+        PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install tacacs_plus
+
+    - name: Install LLVM from Homebrew
+      uses: ./.github/actions/llvm-homebrew
+      with:
+        llvm_version: ${{ needs.common_vars.outputs.llvm_version }}
+
+    #
+    #  Ensure that we use Python 3.10
+    #
+    - name: Set path for Python 3.10
+      run: |
+        echo "PATH=`brew --prefix python@3.10`/bin/:$PATH" >> $GITHUB_ENV
+
+    #
+    #  Ensure that we use the Homebrew-installed OpenSSL
+    #
+    - name: Set path for OpenSSL
+      run: |
+        echo "PATH=`brew --prefix openssl`/bin/:$PATH" >> $GITHUB_ENV
+
+    - name: Show versions
+      run: |
+        $CC --version
+        make --version
+        krb5-config --all || :
+        pcre-config --libs-posix --version 2>/dev/null || :
+        pcre2-config --libs-posix --version 2>/dev/null || :
+        openssl version
+
+    - name: Configure
+      run: |
+        if $CC -v 2>&1 | grep clang > /dev/null; then
+            echo "Enabling sanitizers"
+            enable_sanitizers="--enable-address-sanitizer --enable-undefined-behaviour-sanitizer"
+            if [ "`uname`" != "Darwin" ]; then
+                enable_sanitizers="$enable_sanitizers --enable-leak-sanitizer"
+            fi
+        else
+            enable_sanitizers=""
+        fi
+        build_paths=""
+        if [ "`uname`" = "Darwin" ]; then
+            build_paths="--with-libfreeradius-ldap-lib-dir=`brew --prefix`/opt/openldap/lib --with-libfreeradius-ldap-include-dir=`brew --prefix`/opt/openldap/include --with-openssl-lib-dir=`brew --prefix`/opt/openssl/lib --with-openssl-include-dir=`brew --prefix`/opt/openssl/include --with-unixodbc-lib-dir=`brew --prefix`/opt/unixodbc/lib --with-unixodbc-include-dir=`brew --prefix`/opt/unixodbc/include --with-rlm-python-config-bin=`brew --prefix python@3.10`/bin/python3.10-config"
+        fi
+        CFLAGS="${BUILD_CFLAGS}" ./configure -C \
+            --enable-developer \
+            --enable-werror \
+            $enable_sanitizers \
+            $build_paths \
+            --prefix=$HOME/freeradius \
+            --with-threads=$LIBS_OPTIONAL \
+            --with-udpfromto=$LIBS_OPTIONAL \
+            --with-openssl=$LIBS_OPTIONAL \
+            --with-pcre=$LIBS_OPTIONAL
+        echo "config.log"
+        cat config.log
+        echo "Contents of src/include/autoconf.h"
+        cat "./src/include/autoconf.h"
+
+    - name: Make
+      run: |
+        make -j `nproc`
+
+    # AddressSanitizer (ASAN) does not support `detect_leaks` on macOS
+    - name: Run basic tests (macOS)
+      run: |
+        make -j `nproc` test.keywords test.unit test.modules test.auth test.digest
+        make -j `nproc` test
+      env:
+        ASAN_OPTIONS: symbolize=1 detect_stack_use_after_return=1
+
+    #  macOS writes cores to `/cores` rather than next to the crashing process,
+    #  so search `/cores` as well as the checkout.
+    #  The `checkout` step writes the `collect-core-dumps` action into the
+    #  workspace, so the step runs only when the `checkout` step succeeds.
+    - name: Collect core dumps
+      if: ${{ always() && steps.checkout.outcome == 'success' }}
+      uses: ./.github/actions/collect-core-dumps
+      with:
+        name: ${{ matrix.env.NAME }}
+        roots: ". /cores"
+
+    #
+    #  If the CI has failed and the branch is `ci-debug` then the workflow starts
+    #  a tmate session to provide interactive shell access to the runner.
+    #
+    #  tmate prints the Secure Shell (SSH) rendezvous point continuously in the
+    #  job output:
+    #
+    #      SSH: ssh VfuX8SrNuU5pGPMyZcz7TpJTa@sfo2.tmate.io
+    #
+    #  To use the session:
+    #
+    #    1. Push the failing commit: `git push origin ci-debug --force`
+    #    2. Open the job output in https://github.com/FreeRADIUS/freeradius-server/actions
+    #    3. Run the ssh command from the job output.
+    #
+    #  Access requires that you have the private key corresponding to the
+    #  public key of the GitHub user that initiated the job.
+    #
+    - name: "Debug: Start tmate"
+      uses: mxschmitt/action-tmate@v3
+      with:
+        limit-access-to-actor: true
+      if: ${{ github.ref == 'refs/heads/ci-debug' && failure() }}

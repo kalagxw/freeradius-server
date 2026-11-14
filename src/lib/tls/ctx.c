@@ -20,29 +20,32 @@
  * @file tls/ctx.c
  * @brief Initialise and configure SSL_CTX structures.
  *
- * @copyright 2001 hereUare Communications, Inc. (raghud@hereuare.com)
- * @copyright 2003 Alan DeKok (aland@freeradius.org)
- * @copyright 2006-2016 The FreeRADIUS server project
+ * @copyright 2026 Network RADIUS SAS (legal@networkradius.com)
  */
 RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #ifdef WITH_TLS
-#define LOG_PREFIX "tls - "
+#define LOG_PREFIX "tls"
+#define _TLS_PRIVATE 1
 
 #include <freeradius-devel/tls/log.h>
+#include <freeradius-devel/tls/strerror.h>
 #include <freeradius-devel/util/base16.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/syserror.h>
 
-#include <openssl/rand.h>
-#include <openssl/dh.h>
-
 #include "base.h"
 #include "utils.h"
+#include "dtls.h"
 #include "log.h"
 #include "cert.h"
+
+#include <openssl/rand.h>
+#include <openssl/dh.h>
+#include <openssl/x509v3.h>
+#include <openssl/provider.h>
 
 #ifndef OPENSSL_NO_ECDH
 static int ctx_ecdh_curve_set(SSL_CTX *ctx, char const *ecdh_curve, bool disable_single_dh_use)
@@ -62,8 +65,6 @@ static int ctx_ecdh_curve_set(SSL_CTX *ctx, char const *ecdh_curve, bool disable
 		return -1;
 	}
 	free(list);
-
-	(void) SSL_CTX_set_ecdh_auto(ctx, 1);
 	return 0;
 }
 #endif
@@ -73,8 +74,10 @@ static int ctx_ecdh_curve_set(SSL_CTX *ctx, char const *ecdh_curve, bool disable
  */
 static int ctx_dh_params_load(SSL_CTX *ctx, char *file)
 {
-	DH *dh = NULL;
-	BIO *bio;
+	BIO	*bio;
+	int	ret;
+
+	EVP_PKEY *dh = NULL;
 
 	if (!file) return 0;
 
@@ -88,19 +91,17 @@ static int ctx_dh_params_load(SSL_CTX *ctx, char *file)
 	 *
 	 * Change suggested by @t8m
 	 */
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
-	if (FIPS_mode() > 0) {
+	if (EVP_default_properties_is_fips_enabled(NULL)) {
 		WARN(LOG_PREFIX ": Ignoring user-selected DH parameters in FIPS mode. Using defaults.");
 		return 0;
 	}
-#endif
 
 	if ((bio = BIO_new_file(file, "r")) == NULL) {
 		ERROR("Unable to open DH file - %s", file);
 		return -1;
 	}
 
-	dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
+	dh = PEM_read_bio_Parameters(bio, &dh);
 	BIO_free(bio);
 	if (!dh) {
 		WARN("Unable to set DH parameters.  DH cipher suites may not work!");
@@ -108,121 +109,149 @@ static int ctx_dh_params_load(SSL_CTX *ctx, char *file)
 		return 0;
 	}
 
-	if (SSL_CTX_set_tmp_dh(ctx, dh) < 0) {
+	ret = SSL_CTX_set0_tmp_dh_pkey(ctx, dh);
+	if (ret == 0) {
+		EVP_PKEY_free(dh);
 		ERROR("Unable to set DH parameters");
-		DH_free(dh);
 		return -1;
 	}
 
-	DH_free(dh);
 	return 0;
 }
 
-static int tls_ctx_load_cert_chain(SSL_CTX *ctx, fr_tls_chain_conf_t *chain)
+static int tls_ctx_verify_chain_member(X509 **self_signed, SSL_CTX *ctx, X509 *to_verify,
+				       fr_tls_chain_verify_mode_t verify_mode)
 {
-	char		*password;
+	fr_unix_time_t	not_after;
 
-	/*
-	 *	Conf parser should ensure they're both populated
-	 */
-	fr_assert(chain->certificate_file && chain->private_key_file);
+	STACK_OF(X509)	*chain;
+	X509		*leaf;
 
-	/*
-	 *	Set the password (this should have been retrieved earlier)
-	 */
-	memcpy(&password, &chain->password, sizeof(password));
-	SSL_CTX_set_default_passwd_cb_userdata(ctx, password);
+	leaf = SSL_CTX_get0_certificate(ctx);
+	if (!leaf) {
+		ERROR("Chain does not contain a valid leaf certificate");
+		return -1;
+	}
 
-	/*
-	 *	Always set the callback as it provides useful debug
-	 *	output if the certificate isn't set.
-	 */
-	SSL_CTX_set_default_passwd_cb(ctx, fr_tls_session_password_cb);
+	if (!SSL_CTX_get0_chain_certs(ctx, &chain)) {
+		fr_tls_log_perror(NULL, "Failed retrieving chain certificates");
+		return -1;
+	}
 
-	switch (chain->file_format) {
-	case SSL_FILETYPE_PEM:
-		if (!(SSL_CTX_use_certificate_chain_file(ctx, chain->certificate_file))) {
-			fr_tls_log_error(NULL, "Failed reading certificate file \"%s\"",
-				      chain->certificate_file);
+	switch (fr_tls_cert_is_valid(NULL, &not_after, to_verify)) {
+	case -1:
+		fr_tls_chain_marker_log(NULL, L_ERR, chain, leaf, to_verify);
+		PERROR("Malformed certificate");
+		return -1;
+
+	case -2:
+	case -3:
+		switch (verify_mode) {
+		case FR_TLS_CHAIN_VERIFY_SOFT:
+			fr_tls_chain_marker_log(NULL, L_WARN, chain, leaf, to_verify);
+			PWARN("Certificate validation failed");
+			break;
+
+		case FR_TLS_CHAIN_VERIFY_HARD:
+			fr_tls_chain_marker_log(NULL, L_ERR, chain, leaf, to_verify);
+			PERROR("Certificate validation failed");
 			return -1;
+
+		default:
+			break;
 		}
-		break;
 
-	case SSL_FILETYPE_ASN1:
-		if (!(SSL_CTX_use_certificate_file(ctx, chain->certificate_file, chain->file_format))) {
-			fr_tls_log_error(NULL, "Failed reading certificate file \"%s\"",
-				      chain->certificate_file);
-			return -1;
+	}
+
+	/*
+	 *	Check for self-signed certs
+	 */
+	switch (verify_mode) {
+	case FR_TLS_CHAIN_VERIFY_SOFT:
+	case FR_TLS_CHAIN_VERIFY_HARD:
+		/*
+		 *	There can be only one... self signed
+		 *	cert in a chain.
+		 *
+		 *	We have to do this check manually
+		 *	because the OpenSSL functions will
+		 *	only check to see if it can build
+		 *	a chain, not that all certificates
+		 *	in the chain are used.
+		 *
+		 *	Having multiple self-signed certificates
+		 *	usually indicates someone has copied
+		 *	the wrong certificates into the
+		 *	server.pem file.
+		 */
+		if (X509_name_cmp(X509_get_subject_name(to_verify),
+				  X509_get_issuer_name(to_verify)) == 0) {
+			if (*self_signed) {
+				switch (verify_mode) {
+				case FR_TLS_CHAIN_VERIFY_SOFT:
+					WARN("Found multiple self-signed certificates in chain");
+					WARN("First certificate was:");
+					fr_tls_chain_marker_log(NULL, L_WARN,
+									    chain, leaf, *self_signed);
+
+					WARN("Second certificate was:");
+					fr_tls_chain_marker_log(NULL, L_WARN,
+									    chain, leaf, to_verify);
+					break;
+
+				case FR_TLS_CHAIN_VERIFY_HARD:
+					ERROR("Found multiple self-signed certificates in chain");
+					ERROR("First certificate was:");
+					fr_tls_chain_marker_log(NULL, L_ERR,
+									    chain, leaf, *self_signed);
+
+					ERROR("Second certificate was:");
+					fr_tls_chain_marker_log(NULL, L_ERR,
+									    chain, leaf, to_verify);
+					return -1;
+
+				default:
+					break;
+				}
+			}
+			*self_signed = to_verify;
 		}
 		break;
 
 	default:
-		fr_assert(0);
 		break;
 	}
 
-	if (!(SSL_CTX_use_PrivateKey_file(ctx, chain->private_key_file, chain->file_format))) {
-		fr_tls_log_error(NULL, "Failed reading private key file \"%s\"",
-			      chain->private_key_file);
+	return 0;
+}
+
+static int tls_ctx_load_cert_chain(SSL_CTX *ctx, fr_tls_chain_conf_t *chain, bool allow_multi_self_signed)
+{
+	int		i;
+
+	/*
+	 *	The chain section loaded the files when it was parsed,
+	 *	each SSL_CTX just takes references.
+	 */
+	fr_assert(chain->leaf && chain->private_key);
+
+	if (SSL_CTX_use_certificate(ctx, chain->leaf) != 1) {
+		fr_tls_log_perror(NULL, "Failed setting certificate from \"%s\"", chain->certificate_file);
 		return -1;
 	}
 
-	{
-		size_t		extra_cnt, i;
-		/*
-		 *	Load additional chain certificates from other files
-		 *	This allows us to specify chains in DER format as
-		 *	well as PEM, and means we can keep the intermediaries
-		 *	CAs and client/server certs in separate files.
-		 */
-		extra_cnt = talloc_array_length(chain->ca_files);
-		for (i = 0; i < extra_cnt; i++) {
-			FILE		*fp;
-			X509		*cert;
-			char const	*filename = chain->ca_files[i];
-
-			fp = fopen(filename, "r");
-			if (!fp) {
-				ERROR("Failed opening ca_file \"%s\": %s", filename, fr_syserror(errno));
-				return -1;
-			}
-
-			/*
-			 *	Load the PEM encoded X509 certificate
-			 */
-			switch (chain->file_format) {
-			case SSL_FILETYPE_PEM:
-				cert = PEM_read_X509(fp, NULL, NULL, NULL);
-				break;
-
-			case SSL_FILETYPE_ASN1:
-				cert = d2i_X509_fp(fp, NULL);
-				break;
-
-			default:
-				fr_assert(0);
-				fclose(fp);
-				return -1;
-			}
-			fclose(fp);
-
-			if (!cert) {
-				fr_tls_log_error(NULL, "Failed reading certificate file \"%s\"", filename);
-				return -1;
-			}
-			SSL_CTX_add0_chain_cert(ctx, cert);
+DIAG_OFF_OPTIONAL(used-but-marked-unused)	/* fix spurious warnings for sk macros */
+	for (i = 0; i < sk_X509_num(chain->extra); i++) {
+		if (SSL_CTX_add1_chain_cert(ctx, sk_X509_value(chain->extra, i)) != 1) {
+			fr_tls_log_perror(NULL, "Failed adding certificate %d to the chain for \"%s\"",
+					  i + 1, chain->certificate_file);
+			return -1;
 		}
 	}
+DIAG_ON_OPTIONAL(used-but-marked-unused)
 
-	/*
-	 *	Check if the last loaded private key matches the last
-	 *	loaded certificate.
-	 *
-	 *	Note: The call to SSL_CTX_use_certificate_chain_file
-	 *	can load in a private key too.
-	 */
-	if (!SSL_CTX_check_private_key(ctx)) {
-		ERROR("Private key does not match the certificate public key");
+	if (SSL_CTX_use_PrivateKey(ctx, chain->private_key) != 1) {
+		fr_tls_log_perror(NULL, "Failed setting private key from \"%s\"", chain->private_key_file);
 		return -1;
 	}
 
@@ -230,66 +259,34 @@ static int tls_ctx_load_cert_chain(SSL_CTX *ctx, fr_tls_chain_conf_t *chain)
 	 *	Loop over the certificates checking validity periods.
 	 *	SSL_CTX_build_cert_chain does this too, but we can
 	 *	produce significantly better errors here.
-	 *
-	 *	After looping over all the certs we figure out when
-	 *      the chain will next need refreshing.
 	 */
 	{
-		fr_unix_time_t  expires_first = 0;
-		int		ret;
+		X509		*self_signed = NULL;
+		STACK_OF(X509)	*our_chain;
 
-		for (ret = SSL_CTX_set_current_cert(ctx, SSL_CERT_SET_FIRST);
-		     ret == 1;
-		     ret = SSL_CTX_set_current_cert(ctx, SSL_CERT_SET_NEXT)) {
-			fr_unix_time_t	not_after;
-			STACK_OF(X509)	*our_chain;
-			X509		*our_cert;
+		if (tls_ctx_verify_chain_member(&self_signed, ctx, SSL_CTX_get0_certificate(ctx),
+						chain->verify_mode) < 0) return -1;
 
-			our_cert = SSL_CTX_get0_certificate(ctx);
-			if (!SSL_CTX_get0_chain_certs(ctx, &our_chain)) {
-				fr_tls_log_error(NULL, "Failed retrieving chain certificates");
-				return -1;
-			}
-
-			switch (fr_tls_cert_is_valid(NULL, &not_after, our_cert)) {
-			case -1:
-				fr_tls_log_certificate_chain(NULL, L_ERR, our_chain, our_cert);
-				PERROR("Malformed certificate");
-				return -1;
-
-			case -2:
-			case -3:
-				switch (chain->verify_mode) {
-				case FR_TLS_CHAIN_VERIFY_SOFT:
-					fr_tls_log_certificate_chain(NULL, L_WARN, our_chain, our_cert);
-					PWARN("Certificate validation failed");
-					break;
-
-				case FR_TLS_CHAIN_VERIFY_HARD:
-					fr_tls_log_certificate_chain(NULL, L_ERR, our_chain, our_cert);
-					PERROR("Certificate validation failed");
-					return -1;
-
-				default:
-					break;
-				}
-
-			}
-
-			/*
-			 *	Record the time the first certificate in
-			 *	the chain expires so we can use it for
-			 *	runtime checks.
-			 */
-			if ((expires_first == 0) || (expires_first > not_after)) expires_first = not_after;
+		if (!SSL_CTX_get0_chain_certs(ctx, &our_chain)) {
+			fr_tls_log_perror(NULL, "Failed retrieving chain certificates");
+			return -1;
 		}
 
-		/*
-		 *	Record this as a unix timestamp as
-		 *	internal time might not progress at
-		 *	the same rate as wallclock time.
-		 */
-		chain->valid_until = expires_first;
+		if (allow_multi_self_signed) self_signed = NULL;
+
+DIAG_OFF_OPTIONAL(used-but-marked-unused)	/* fix spurious warnings for sk macros */
+		for (i = sk_X509_num(our_chain); i > 0 ; i--) {
+			/*
+			 *	SSL_CTX_use_certificate_chain_file set the
+			 *	current cert to be the one loaded from
+			 *	that pem file.
+			 */
+			if (tls_ctx_verify_chain_member(&self_signed, ctx, sk_X509_value(our_chain, i - 1),
+							chain->verify_mode) < 0) return -1;
+
+			if (allow_multi_self_signed) self_signed = NULL;
+		}
+DIAG_ON_OPTIONAL(used-but-marked-unused)	/* fix spurious warnings for sk macros */
 	}
 
 	{
@@ -316,14 +313,14 @@ static int tls_ctx_load_cert_chain(SSL_CTX *ctx, fr_tls_chain_conf_t *chain)
 		 */
 		case FR_TLS_CHAIN_VERIFY_SOFT:
 			if (!SSL_CTX_build_cert_chain(ctx, mode)) {
-				fr_tls_log_strerror_printf(NULL);
+				fr_tls_strerror_printf(NULL);
 				PWARN("Failed verifying chain");
 			}
 			break;
 
 		case FR_TLS_CHAIN_VERIFY_HARD:
 			if (!SSL_CTX_build_cert_chain(ctx, mode)) {
-				fr_tls_log_strerror_printf(NULL);
+				fr_tls_strerror_printf(NULL);
 				PERROR("Failed verifying chain");
 				return -1;
 			}
@@ -337,15 +334,100 @@ static int tls_ctx_load_cert_chain(SSL_CTX *ctx, fr_tls_chain_conf_t *chain)
 	return 0;
 }
 
+/** Map the configured version numbers onto the DTLS ones
+ *
+ * DTLS has 1.0 and 1.2, and nothing else.  There is no DTLS 1.1, and this
+ * OpenSSL has no DTLS 1.3: dtls1.h defines DTLS_MAX_VERSION as
+ * DTLS1_2_VERSION.
+ *
+ * The version numbers also run backwards.  DTLS1_VERSION is 0xFEFF and
+ * DTLS1_2_VERSION is 0xFEFD, this function fixes that mapping.
+ *
+ * @param[in] ctx	to configure.
+ * @param[in] conf	to read the versions from.
+ * @return
+ *	- 0 on success.
+ *	- -1 on failure.
+ */
 static inline CC_HINT(always_inline)
-int tls_ctx_version_set(
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
-			UNUSED
-#endif
-			int *ctx_options, SSL_CTX *ctx, fr_tls_conf_t const *conf)
+int tls_ctx_version_set_dtls(SSL_CTX *ctx, fr_tls_conf_t const *conf)
 {
+	int version;
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+	if (conf->tls_max_version > (float) 0.0) {
+		if (conf->tls_min_version > conf->tls_max_version) {
+			ERROR("tls_min_version (%f) must be <= tls_max_version (%f)",
+			      (double)conf->tls_min_version, (double)conf->tls_max_version);
+			return -1;
+		}
+
+		/*
+		 *	1.3 and above allow more than exists, and the most
+		 *	recent DTLS there is satisfies them.
+		 */
+		if (conf->tls_max_version >= (float) 1.2) {
+			WARN("Ignoring DTLS 1.3, OpenSSL does not support it.");
+			version = DTLS1_2_VERSION;
+
+		} else if (conf->tls_max_version >= (float) 1.1) {
+			ERROR("There is no DTLS 1.1.  Set tls_max_version to 1.0 or 1.2");
+			return -1;
+
+		} else if (conf->tls_max_version >= (float) 1.0) {
+			version = DTLS1_VERSION;
+			WARN("DTLS 1.0 is insecure and SHOULD NOT be used");
+			WARN("tls_max_version SHOULD be 1.2");
+
+		} else {
+			ERROR("tls_max_version must be >= 1.0");
+			return -1;
+		}
+
+		if (!SSL_CTX_set_max_proto_version(ctx, version)) {
+			fr_tls_log_perror(NULL, "Failed setting DTLS maximum version");
+			return -1;
+		}
+	}
+
+	/*
+	 *	A minimum which does not exist cannot be rounded down to one
+	 *	which does, as that would hand the administrator a weaker
+	 *	connection than the one asked for.
+	 */
+	if (conf->tls_min_version >= (float) 1.3) {
+		ERROR("DTLS 1.3 is not supported by this version of OpenSSL");
+		return -1;
+
+	} else if (conf->tls_min_version >= (float) 1.2) {
+		version = DTLS1_2_VERSION;
+
+	} else if (conf->tls_min_version >= (float) 1.1) {
+		ERROR("There is no DTLS 1.1.  Set tls_min_version to 1.0 or 1.2");
+		return -1;
+
+	} else if (conf->tls_min_version >= (float) 1.0) {
+		version = DTLS1_VERSION;
+		WARN("DTLS 1.0 is insecure and SHOULD NOT be used");
+		WARN("tls_min_version SHOULD be 1.2");
+
+	} else {
+		ERROR("tls_min_version must be >= 1.0 as SSLv2 and SSLv3 are permanently disabled");
+		return -1;
+	}
+
+	if (!SSL_CTX_set_min_proto_version(ctx, version)) {
+		fr_tls_log_perror(NULL, "Failed setting DTLS minimum version");
+		return -1;
+	}
+
+	return 0;
+}
+
+static inline CC_HINT(always_inline)
+int tls_ctx_version_set(UNUSED int *ctx_options, SSL_CTX *ctx, fr_tls_conf_t const *conf)
+{
+	if (conf->socket_type == SOCK_DGRAM) return tls_ctx_version_set_dtls(ctx, conf);
+
 	/*
 	 *	SSL_CTX_set_(min|max)_proto_version was included in OpenSSL 1.1.0
 	 *
@@ -355,7 +437,7 @@ int tls_ctx_version_set(
 	 *	TLS1_3_VERSION is available in OpenSSL 1.1.1.
 	 *
 	 *	TLS1_4_VERSION does not exist yet.  But we allow it
-	 *	only if it is explictly permitted by the
+	 *	only if it is explicitly permitted by the
 	 *	administrator.
 	 */
 	if (conf->tls_max_version > (float) 0.0) {
@@ -380,9 +462,7 @@ int tls_ctx_version_set(
 #  ifdef TLS1_4_VERSION
 		else if (conf->tls_max_version >= (float) 1.4) max_version = TLS1_4_VERSION;
 #  endif
-#  ifdef TLS1_3_VERSION
 		else if (conf->tls_max_version >= (float) 1.3) max_version = TLS1_3_VERSION;
-#  endif
 		else if (conf->tls_max_version >= (float) 1.2) max_version = TLS1_2_VERSION;
 		else if (conf->tls_max_version >= (float) 1.1) max_version = TLS1_1_VERSION;
 		else max_version = TLS1_VERSION;
@@ -396,7 +476,7 @@ int tls_ctx_version_set(
 		}
 
 		if (!SSL_CTX_set_max_proto_version(ctx, max_version)) {
-			fr_tls_log_error(NULL, "Failed setting TLS maximum version");
+			fr_tls_log_perror(NULL, "Failed setting TLS maximum version");
 			goto error;
 		}
 	}
@@ -411,9 +491,7 @@ int tls_ctx_version_set(
 #  ifdef TLS1_4_VERSION
 		else if (conf->tls_min_version >= (float) 1.4) min_version = TLS1_4_VERSION;
 #  endif
-#  ifdef TLS1_3_VERSION
 		else if (conf->tls_min_version >= (float) 1.3) min_version = TLS1_3_VERSION;
-#  endif
 		else if (conf->tls_min_version >= (float) 1.2) min_version = TLS1_2_VERSION;
 		else if (conf->tls_min_version >= (float) 1.1) min_version = TLS1_1_VERSION;
 		else min_version = TLS1_VERSION;
@@ -427,49 +505,10 @@ int tls_ctx_version_set(
 		}
 
 		if (!SSL_CTX_set_min_proto_version(ctx, min_version)) {
-			fr_tls_log_error(NULL, "Failed setting TLS minimum version");
+			fr_tls_log_perror(NULL, "Failed setting TLS minimum version");
 			goto error;
 		}
 	}
-#else
-	/*
-	 *	OpenSSL < 1.1.0 - This doesn't need to change when new TLS versions are issued
-	 *	as new TLS versions will never be added to older OpenSSL versions.
-	 */
-	{
-		int ctx_tls_versions = 0;
-
-		/*
-		 *	We never want SSLv2 or SSLv3.
-		 */
-		*ctx_options |= SSL_OP_NO_SSLv2;
-		*ctx_options |= SSL_OP_NO_SSLv3;
-
-#  ifdef SSL_OP_NO_TLSv1
-		if (conf->tls_min_version > (float) 1.0) *ctx_options |= SSL_OP_NO_TLSv1;
-		ctx_tls_versions |= SSL_OP_NO_TLSv1;
-#  endif
-#  ifdef SSL_OP_NO_TLSv1_1
-		if (conf->tls_min_version > (float) 1.1) *ctx_options |= SSL_OP_NO_TLSv1_1;
-		if ((conf->tls_max_version > (float) 0.0) && (conf->tls_max_version < (float) 1.1)) {
-			*ctx_options |= SSL_OP_NO_TLSv1_1;
-		}
-		ctx_tls_versions |= SSL_OP_NO_TLSv1_1;
-#  endif
-#  ifdef SSL_OP_NO_TLSv1_2
-		if (conf->tls_min_version > (float) 1.2) *ctx_options |= SSL_OP_NO_TLSv1_2;
-		if ((conf->tls_max_version > (float) 0.0) && (conf->tls_max_version < (float) 1.2)) {
-			*ctx_options |= SSL_OP_NO_TLSv1_2;
-		}
-		ctx_tls_versions |= SSL_OP_NO_TLSv1_2;
-#  endif
-
-		if ((*ctx_options & ctx_tls_versions) == ctx_tls_versions) {
-			ERROR("You have disabled all available TLS versions");
-			goto error;
-		}
-	}
-#endif
 
 	return 0;
 }
@@ -480,7 +519,7 @@ int tls_ctx_version_set(
  * - Load the Private key & the certificate
  * - Set the Context options & Verify options
  *
- * @param conf to read settings from.
+ * @param conf to read settings from, including `socket_type`.
  * @param client If true SSL_CTX will be configured as a client context.
  * @return
  *	- A new SSL_CTX on success.
@@ -489,20 +528,36 @@ int tls_ctx_version_set(
 SSL_CTX *fr_tls_ctx_alloc(fr_tls_conf_t const *conf, bool client)
 {
 	SSL_CTX		*ctx;
-	X509_STORE	*cert_vpstore;
-	X509_STORE	*chain_store;
-	X509_STORE 	*verify_store;
-	int		verify_mode = SSL_VERIFY_NONE;
+	X509_STORE	*verify_store = NULL;
 	int		ctx_options = 0;
+	int		mode= SSL_MODE_ASYNC;
+
 
 	/*
-	 *	This addresses memory leaks in OpenSSL 1.0.2
-	 *	at the cost of the server occasionally
-	 *	crashing on exit.
+	 *	SOCK_SEQPACKET is refused rather than guessed at: OpenSSL has
+	 *	DTLS over SCTP, and nothing here has been written or tested
+	 *	for it.
 	 */
-	ctx = SSL_CTX_new(SSLv23_method());
+	switch (conf->socket_type) {
+
+	/*
+	 *	Zero means the application never set it, which every caller other than DTLS does.  For EAP,
+	 *	the configuration is in module structure, and is mprotect()'d.
+	 */
+	case 0:
+	case SOCK_STREAM:
+	case SOCK_DGRAM:
+		break;
+
+	default:
+		ERROR("Unsupported socket type %d for a TLS context, expected SOCK_STREAM (%d) "
+		      "or SOCK_DGRAM (%d)", conf->socket_type, SOCK_STREAM, SOCK_DGRAM);
+		return NULL;
+	}
+
+	ctx = SSL_CTX_new((conf->socket_type == SOCK_DGRAM) ? DTLS_method() : TLS_method());
 	if (!ctx) {
-		fr_tls_log_error(NULL, "Failed creating TLS context");
+		fr_tls_log_perror(NULL, "Failed creating TLS context");
 		return NULL;
 	}
 
@@ -517,149 +572,138 @@ SSL_CTX *fr_tls_ctx_alloc(fr_tls_conf_t const *conf, bool client)
 	 */
 #ifdef PSK_MAX_IDENTITY_LEN
 	/*
-	 *	A dynamic query exists.  There MUST NOT be a
-	 *	statically configured identity and password.
+	 *	The virtual server has a `load psk` section, so the
+	 *	configuration MUST NOT also set a fixed key in a `psk` section.
 	 */
-	if (conf->psk_query) {
-		if (!*conf->psk_query) {
-			ERROR("Invalid PSK Configuration: psk_query cannot be empty");
+	if (conf->load_psk) {
+		if (conf->psk.identity || conf->psk.key) {
+			ERROR("Invalid PSK Configuration: a fixed key is set in the psk section and the virtual server "
+			      "has a \"load psk\" section.  Remove one of the two");
 		error:
 			SSL_CTX_free(ctx);
 			return NULL;
 		}
 
-		if (conf->psk_identity && *conf->psk_identity) {
-			ERROR("Invalid PSK Configuration: psk_identity and psk_query cannot be used at the same time.");
+	/*
+	 *	A fixed key requires both `psk.identity` and `psk.key`.
+	 */
+	} else if (conf->psk.identity) {
+		size_t key_len = conf->psk.key ? talloc_array_length(conf->psk.key) : 0;
+
+		if (!*conf->psk.identity) {
+			ERROR("Invalid PSK Configuration: psk.identity is empty");
 			goto error;
 		}
 
-		if (conf->psk_password && *conf->psk_password) {
-			ERROR("Invalid PSK Configuration: psk_password and psk_query cannot be used at the same time.");
+		if (key_len == 0) {
+			ERROR("Invalid PSK Configuration: psk.identity is set but psk.key is missing or empty");
 			goto error;
 		}
 
-		if (client) {
-			ERROR("Invalid PSK Configuration: psk_query cannot be used for outgoing connections");
+		if (key_len > PSK_MAX_PSK_LEN) {
+			ERROR("Invalid PSK Configuration: psk.key is %zu bytes, OpenSSL accepts at most %d bytes",
+			      key_len, PSK_MAX_PSK_LEN);
 			goto error;
 		}
 
-		/*
-		 *	Now check that if PSK is being used, that the config is valid.
-		 */
-	} else if (conf->psk_identity) {
-		if (!*conf->psk_identity) {
-			ERROR("Invalid PSK Configuration: psk_identity is empty");
-			goto error;
-		}
-
-
-		if (!conf->psk_password || !*conf->psk_password) {
-			ERROR("Invalid PSK Configuration: psk_identity is set, but there is no psk_password");
-			goto error;
-		}
-
-	} else if (conf->psk_password) {
-		ERROR("Invalid PSK Configuration: psk_password is set, but there is no psk_identity");
+	} else if (conf->psk.key) {
+		ERROR("Invalid PSK Configuration: psk.key is set but psk.identity is not set");
 		goto error;
 	}
 
 	/*
 	 *	Set the server PSK callback if necessary.
 	 */
-	if (!client && (conf->psk_identity || conf->psk_query)) {
+	if (!client && (conf->psk.identity || conf->load_psk)) {
 		SSL_CTX_set_psk_server_callback(ctx, fr_tls_session_psk_server_cb);
 	}
 
 	/*
-	 *	Do more sanity checking if we have a PSK identity.  We
-	 *	check the password, and convert it to it's final form.
+	 *	A fixed key takes the place of the certificate chain, so a
+	 *	configuration with a fixed key skips the chain loading below.
 	 */
-	if (conf->psk_identity && *conf->psk_identity) {
-		size_t psk_len, hex_len;
-		uint8_t buffer[PSK_MAX_PSK_LEN];
-
+	if (conf->psk.identity) {
 		if (client) {
 			SSL_CTX_set_psk_client_callback(ctx, fr_tls_session_psk_client_cb);
 		}
 
-		if (!conf->psk_password) goto error; /* clang is too dumb to catch the above checks */
-
-		psk_len = strlen(conf->psk_password);
-		if (strlen(conf->psk_password) > (2 * PSK_MAX_PSK_LEN)) {
-			ERROR("psk_hexphrase is too long (max %d)", PSK_MAX_PSK_LEN);
-			goto error;
-		}
-
-		/*
-		 *	Check the password now, so that we don't have
-		 *	errors at run-time.
-		 */
-		hex_len = fr_base16_decode(NULL,
-				     &FR_DBUFF_TMP(buffer, sizeof(buffer)),
-				     &FR_SBUFF_IN(conf->psk_password, psk_len), false);
-		if (psk_len != (2 * hex_len)) {
-			ERROR("psk_hexphrase is not all hex");
-			goto error;
-		}
-
+		SSL_CTX_set_mode(ctx, mode);
 		goto post_ca;
 	}
-#else
-	(void) client;	/* -Wunused */
 #endif
 
 	/*
-	 *	Set mode before processing any certifictes
+	 *	OpenSSL will automatically create certificate chains,
+	 *	unless we tell it to not do that.  The problem is that
+	 *	it sometimes gets the chains right from a certificate
+	 *	signature view, but wrong from the clients view.
+	 *
+	 *	It's better just to have users specify the complete
+	 *	chains.
 	 */
-	{
-		int mode = SSL_MODE_ASYNC;
+	mode |= SSL_MODE_NO_AUTO_CHAIN;
 
-		/*
-		 *	OpenSSL will automatically create certificate chains,
-		 *	unless we tell it to not do that.  The problem is that
-		 *	it sometimes gets the chains right from a certificate
-		 *	signature view, but wrong from the clients view.
-		 */
-		if (!conf->auto_chain) mode |= SSL_MODE_NO_AUTO_CHAIN;
-
-		if (client) {
-			mode |= SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER;
-			mode |= SSL_MODE_AUTO_RETRY;
-		}
-
-		if (mode) SSL_CTX_set_mode(ctx, mode);
+	if (client) {
+		mode |= SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER;
+		mode |= SSL_MODE_AUTO_RETRY;
 	}
+
+	SSL_CTX_set_mode(ctx, mode);
 
 	/*
-	 *	If we're using a sufficiently new version of
-	 *	OpenSSL, initialise different stores for creating
-	 *	the certificate chains we present, and for
-	 *	holding certificates to verify the chain presented
-	 *	by the peer.
+	 *	Initialise a separate store for verifying user
+	 *      certificates.
 	 *
-	 *	If we don't do this, a single store is used for
-	 *	both functions, which is confusing and annoying.
-	 *
-	 *	We use the set0 variant so that the stores are
-	 *	freed at the same time as the SSL_CTX.
+	 *      This makes the configuration cleaner as there's
+	 *	no mixing of chain certs and user certs.
 	 */
-	if (!conf->auto_chain) {
-		MEM(chain_store = X509_STORE_new());
-		SSL_CTX_set0_chain_cert_store(ctx, chain_store);
+	MEM(verify_store = X509_STORE_new());
 
-		MEM(verify_store = X509_STORE_new());
-		SSL_CTX_set0_verify_cert_store(ctx, verify_store);
-	}
+	/* Sets OpenSSL's (CERT *)->verify_store, overring (SSL_CTX *)->cert_store */
+	SSL_CTX_set0_verify_cert_store(ctx, verify_store);
+
+	/* This isn't accessible to use later, i.e. there's no SSL_CTX_get0_verify_cert_store */
+	SSL_CTX_set_ex_data(ctx, FR_TLS_EX_CTX_INDEX_VERIFY_STORE, verify_store);
 
 	/*
 	 *	Load the CAs we trust
 	 */
 	if (conf->ca_file || conf->ca_path) {
-		if (!SSL_CTX_load_verify_locations(ctx, conf->ca_file, conf->ca_path)) {
-			fr_tls_log_error(NULL, "Failed reading Trusted root CA list \"%s\"",
-				      conf->ca_file);
+		/*
+		 *	This adds all the certificates to the store for conf->ca_file
+		 *      and adds a dynamic lookup for conf->ca_path.
+		 *
+		 *      It's also possible to add extra virtual server lookups
+		 */
+		if (!X509_STORE_load_locations(verify_store, conf->ca_file, conf->ca_path)) {
+			fr_tls_log_perror(NULL, "Failed reading Trusted root CA list \"%s\"",
+				      conf->ca_file ? conf->ca_file : conf->ca_path);
 			goto error;
 		}
+
+		/*
+		 *	These set the default parameters of the store when the
+		 *      store is involved in building chains.
+		 *
+		 *	The store validates the peer's certificate, so
+		 *	the certificate purpose is the _peer's_
+		 *	certificate purpose, which the opposite of us.
+		 *
+		 *	If we're a server, then we check that the peer is a client.
+		 *	If we're a client, then we check the peer is a server.
+		 */
+		X509_STORE_set_purpose(verify_store, client ? X509_PURPOSE_SSL_SERVER : X509_PURPOSE_SSL_CLIENT);
+
+		/*
+		 *	Sets the list of CAs we send to the peer if we're
+		 *	requesting a certificate.
+		 *
+		 *	This does not change the trusted certificate authorities,
+		 *	those are set above with SSL_CTX_load_verify_locations.
+		 */
+		if (conf->ca_file) SSL_CTX_set_client_CA_list(ctx, SSL_load_client_CA_file(conf->ca_file));
+	} else {
+		X509_STORE_set_default_paths(verify_store);
 	}
 
 	/*
@@ -681,7 +725,7 @@ SSL_CTX *fr_tls_ctx_alloc(fr_tls_conf_t const *conf, bool client)
 			size_t i;
 
 			for (i = 0; i < chains_conf; i++) {
-				if (tls_ctx_load_cert_chain(ctx, conf->chains[i]) < 0) goto error;
+				if (tls_ctx_load_cert_chain(ctx, conf->chains[i], false) < 0) goto error;
 			}
 		}
 
@@ -732,24 +776,15 @@ SSL_CTX *fr_tls_ctx_alloc(fr_tls_conf_t const *conf, bool client)
 				 */
 				DEBUG3("%s chain", fr_tls_utils_x509_pkey_type(our_cert));
 				if (!SSL_CTX_get0_chain_certs(ctx, &our_chain)) {
-					fr_tls_log_error(NULL, "Failed retrieving chain certificates");
+					fr_tls_log_perror(NULL, "Failed retrieving chain certificates");
 					goto error;
 				}
 
-				if (DEBUG_ENABLED3) fr_tls_log_certificate_chain(NULL, L_DBG, our_chain, our_cert);
+				if (DEBUG_ENABLED3) fr_tls_chain_log(NULL, L_DBG, our_chain, our_cert);
 			}
 			(void)SSL_CTX_set_current_cert(ctx, SSL_CERT_SET_FIRST);	/* Reset */
 		}
 	}
-
-	/*
-	 *	Sets the list of CAs we send to the peer if we're
-	 *	requesting a certificate.
-	 *
-	 *	This does not change the trusted certificate authorities,
-	 *	those are set above with SSL_CTX_load_verify_locations.
-	 */
-	if (conf->ca_file && *conf->ca_file) SSL_CTX_set_client_CA_list(ctx, SSL_load_client_CA_file(conf->ca_file));
 
 #ifdef PSK_MAX_IDENTITY_LEN
 post_ca:
@@ -799,64 +834,29 @@ post_ca:
 	 *	SSL_CTX_set_tmp_dh_callback(ctx, cbtls_dh);
 	 */
 
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
 	/*
 	 *	Set the block size for record padding.  This is only
 	 *	used in TLS 1.3.
 	 */
 	if (conf->padding_block_size) SSL_CTX_set_block_padding(ctx, conf->padding_block_size);
-#endif
 
 	/*
-	 *	Set eliptical curve crypto configuration.
+	 *	Set elliptical curve crypto configuration.
 	 */
 #ifndef OPENSSL_NO_ECDH
 	if (ctx_ecdh_curve_set(ctx, conf->ecdh_curve, conf->disable_single_dh_use) < 0) goto error;
 #endif
 
 
-	/*
-	 *	set the message callback to identify the type of
-	 *	message.  For every new session, there can be a
-	 *	different callback argument.
-	 */
-	 SSL_CTX_set_msg_callback(ctx, fr_tls_session_msg_cb);
 	/* Set Info callback */
 	SSL_CTX_set_info_callback(ctx, fr_tls_session_info_cb);
 
 	/*
-	 *	Check the certificates for revocation.
+	 *	SSL_ctx_set_verify is now called in the session
+	 *	alloc functions so they can set custom behaviour
+	 *	depending on the code area the SSL * will be used
+	 *	and whether we're acting as a client or server.
 	 */
-#ifdef X509_V_FLAG_CRL_CHECK_ALL
-	if (conf->verify.check_crl) {
-		cert_vpstore = SSL_CTX_get_cert_store(ctx);
-		if (cert_vpstore == NULL) {
-			fr_tls_log_error(NULL, "Error reading Certificate Store");
-	    		goto error;
-		}
-		X509_STORE_set_flags(cert_vpstore, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
-#ifdef X509_V_FLAG_USE_DELTAS
-		/*
-		 *	If set, delta CRLs (if present) are used to
-		 *	determine certificate status. If not set
-		 *	deltas are ignored.
-		 *
-		 *	So it's safe to always set this flag.
-		 */
-		X509_STORE_set_flags(cert_vpstore, X509_V_FLAG_USE_DELTAS);
-#endif
-	}
-#endif
-
-	/*
-	 *	Set verify modes
-	 *	Always verify the peer certificate
-	 */
-	verify_mode |= SSL_VERIFY_PEER;
-	verify_mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
-	verify_mode |= SSL_VERIFY_CLIENT_ONCE;
-	SSL_CTX_set_verify(ctx, verify_mode, fr_tls_verify_cert_cb);
-
 	if (conf->verify_depth) {
 		SSL_CTX_set_verify_depth(ctx, conf->verify_depth);
 	}
@@ -872,11 +872,60 @@ post_ca:
 #endif
 
 	/*
-	 *	Set the cipher list if we were told to
+	 *	Set the cipher list if we were told to do so.  We do
+	 *	this before setting min/max TLS version.  In a sane
+	 *	world, OpenSSL would error out if we set the max TLS
+	 *	version to something which was unsupported by the
+	 *	current security level.  However, this is OpenSSL.  If
+	 *	you set conflicting options, it doesn't give an error.
+	 *	Instead, it just picks something to do.
+	 *
+	 *	SSL_CTX_set_cipher_list() accepts an empty string to
+	 *	clear the list for TLS <1.3 methods.  However, it
+	 *	reports an error.  We therefore catch the error, and
+	 *	allow it.
 	 */
-	if (conf->cipher_list) {
-		if (!SSL_CTX_set_cipher_list(ctx, conf->cipher_list)) {
-			fr_tls_log_error(NULL, "Failed setting cipher list");
+	if (conf->cipher_list &&
+	    !SSL_CTX_set_cipher_list(ctx, conf->cipher_list)) {
+		unsigned long err = ERR_peek_last_error();
+
+DIAG_OFF_OPTIONAL(used-but-marked-unused)	/* fix spurious warnings for ERR_GET macros */
+		if (ERR_GET_LIB(err) != ERR_LIB_SSL ||
+		    ERR_GET_REASON(err) != SSL_R_NO_CIPHER_MATCH) {
+			fr_tls_log_perror(NULL, "Failed setting cipher_list");
+			goto error;
+		}
+DIAG_ON_OPTIONAL(used-but-marked-unused)
+	}
+
+	/*
+	 *	SSL_CTX_set_ciphersuites() accepts an empty string to
+	 *	clear the list for TLS >=1.3 methods.  However, it
+	 *	reports an error.  We therefore catch the error, and
+	 *	allow it.
+	 */
+       if (conf->cipher_suites &&
+	   !SSL_CTX_set_ciphersuites(ctx, conf->cipher_suites)) {
+		unsigned long err = ERR_peek_last_error();
+
+DIAG_OFF_OPTIONAL(used-but-marked-unused)	/* fix spurious warnings for ERR_GET macros */
+		if (ERR_GET_LIB(err) != ERR_LIB_SSL ||
+		    ERR_GET_REASON(err) != SSL_R_NO_CIPHER_MATCH) {
+			fr_tls_log_perror(NULL, "Failed setting cipher_suites");
+			goto error;
+		}
+DIAG_ON_OPTIONAL(used-but-marked-unused)
+       }
+
+	/*
+	 *	Set the supported groups if configured.
+	 *
+	 *	For TLS 1.3 this can help reduce round trips if the list
+	 *	includes a group the client predicted in the key_share extension.
+	 */
+	if (conf->group_list) {
+		if (!SSL_CTX_set1_groups_list(ctx, UNCONST(char *,conf->group_list))) {
+			fr_tls_log_perror(NULL, "Failed setting group list");
 			goto error;
 		}
 	}
@@ -891,14 +940,14 @@ post_ca:
 
 		ssl = SSL_new(ctx);
 		if (!ssl) {
-			fr_tls_log_error(NULL, "Failed creating temporary SSL session");
+			fr_tls_log_perror(NULL, "Failed creating temporary SSL session");
 			goto error;
 		}
 
 		DEBUG3("Configured ciphers (by priority)");
 
 		while ((cipher = SSL_get_cipher_list(ssl, i))) {
-			DEBUG3("[%i] %s", i, cipher);
+			DEBUG3("[%u] %s", i, cipher);
 			i++;		/* Print index starting at zero */
 		}
 
@@ -908,12 +957,67 @@ post_ca:
 	/*
 	 *	Load dh params
 	 */
-	if (conf->dh_file && (ctx_dh_params_load(ctx, UNCONST(char *, conf->dh_file)) < 0)) goto error;
+	if (conf->dh_file) {
+		if (ctx_dh_params_load(ctx, UNCONST(char *, conf->dh_file)) < 0) goto error;
+	} else {
+		/*
+		 *	Tell OpenSSL to automatically set the DH
+		 *	parameters based on the the size of the key
+		 *	associated with the certificate, or for PSK,
+		 *	with the negotiated symmetric cipher key.
+		 */
+		SSL_CTX_set_dh_auto(ctx, 1);
+	}
+
+	/*
+	 *	DTLS doesn't support stateless session resumption.  So
+	 *	we forbid that.
+	 *
+	 *	For "auto", we do a horrible hack, and just rewrite
+	 *	the config.  This is simpler than adding more options
+	 *	to the ctx_init() function.
+	 */
+	if (conf->socket_type == SOCK_DGRAM) {
+		if (conf->cache.mode == FR_TLS_TICKET_STATELESS) {
+			ERROR("session { mode = \"stateless\" } is not supported with DTLS.  "
+			      "Use \"stateful\" or \"disabled\"");
+			goto error;
+		}
+
+		if (conf->cache.mode == FR_TLS_TICKET_AUTO) {
+			UNCONST(fr_tls_conf_t *, conf)->cache.mode = FR_TLS_TICKET_STATEFUL;
+		}
+
+		/*
+		 *	A DTLS server answers the first ClientHello with a HelloVerifyRequest that carries a
+		 *	cookie.  The cookie prevents an attacker from forging DTLS packets which would
+		 *	otherwise be able to affect the connection.
+		 *
+		 *	The client simply echoes back any cookie that it received.
+		 */
+		if (!client) {
+			SSL_CTX_set_options(ctx, SSL_OP_COOKIE_EXCHANGE);
+			SSL_CTX_set_cookie_generate_cb(ctx, fr_dtls_cookie_generate_cb);
+			SSL_CTX_set_cookie_verify_cb(ctx, fr_dtls_cookie_verify_cb);
+		}
+	}
 
 	/*
 	 *	Setup session caching
 	 */
-	if (fr_tls_cache_ctx_init(ctx, &conf->cache) < 0) goto error;
+	if (fr_tls_ticket_ctx_init(ctx, &conf->cache, client) < 0) goto error;
+
+	/*
+	 *	Set the ALPN context.
+	 */
+	if (fr_tls_ctx_alpn_set(ctx, conf, client) < 0) goto error;
+
+	/*
+	 *	Set the keylog file if the admin requested it.
+	 */
+	if ((getenv("SSLKEYLOGFILE") != NULL) || (conf->keylog_file && *conf->keylog_file)) {
+		SSL_CTX_set_keylog_callback(ctx, fr_tls_session_keylog_cb);
+	}
 
 	return ctx;
 }

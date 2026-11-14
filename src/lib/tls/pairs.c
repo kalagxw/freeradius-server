@@ -26,36 +26,209 @@ RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #ifdef WITH_TLS
-#define LOG_PREFIX "tls - "
+#define LOG_PREFIX "tls"
 
-#include <openssl/x509v3.h>
-#include <openssl/ssl.h>
-
+#include <freeradius-devel/tls/openssl_user_macros.h>
 #include <freeradius-devel/util/pair.h>
 #include <freeradius-devel/server/request.h>
 #include <freeradius-devel/server/pair.h>
+#include <freeradius-devel/der/der.h>
 
 #include "attrs.h"
-#include "base.h"
 #include "bio.h"
 #include "log.h"
 #include "session.h"
 #include "utils.h"
 
-DIAG_OFF(DIAG_UNKNOWN_PRAGMAS)
-DIAG_OFF(used-but-marked-unused)	/* fix spurious warnings for sk macros */
+#include <openssl/x509v3.h>
+#include <openssl/ssl.h>
+#include <openssl/ocsp.h>
+
+DIAG_OFF_OPTIONAL(used-but-marked-unused)	/* fix spurious warnings for sk macros */
+/** Extract session pairs from the Subject Alternate Name extension
+ *
+ */
+static bool tls_session_pairs_from_san(fr_pair_list_t *pair_list, TALLOC_CTX *ctx, request_t *request,
+				       FR_OPENSSL_X509_CONST X509_EXTENSION *ext)
+{
+	GENERAL_NAMES	*names = NULL;
+	int		i;
+	fr_pair_t	*vp;
+
+	if (!(names = X509V3_EXT_d2i(ext))) return false;
+
+	for (i = 0; i < sk_GENERAL_NAME_num(names); i++) {
+		GENERAL_NAME *name = sk_GENERAL_NAME_value(names, i);
+
+		switch (name->type) {
+#ifdef GEN_EMAIL
+		case GEN_EMAIL:
+			MEM(fr_pair_append_by_da(ctx, &vp, pair_list,
+						 attr_tls_certificate_subject_alt_name_email) == 0);
+			MEM(fr_pair_value_bstrndup(vp,
+						   (char const *)ASN1_STRING_get0_data(name->d.rfc822Name),
+						   fr_tls_asn1_string_length(name->d.rfc822Name), true) == 0);
+			break;
+#endif	/* GEN_EMAIL */
+#ifdef GEN_DNS
+		case GEN_DNS:
+			MEM(fr_pair_append_by_da(ctx, &vp, pair_list,
+						 attr_tls_certificate_subject_alt_name_dns) == 0);
+			MEM(fr_pair_value_bstrndup(vp,
+						   (char const *)ASN1_STRING_get0_data(name->d.dNSName),
+						   fr_tls_asn1_string_length(name->d.dNSName), true) == 0);
+			break;
+#endif	/* GEN_DNS */
+#ifdef GEN_OTHERNAME
+		case GEN_OTHERNAME:
+			/* look for a MS UPN */
+			if (NID_ms_upn != OBJ_obj2nid(name->d.otherName->type_id)) break;
+
+			/* we've got a UPN - Must be ASN1-encoded UTF8 string */
+			if (name->d.otherName->value->type == V_ASN1_UTF8STRING) {
+				MEM(fr_pair_append_by_da(ctx, &vp, pair_list,
+							 attr_tls_certificate_subject_alt_name_upn) == 0);
+				MEM(fr_pair_value_bstrndup(vp,
+							   (char const *)ASN1_STRING_get0_data(name->d.otherName->value->value.utf8string),
+							   fr_tls_asn1_string_length(name->d.otherName->value->value.utf8string),
+							   true) == 0);
+				break;
+			}
+			RWARN("Invalid UPN in Subject Alt Name (should be UTF-8)");
+				break;
+#endif	/* GEN_OTHERNAME */
+			default:
+				/* XXX TODO handle other SAN types */
+				break;
+		}
+	}
+	if (names != NULL) GENERAL_NAMES_free(names);
+
+	return true;
+}
+
+/** Extract session pairs from the X509v3-CRL-Distribution-Points extension
+ *
+ */
+static bool tls_session_pairs_from_crl(fr_pair_list_t *pair_list, TALLOC_CTX *ctx, UNUSED request_t *request,
+				       FR_OPENSSL_X509_CONST X509_EXTENSION *ext)
+{
+	ASN1_STRING const	*s = X509_EXTENSION_get_data(ext);
+	char unsigned const	*data = ASN1_STRING_get0_data(s);
+	STACK_OF(DIST_POINT)	*dps;
+	DIST_POINT		*dp;
+	STACK_OF(GENERAL_NAME)	*names;
+	GENERAL_NAME		*name;
+	fr_pair_t		*vp;
+	int			i, j;
+
+	if (!(dps = d2i_CRL_DIST_POINTS(NULL, &data, fr_tls_asn1_string_length(s)))) return false;
+
+	for (i = 0; i < sk_DIST_POINT_num(dps); i++) {
+		dp = sk_DIST_POINT_value(dps, i);
+
+		/*
+		 *	RFC 5280 Section 4.2.1.13 says that the distpoint is optional.
+		 */
+		if (!dp->distpoint) {
+			CRL_DIST_POINTS_free(dps);
+			return false;
+		}
+
+		names = dp->distpoint->name.fullname;
+
+		/*
+		 *	We only want CRL distribution points that cover all reasons,
+		 *	so ignore any where reasons are set.
+		 */
+		if (dp->reasons) continue;
+
+		for (j = 0; j < sk_GENERAL_NAME_num(names); j++) {
+			name = sk_GENERAL_NAME_value(names, j);
+
+			if (name->type != GEN_URI) continue;
+			MEM(fr_pair_append_by_da(ctx, &vp, pair_list,
+						 attr_tls_certificate_x509v3_crl_distribution_points) == 0);
+			MEM(fr_pair_value_bstrndup(vp,
+						   (char const *)ASN1_STRING_get0_data(name->d.uniformResourceIdentifier),
+						   fr_tls_asn1_string_length(name->d.uniformResourceIdentifier),
+						   true) == 0);
+		}
+	}
+
+	CRL_DIST_POINTS_free(dps);
+
+	return true;
+}
+
+/** Extract session pairs from the Authority Key Identifier extension - specifically OCSP URI
+ *
+ */
+static bool tls_session_pairs_from_aia(fr_pair_list_t *pair_list, TALLOC_CTX *ctx, UNUSED request_t *request,
+				       FR_OPENSSL_X509_CONST X509_EXTENSION *ext)
+{
+	ASN1_STRING const	*s = X509_EXTENSION_get_data(ext);
+	char unsigned const	*data = ASN1_STRING_get0_data(s);
+	fr_pair_t		*vp;
+	AUTHORITY_INFO_ACCESS	*aia;
+	ACCESS_DESCRIPTION	*ad;
+	char			*host = NULL, *path = NULL;
+	int			i, port, is_https;
+
+	if (!(aia = d2i_AUTHORITY_INFO_ACCESS(NULL, &data, fr_tls_asn1_string_length(s)))) return false;
+
+	for (i = 0; i < sk_ACCESS_DESCRIPTION_num(aia); i++) {
+		char	*uri;
+		size_t	len;
+
+		ad = sk_ACCESS_DESCRIPTION_value(aia, i);
+		if (OBJ_obj2nid(ad->method) != NID_ad_OCSP) continue;
+		if (ad->location->type != GEN_URI) continue;
+
+		len = fr_tls_asn1_string_length(ad->location->d.uniformResourceIdentifier);
+		MEM(uri = talloc_bstrndup(NULL,
+					  (char const *)ASN1_STRING_get0_data(ad->location->d.uniformResourceIdentifier),
+					  len));
+
+		/*
+		 *	Use OpenSSL URL parsing to check that the URL is valid.  It only takes a
+		 *	C string, so it needs the terminated copy.
+		 */
+		if (OSSL_HTTP_parse_url(uri, &is_https, NULL, &host, NULL, &port, &path, NULL, NULL)) {
+			OPENSSL_free(host);
+			OPENSSL_free(path);
+			MEM(fr_pair_append_by_da(ctx, &vp, pair_list,
+						 attr_tls_certificate_ocsp_uri) == 0);
+			MEM(fr_pair_value_bstrndup(vp, uri, len, true) == 0);
+		}
+		talloc_free(uri);
+	}
+	AUTHORITY_INFO_ACCESS_free(aia);
+
+	return true;
+}
+
 /** Extract attributes from an X509 certificate
  *
  * @param[out] pair_list	to copy attributes to.
  * @param[in] ctx		to allocate attributes in.
  * @param[in] request		the current request.
  * @param[in] cert		to validate.
+ * @param[in] issuer		of the certificate.
+ * @param[in] der_decode	should the certificate be parsed with the DER decoder.
  * @return
  *	- 1 already exists.
  *	- 0 on success.
  *	- < 0 on failure.
  */
-int fr_tls_session_pairs_from_x509_cert(fr_pair_list_t *pair_list, TALLOC_CTX *ctx, request_t *request, X509 *cert)
+int fr_tls_session_pairs_from_x509_cert(fr_pair_list_t *pair_list, TALLOC_CTX *ctx, request_t *request, X509 *cert,
+					X509 *issuer,
+#if OPENSSL_VERSION_NUMBER >= 0x30400000L
+					bool der_decode
+#else
+					UNUSED bool der_decode
+#endif
+				)
 {
 	int		loc;
 	char		buff[1024];
@@ -66,7 +239,48 @@ int fr_tls_session_pairs_from_x509_cert(fr_pair_list_t *pair_list, TALLOC_CTX *c
 	STACK_OF(X509_EXTENSION) const *ext_list = NULL;
 
 	fr_pair_t	*vp = NULL;
-	ssize_t		slen;
+	bool		san_found = false, crl_found = false, aia_found = false;
+
+	/*
+	 *	We require OpenSSL >= 3.4 to call the DER decoder due to the stack size
+	 *	needed to handle the recursive calls involved in certificate decoding.
+	 */
+#if OPENSSL_VERSION_NUMBER >= 0x30400000L
+	if (der_decode) {
+		uint8_t			*cert_der;
+		uint8_t			*cd;
+		int			der_len;
+		fr_der_decode_ctx_t	der_ctx;
+		fr_pair_list_t		tmp_list;
+		ssize_t			slen;
+
+		der_len = i2d_X509(cert, NULL);
+		if (der_len < 0) {
+			fr_tls_log_perror(request, "Failed retrieving certificate");
+			return -1;
+		}
+		der_ctx = (fr_der_decode_ctx_t) {
+			.tmp_ctx = talloc_new(ctx),
+			.root = attr_der_certificate,
+		};
+		cert_der = cd = talloc_array(der_ctx.tmp_ctx, uint8_t, der_len);
+		i2d_X509(cert, &cd);
+		fr_pair_list_init(&tmp_list);
+		slen = fr_der_decode_pair_dbuff(request->session_state_ctx, &tmp_list,
+						attr_der_certificate, &FR_DBUFF_TMP(cert_der, (size_t)der_len), &der_ctx);
+		talloc_free(der_ctx.tmp_ctx);
+		if (slen < 0) {
+			fr_tls_log_perror(request, "Failed decoding certificate");
+			fr_pair_list_free(&tmp_list);
+			return -1;
+		}
+		/*
+		 *  Certificates are decoded in CA .. intermediate .. client sequence
+		 *  so, prepend each decoded one to get the client cert first.
+		 */
+		fr_pair_list_prepend(&request->session_state_pairs, &tmp_list);
+	}
+#endif
 
 	/*
 	 *	Subject
@@ -75,30 +289,27 @@ int fr_tls_session_pairs_from_x509_cert(fr_pair_list_t *pair_list, TALLOC_CTX *c
 	if (unlikely(X509_NAME_print_ex(fr_tls_bio_dbuff_thread_local(vp, 256, 0),
 					X509_get_subject_name(cert), 0, XN_FLAG_ONELINE) < 0)) {
 		fr_tls_bio_dbuff_thread_local_clear();
-		fr_tls_log_error(request, "Failed retrieving certificate subject");
+		fr_tls_log_perror(request, "Failed retrieving certificate subject");
 	error:
 		fr_pair_list_free(pair_list);
 		return -1;
 	}
 	fr_pair_value_bstrdup_buffer_shallow(vp, fr_tls_bio_dbuff_thread_local_finalise_bstr(), true);
 
-	RDEBUG3("Creating attributes for \"%pV\":", fr_box_strvalue_buffer(vp->vp_strvalue));
+	RDEBUG3("(TLS) Creating attributes for \"%pV\":", fr_box_strvalue_buffer(vp->vp_strvalue));
 
 	/*
 	 *	Common name
 	 */
-	slen = X509_NAME_get_text_by_NID(X509_get_subject_name(cert),
-					 NID_commonName, NULL, 0);
-	if (slen > 0) {
-		char *cn;
+	loc = X509_NAME_get_index_by_NID(X509_get_subject_name(cert), NID_commonName, -1);
+	if (loc >= 0) {
+		ASN1_STRING const *cn;
 
-		MEM(fr_pair_append_by_da(ctx, &vp, pair_list, attr_tls_certificate_common_name) == 0);
-		MEM(fr_pair_value_bstr_alloc(vp, &cn, (size_t)slen, true) == 0); /* Allocs \0 byte in addition to len */
-
-		slen = X509_NAME_get_text_by_NID(X509_get_subject_name(cert), NID_commonName, cn, (size_t)slen + 1);
-		if (slen < 0) {
-			fr_tls_log_error(request, "Failed retrieving certificate common name");
-			goto error;
+		cn = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(X509_get_subject_name(cert), loc));
+		if (cn && (fr_tls_asn1_string_length(cn) > 0)) {
+			MEM(fr_pair_append_by_da(ctx, &vp, pair_list, attr_tls_certificate_common_name) == 0);
+			MEM(fr_pair_value_bstrndup(vp, (char const *)ASN1_STRING_get0_data(cn),
+						   fr_tls_asn1_string_length(cn), true) == 0);
 		}
 	}
 
@@ -114,11 +325,11 @@ int fr_tls_session_pairs_from_x509_cert(fr_pair_list_t *pair_list, TALLOC_CTX *c
 		MEM(fr_pair_append_by_da(ctx, &vp, pair_list, attr_tls_certificate_signature) == 0);
 		MEM(fr_pair_value_memdup(vp,
 					 (uint8_t const *)ASN1_STRING_get0_data(sig),
-					 ASN1_STRING_length(sig), true) == 0);
+					 fr_tls_asn1_string_length(sig), true) == 0);
 
 		OBJ_obj2txt(buff, sizeof(buff), alg->algorithm, 0);
 		MEM(fr_pair_append_by_da(ctx, &vp, pair_list, attr_tls_certificate_signature_algorithm) == 0);
-		fr_pair_value_strdup(vp, buff);
+		fr_pair_value_strdup(vp, buff, false);
 	}
 
 	/*
@@ -128,7 +339,7 @@ int fr_tls_session_pairs_from_x509_cert(fr_pair_list_t *pair_list, TALLOC_CTX *c
 	if (unlikely(X509_NAME_print_ex(fr_tls_bio_dbuff_thread_local(vp, 256, 0),
 					X509_get_issuer_name(cert), 0, XN_FLAG_ONELINE) < 0)) {
 		fr_tls_bio_dbuff_thread_local_clear();
-		fr_tls_log_error(request, "Failed retrieving certificate issuer");
+		fr_tls_log_perror(request, "Failed retrieving certificate issuer");
 		goto error;
 	}
 	fr_pair_value_bstrdup_buffer_shallow(vp, fr_tls_bio_dbuff_thread_local_finalise_bstr(), true);
@@ -138,15 +349,19 @@ int fr_tls_session_pairs_from_x509_cert(fr_pair_list_t *pair_list, TALLOC_CTX *c
 	 */
 	{
 		ASN1_INTEGER const *serial = NULL;
+		unsigned char *der;
+		int len;
 
 		serial = X509_get0_serialNumber(cert);
 		if (!serial) {
-			fr_tls_log_error(request, "Failed retrieving certificate serial");
+			fr_tls_log_perror(request, "Failed retrieving certificate serial");
 			goto error;
 		}
 
+		len = i2d_ASN1_INTEGER(serial, NULL);	/* get length */
 		MEM(fr_pair_append_by_da(ctx, &vp, pair_list, attr_tls_certificate_serial) == 0);
-		MEM(fr_pair_value_memdup(vp, serial->data, serial->length, true) == 0);
+		MEM(fr_pair_value_mem_alloc(vp, &der, len, false) == 0);
+		i2d_ASN1_INTEGER(serial, &der);
 	}
 
 	/*
@@ -155,7 +370,7 @@ int fr_tls_session_pairs_from_x509_cert(fr_pair_list_t *pair_list, TALLOC_CTX *c
 	asn_time = X509_get0_notBefore(cert);
 
 	if (fr_tls_utils_asn1time_to_epoch(&time, asn_time) < 0) {
-		RPWDEBUG("Failed parsing certificate not-before");
+		RPWDEBUG("(TLS) Failed parsing certificate not-before");
 		goto error;
 	}
 
@@ -168,7 +383,7 @@ int fr_tls_session_pairs_from_x509_cert(fr_pair_list_t *pair_list, TALLOC_CTX *c
 	asn_time = X509_get0_notAfter(cert);
 
 	if (fr_tls_utils_asn1time_to_epoch(&time, asn_time) < 0) {
-		RPWDEBUG("Failed parsing certificate not-after");
+		RPWDEBUG("(TLS) Failed parsing certificate not-after");
 		goto error;
 	}
 
@@ -180,75 +395,45 @@ int fr_tls_session_pairs_from_x509_cert(fr_pair_list_t *pair_list, TALLOC_CTX *c
 	 */
 	loc = X509_get_ext_by_NID(cert, NID_subject_alt_name, 0);
 	if (loc >= 0) {
-		X509_EXTENSION	*ext = NULL;
-		GENERAL_NAMES	*names = NULL;
-		int		i;
-
-		ext = X509_get_ext(cert, loc);
-		if (!ext || !(names = X509V3_EXT_d2i(ext))) goto skip_alt;
-
-
-		for (i = 0; i < sk_GENERAL_NAME_num(names); i++) {
-			GENERAL_NAME *name = sk_GENERAL_NAME_value(names, i);
-
-			switch (name->type) {
-#ifdef GEN_EMAI
-			case GEN_EMAIL:
-				MEM(fr_pair_append_by_da(ctx, &vp, pair_list,
-							 attr_tls_certificate_subject_alt_name_email) == 0);
-				MEM(fr_pair_value_bstrndup(vp,
-							   (char const *)ASN1_STRING_get0_data(name->d.rfc822Name),
-							   ASN1_STRING_length(name->d.rfc822Name), true) == 0);
-				break;
-#endif	/* GEN_EMAIL */
-#ifdef GEN_DNS
-			case GEN_DNS:
-				MEM(fr_pair_append_by_da(ctx, &vp, pair_list,
-							 attr_tls_certificate_subject_alt_name_dns) == 0);
-				MEM(fr_pair_value_bstrndup(vp,
-							   (char const *)ASN1_STRING_get0_data(name->d.dNSName),
-							   ASN1_STRING_length(name->d.dNSName), true) == 0);
-				break;
-#endif	/* GEN_DNS */
-#ifdef GEN_OTHERNAME
-			case GEN_OTHERNAME:
-				/* look for a MS UPN */
-				if (NID_ms_upn != OBJ_obj2nid(name->d.otherName->type_id)) break;
-
-				/* we've got a UPN - Must be ASN1-encoded UTF8 string */
-				if (name->d.otherName->value->type == V_ASN1_UTF8STRING) {
-					MEM(fr_pair_append_by_da(ctx, &vp, pair_list,
-								 attr_tls_certificate_subject_alt_name_upn) == 0);
-					MEM(fr_pair_value_bstrndup(vp,
-								   (char const *)ASN1_STRING_get0_data(name->d.otherName->value->value.utf8string),
-								   ASN1_STRING_length(name->d.otherName->value->value.utf8string),
-								   true) == 0);
-					break;
-				}
-				RWARN("Invalid UPN in Subject Alt Name (should be UTF-8)");
-					break;
-#endif	/* GEN_OTHERNAME */
-				default:
-					/* XXX TODO handle other SAN types */
-					break;
-			}
-		}
-		if (names != NULL) GENERAL_NAMES_free(names);
+		FR_OPENSSL_X509_CONST X509_EXTENSION *ext = X509_get_ext(cert, loc);
+		if (ext) san_found = tls_session_pairs_from_san(pair_list, ctx, request, ext);
 	}
 
-skip_alt:
+	loc = X509_get_ext_by_NID(cert, NID_crl_distribution_points, 0);
+	if (loc >= 0) {
+		FR_OPENSSL_X509_CONST X509_EXTENSION *ext = X509_get_ext(cert, loc);
+		if (ext) crl_found = tls_session_pairs_from_crl(pair_list, ctx, request, ext);
+	}
+
+	if (issuer) {
+		OCSP_CERTID	*certid;
+		int		len;
+		uint8_t		*ocsp_certid = NULL;
+
+		certid = OCSP_cert_to_id(NULL, cert, issuer);
+		if (unlikely(!certid)) goto error;
+		len = i2d_OCSP_CERTID(certid, &ocsp_certid);
+		if (len < 0) goto error;
+		if (ocsp_certid != NULL) {
+			MEM(fr_pair_append_by_da(ctx, &vp, pair_list, attr_tls_certificate_ocsp_cert_id) == 0);
+			fr_value_box_memdup(vp, &vp->data, NULL, ocsp_certid, len, false);
+			OPENSSL_free(ocsp_certid);
+		}
+		OCSP_CERTID_free(certid);
+	}
+
 	/*
 	 *	Only add extensions for the actual client certificate
 	 */
 	ext_list = X509_get0_extensions(cert);
 	if (unlikely(!ext_list)) {
-		RWDEBUG("Failed retrieving extensions");
+		RWDEBUG("(TLS) Failed retrieving extensions");
 		goto done;
 	}
 
 	/*
 	 *	Grab the X509 extensions, and create attributes out of them.
-	 *	For laziness, we re-use the OpenSSL names
+	 *	For laziness, we reuse the OpenSSL names
 	 */
 	if (sk_X509_EXTENSION_num(ext_list) > 0) {
 		int			i;
@@ -261,7 +446,7 @@ skip_alt:
 		out = fr_tls_bio_dbuff_out(bd);
 
 		for (i = 0; i < sk_X509_EXTENSION_num(ext_list); i++) {
-			ASN1_OBJECT		*obj;
+			ASN1_OBJECT const	*obj;
 			X509_EXTENSION		*ext;
 			fr_dict_attr_t const	*da;
 			char			*p;
@@ -269,8 +454,32 @@ skip_alt:
 			ext = sk_X509_EXTENSION_value(ext_list, i);
 
 			obj = X509_EXTENSION_get_object(ext);
+
+			/*
+			 *	If this is extension is Subject Alternate Name have we already
+			 *	handled it?  If not, do that now.
+			 *
+			 *	Some certificate encodings have been observed where the SAN extension
+			 *	was not found by X509_get_ext_by_NID() but then seen when the list
+			 *	of extensions is handled here.
+			 */
+			if (OBJ_obj2nid(obj) == NID_subject_alt_name) {
+				if (!san_found) san_found = tls_session_pairs_from_san(pair_list, ctx, request, ext);
+				goto again;
+			}
+
+			if (OBJ_obj2nid(obj) == NID_crl_distribution_points) {
+				if (!crl_found) crl_found = tls_session_pairs_from_crl(pair_list, ctx, request, ext);
+				goto again;
+			}
+
+			if (OBJ_obj2nid(obj) == NID_info_access) {
+				if (!aia_found) aia_found = tls_session_pairs_from_aia(pair_list, ctx, request, ext);
+				goto again;
+			}
+
 			if (i2a_ASN1_OBJECT(bio, obj) <= 0) {
-				RPWDEBUG("Skipping X509 Extension (%i) conversion to attribute. "
+				RPWDEBUG("(TLS) Skipping X509 Extension (%i) conversion to attribute. "
 					 "Conversion from ASN1 failed...", i);
 			again:
 				fr_tls_bio_dbuff_reset(bd);
@@ -291,7 +500,7 @@ skip_alt:
 			 *	so we do don't replace the \0)
 			 */
 			if (unlikely(fr_dbuff_in_bytes(in, (uint8_t)'\0') <= 0)) {
-				RWDEBUG("Attribute name too long");
+				RWDEBUG("(TLS) Attribute name too long");
 				goto again;
 			}
 
@@ -300,26 +509,31 @@ skip_alt:
 			fr_dbuff_set(in, fr_dbuff_current(in) - 1);	/* Ensure the \0 isn't counted in remaining */
 
 			if (!da) {
-				RWDEBUG3("Skipping attribute %pV: "
+				RWDEBUG3("(TLS) Skipping attribute \"%pV\": "
 					 "Add a dictionary definition if you want to access it",
 					 fr_box_strvalue_len((char *)fr_dbuff_current(out),
 					  		     fr_dbuff_remaining(out)));
+				fr_strerror_clear();	/* Don't leave spurious errors from failed resolution */
 				goto again;
 			}
 
 			fr_tls_bio_dbuff_reset(bd);	/* 'free' any data used */
 
-			X509V3_EXT_print(bio, ext, 0, 0);
+			if (X509V3_EXT_print(bio, ext, X509V3_EXT_PARSE_UNKNOWN, 0) != 1) {
+				REDEBUG("(TLS) Failed extracting data for \"%s\"", da->name);
+				goto again;
+			}
 
 			MEM(vp = fr_pair_afrom_da(ctx, da));
 			if (fr_pair_value_from_str(vp, (char *)fr_dbuff_current(out), fr_dbuff_remaining(out),
-						   '\0', true) < 0) {
-				RPWDEBUG3("Skipping: %s += '%pV'",
+						   NULL, true) < 0) {
+				RPWDEBUG3("Skipping: %s += \"%pV\"",
 					  da->name, fr_box_strvalue_len((char *)fr_dbuff_current(out),
 					  				fr_dbuff_remaining(out)));
 				talloc_free(vp);
 				goto again;
 			}
+			fr_tls_bio_dbuff_reset(bd);	/* 'free' any data used */
 
 			fr_pair_append(pair_list, vp);
 		}
@@ -329,6 +543,172 @@ skip_alt:
 done:
 	return 0;
 }
-DIAG_ON(used-but-marked-unused)
-DIAG_ON(DIAG_UNKNOWN_PRAGMAS)
+
+/** Extract values from ClientHello extensions into pairs
+ *
+ * @param request	being processed.
+ * @param container	List to put pairs in.
+ * @param extension	data to parse.
+ * @param hlen		Length of "length" header in extension.
+ * @param dlen		Length of each data entry in extension.
+ * @param total_len	of extension.
+ * @param da		Attribute to create using extension values.
+ * @return
+ *   - 0 on success
+ *   - -1 on failure
+ */
+static int fr_tls_extension_decode(request_t *request, fr_pair_t *container, uint8_t const *extension,
+				   size_t hlen, size_t dlen, size_t total_len, fr_dict_attr_t const *da)
+{
+	size_t i,extension_len;
+	uint8_t const *data;
+
+	fr_assert((hlen == 1) || (hlen == 2));
+	fr_assert((dlen == 1) || (dlen == 2));
+
+	if (total_len < hlen) {
+		REDEBUG("(TLS) Missing length in %s extension", da->name);
+		return -1;
+	}
+
+	if (hlen == 1) {
+		extension_len = extension[0];
+	} else {
+		extension_len = (extension[0] << 8) + extension[1];
+	}
+	fr_assert(da->type == ((dlen == 1) ? FR_TYPE_UINT8 : FR_TYPE_UINT16));
+
+	if (extension_len + hlen > total_len) {
+		REDEBUG("(TLS) Invalid length %zu in %s extension", extension_len, da->name);
+		return -1;
+	}
+
+	data = extension + hlen;
+
+	for (i = 0; i < extension_len; i += dlen) {
+		fr_pair_t *vp;
+
+		MEM(fr_pair_append_by_da(container, &vp, &container->vp_group, da) >= 0);
+
+		switch (dlen) {
+		case 1:
+			vp->vp_uint8= data[0];
+			break;
+
+		case 2:
+			vp->vp_uint16 = (data[0] << 8) + data[1];
+			break;
+		}
+
+		data += dlen;
+	}
+
+	return 0;
+}
+
+/** Callback to extract pairs from a Client Hello
+ *
+ */
+int fr_tls_session_client_hello_pairs(SSL *ssl, request_t *request)
+{
+	request_t		*parent = request->parent;
+	uint8_t	const		*ciphers, *extension;
+	int			i, *extensions = NULL;
+	size_t			data_size, j;
+	STACK_OF(SSL_CIPHER)	*sk;
+	SSL_CIPHER const	*cipher;
+	STACK_OF(SSL_CIPHER)	*scsvs;
+	fr_pair_t		*container, *vp;
+
+	fr_assert(parent);
+
+	container = fr_pair_find_by_da(&parent->session_state_pairs, NULL, attr_tls_client_hello);
+	if (container) return SSL_CLIENT_HELLO_SUCCESS;
+
+	MEM(container = fr_pair_afrom_da(parent->session_state_ctx, attr_tls_client_hello));
+
+	data_size = SSL_client_hello_get0_ciphers(ssl, &ciphers);
+	if (SSL_bytes_to_cipher_list(ssl, ciphers, data_size,
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+				     0,	/* OpenSSL 4.0 removed SSLv2 ClientHello support */
+#else
+				     SSL_client_hello_isv2(ssl),
+#endif
+				     &sk, &scsvs) == 0) {
+		RPEDEBUG("(TLS) Failed to decode cipher list");
+	fail:
+		if (extensions) OPENSSL_free(extensions);
+		talloc_free(container);
+		return SSL_CLIENT_HELLO_ERROR;
+	}
+
+	for (i = 0; i < sk_SSL_CIPHER_num(sk); i++) {
+		fr_pair_append_by_da(container, &vp, &container->vp_group, attr_tls_client_hello_cipher);
+		cipher = sk_SSL_CIPHER_value(sk, i);
+		fr_value_box_strdup(vp, &vp->data, NULL, SSL_CIPHER_get_name(cipher), false);
+	}
+
+	sk_SSL_CIPHER_free(sk);
+	sk_SSL_CIPHER_free(scsvs);
+
+	/*
+	 *	Fetch the extensions and decode the ones we know about
+	 *	These are the ones which are returned as simple lists
+	 *	of values of known length which map to enum attributes.
+	 */
+	if (SSL_client_hello_get1_extensions_present(ssl, &extensions, &data_size) == 0) {
+		RPEDEBUG("(TLS) Failed to fetch client hello extensions");
+		goto fail;
+	}
+
+	for (j = 0; j < data_size; j++) {
+		size_t total_len;
+
+		if (SSL_client_hello_get0_ext(ssl, extensions[j], &extension, &total_len) == 0) {
+			RPDEBUG("Failed getting client hello extension %d", extensions[j]);
+			goto fail;
+		}
+
+		switch (extensions[j]) {
+		case TLSEXT_TYPE_supported_groups: /* length[2] + 2*data */
+			if (fr_tls_extension_decode(request, container, extension, 2, 2, total_len,
+						    attr_tls_client_hello_supported_group) < 0) goto fail;
+			break;
+
+		case TLSEXT_TYPE_ec_point_formats: /* length[1] + data */
+			if (fr_tls_extension_decode(request, container, extension, 1, 1, total_len,
+						    attr_tls_client_hello_ec_point_format) < 0) goto fail;
+			break;
+
+		case TLSEXT_TYPE_signature_algorithms: /* length[2] + 2*data */
+			if (fr_tls_extension_decode(request, container, extension, 2, 2, total_len,
+						    attr_tls_client_hello_sig_algo) < 0) goto fail;
+			break;
+
+		case TLSEXT_TYPE_supported_versions: /* length[1] + 2*data */
+			if (fr_tls_extension_decode(request, container, extension, 1, 2, total_len,
+						    attr_tls_client_hello_tls_version) < 0) goto fail;
+			break;
+
+		case TLSEXT_TYPE_psk_kex_modes: /* length[1] + data */
+			if (fr_tls_extension_decode(request, container, extension, 1, 1, total_len,
+						    attr_tls_client_hello_psk_key_mode) < 0) goto fail;
+			break;
+		}
+	}
+
+	if (extensions) OPENSSL_free(extensions);
+
+	/*
+	 *	This is the version being negotiated by the client, but tops at	1.2.
+	 *	After that the supported_versions extension is where the real value is.
+	 */
+	fr_pair_append_by_da(container, &vp, &container->vp_group, attr_tls_client_hello_tls_version);
+	vp->vp_uint16 = SSL_client_hello_get0_legacy_version(ssl);
+
+	fr_pair_append(&parent->session_state_pairs, container);
+
+	return SSL_CLIENT_HELLO_SUCCESS;
+}
+DIAG_ON_OPTIONAL(used-but-marked-unused)
 #endif

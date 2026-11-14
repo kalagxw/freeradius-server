@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License, version 2 of the
  *   License as published by the Free Software Foundation.
  *
@@ -26,26 +26,26 @@
 #include <freeradius-devel/util/syserror.h>
 #include <freeradius-devel/util/value.h>
 
-#include <ctype.h>
-#include <netdb.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
 #include <ifaddrs.h>
+#include <net/if_arp.h>
+#include <sys/un.h>
 
-#ifdef HAVE_LINUX_IF_PACKET_H
+/*
+ *	Linux
+ */
+#if defined(HAVE_LINUX_IF_PACKET_H)
 #  include <linux/if_packet.h>
 #  include <linux/if_ether.h>
-#endif
-
-#include <net/if_arp.h>
-
 /*
  *	Apple, *BSD
  */
-#ifndef __linux__
-#include <net/if_dl.h>
+#elif defined(HAVE_NET_IF_DL_H)
+#  include <net/if_dl.h>		 /* Needed for struct sockaddr_ll def */
+/*
+ *	emscripten/musl
+ */
+#elif defined(HAVE_NETPACKET_PACKET_H)
+#  include <netpacket/packet.h>	 	/* Needed for struct sockaddr_ll def */
 #endif
 
 bool fr_reverse_lookups = false;		//!< IP -> hostname lookups?
@@ -69,7 +69,8 @@ int fr_ipaddr_is_inaddr_any(fr_ipaddr_t const *ipaddr)
 
 #ifdef HAVE_STRUCT_SOCKADDR_IN6
 	} else if (ipaddr->af == AF_INET6) {
-		if (IN6_IS_ADDR_UNSPECIFIED(&(ipaddr->addr.v6))) {
+		/* Unconst for emscripten/musl */
+		if (IN6_IS_ADDR_UNSPECIFIED(UNCONST(struct in6_addr *, &(ipaddr->addr.v6)))) {
 			return 1;
 		}
 #endif
@@ -94,12 +95,14 @@ int fr_ipaddr_is_multicast(fr_ipaddr_t const *ipaddr)
 {
 	if (ipaddr->af == AF_INET) {
 		/*
-		 *	224.0.0.0 (3758096384) - 239.255.255.255 (4026531839)
+		 *	224.0.0.0 - 239.255.255.255.
 		 */
-		if ((ipaddr->addr.v4.s_addr >= 3758096384) && (ipaddr->addr.v4.s_addr <= 4026531839)) return 1;
+		if ((ipaddr->addr.v4.s_addr >= htonl((uint32_t) 0xe0000000)) &&
+		    (ipaddr->addr.v4.s_addr < htonl((uint32_t) 0xf0000000))) return 1;
 #ifdef HAVE_STRUCT_SOCKADDR_IN6
 	} else if (ipaddr->af == AF_INET6) {
-		if (IN6_IS_ADDR_MULTICAST(&(ipaddr->addr.v6))) {
+		/* Unconst for emscripten/musl */
+		if (IN6_IS_ADDR_MULTICAST(UNCONST(struct in6_addr *, &(ipaddr->addr.v6)))) {
 			return 1;
 		}
 #endif
@@ -164,9 +167,9 @@ static struct in_addr fr_inaddr_mask(struct in_addr const *ipaddr, uint8_t prefi
  */
 static struct in6_addr fr_in6addr_mask(struct in6_addr const *ipaddr, uint8_t prefix)
 {
-	uint64_t const *p = (uint64_t const *) ipaddr;
 	uint64_t addr;					/* Needed for alignment */
 	uint64_t ret[2], *o = ret;
+	uint8_t i = 0;
 
 	if (prefix > 128) prefix = 128;
 
@@ -175,16 +178,30 @@ static struct in6_addr fr_in6addr_mask(struct in6_addr const *ipaddr, uint8_t pr
 
 	if (prefix >= 64) {
 		prefix -= 64;
-		memcpy(&addr, p, sizeof(addr));		/* Needed for aligned access (ubsan) */
+		addr = (uint64_t)ipaddr->s6_addr[i] |
+			((uint64_t)ipaddr->s6_addr[i + 1] << 8) |
+			((uint64_t)ipaddr->s6_addr[i + 2] << 16) |
+			((uint64_t)ipaddr->s6_addr[i + 3] << 24) |
+			((uint64_t)ipaddr->s6_addr[i + 4] << 32) |
+			((uint64_t)ipaddr->s6_addr[i + 5] << 40) |
+			((uint64_t)ipaddr->s6_addr[i + 6] << 48) |
+			((uint64_t)ipaddr->s6_addr[i + 7] << 56);
 		*o++ = 0xffffffffffffffffULL & addr;	/* lhs portion masked */
-		p++;
+		i += 8;
 	} else {
 		ret[1] = 0;				/* rhs portion zeroed */
 	}
 
 	/* Max left shift is 63 else we get overflow */
 	if (prefix > 0) {
-		memcpy(&addr, p, sizeof(addr));		/* Needed for aligned access (ubsan) */
+		addr = (uint64_t)ipaddr->s6_addr[i] |
+			((uint64_t)ipaddr->s6_addr[i + 1] << 8) |
+			((uint64_t)ipaddr->s6_addr[i + 2] << 16) |
+			((uint64_t)ipaddr->s6_addr[i + 3] << 24) |
+			((uint64_t)ipaddr->s6_addr[i + 4] << 32) |
+			((uint64_t)ipaddr->s6_addr[i + 5] << 40) |
+			((uint64_t)ipaddr->s6_addr[i + 6] << 48) |
+			((uint64_t)ipaddr->s6_addr[i + 7] << 56);
 		*o = htonll(~((uint64_t)(0x0000000000000001ULL << (64 - prefix)) - 1)) & addr;
 	} else {
 		*o = 0;
@@ -221,11 +238,11 @@ void fr_ipaddr_mask(fr_ipaddr_t *addr, uint8_t prefix)
  * This function returns only one IP address, of the specified address family,
  * or the first address (of whatever family), if AF_UNSPEC is used.
  *
- * If fallback is specified and af is AF_INET, but not AF_INET records were
- * found and a record for AF_INET6 exists that record will be returned.
+ * If fallback is specified and af is AF_INET, but no AF_INET records were
+ * found and a record for AF_INET6 exists, then the IPv6 record will be returned.
  *
  * If fallback is specified and af is AF_INET6, and a record with AF_INET4 exists
- * that record will be returned inseted.
+ * that record will be returned inserted.
  *
  * @param[out] out Where to write result.
  * @param[in] af To search for in preference.
@@ -268,7 +285,7 @@ int fr_inet_hton(fr_ipaddr_t *out, int af, char const *hostname, bool fallback)
 			return -1;
 		}
 		out->af = af;
-		out->prefix = 32;
+		out->prefix = (af == AF_INET) ? 32 : 128;
 		out->scope_id = 0;
 
 		return 0;
@@ -463,7 +480,7 @@ static int ip_prefix_addr_from_str(struct in_addr *out, char const *str)
  */
 int fr_inet_pton4(fr_ipaddr_t *out, char const *value, ssize_t inlen, bool resolve, bool fallback, bool mask_bits)
 {
-	char		*p;
+	char const	*p;
 	unsigned int	mask;
 	char const	*end;
 	char		*eptr;
@@ -476,8 +493,10 @@ int fr_inet_pton4(fr_ipaddr_t *out, char const *value, ssize_t inlen, bool resol
 	 */
 	memset(out, 0, sizeof(*out));
 
+	if (inlen < 0) inlen = strlen(value);
+
 	end = value + inlen;
-	while (isspace((int) *value) && (value < end)) value++;
+	while ((value < end) && isspace((uint8_t) *value)) value++;
 	if (value == end) {
 		fr_strerror_const("Empty IPv4 address string is invalid");
 		return -1;
@@ -522,10 +541,21 @@ int fr_inet_pton4(fr_ipaddr_t *out, char const *value, ssize_t inlen, bool resol
 			out->addr.v4.s_addr = htonl(strtoul(value, NULL, 0));
 
 		} else if (!resolve) {
-			if (inet_pton(AF_INET, value, &out->addr.v4.s_addr) <= 0) {
+			unsigned int a, b, c, d;
+			int num;
+			char rest;
+
+			a = b = c = d = 0;
+
+			num = sscanf(value, "%u.%u.%u.%u%c", &a, &b, &c, &d, &rest);
+			if ((num == 0) || (num == 5) ||
+			    (a > 255) || (b > 255) || (c > 255) || (d > 255)) {
 				fr_strerror_printf("Failed to parse IPv4 address string \"%s\"", value);
 				return -1;
 			}
+
+			out->addr.v4.s_addr = htonl((a << 24) | (b << 16) | (c << 8) | d);
+
 		} else if (fr_inet_hton(out, AF_INET, value, fallback) < 0) return -1;
 
 		return 0;
@@ -601,7 +631,8 @@ int fr_inet_pton4(fr_ipaddr_t *out, char const *value, ssize_t inlen, bool resol
  */
 int fr_inet_pton6(fr_ipaddr_t *out, char const *value, ssize_t inlen, bool resolve, bool fallback, bool mask)
 {
-	char const	*p, *end;
+	char		*p;
+	char const	*end;
 	unsigned int	prefix;
 	char		*eptr;
 	char		buffer[256];	/* As per RFC1035 */
@@ -613,31 +644,38 @@ int fr_inet_pton6(fr_ipaddr_t *out, char const *value, ssize_t inlen, bool resol
 	 */
 	memset(out, 0, sizeof(*out));
 
+	if (inlen < 0) inlen = strlen(value);
+
 	end = value + inlen;
-	while (isspace((int) *value) && (value < end)) value++;
+	while ((value < end) && isspace((uint8_t) *value)) value++;
 	if (value == end) {
-		fr_strerror_const("Empty IPv4 address string is invalid");
+		fr_strerror_const("Empty IPv6 address string is invalid");
 		return -1;
 	}
-	inlen = end - value;
+	inlen = end - value;	/* always >0 due to the above check for value==end */
 
 	/*
-	 *	Copy to intermediary buffer if we were given a length
+	 *	Copy to intermediary buffer.
 	 */
-	if (inlen >= 0) {
-		if (inlen >= (ssize_t)sizeof(buffer)) {
-			fr_strerror_printf("Invalid IPv6 address string \"%pV\"", fr_box_strvalue_len(value, inlen));
-			return -1;
-		}
-		memcpy(buffer, value, inlen);
-		buffer[inlen] = '\0';
-		value = buffer;
+	if (inlen >= (ssize_t)sizeof(buffer)) {
+		fr_strerror_printf("Invalid IPv6 address string \"%pV\"", fr_box_strvalue_len(value, inlen));
+		return -1;
 	}
 
-	p = strchr(value, '/');
+	memcpy(buffer, value, inlen);
+	buffer[inlen] = '\0';
+	value = buffer;
+
+	p = UNCONST(char *, strchr(value, '/'));
 	if (!p) {
 		out->prefix = 128;
 		out->af = AF_INET6;
+
+		/*
+		 *	Allow scopes for non-prefix values.
+		 */
+		p = UNCONST(char *, strchr(value, '%'));
+		if (p) *(p++) = '\0';
 
 		/*
 		 *	Allow '*' as the wildcard address
@@ -650,6 +688,27 @@ int fr_inet_pton6(fr_ipaddr_t *out, char const *value, ssize_t inlen, bool resol
 				return -1;
 			}
 		} else if (fr_inet_hton(out, AF_INET6, value, fallback) < 0) return -1;
+
+		/*
+		 *	No scope, or just '%'.  That's fine.
+		 */
+		if (!p || !*p) return 0;
+
+		/*
+		 *	Parse scope ID.
+		 */
+		prefix = strtoul(p, &eptr, 10);
+		if (prefix > UINT32_MAX) {
+			fr_strerror_printf("Invalid scope ID \"%s\".  Should be between 0-2^32-1", p);
+			return -1;
+		}
+		if (eptr[0] != '\0') {
+			fr_strerror_printf("Failed to parse scope \"%s\", "
+					   "got garbage after numerical scope value \"%s\"", p, eptr);
+			return -1;
+		}
+
+		out->scope_id = prefix;
 
 		return 0;
 	}
@@ -729,8 +788,10 @@ int fr_inet_pton(fr_ipaddr_t *out, char const *value, ssize_t inlen, int af, boo
 	bool ipv6 = true;
 	char const *end;
 
+	if (inlen < 0) inlen = strlen(value);
+
 	end = value + inlen;
-	while (isspace((int) *value) && (value < end)) value++;
+	while ((value < end) && isspace((uint8_t) *value)) value++;
 	if (value == end) {
 		fr_strerror_const("Empty IPv4 address string is invalid");
 		return -1;
@@ -857,7 +918,7 @@ int fr_inet_pton(fr_ipaddr_t *out, char const *value, ssize_t inlen, int af, boo
 	/*
 	 *	No idea what it is...
 	 */
-	fr_strerror_printf("Invalid address family %i", af);
+	fr_strerror_printf("Invalid address family %d", af);
 	return -1;
 }
 
@@ -1045,8 +1106,8 @@ char *fr_inet_ntop_prefix(char out[static FR_IPADDR_PREFIX_STRLEN], size_t outle
 char *fr_inet_ifid_ntop(char *out, size_t outlen, uint8_t const *ifid)
 {
 	snprintf(out, outlen, "%x:%x:%x:%x",
-		 (ifid[0] << 8) + ifid[1], (ifid[2] << 8) + ifid[3],
-		 (ifid[4] << 8) + ifid[5], (ifid[6] << 8) + ifid[7]);
+		 fr_nbo_to_uint16(ifid),     fr_nbo_to_uint16(ifid + 2),
+		 fr_nbo_to_uint16(ifid + 4), fr_nbo_to_uint16(ifid + 6));
 	return out;
 }
 
@@ -1085,7 +1146,7 @@ uint8_t *fr_inet_ifid_pton(uint8_t out[static 8], char const *ifid_str)
 			num_id = 0;
 			if ((idx += 2) > 6)
 				return NULL;
-		} else if ((pch = strchr(xdigits, tolower(*p))) != NULL) {
+		} else if ((pch = strchr(xdigits, tolower((uint8_t) *p))) != NULL) {
 			if (++num_id > 4)
 				return NULL;
 			/*
@@ -1127,13 +1188,13 @@ int fr_ipaddr_from_ifname(fr_ipaddr_t *out, int af, char const *name)
 	fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (fd < 0) {
 		fr_strerror_printf("Failed opening temporary socket for SIOCGIFADDR: %s", fr_syserror(errno));
-	error:
-		close(fd);
 		return -1;
 	}
 	if (ioctl(fd, SIOCGIFADDR, &if_req) < 0) {
 		fr_strerror_printf("Failed determining address for interface %s: %s", name, fr_syserror(errno));
-		goto error;
+	error:
+		close(fd);
+		return -1;
 	}
 
 	/*
@@ -1281,33 +1342,45 @@ int fr_ipaddr_from_ifindex(fr_ipaddr_t *out, int fd, int af, int ifindex)
 
 /** Compare two ip addresses
  *
+ * @param[in] a		First ip to compare.
+ * @param[in] b		Second ip to compare.
+ * @return
+ *	- 1 if a > b
+ *	- 0 if a == b
+ *	- CMP_LT if a < b
+ *	- CMP_ERR on invalid address family, retrieve the error with fr_strerror.
  */
-int8_t fr_ipaddr_cmp(fr_ipaddr_t const *a, fr_ipaddr_t const *b)
+fr_cmp_ret_t fr_ipaddr_cmp(fr_ipaddr_t const *a, fr_ipaddr_t const *b)
 {
 	int ret;
+	size_t len;
 
 	CMP_RETURN(a, b, af);
 	CMP_RETURN(a, b, prefix);
 
+	/*
+	 *	We only care about prefix bytes.
+	 *
+	 *	Host bytes should be masked on ingestion
+	 *	for prefix types.
+	 */
+	len = ((a->prefix + 7) & -8) >> 3;
 	switch (a->af) {
 	case AF_INET:
-		ret = memcmp(&a->addr.v4,
-			     &b->addr.v4,
-			     sizeof(a->addr.v4));
+		ret = memcmp(&a->addr.v4, &b->addr.v4, len);
 		return CMP(ret, 0);
 
 #ifdef HAVE_STRUCT_SOCKADDR_IN6
 	case AF_INET6:
 		CMP_RETURN(a, b, scope_id);
-		ret = memcmp(&a->addr.v6, &b->addr.v6, sizeof(a->addr.v6));
+		ret = memcmp(&a->addr.v6, &b->addr.v6, len);
 		return CMP(ret, 0);
 #endif
 
 	default:
-		break;
+		fr_strerror_printf("Invalid address family %d", a->af);
+		return CMP_ERR;
 	}
-
-	return -1;
 }
 
 /** Convert our internal ip address representation to a sockaddr
@@ -1382,7 +1455,7 @@ int fr_ipaddr_from_sockaddr(fr_ipaddr_t *ipaddr, uint16_t *port,
 
 		if (salen < sizeof(s4)) {
 			fr_strerror_const("IPv4 address is too small");
-			return 0;
+			return -1;
 		}
 
 		memcpy(&s4, sa, sizeof(s4));
@@ -1398,7 +1471,7 @@ int fr_ipaddr_from_sockaddr(fr_ipaddr_t *ipaddr, uint16_t *port,
 
 		if (salen < sizeof(s6)) {
 			fr_strerror_const("IPv6 address is too small");
-			return 0;
+			return -1;
 		}
 
 		memcpy(&s6, sa, sizeof(s6));
@@ -1417,6 +1490,85 @@ int fr_ipaddr_from_sockaddr(fr_ipaddr_t *ipaddr, uint16_t *port,
 	return 0;
 }
 
+/** Convert an address from getifaddrs() to our internal ip address representation
+ *
+ * getifaddrs() does not align the addresses it returns to struct sockaddr_storage,
+ * and reading one through a struct sockaddr_storage pointer is undefined behaviour.
+ * The function copies the address into an aligned struct before converting it.
+ *
+ * @param[out] ipaddr	Where to write the ipaddr.
+ * @param[in] ifa_addr	The ifa_addr field of a struct ifaddrs entry.
+ * @return
+ *	- 0 on success.
+ *	- -1 if the address family is not AF_INET or AF_INET6.
+ */
+int fr_ipaddr_from_ifaddr(fr_ipaddr_t *ipaddr, struct sockaddr const *ifa_addr)
+{
+	struct sockaddr_storage	sa;
+	socklen_t		salen;
+
+	switch (ifa_addr->sa_family) {
+	case AF_INET:
+		salen = sizeof(struct sockaddr_in);
+		break;
+
+	case AF_INET6:
+		salen = sizeof(struct sockaddr_in6);
+		break;
+
+	default:
+		fr_strerror_printf("Unsupported address family %d", ifa_addr->sa_family);
+		return -1;
+	}
+
+	memcpy(&sa, ifa_addr, salen);
+
+	return fr_ipaddr_from_sockaddr(ipaddr, NULL, &sa, salen);
+}
+
+void  fr_ipaddr_get_scope_id(fr_ipaddr_t *ipaddr)
+{
+	struct ifaddrs *list = NULL;
+	struct ifaddrs *i;
+
+	/*
+	 *	This should be set already for IPv6.  We should only need to do this for IPv4.
+	 */
+	if (ipaddr->scope_id != 0) return;
+
+	/*
+	 *	Bind manually to an IP used by the named interface.
+	 */
+	if (getifaddrs(&list) < 0) return;
+
+	for (i = list; i != NULL; i = i->ifa_next) {
+		fr_ipaddr_t my_ipaddr;
+
+		if (!i->ifa_addr || !i->ifa_name || (ipaddr->af != i->ifa_addr->sa_family)) continue;
+
+		if (fr_ipaddr_from_ifaddr(&my_ipaddr, i->ifa_addr) < 0) continue;
+		my_ipaddr.scope_id = 0;
+
+		/*
+		 *	my_ipaddr will have a scope_id, but the input
+		 *	ipaddr won't have one.  We therefore set the
+		 *	local one to zero, so that we can do correct
+		 *	IP address comparisons.
+		 *
+		 *	If the comparison succeeds, then we return
+		 *	both the interface name, and we update the
+		 *	input ipaddr with the correct scope_id.
+		 */
+		if (fr_ipaddr_cmp(ipaddr, &my_ipaddr) == 0) {
+			ipaddr->scope_id = if_nametoindex(i->ifa_name);
+			break;
+		}
+	}
+
+	freeifaddrs(list);
+}
+
+
 char *fr_ipaddr_to_interface(TALLOC_CTX *ctx, fr_ipaddr_t *ipaddr)
 {
 	struct ifaddrs *list = NULL;
@@ -1434,8 +1586,7 @@ char *fr_ipaddr_to_interface(TALLOC_CTX *ctx, fr_ipaddr_t *ipaddr)
 
 		if (!i->ifa_addr || !i->ifa_name || (ipaddr->af != i->ifa_addr->sa_family)) continue;
 
-		fr_ipaddr_from_sockaddr(&my_ipaddr, NULL,
-					(struct sockaddr_storage *)i->ifa_addr, sizeof(struct sockaddr_in6));
+		if (fr_ipaddr_from_ifaddr(&my_ipaddr, i->ifa_addr) < 0) continue;
 
 		/*
 		 *	my_ipaddr will have a scope_id, but the input
@@ -1474,8 +1625,11 @@ int fr_interface_to_ipaddr(char const *interface, fr_ipaddr_t *ipaddr, int af, b
 		if (!i->ifa_addr || !i->ifa_name || ((af != AF_UNSPEC) && (af != i->ifa_addr->sa_family))) continue;
 		if (strcmp(i->ifa_name, interface) != 0) continue;
 
-		fr_ipaddr_from_sockaddr(&my_ipaddr, NULL,
-					(struct sockaddr_storage *)i->ifa_addr, sizeof(struct sockaddr_in6));
+		/*
+		 *	With af == AF_UNSPEC the entry may be a link layer
+		 *	address, which has no ip address to return.
+		 */
+		if (fr_ipaddr_from_ifaddr(&my_ipaddr, i->ifa_addr) < 0) continue;
 
 		/*
 		 *	If they ask for a link local address, then give
@@ -1515,21 +1669,24 @@ int fr_interface_to_ethernet(char const *interface, fr_ethernet_t *ethernet)
 		if (!i->ifa_addr || !i->ifa_name || (i->ifa_addr->sa_family != AF_LINK)) continue;
 		if (strcmp(i->ifa_name, interface) != 0) continue;
 
-#ifdef __linux__
-		struct sockaddr_ll *ll;
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
+		{
+			struct sockaddr_ll *ll;
 
-		ll = (struct sockaddr_ll *) i->ifa_addr;
-		if ((ll->sll_hatype != 1) || (ll->sll_halen != 6)) continue;
+			ll = (struct sockaddr_ll *) i->ifa_addr;
+			if ((ll->sll_hatype != 1) || (ll->sll_halen != 6)) continue;
 
-		memcpy(ethernet->addr, ll->sll_addr, 6);
-
+			memcpy(ethernet->addr, ll->sll_addr, 6);
+		}
 #else
-		struct sockaddr_dl *ll;
+		{
+			struct sockaddr_dl *ll;
 
-		ll = (struct sockaddr_dl *) i->ifa_addr;
-		if (ll->sdl_alen != 6) continue;
+			ll = (struct sockaddr_dl *) i->ifa_addr;
+			if (ll->sdl_alen != 6) continue;
 
-		memcpy(ethernet->addr, LLADDR(ll), 6);
+			memcpy(ethernet->addr, LLADDR(ll), 6);
+		}
 #endif
 		ret = 0;
 		break;
@@ -1537,4 +1694,49 @@ int fr_interface_to_ethernet(char const *interface, fr_ethernet_t *ethernet)
 
 	freeifaddrs(list);
 	return ret;
+}
+
+
+fr_cmp_ret_t fr_sockaddr_cmp(struct sockaddr_storage const *a, struct sockaddr_storage const *b)
+{
+	int ret;
+
+	ret = CMP(a->ss_family, b->ss_family);
+	if (ret != 0) return ret;
+
+	switch (a->ss_family) {
+	case AF_INET:
+		ret = CMP(((struct sockaddr_in const *)a)->sin_port, ((struct sockaddr_in const *)b)->sin_port);
+		if (ret != 0) return ret;
+
+		ret = memcmp(&((struct sockaddr_in const *)a)->sin_addr,
+			     &((struct sockaddr_in const *)b)->sin_addr,
+			     sizeof(((struct sockaddr_in const *)a)->sin_addr));
+		return CMP(ret, 0);
+
+	case AF_INET6:
+		ret = CMP(((struct sockaddr_in6 const *)a)->sin6_port, ((struct sockaddr_in6 const *)b)->sin6_port);
+		if (ret != 0) return ret;
+
+		/*
+		 *	@todo - flow info?
+		 */
+
+		ret = CMP(((struct sockaddr_in6 const *)a)->sin6_scope_id, ((struct sockaddr_in6 const *)b)->sin6_scope_id);
+		if (ret != 0) return ret;
+
+		ret = memcmp(&((struct sockaddr_in6 const *)a)->sin6_addr,
+			     &((struct sockaddr_in6 const *)b)->sin6_addr,
+			     sizeof(((struct sockaddr_in6 const *)a)->sin6_addr));
+		return CMP(ret, 0);
+
+	case AF_LOCAL:
+		ret = strcmp(((struct sockaddr_un const *)a)->sun_path,
+			     ((struct sockaddr_un const *)b)->sun_path);
+		return CMP(ret, 0);
+
+	default:
+		fr_assert(0);
+		return CMP_EQ;
+	}
 }

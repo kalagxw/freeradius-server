@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -46,14 +46,14 @@ int cache_serialize(TALLOC_CTX *ctx, char **out, rlm_cache_entry_t const *c)
 
 	char		*to_store = NULL;
 
-	to_store = talloc_typed_asprintf(ctx, "Cache-Expires = %pV\nCache-Created = %pV\n",
-					 fr_box_date(c->expires), fr_box_date(c->created));
+	to_store = fr_asprintf(ctx, "Cache-Expires = '%pV'\nCache-Created = '%pV'\n",
+			       fr_box_date(c->expires), fr_box_date(c->created));
 	if (!to_store) return -1;
 
 	/*
 	 *	It's valid to have an empty cache entry (save allocing the pairs pool)
 	 */
-	if (fr_dlist_empty(&c->maps)) goto finish;
+	if (map_list_empty(&c->maps)) goto finish;
 
 	value_pool = talloc_pool(ctx, 512);
 	if (!value_pool) {
@@ -63,18 +63,18 @@ int cache_serialize(TALLOC_CTX *ctx, char **out, rlm_cache_entry_t const *c)
 		return -1;
 	}
 
-	while ((map = fr_dlist_next(&c->maps, map))) {
+	while ((map = map_list_next(&c->maps, map))) {
 		char	*value;
 		ssize_t	slen;
 
-		slen = tmpl_print(&FR_SBUFF_OUT(attr, sizeof(attr)), map->lhs, TMPL_ATTR_REF_PREFIX_NO, NULL);
+		slen = tmpl_print(&FR_SBUFF_OUT(attr, sizeof(attr)), map->lhs, NULL);
 		if (slen < 0) {
 			fr_strerror_printf("Serialized attribute too long.  Must be < " STRINGIFY(sizeof(attr)) " "
 					   "bytes, needed %zu additional bytes", (size_t)(slen * -1));
 			goto error;
 		}
 
-		fr_value_box_aprint(value_pool, &value, tmpl_value(map->rhs), &fr_value_escape_single);
+		fr_value_box_aprint_quoted(value_pool, &value, tmpl_value(map->rhs), T_DOUBLE_QUOTED_STRING);
 		if (!value) goto error;
 
 		to_store = talloc_asprintf_append_buffer(to_store, "%s %s %s\n", attr,
@@ -84,6 +84,7 @@ int cache_serialize(TALLOC_CTX *ctx, char **out, rlm_cache_entry_t const *c)
 	}
 finish:
 	talloc_free(value_pool);
+	talloc_set_type(to_store, char);
 	*out = to_store;
 
 	return 0;
@@ -91,6 +92,7 @@ finish:
 
 /** Converts a serialized cache entry back into a structure
  *
+ * @param[in] request	Current request
  * @param[in] c		Cache entry to populate (should already be allocated)
  * @param[in] dict	to use for unqualified attributes.
  * @param[in] in	String representation of cache entry.
@@ -100,7 +102,7 @@ finish:
  *	- 0 on success.
  *	- -1 on failure.
  */
-int cache_deserialize(rlm_cache_entry_t *c, fr_dict_t const *dict, char *in, ssize_t inlen)
+int cache_deserialize(request_t *request, rlm_cache_entry_t *c, fr_dict_t const *dict, char *in, ssize_t inlen)
 {
 	char		*p, *q;
 
@@ -111,9 +113,15 @@ int cache_deserialize(rlm_cache_entry_t *c, fr_dict_t const *dict, char *in, ssi
 	while (((size_t)(p - in)) < (size_t)inlen) {
 		map_t	*map = NULL;
 		tmpl_rules_t parse_rules = {
-					.dict_def = dict,
-					.prefix = TMPL_ATTR_REF_PREFIX_NO
-				};
+			.attr = {
+				.dict_def = dict,
+				.list_def = request_attr_request,
+			},
+			.xlat = {
+				.runtime_el = unlang_interpret_event_list(request),
+			},
+			.at_runtime = true,
+		};
 
 		q = strchr(p, '\n');
 		if (!q) break;	/* List should also be terminated with a \n */
@@ -129,27 +137,27 @@ int cache_deserialize(rlm_cache_entry_t *c, fr_dict_t const *dict, char *in, ssi
 		if (!tmpl_is_attr(map->lhs)) {
 			fr_strerror_printf("Pair left hand side \"%s\" parsed as %s, needed attribute.  "
 					   "Check local dictionaries", map->lhs->name,
-					   fr_table_str_by_value(tmpl_type_table, map->lhs->type, "<INVALID>"));
+					   tmpl_type_to_str(map->lhs->type));
 			goto error;
 		}
 
-		if (!tmpl_is_unresolved(map->rhs)) {
+		if (!tmpl_is_data(map->rhs)) {
 			fr_strerror_printf("Pair right hand side \"%s\" parsed as %s, needed literal.  "
 					   "Check serialized data quoting", map->rhs->name,
-					   fr_table_str_by_value(tmpl_type_table, map->rhs->type, "<INVALID>"));
+					   tmpl_type_to_str(map->rhs->type));
 			goto error;
 		}
 
 		/*
 		 *	Convert literal to a type appropriate for the VP.
 		 */
-		if (tmpl_cast_in_place(map->rhs, tmpl_da(map->lhs)->type, tmpl_da(map->lhs)) < 0) goto error;
+		if (tmpl_cast_in_place(map->rhs, tmpl_attr_tail_da(map->lhs)->type, tmpl_attr_tail_da(map->lhs)) < 0) goto error;
 
 		/*
 		 *	Pull out the special attributes, and set the
 		 *	relevant cache entry fields.
 		 */
-		if (fr_dict_attr_is_top_level(tmpl_da(map->lhs))) switch (tmpl_da(map->lhs)->attr) {
+		if (fr_dict_attr_is_top_level(tmpl_attr_tail_da(map->lhs))) switch (tmpl_attr_tail_da(map->lhs)->attr) {
 		case FR_CACHE_CREATED:
 			c->created = tmpl_value(map->rhs)->vb_date;
 			talloc_free(map);
@@ -167,7 +175,7 @@ int cache_deserialize(rlm_cache_entry_t *c, fr_dict_t const *dict, char *in, ssi
 		MAP_VERIFY(map);
 
 		/* It's not a special attribute, add it to the map list */
-		fr_dlist_insert_tail(&c->maps, map);
+		map_list_insert_tail(&c->maps, map);
 
 	next:
 		p = q + 1;

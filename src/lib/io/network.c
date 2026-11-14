@@ -24,33 +24,25 @@
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "%s - "
-#define LOG_PREFIX_ARGS nr->name
+#define LOG_PREFIX nr->name
 
 #define LOG_DST nr->log
 
 #include <freeradius-devel/util/event.h>
-#include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/rand.h>
 #include <freeradius-devel/util/rb.h>
 #include <freeradius-devel/util/syserror.h>
 #include <freeradius-devel/util/atexit.h>
-#include <freeradius-devel/util/talloc.h>
 
 #include <freeradius-devel/io/channel.h>
-#include <freeradius-devel/io/control.h>
 #include <freeradius-devel/io/listen.h>
 #include <freeradius-devel/io/network.h>
 #include <freeradius-devel/io/queue.h>
-#include <freeradius-devel/io/ring_buffer.h>
-#include <freeradius-devel/io/worker.h>
 
 #define MAX_WORKERS 64
 
-static _Thread_local fr_ring_buffer_t *fr_network_rb;
-
 typedef struct {
-	fr_listen_t		*listen;
+	fr_listen_instance_t	*inst;
 	uint8_t			*packet;
 	size_t			packet_len;
 	fr_time_t		recv_time;
@@ -61,12 +53,13 @@ typedef struct {
  */
 typedef struct {
 	fr_heap_index_t		heap_id;		//!< workers are in a heap
-	fr_time_t		cpu_time;		//!< how much CPU time this worker has spent
-	fr_time_t		predicted;		//!< predicted processing time for one packet
+	fr_time_delta_t		cpu_time;		//!< how much CPU time this worker has spent
+	fr_time_delta_t		predicted;		//!< predicted processing time for one packet
 
 	bool			blocked;		//!< is this worker blocked?
 
 	fr_channel_t		*channel;		//!< channel to the worker
+	fr_message_set_t	*reply_ms;		//!< message set the worker will use to send reply data.
 	fr_worker_t		*worker;		//!< worker pointer
 	fr_io_stats_t		stats;
 } fr_network_worker_t;
@@ -80,12 +73,15 @@ typedef struct {
 	fr_heap_index_t		heap_id;		//!< for the sockets_by_num heap
 
 	fr_event_filter_t	filter;			//!< what type of filter it is
+	fr_event_fd_t		*ef;			//!< the I/O event, if it was inserted.  Parented off
+							///< this socket, so it cannot outlive it.
 
 	bool			dead;			//!< is it dead?
 	bool			blocked;		//!< is it blocked?
+	bool			closed;			//!< the descriptor has been closed.
 
-	size_t			outstanding;		//!< number of outstanding packets sent to the worker
-	fr_listen_t		*listen;		//!< I/O ctx and functions.
+	unsigned int		outstanding;		//!< number of outstanding packets sent to the worker
+	fr_listen_instance_t	*inst;			//!< I/O ctx and functions.
 
 	fr_message_set_t	*ms;			//!< message buffers for this socket.
 	fr_channel_data_t	*cd;			//!< cached in case of allocation & read error
@@ -113,17 +109,14 @@ typedef struct {
 struct fr_network_s {
 	char const		*name;			//!< Network ID for logging.
 
-	bool			started;		//!< Set to true when the first worker is added.
+	pthread_t		thread_id;		//!< for self
+
 	bool			suspended;		//!< whether or not we're suspended.
 
 	fr_log_t const		*log;			//!< log destination
 	fr_log_lvl_t		lvl;			//!< debug log level
 
-	fr_atomic_queue_t	*aq_control;		//!< atomic queue for control messages sent to me
-
 	fr_control_t		*control;		//!< the control plane
-
-	fr_ring_buffer_t	*rb;			//!< ring buffer for my control-plane messages
 
 	fr_event_list_t		*el;			//!< our event list
 
@@ -134,104 +127,98 @@ struct fr_network_s {
 	fr_rb_tree_t		*sockets;		//!< list of sockets we're managing, ordered by the listener
 	fr_rb_tree_t		*sockets_by_num;       	//!< ordered by number;
 
-	int			num_workers;		//!< number of active workers
-	int			num_blocked;		//!< number of blocked workers
+	unsigned int		num_workers;		//!< number of active workers
+	unsigned int		num_blocked;		//!< number of blocked workers
 	int			num_pending_workers;	//!< number of workers we're waiting to start.
-	int			max_workers;		//!< maximum number of allowed workers
+	unsigned int		max_workers;		//!< maximum number of allowed workers
 	int			num_sockets;		//!< actually a counter...
 
 	int			signal_pipe[2];		//!< Pipe for signalling the worker in an orderly way.
 							///< This is more deterministic than using async signals.
+
+	bool			exiting;		//!< are we exiting?
 
 	fr_network_config_t	config;			//!< configuration
 	fr_network_worker_t	*workers[MAX_WORKERS]; 	//!< each worker
 };
 
 static void fr_network_post_event(fr_event_list_t *el, fr_time_t now, void *uctx);
-static int fr_network_pre_event(fr_time_t wake, void *uctx);
+static int fr_network_pre_event(fr_time_t now, fr_time_delta_t wake, void *uctx);
 static void fr_network_socket_dead(fr_network_t *nr, fr_network_socket_t *s);
+static int network_socket_close(fr_network_socket_t *s);
 static void fr_network_read(UNUSED fr_event_list_t *el, int sockfd, UNUSED int flags, void *ctx);
 
-static int8_t reply_cmp(void const *one, void const *two)
+static fr_cmp_ret_t reply_cmp(void const *one, void const *two)
 {
 	fr_channel_data_t const *a = one, *b = two;
 	int ret;
 
-	ret = (a->priority > b->priority) - (a->priority < b->priority);
+	ret = CMP(a->priority, b->priority);
 	if (ret != 0) return ret;
 
-	return (a->m.when > b->m.when) - (a->m.when < b->m.when);
+	return fr_time_cmp(a->m.when, b->m.when);
 }
 
-static int8_t waiting_cmp(void const *one, void const *two)
+static fr_cmp_ret_t waiting_cmp(void const *one, void const *two)
 {
 	fr_channel_data_t const *a = one, *b = two;
 	int ret;
 
-	ret = (a->priority > b->priority) - (a->priority < b->priority);
+	ret = CMP(a->priority, b->priority);
 	if (ret != 0) return ret;
 
-	return (a->reply.request_time > b->reply.request_time) - (a->reply.request_time < b->reply.request_time);
+	return fr_time_cmp(a->reply.request_time, b->reply.request_time);
 }
 
-static int8_t socket_listen_cmp(void const *one, void const *two)
+static fr_cmp_ret_t socket_listen_cmp(void const *one, void const *two)
 {
 	fr_network_socket_t const *a = one, *b = two;
 
-	return CMP(a->listen, b->listen);
+	return CMP(a->inst, b->inst);
 }
 
-static int8_t socket_num_cmp(void const *one, void const *two)
+static fr_cmp_ret_t socket_num_cmp(void const *one, void const *two)
 {
 	fr_network_socket_t const *a = one, *b = two;
 
 	return CMP(a->number, b->number);
 }
 
-/*
- *	Explicitly cleanup the memory allocated to the ring buffer,
- *	just in case valgrind complains about it.
- */
-static void _fr_network_rb_free(void *arg)
+static inline bool is_network_thread(fr_network_t const *nr)
 {
-	talloc_free(arg);
+	return (pthread_equal(pthread_self(), nr->thread_id) != 0);
 }
 
-/** Initialise thread local storage
- *
- * @return fr_ring_buffer_t for messages
- */
-static inline fr_ring_buffer_t *fr_network_rb_init(void)
-{
-	fr_ring_buffer_t *rb;
+static int fr_network_listen_add_self(fr_network_t *nr, fr_listen_instance_t *listen);
 
-	rb = fr_network_rb;
-	if (rb) return rb;
-
-	rb = fr_ring_buffer_create(NULL, FR_CONTROL_MAX_MESSAGES * FR_CONTROL_MAX_SIZE);
-	if (!rb) {
-		fr_perror("Failed allocating memory for network ring buffer");
-		return NULL;
-	}
-
-	fr_atexit_thread_local(fr_network_rb, _fr_network_rb_free, rb);
-
-	return rb;
-}
-
-/** Add a fr_listen_t to a network
+/** Add a fr_listen_instance_t to a network
  *
  * @param nr		the network
  * @param li		the listener
  */
-int fr_network_listen_add(fr_network_t *nr, fr_listen_t *li)
+int fr_network_listen_add(fr_network_t *nr, fr_listen_instance_t *li)
 {
-	fr_ring_buffer_t *rb;
+	/*
+	 *	Associate the protocol dictionary with the listener, so that the decode functions can check /
+	 *	use it.
+	 *
+	 *	A virtual server may start off with a "dictionary" block, and therefore define a local
+	 *	dictionary.  So the "root" dictionary of a virtual server may not be a protocol dict.
+	 */
+	fr_assert(li->listen->server_cs != NULL);
+	li->listen->dict = fr_dict_proto_dict(virtual_server_dict_by_cs(li->listen->server_cs));
 
-	rb = fr_network_rb_init();
-	if (!rb) return -1;
+	fr_assert(li->listen->dict != NULL);
 
-	return fr_control_message_send(nr->control, rb, FR_CONTROL_ID_LISTEN, &li, sizeof(li));
+	/*
+	 *	Skip a bunch of work if we're already in the network thread.
+	 */
+	if (is_network_thread(nr) && !li->listen->needs_full_setup) {
+		return fr_network_listen_add_self(nr, li);
+	}
+
+	return fr_control_message_send(nr->control, FR_CONTROL_EVENTSET_NETWORK,
+				       FR_NETWORK_CONTROL_LISTEN, &li, sizeof(li));
 }
 
 
@@ -240,11 +227,13 @@ int fr_network_listen_add(fr_network_t *nr, fr_listen_t *li)
  * @param nr		the network
  * @param li		the listener
  */
-int fr_network_socket_delete(fr_network_t *nr, fr_listen_t *li)
+int fr_network_listen_delete(fr_network_t *nr, fr_listen_instance_t *li)
 {
 	fr_network_socket_t *s;
 
-	s = fr_rb_find(nr->sockets, &(fr_network_socket_t){ .listen = li });
+	fr_assert(is_network_thread(nr));
+
+	fr_rb_find((void **)&s, nr->sockets, &(fr_network_socket_t){ .inst = li });
 	if (!s) return -1;
 
 	fr_network_socket_dead(nr, s);
@@ -257,53 +246,58 @@ int fr_network_socket_delete(fr_network_t *nr, fr_listen_t *li)
  * @param nr		the network
  * @param li		the listener
  */
-int fr_network_directory_add(fr_network_t *nr, fr_listen_t *li)
+int fr_network_directory_add(fr_network_t *nr, fr_listen_instance_t *li)
 {
-	fr_ring_buffer_t *rb;
-
-	rb = fr_network_rb_init();
-	if (!rb) return -1;
-
-	return fr_control_message_send(nr->control, rb, FR_CONTROL_ID_DIRECTORY, &li, sizeof(li));
+	return fr_control_message_send(nr->control, FR_CONTROL_EVENTSET_NETWORK,
+				       FR_NETWORK_CONTROL_DIRECTORY, &li, sizeof(li));
 }
 
-/** Add a worker to a network
+/** Add a worker to a network in a different thread
  *
  * @param nr the network
  * @param worker the worker
  */
 int fr_network_worker_add(fr_network_t *nr, fr_worker_t *worker)
 {
-	fr_ring_buffer_t *rb;
-
-	rb = fr_network_rb_init();
-	if (!rb) return -1;
-
 	(void) talloc_get_type_abort(nr, fr_network_t);
 	(void) talloc_get_type_abort(worker, fr_worker_t);
 
-	return fr_control_message_send(nr->control, rb, FR_CONTROL_ID_WORKER, &worker, sizeof(worker));
+	return fr_control_message_send(nr->control, FR_CONTROL_EVENTSET_NETWORK,
+				       FR_NETWORK_CONTROL_WORKER, &worker, sizeof(worker));
 }
+
+static void fr_network_worker_started_callback(void const *data, size_t data_size, fr_time_t now, void *uctx);
+
+/** Add a worker to a network in the same thread
+ *
+ * @param nr the network
+ * @param worker the worker
+ */
+void fr_network_worker_add_self(fr_network_t *nr, fr_worker_t *worker)
+{
+	fr_network_worker_started_callback(&worker, sizeof(worker), fr_time_wrap(0), nr);
+}
+
 
 /** Signal the network to read from a listener
  *
  * @param nr the network
  * @param li the listener to read from
  */
-void fr_network_listen_read(fr_network_t *nr, fr_listen_t *li)
+void fr_network_listen_read(fr_network_t *nr, fr_listen_instance_t *li)
 {
 	fr_network_socket_t *s;
 
 	(void) talloc_get_type_abort(nr, fr_network_t);
-	(void) talloc_get_type_abort_const(li, fr_listen_t);
+	(void) talloc_get_type_abort_const(li, fr_listen_instance_t);
 
-	s = fr_rb_find(nr->sockets, &(fr_network_socket_t){ .listen = li });
+	fr_rb_find((void **)&s, nr->sockets, &(fr_network_socket_t){ .inst = li });
 	if (!s) return;
 
 	/*
 	 *	Go read the socket.
 	 */
-	fr_network_read(nr->el, s->listen->fd, 0, s);
+	fr_network_read(nr->el, s->inst->fd, 0, s);
 }
 
 
@@ -316,7 +310,7 @@ void fr_network_listen_read(fr_network_t *nr, fr_listen_t *li)
  * @param packet_ctx	The packet context to write
  * @param request_time	when the packet was received.
  */
-void fr_network_listen_write(fr_network_t *nr, fr_listen_t *li, uint8_t const *packet, size_t packet_len,
+void fr_network_listen_write(fr_network_t *nr, fr_listen_instance_t *li, uint8_t const *packet, size_t packet_len,
 			     void *packet_ctx, fr_time_t request_time)
 {
 	fr_message_t *lm;
@@ -330,10 +324,10 @@ void fr_network_listen_write(fr_network_t *nr, fr_listen_t *li, uint8_t const *p
 		},
 
 		.channel = {
-			.heap_id = 0,
+			.heap_id = FR_HEAP_INDEX_INVALID,
 		},
 
-		.listen = li,
+		.inst = li,
 		.priority = PRIORITY_NOW,
 		.reply.request_time = request_time,
 	};
@@ -347,7 +341,7 @@ void fr_network_listen_write(fr_network_t *nr, fr_listen_t *li, uint8_t const *p
 	lm = fr_message_localize(nr, &cd.m, sizeof(cd));
 	if (!lm) return;
 
-	if (fr_heap_insert(nr->replies, lm) < 0) {
+	if (fr_heap_insert(&nr->replies, lm) < 0) {
 		fr_message_done(lm);
 	}
 }
@@ -364,80 +358,123 @@ void fr_network_listen_write(fr_network_t *nr, fr_listen_t *li, uint8_t const *p
  *	- <0 on error
  *	- 0 on success
  */
-int fr_network_listen_inject(fr_network_t *nr, fr_listen_t *li, uint8_t const *packet, size_t packet_len, fr_time_t recv_time)
+int fr_network_listen_inject(fr_network_t *nr, fr_listen_instance_t *li, uint8_t const *packet, size_t packet_len,
+			     fr_time_t recv_time)
 {
-	fr_ring_buffer_t *rb;
+	int rcode;
 	fr_network_inject_t my_inject;
-
-	rb = fr_network_rb_init();
-	if (!rb) return -1;
-
-	(void) talloc_get_type_abort(nr, fr_network_t);
-	(void) talloc_get_type_abort(li, fr_listen_t);
 
 	/*
 	 *	Can't inject to injection-less destinations.
 	 */
-	if (!li->app_io->inject) return -1;
+	if (!li->listen->app_io->inject) {
+		fr_strerror_const("Listener cannot accept injected packet");
+		return -1;
+	}
 
-	my_inject.listen = li;
-	my_inject.packet = talloc_memdup(NULL, packet, packet_len);
+	/*
+	 *	Avoid a bounce through the event loop if we're being called from the network thread.
+	 */
+	if (is_network_thread(nr)) {
+		fr_network_socket_t *s;
+
+		fr_rb_find((void **)&s, nr->sockets, &(fr_network_socket_t){ .inst = li });
+		if (!s) {
+			fr_strerror_const("Listener was not found for injected packet");
+			return -1;
+		}
+
+		/*
+		 *	Inject the packet.  The master.c mod_read() routine will then take care of avoiding
+		 *	IO, and instead return the packet to the network side.
+		 */
+		if (li->listen->app_io->inject(li, packet, packet_len, recv_time) == 0) {
+			(void) fr_network_read(nr->el, li->fd, 0, s);
+		}
+
+		return 0;
+	}
+
+	my_inject.inst = li;
+	MEM(my_inject.packet = talloc_memdup(NULL, packet, packet_len));
 	my_inject.packet_len = packet_len;
 	my_inject.recv_time = recv_time;
 
-	return fr_control_message_send(nr->control, rb, FR_CONTROL_ID_INJECT, &my_inject, sizeof(my_inject));
+	rcode = fr_control_message_send(nr->control, FR_CONTROL_EVENTSET_NETWORK,
+					FR_NETWORK_CONTROL_INJECT, &my_inject, sizeof(my_inject));
+	if (rcode < 0) talloc_free(my_inject.packet);
+
+	return rcode;
 }
+
+static fr_event_update_t const pause_read[] = {
+	FR_EVENT_SUSPEND(fr_event_io_func_t, read),
+	{ 0 }
+};
+
+static fr_event_update_t const resume_read[] = {
+	FR_EVENT_RESUME(fr_event_io_func_t, read),
+	{ 0 }
+};
+
+static fr_event_update_t const pause_write[] = {
+	FR_EVENT_SUSPEND(fr_event_io_func_t, write),
+	{ 0 }
+};
+
+static fr_event_update_t const resume_write[] = {
+	FR_EVENT_RESUME(fr_event_io_func_t, write),
+	{ 0 }
+};
 
 static void fr_network_suspend(fr_network_t *nr)
 {
-	static fr_event_update_t pause_read[] = {
-		FR_EVENT_SUSPEND(fr_event_io_func_t, read),
-		{ 0 }
-	};
 	fr_rb_iter_inorder_t	iter;
-	fr_network_socket_t		*socket;
+	fr_network_socket_t	*s;
 
 	if (nr->suspended) return;
 
-	for (socket = fr_rb_iter_init_inorder(&iter, nr->sockets);
-	     socket;
-	     socket = fr_rb_iter_next_inorder(&iter)) {
-		fr_event_filter_update(socket->nr->el, socket->listen->fd, FR_EVENT_FILTER_IO, pause_read);
+	for (s = fr_rb_iter_init_inorder(nr->sockets, &iter);
+	     s != NULL;
+	     s = fr_rb_iter_next_inorder(nr->sockets, &iter)) {
+		if (fr_event_filter_update(s->nr->el, s->inst->fd, FR_EVENT_FILTER_IO, pause_read) < 0) {
+			PERROR("Failed removing read callback from event loop");
+			fr_network_socket_dead(nr, s);
+		}
 	}
 	nr->suspended = true;
 }
 
 static void fr_network_unsuspend(fr_network_t *nr)
 {
-	static fr_event_update_t resume_read[] = {
-		FR_EVENT_RESUME(fr_event_io_func_t, read),
-		{ 0 }
-	};
 	fr_rb_iter_inorder_t	iter;
-	fr_network_socket_t		*socket;
+	fr_network_socket_t	*s;
 
 	if (!nr->suspended) return;
 
-	for (socket = fr_rb_iter_init_inorder(&iter, nr->sockets);
-	     socket;
-	     socket = fr_rb_iter_next_inorder(&iter)) {
-		fr_event_filter_update(socket->nr->el, socket->listen->fd, FR_EVENT_FILTER_IO, resume_read);
+	for (s = fr_rb_iter_init_inorder(nr->sockets, &iter);
+	     s != NULL;
+	     s = fr_rb_iter_next_inorder(nr->sockets, &iter)) {
+		if (fr_event_filter_update(s->nr->el, s->inst->fd, FR_EVENT_FILTER_IO, resume_read) < 0) {
+			PERROR("Failed adding read callback to event loop");
+			fr_network_socket_dead(nr, s);
+		}
 	}
 	nr->suspended = false;
 }
 
 #define IALPHA (8)
-#define RTT(_old, _new) ((_new + ((IALPHA - 1) * _old)) / IALPHA)
+#define RTT(_old, _new) fr_time_delta_wrap((fr_time_delta_unwrap(_new) + (fr_time_delta_unwrap(_old) * (IALPHA - 1))) / IALPHA)
 
 /** Callback which handles a message being received on the network side.
  *
- * @param[in] ctx the network
  * @param[in] ch the channel that the message is on.
  * @param[in] cd the message (if any) to start with
+ * @param[in] uctx the network
  */
-static void fr_network_recv_reply(void *ctx, fr_channel_t *ch, fr_channel_data_t *cd)
+static void fr_network_recv_reply(fr_channel_t *ch, fr_channel_data_t *cd, void *uctx)
 {
-	fr_network_t *nr = ctx;
+	fr_network_t *nr = uctx;
 	fr_network_worker_t *worker;
 
 	cd->channel.ch = ch;
@@ -448,7 +485,7 @@ static void fr_network_recv_reply(void *ctx, fr_channel_t *ch, fr_channel_data_t
 	worker = fr_channel_requestor_uctx_get(ch);
 	worker->stats.out++;
 	worker->cpu_time = cd->reply.cpu_time;
-	if (!worker->predicted) {
+	if (!fr_time_delta_ispos(worker->predicted)) {
 		worker->predicted = cd->reply.processing_time;
 	} else {
 		worker->predicted = RTT(worker->predicted, cd->reply.processing_time);
@@ -466,83 +503,50 @@ static void fr_network_recv_reply(void *ctx, fr_channel_t *ch, fr_channel_data_t
 	/*
 	 *	Ensure that heap insert works.
 	 */
-	cd->channel.heap_id = 0;
-	if (fr_heap_insert(nr->replies, cd) < 0) {
+	cd->channel.heap_id = FR_HEAP_INDEX_INVALID;
+	if (fr_heap_insert(&nr->replies, cd) < 0) {
 		fr_message_done(&cd->m);
 		fr_assert(0 == 1);
 	}
 }
 
-/** Handle a network control message callback for a channel
+/** A worker has finished closing a channel we asked it to close, remove it from the array
  *
- * This is called from the event loop when we get a notification
- * from the event signalling pipe.
- *
- * @param[in] ctx	the network
- * @param[in] data	the message
- * @param[in] data_size	size of the data
+ * @param[in] ch	the channel.
  * @param[in] now	the current time
+ * @param[in] uctx	the network
  */
-static void fr_network_channel_callback(void *ctx, void const *data, size_t data_size, fr_time_t now)
+static void fr_network_channel_closed(fr_channel_t *ch, UNUSED fr_time_t now, void *uctx)
 {
-	fr_channel_event_t	ce;
-	fr_channel_t		*ch;
-	fr_network_t		*nr = ctx;
+	fr_network_t		*nr = uctx;
+	fr_network_worker_t	*w = talloc_get_type_abort(fr_channel_requestor_uctx_get(ch),
+							   fr_network_worker_t);
+	unsigned int		i;
 
-	ce = fr_channel_service_message(now, &ch, data, data_size);
-	DEBUG3("Channel %s",
-	       fr_table_str_by_value(channel_signals, ce, "<INVALID>"));
-	switch (ce) {
-	case FR_CHANNEL_ERROR:
-		return;
+	DEBUG3("Worker acked our close request");
+	for (i = 0; i < nr->num_workers; i++) {
+		if (nr->workers[i] == w) {
+			if (i == (nr->num_workers - 1)) break;
 
-	case FR_CHANNEL_EMPTY:
-		return;
-
-	case FR_CHANNEL_NOOP:
-		break;
-
-	case FR_CHANNEL_DATA_READY_REQUESTOR:
-		fr_assert(ch != NULL);
-		while (fr_channel_recv_reply(ch));
-		break;
-
-	case FR_CHANNEL_DATA_READY_RESPONDER:
-		fr_assert(0 == 1);
-		break;
-
-	case FR_CHANNEL_OPEN:
-		fr_assert(0 == 1);
-		break;
-
-	case FR_CHANNEL_CLOSE:
-	{
-		fr_network_worker_t	*w = talloc_get_type_abort(fr_channel_requestor_uctx_get(ch),
-								   fr_network_worker_t);
-		int			i;
-
-		/*
-		 *	Remove this worker from the array
-		 */
-		for (i = 0; i < nr->num_workers; i++) {
-			DEBUG3("Worker acked our close request");
-			if (nr->workers[i] == w) {
-				nr->workers[i] = NULL;
-
-				if (i == (nr->num_workers - 1)) break;
-
-				/*
-				 *	Close the hole...
-				 */
-				memcpy(&nr->workers[i], &nr->workers[i + 1], ((nr->num_workers - i) - 1));
-				break;
-			}
+			/*
+			 *	Close the hole...
+			 */
+			memmove(&nr->workers[i], &nr->workers[i + 1],
+				(uint8_t *) &nr->workers[nr->num_workers] - (uint8_t *) &nr->workers[i + 1]);
+			break;
 		}
-		nr->num_workers--;
 	}
-		break;
-	}
+	nr->num_workers--;
+	nr->workers[nr->num_workers] = NULL; /* over-write now unused pointer */
 }
+
+/** Channel events the network handles.  As the requestor it is never sent an open or a close.
+ */
+static fr_channel_callbacks_t const fr_network_channel_callbacks = {
+	.closed		= fr_network_channel_closed
+};
+
+#define OUTSTANDING(_x) ((_x)->stats.in - (_x)->stats.out)
 
 /** Send a message on the "best" channel.
  *
@@ -555,18 +559,38 @@ static int fr_network_send_request(fr_network_t *nr, fr_channel_data_t *cd)
 
 	(void) talloc_get_type_abort(nr, fr_network_t);
 
+	/*
+	 *	The workers have been signalled to close and are tearing their
+	 *	channels down.  Anything queued now is stranded: the worker
+	 *	discards it without a reply, so our outstanding count for the
+	 *	socket never comes back down and the socket can never be freed.
+	 *
+	 *	The listeners are closed before the close is signalled, so a
+	 *	socket read cannot get here.  Assert, so that whatever did shows
+	 *	itself with a backtrace, and drop the packet in release builds.
+	 */
+	if (!fr_cond_assert_msg(!nr->exiting,
+				"Sending packet to worker after signalling the channel close")) return -1;
+
+	if (!nr->num_workers) {
+		RATE_LIMIT_GLOBAL(ERROR, "Failed sending packet to worker - "
+				  "No workers are available");
+		return -1;
+	}
+
 retry:
 	if (nr->num_workers == 1) {
 		worker = nr->workers[0];
 		if (worker->blocked) {
 			RATE_LIMIT_GLOBAL(ERROR, "Failed sending packet to worker - "
 					  "In single-threaded mode and worker is blocked");
-		drop:
+	drop:
 			worker->stats.dropped++;
 			return -1;
 		}
 
 	} else if (nr->num_blocked == 0) {
+		int64_t cmp;
 		uint32_t one, two;
 
 		one = fr_rand() % nr->num_workers;
@@ -574,26 +598,56 @@ retry:
 			two = fr_rand() % nr->num_workers;
 		} while (two == one);
 
-		if (nr->workers[one]->cpu_time < nr->workers[two]->cpu_time) {
+		/*
+		 *	Choose a worker based on minimizing the amount
+		 *	of future work it's being asked to do.
+		 *
+		 *	If both workers have the same number of
+		 *	outstanding requests, then choose the worker
+		 *	which has used the least total CPU time.
+		 */
+		cmp = (OUTSTANDING(nr->workers[one]) - OUTSTANDING(nr->workers[two]));
+		if (cmp < 0) {
 			worker = nr->workers[one];
+
+		} else if (cmp > 0) {
+			worker = nr->workers[two];
+
+		} else if (fr_time_delta_lt(nr->workers[one]->cpu_time, nr->workers[two]->cpu_time)) {
+			worker = nr->workers[one];
+
 		} else {
 			worker = nr->workers[two];
 		}
 	} else {
-		int i;
-		fr_time_t cpu_time = ~((fr_time_t) 0);
+		unsigned int i;
+		uint64_t min_outstanding = UINT64_MAX;
 		fr_network_worker_t *found = NULL;
 
 		/*
-		 *	Some workers are blocked.  Pick an active
-		 *	worker with low CPU time.
+		 *	Some workers are blocked.  Pick the worker
+		 *	with the least amount of future work to do.
 		 */
 		for (i = 0; i < nr->num_workers; i++) {
+			uint64_t outstanding;
+
 			worker = nr->workers[i];
 			if (worker->blocked) continue;
 
-			if (worker->cpu_time < cpu_time) {
+			outstanding = OUTSTANDING(worker);
+			if ((outstanding < min_outstanding) || !found) {
 				found = worker;
+				min_outstanding = outstanding;
+
+			} else if (outstanding == min_outstanding) {
+				/*
+				 *	Queue lengths are the same.
+				 *	Choose this worker if it's
+				 *	less busy than the previous one we found.
+				 */
+				if (fr_time_delta_lt(worker->cpu_time, found->cpu_time)) {
+					found = worker;
+				}
 			}
 		}
 
@@ -612,12 +666,18 @@ retry:
 	 *	Too many outstanding packets for this worker.  Drop
 	 *	the request.
 	 *
-	 *	@todo - pick another worker?  Or maybe keep a
-	 *	local/temporary set of blacklisted workers.
+	 *	If the worker we've picked has too many outstanding
+	 *	packets, then we have either only one worker, in which
+	 *	cae we should drop the packet.  Or, we were unable to
+	 *	find a worker with smaller than max_outstanding
+	 *	packets.  In which case all of the workers are likely
+	 *	at max_outstanding.
+	 *
+	 *	In both cases, we should just drop the new packet.
 	 */
 	fr_assert(worker->stats.in >= worker->stats.out);
 	if (nr->config.max_outstanding &&
-	    ((worker->stats.in - worker->stats.out) >= nr->config.max_outstanding)) {
+	    (OUTSTANDING(worker) >= nr->config.max_outstanding)) {
 		RATE_LIMIT_GLOBAL(PERROR, "max_outstanding reached - dropping packet");
 		goto drop;
 	}
@@ -652,9 +712,79 @@ retry:
 	 *	updated with a more accurate number when we receive a
 	 *	reply from this channel.
 	 */
-	worker->cpu_time += worker->predicted;
+	worker->cpu_time = fr_time_delta_add(worker->cpu_time, worker->predicted);
 
 	return 0;
+}
+
+
+/** Send a packet to the worker.
+ *
+ *  MUST only be called from the network thread.
+ *
+ * @param nr the network
+ * @param parent the parent listener
+ * @param li the listener that the packet was "read" from.  Can be "parent"
+ * @param buffer the packet to send
+ * @param buflen size of the packet to send
+ * @param recv_time of the packet
+ * @param packet_ctx for the packet
+ * @return
+ *	- <0 on error
+ *	- 0 on success
+ */
+int fr_network_listen_send_packet(fr_network_t *nr, fr_listen_instance_t *parent, fr_listen_instance_t *li,
+				  const uint8_t *buffer, size_t buflen, fr_time_t recv_time, void *packet_ctx)
+{
+	fr_channel_data_t *cd;
+	fr_network_socket_t *s;
+
+	(void) talloc_get_type_abort(nr, fr_network_t);
+	(void) talloc_get_type_abort_const(li, fr_listen_instance_t);
+
+	fr_rb_find((void **)&s, nr->sockets, &(fr_network_socket_t){ .inst = li });
+	if (!s) return -1;
+
+	cd = (fr_channel_data_t *) fr_message_and_data_alloc(s->ms, buflen);
+	if (!cd) return -1;
+
+	cd->inst = parent;
+	cd->priority = PRIORITY_NORMAL;
+	cd->packet_ctx = packet_ctx;
+	cd->request.recv_time = recv_time;
+	memcpy(cd->m.data, buffer, buflen);
+	cd->m.when = fr_time();
+
+	if (fr_network_send_request(nr, cd) < 0) {
+		talloc_free(cd->packet_ctx);
+		fr_message_done(&cd->m);
+		nr->stats.dropped++;
+		s->stats.dropped++;
+		return -1;
+	}
+
+	s->outstanding++;
+	return 0;
+}
+
+/** Get the number of outstanding packets
+ *
+ * @param nr the network
+ * @param li the listener that the packet was "read" from
+ * @return
+ *	- <0 on error
+ *	- the number of outstanding packets
+*/
+ssize_t fr_network_listen_outstanding(fr_network_t *nr, fr_listen_instance_t *li) {
+	fr_network_socket_t *s;
+
+	(void) talloc_get_type_abort(nr, fr_network_t);
+	(void) talloc_get_type_abort_const(li, fr_listen_instance_t);
+
+	fr_rb_find((void **)&s, nr->sockets, &(fr_network_socket_t){ .inst = li });
+	if (!s) return -1;
+
+	return s->outstanding;
 }
 
 /*
@@ -663,11 +793,24 @@ retry:
  */
 static void fr_network_socket_dead(fr_network_t *nr, fr_network_socket_t *s)
 {
+	unsigned int i;
+
 	if (s->dead) return;
 
 	s->dead = true;
 
-	fr_event_fd_delete(nr->el, s->listen->fd, s->filter);
+	/*
+	 *	Nothing writes to a dead socket - fr_network_post_event()
+	 *	discards its replies - so the descriptor goes now.  The memory
+	 *	has to wait for the workers to finish with its messages.
+	 */
+	if (network_socket_close(s) < 0) PWARN("Failed removing event for socket %d", s->number);
+
+	for (i = 0; i < nr->max_workers; i++) {
+		if (!nr->workers[i]) continue;
+
+		(void) fr_worker_listen_cancel(nr->workers[i]->worker, s->inst);
+	}
 
 	/*
 	 *	If there are no outstanding packets, then we can free
@@ -700,20 +843,17 @@ static void fr_network_read(UNUSED fr_event_list_t *el, int sockfd, UNUSED int f
 	fr_network_t		*nr = s->nr;
 	ssize_t			data_size;
 	fr_channel_data_t	*cd, *next;
-#ifndef NDEBUG
-	fr_time_t		now;
-#endif
 
-	if (!fr_cond_assert_msg(s->listen->fd == sockfd, "Expected listen->fd (%u) to be equal event fd (%u)",
-				s->listen->fd, sockfd)) return;
+	if (!fr_cond_assert_msg(s->inst->fd == sockfd, "Expected listen->fd (%d) to be equal event fd (%d)",
+				s->inst->fd, sockfd)) return;
 
-	DEBUG3("Reading data from FD %u", sockfd);
+	DEBUG3("Reading data from FD %d", sockfd);
 
 	if (!s->cd) {
-		cd = (fr_channel_data_t *) fr_message_reserve(s->ms, s->listen->default_message_size);
+		cd = (fr_channel_data_t *) fr_message_and_data_reserve(s->ms, s->inst->listen->default_message_size);
 		if (!cd) {
-			ERROR("Failed allocating message size %zd! - Closing socket",
-			      s->listen->default_message_size);
+			ERROR("Failed allocating message size %zu! - Closing socket",
+			      s->inst->listen->default_message_size);
 			fr_network_socket_dead(nr, s);
 			return;
 		}
@@ -733,7 +873,6 @@ next_message:
 		return;
 	}
 
-	cd->request.is_dup = false;
 	cd->priority = PRIORITY_NORMAL;
 
 	/*
@@ -746,26 +885,45 @@ next_message:
 	 *	network side knows that it needs to close the
 	 *	connection.
 	 */
-	data_size = s->listen->app_io->read(s->listen, &cd->packet_ctx, &cd->request.recv_time,
-					    cd->m.data, cd->m.rb_size, &s->leftover, &cd->priority, &cd->request.is_dup);
+	data_size = s->inst->listen->app_io->read(s->inst, &cd->packet_ctx, &cd->request.recv_time,
+					    cd->m.data, cd->m.rb_size, &s->leftover);
 	if (data_size == 0) {
 		/*
-		 *	Cache the message for later.  This is
-		 *	important for stream sockets, which can do
-		 *	partial reads into the current buffer.  We
-		 *	need to be able to give the same buffer back
-		 *	to the stream socket for subsequent reads.
+		 *	Cache the message only when there are leftover
+		 *	bytes from a partial stream read.  The buffer
+		 *	must be handed back on the next call so the
+		 *	stream can append to it.
 		 *
-		 *	Since we have a message set for each
-		 *	fr_io_socket_t, no "head of line"
-		 *	blocking issues can happen for stream sockets.
+		 *	When app_io->read() calls fr_network_listen_send_packet()
+		 *	internally, that function calls fr_message_and_data_alloc()
+		 *	on the same message set.  Because the message ring uses
+		 *	fr_ring_buffer_reserve() (which does not advance write_offset),
+		 *	the new alloc returns the same ring slot as our reservation.
+		 *	The memset inside message_reserve zeroes our struct, then the
+		 *	new message commits into that slot.  We can detect this
+		 *	because cd->m.data_size is non-zero after the alloc commits.
+		 *
+		 *	In the aliased case, cd now refers to the already-committed
+		 *	message that was dispatched to a worker.  We must not reset
+		 *	or modify it; just clear s->cd so the next call reserves fresh.
+		 *
+		 *	When neither leftover nor aliasing applies, the reservation
+		 *	is clean and unused; reset it explicitly so its ring-buffer
+		 *	slot is immediately reusable.
 		 */
-		s->cd = cd;
+		if (s->leftover) {
+			s->cd = cd;
+		} else if (cd->m.data_size != 0) {
+			s->cd = NULL;
+		} else {
+			fr_message_and_data_reset(s->ms, &cd->m);
+			s->cd = NULL;
+		}
 		return;
 	}
 
 	/*
-	 *	Error: close the connection, and remove the fr_listen_t
+	 *	Error: close the connection, and remove the fr_listen_instance_t
 	 */
 	if (data_size < 0) {
 //		fr_log(nr->log, L_DBG_ERR, "error from transport read on socket %d", sockfd);
@@ -774,7 +932,8 @@ next_message:
 	}
 	s->cd = NULL;
 
-	DEBUG3("Read %zd byte(s) from FD %u", data_size, sockfd);
+	DEBUG3("Read %zu byte(s) from FD %d", (size_t)data_size, sockfd);
+	if (s->inst->listen->read_hexdump) HEXDUMP2(cd->m.data, data_size, "%s read ", s->inst->name);
 	nr->stats.in++;
 	s->stats.in++;
 
@@ -791,41 +950,56 @@ next_message:
 	 *	duplicate.
 	 */
 	cd->m.when = fr_time();
-#ifndef NDEBUG
-	now = cd->m.when;
-#endif
-	cd->listen = s->listen;
+	cd->inst = s->inst;
 
 	/*
 	 *	Nothing in the buffer yet.  Allocate room for one
 	 *	packet.
 	 */
 	if ((cd->m.data_size == 0) && (!s->leftover)) {
-
-		(void) fr_message_alloc(s->ms, &cd->m, data_size);
+		(void) fr_message_and_data_commit(s->ms, &cd->m, data_size);
 		next = NULL;
-
 	} else {
 		/*
 		 *	There are leftover bytes in the buffer, feed
 		 *	them to the next round of reading.
 		 */
-		next = (fr_channel_data_t *) fr_message_alloc_reserve(s->ms, &cd->m, data_size, s->leftover,
-								      s->listen->default_message_size);
-		if (!next) {
-			PERROR("Failed reserving partial packet.");
-			// @todo - probably close the socket...
-			fr_assert(0 == 1);
+		if (s->leftover) {
+			next = (fr_channel_data_t *) fr_message_and_data_commit_with_leftover(s->ms, &cd->m, data_size, s->leftover,
+									      s->inst->listen->default_message_size);
+			if (!next) {
+				PERROR("Failed reserving partial packet.");
+				// @todo - probably close the socket...
+				fr_assert(0 == 1);
+			}
+		} else {
+			(void) fr_message_and_data_commit(s->ms, &cd->m, data_size);
+			next = NULL;
 		}
 	}
 
 	/*
-	 *	Ensure this hasn't been somehow corrupted during
-	 *	ring buffer allocation.
+	 *	Set the priority.  Which incidentally also checks if
+	 *	we're allowed to read this particular kind of packet.
+	 *
+	 *	That check is because the app_io handlers just read
+	 *	packets, and don't really have access to the parent
+	 *	"list of allowed packet types".  So we have to do the
+	 *	work here in a callback.
+	 *
+	 *	That should probably be fixed...
 	 */
-	fr_assert(cd->m.when == now);
+	if (s->inst->listen->app->priority) {
+		int priority;
+
+		priority = s->inst->listen->app->priority(s->inst->listen->app_instance, cd->m.data, data_size);
+		if (priority <= 0) goto discard;
+
+		cd->priority = priority;
+	}
 
 	if (fr_network_send_request(nr, cd) < 0) {
+	discard:
 		talloc_free(cd->packet_ctx); /* not sure what else to do here */
 		fr_message_done(&cd->m);
 		nr->stats.dropped++;
@@ -853,6 +1027,43 @@ next_message:
 	}
 }
 
+int fr_network_sendto_worker(fr_network_t *nr, fr_listen_instance_t *li, void *packet_ctx, uint8_t const *data,
+			     size_t data_len, fr_time_t recv_time)
+{
+	fr_channel_data_t *cd;
+	fr_network_socket_t *s;
+
+	fr_rb_find((void **)&s, nr->sockets, &(fr_network_socket_t){ .inst = li });
+	if (!s) return -1;
+
+	cd = (fr_channel_data_t *) fr_message_and_data_alloc(s->ms, data_len);
+	if (!cd) return -1;
+
+	s->stats.in++;
+
+	cd->priority = PRIORITY_NORMAL;
+
+	cd->m.when = recv_time;
+	cd->inst = li;
+	cd->packet_ctx = packet_ctx;
+
+	memcpy(cd->m.data, data, data_len);
+
+	if (fr_network_send_request(nr, cd) < 0) {
+		talloc_free(packet_ctx);
+		fr_message_done(&cd->m);
+		nr->stats.dropped++;
+		s->stats.dropped++;
+		return -1;
+	}
+
+	/*
+	 *	One more packet sent to a worker.
+	 */
+	s->outstanding++;
+	return 0;
+}
+
 
 /** Get a notification that a vnode changed
  *
@@ -866,7 +1077,7 @@ static void fr_network_vnode_extend(UNUSED fr_event_list_t *el, int sockfd, int 
 	fr_network_socket_t *s = ctx;
 	fr_network_t *nr = s->nr;
 
-	fr_cond_assert(s->listen->fd == sockfd);
+	if (!fr_cond_assert(s->inst->fd == sockfd)) return;
 
 	DEBUG3("network vnode");
 
@@ -874,7 +1085,7 @@ static void fr_network_vnode_extend(UNUSED fr_event_list_t *el, int sockfd, int 
 	 *	Tell the IO handler that something has happened to the
 	 *	file.
 	 */
-	s->listen->app_io->vnode(s->listen, fflags);
+	s->inst->listen->app_io->vnode(s->inst, fflags);
 }
 
 
@@ -886,13 +1097,20 @@ static void fr_network_vnode_extend(UNUSED fr_event_list_t *el, int sockfd, int 
  * @param[in] fd_errno		returned by kevent.
  * @param[in] ctx		the network socket context.
  */
-static void fr_network_error(UNUSED fr_event_list_t *el, UNUSED int sockfd, UNUSED int flags,
-			     UNUSED int fd_errno, void *ctx)
+static void fr_network_error(UNUSED fr_event_list_t *el, UNUSED int sockfd, int flags,
+			     int fd_errno, void *ctx)
 {
 	fr_network_socket_t *s = ctx;
+	fr_network_t *nr = s->nr;
 
-	if (s->listen->app_io->error) {
-		s->listen->app_io->error(s->listen);
+	if (s->inst->listen->app_io->error) {
+		s->inst->listen->app_io->error(s->inst);
+
+	} else if (flags & EV_EOF) {
+		DEBUG2("Socket %s closed by peer", s->inst->name);
+
+	} else {
+		ERROR("Socket %s errored - %s", s->inst->name, fr_syserror(fd_errno));
 	}
 
 	fr_network_socket_dead(s->nr, s);
@@ -909,7 +1127,7 @@ static void fr_network_error(UNUSED fr_event_list_t *el, UNUSED int sockfd, UNUS
 static void fr_network_write(UNUSED fr_event_list_t *el, UNUSED int sockfd, UNUSED int flags, void *ctx)
 {
 	fr_network_socket_t *s = ctx;
-	fr_listen_t *li = s->listen;
+	fr_listen_instance_t *li = s->inst;
 	fr_network_t *nr = s->nr;
 	fr_channel_data_t *cd;
 
@@ -924,22 +1142,26 @@ static void fr_network_write(UNUSED fr_event_list_t *el, UNUSED int sockfd, UNUS
 		s->pending = NULL;
 
 	} else {
-		cd = fr_heap_pop(s->waiting);
+		fr_heap_pop((void **)&cd, &s->waiting);
 	}
 
 	while (cd != NULL) {
-		int rcode;
+		ssize_t rcode;
 
-		fr_assert(li == cd->listen);
-		rcode = li->app_io->write(li, cd->packet_ctx,
+		fr_assert(li == cd->inst);
+		if (li->listen->write_hexdump) HEXDUMP2(cd->m.data, cd->m.data_size, "%s writing ", li->name);
+		rcode = li->listen->app_io->write(li, cd->packet_ctx,
 					  cd->reply.request_time,
 					  cd->m.data, cd->m.data_size, s->written);
 
 		/*
-		 *	As a special case, allow write() to return
-		 *	"0", which means "close the socket".
+		 *	Write of 0 bytes means an OS bug, and we just discard this packet.
 		 */
-		if (rcode == 0) goto dead;
+		if (rcode == 0) {
+			RATE_LIMIT_GLOBAL(ERROR, "Discarding packet due to write returning zero for socket %s",
+					  s->inst->name);
+			goto discard;
+		}
 
 		/*
 		 *	Or we have a write error.
@@ -957,8 +1179,6 @@ static void fr_network_write(UNUSED fr_event_list_t *el, UNUSED int sockfd, UNUS
 					fr_message_t *lm;
 
 					lm = fr_message_localize(s, &cd->m, sizeof(*cd));
-					fr_message_done(&cd->m);
-
 					if (!lm) {
 						ERROR("Failed saving pending packet");
 						goto dead;
@@ -968,11 +1188,8 @@ static void fr_network_write(UNUSED fr_event_list_t *el, UNUSED int sockfd, UNUS
 				}
 
 				if (!s->blocked) {
-					if (fr_event_fd_insert(nr, nr->el, s->listen->fd,
-							       fr_network_read,
-							       fr_network_write,
-							       fr_network_error,
-							       s) < 0) {
+					if (fr_event_filter_update(nr->el, s->inst->fd, FR_EVENT_FILTER_IO,
+					    resume_write) < 0) {
 						PERROR("Failed adding write callback to event loop");
 						goto dead;
 					}
@@ -984,6 +1201,9 @@ static void fr_network_write(UNUSED fr_event_list_t *el, UNUSED int sockfd, UNUS
 				return;
 			}
 
+			PERROR("Failed writing to socket %s", s->inst->name);
+
+			switch (errno) {
 			/*
 			 *	As a special hack, check for something
 			 *	that will never be returned from a
@@ -991,10 +1211,24 @@ static void fr_network_write(UNUSED fr_event_list_t *el, UNUSED int sockfd, UNUS
 			 *	signals to us that we have to close
 			 *	the socket, but NOT complain about it.
 			 */
-			if (errno == ECONNREFUSED) goto dead;
+			case ECONNREFUSED:
+			case ECONNRESET:
+				break;
 
-			PERROR("Failed writing to socket %s", s->listen->name);
-			if (li->app_io->error) li->app_io->error(li);
+				/*
+				 *	These are temporary errors.  We just discard the data.
+				 */
+			case ENETDOWN:
+			case ENETUNREACH:
+				if (li->listen->app_io->error) li->listen->app_io->error(li);
+
+				fr_message_done(&cd->m);
+				return;
+
+			default:
+				if (li->listen->app_io->error) li->listen->app_io->error(li);
+				break;
+			}
 
 		dead:
 			fr_message_done(&cd->m);
@@ -1010,6 +1244,7 @@ static void fr_network_write(UNUSED fr_event_list_t *el, UNUSED int sockfd, UNUS
 			goto save_pending;
 		}
 
+	discard:
 		s->written = 0;
 
 		/*
@@ -1022,18 +1257,14 @@ static void fr_network_write(UNUSED fr_event_list_t *el, UNUSED int sockfd, UNUS
 		/*
 		 *	Grab the net entry.
 		 */
-		cd = fr_heap_pop(s->waiting);
+		fr_heap_pop((void **)&cd, &s->waiting);
 	}
 
 	/*
 	 *	We've successfully written all of the packets.  Remove
 	 *	the write callback.
 	 */
-	if (fr_event_fd_insert(nr, nr->el, s->listen->fd,
-			       fr_network_read,
-			       NULL,
-			       fr_network_error,
-			       s) < 0) {
+	if (fr_event_filter_update(nr->el, s->inst->fd, FR_EVENT_FILTER_IO, pause_write) < 0) {
 		PERROR("Failed removing write callback from event loop");
 		fr_network_socket_dead(nr, s);
 	}
@@ -1041,21 +1272,61 @@ static void fr_network_write(UNUSED fr_event_list_t *el, UNUSED int sockfd, UNUS
 	s->blocked = false;
 }
 
+/** Stop a socket's I/O events and close its descriptor
+ *
+ * Separate from freeing the socket because freeing it also frees s->ms, and
+ * the workers hold messages allocated from that until they ack the channel
+ * close.  The descriptor can go as soon as we are done with it; the memory
+ * cannot.
+ *
+ * Idempotent, so it is safe to call on a socket that is already dead.
+ *
+ * @param[in] s	to close.
+ * @return
+ *	- 0 on success.
+ *	- -1 if the I/O event could not be removed.  The descriptor is closed
+ *	  either way, so this is worth reporting but not worth stopping for.
+ */
+static int network_socket_close(fr_network_socket_t *s)
+{
+	int ret = 0;
+
+	if (s->closed) return 0;
+	s->closed = true;
+
+	/*
+	 *	NULL if the socket never made it into the event loop, which the
+	 *	setup error paths rely on.  This is the only place the event is
+	 *	removed, so the handle cannot have gone stale under us.
+	 */
+	if (s->ef) {
+		ret = fr_event_fd_delete_handle(s->ef);
+		s->ef = NULL;
+	}
+
+	if (s->inst->listen->app_io->close) {
+		s->inst->listen->app_io->close(s->inst);
+	} else {
+		close(s->inst->fd);
+	}
+
+	return ret;
+}
+
 static int _network_socket_free(fr_network_socket_t *s)
 {
 	fr_network_t *nr = s->nr;
 	fr_channel_data_t *cd;
 
+	/*
+	 *	Closing is a separate step, so that the descriptor can be
+	 *	released while the message set stays alive for the workers.
+	 */
+	fr_assert_msg(s->closed, "socket %d freed without being closed", s->number);
+	fr_assert(s->outstanding == 0 || nr->exiting);
+
 	fr_rb_delete(nr->sockets, s);
 	fr_rb_delete(nr->sockets_by_num, s);
-
-	fr_event_fd_delete(nr->el, s->listen->fd, s->filter);
-
-	if (s->listen->app_io->close) {
-		s->listen->app_io->close(s->listen);
-	} else {
-		close(s->listen->fd);
-	}
 
 	if (s->pending) {
 		fr_message_done(&s->pending->m);
@@ -1065,39 +1336,90 @@ static int _network_socket_free(fr_network_socket_t *s)
 	/*
 	 *	Clean up any queued entries.
 	 */
-	while ((cd = fr_heap_pop(s->waiting)) != NULL) {
+	while ((fr_heap_pop((void **)&cd, &s->waiting) == 0) && cd) {
 		fr_message_done(&cd->m);
 	}
 
-	talloc_free(s->waiting);
+	/* s->waiting is already talloc parented from s */
+	talloc_free(s->inst);
 
 	return 0;
 }
 
+
 /** Handle a network control message callback for a new listener
  *
- * @param[in] ctx the network
  * @param[in] data the message
  * @param[in] data_size size of the data
  * @param[in] now the current time
+ * @param[in] uctx the network
  */
-static void fr_network_listen_callback(void *ctx, void const *data, size_t data_size, UNUSED fr_time_t now)
+static void fr_network_listen_callback(void const *data, size_t data_size, UNUSED fr_time_t now, void *uctx)
 {
-	fr_network_t		*nr = ctx;
+	fr_network_t		*nr = talloc_get_type_abort(uctx, fr_network_t);
+	fr_listen_instance_t	*li;
+
+	fr_assert(data_size == sizeof(li));
+
+	if (data_size != sizeof(li)) return;
+
+	li = talloc_get_type_abort(*((void * const *)data), fr_listen_instance_t);
+
+	(void) fr_network_listen_add_self(nr, li);
+}
+
+static void fr_network_limit_ringbuffer(fr_network_socket_t *s, int *num_messages_p, size_t *size_p)
+{
+	size_t num_messages;
+	size_t size;
+
+	num_messages = s->inst->listen->num_messages;
+	if (num_messages < 8) num_messages = 8;
+	if (num_messages > (1 << 20)) num_messages = (1 << 20);
+
+	size = s->inst->listen->default_message_size * num_messages;
+	if (size < (1 << 17)) size = (1 << 17);
+	if (size > (100 * 1024 * 1024)) size = (100 * 1024 * 1024);
+
+	*num_messages_p = (int)num_messages;	/* clamped to (1 << 20) above */
+	*size_p = size;
+}
+
+static int fr_network_listen_add_self(fr_network_t *nr, fr_listen_instance_t *li)
+{
 	fr_network_socket_t	*s;
 	fr_app_io_t const	*app_io;
 	size_t			size;
 	int			num_messages;
 
-	fr_assert(data_size == sizeof(s->listen));
+	fr_assert(li->listen->app_io != NULL);
 
-	if (data_size != sizeof(s->listen)) return;
+	/*
+	 *	Non-socket listeners just get told about the event
+	 *	list, and nothing else.
+	 */
+	if (li->listen->non_socket_listener) {
+		fr_assert(li->listen->app_io->event_list_set != NULL);
+		fr_assert(!li->listen->app_io->read);
+		fr_assert(!li->listen->app_io->write);
+
+		li->listen->app_io->event_list_set(li, nr->el, nr);
+
+		/*
+		 *	We use fr_log() here to avoid the "Network - " prefix.
+		 */
+		fr_log(nr->log, L_DBG, __FILE__, __LINE__, "Listener %s bound to virtual server %s",
+		       li->name, cf_section_name2(li->listen->server_cs));
+
+		return 0;
+	}
 
 	s = talloc_zero(nr, fr_network_socket_t);
 	fr_assert(s != NULL);
+	talloc_steal(s, li);
 
 	s->nr = nr;
-	memcpy(&s->listen, data, sizeof(s->listen));
+	s->inst = li;
 	s->number = nr->num_sockets++;
 
 	MEM(s->waiting = fr_heap_alloc(s, waiting_cmp, fr_channel_data_t, channel.heap_id, 0));
@@ -1109,37 +1431,41 @@ static void fr_network_listen_callback(void *ctx, void const *data, size_t data_
 	 *	round it up to the nearest power of 2, which is
 	 *	required by the ring buffer code.
 	 */
-	num_messages = s->listen->num_messages;
-	if (num_messages < 8) num_messages = 8;
-
-	size = s->listen->default_message_size * num_messages;
-	if (size < (1 << 17)) size = (1 << 17);
-	if (size > (100 * 1024 * 1024)) size = (100 * 1024 * 1024);
+	fr_network_limit_ringbuffer(s, &num_messages, &size);
 
 	/*
 	 *	Allocate the ring buffer for messages and packets.
 	 */
 	s->ms = fr_message_set_create(s, num_messages,
 				      sizeof(fr_channel_data_t),
-				      size);
+				      size, false);
 	if (!s->ms) {
 		PERROR("Failed creating message buffers for network IO");
+		if (network_socket_close(s) < 0) PWARN("Failed removing event for socket %d", s->number);
 		talloc_free(s);
-		return;
+		return -1;
 	}
 
-	app_io = s->listen->app_io;
+	app_io = s->inst->listen->app_io;
 	s->filter = FR_EVENT_FILTER_IO;
 
-	if (fr_event_fd_insert(nr, nr->el, s->listen->fd,
+	if (fr_event_fd_insert(s, &s->ef, nr->el, s->inst->fd,
 			       fr_network_read,
-			       NULL,
+			       s->inst->listen->no_write_callback ? NULL : fr_network_write,
 			       fr_network_error,
 			       s) < 0) {
 		PERROR("Failed adding new socket to network event loop");
+		if (network_socket_close(s) < 0) PWARN("Failed removing event for socket %d", s->number);
 		talloc_free(s);
-		return;
+		return -1;
 	}
+
+	/*
+	 *	Start of with write updates being paused.  We don't
+	 *	care about being able to write if there's nothing to
+	 *	write.
+	 */
+	(void) fr_event_filter_update(nr->el, s->inst->fd, FR_EVENT_FILTER_IO, pause_write);
 
 	/*
 	 *	Add the listener before calling the app_io, so that
@@ -1149,41 +1475,46 @@ static void fr_network_listen_callback(void *ctx, void const *data, size_t data_
 	(void) fr_rb_insert(nr->sockets, s);
 	(void) fr_rb_insert(nr->sockets_by_num, s);
 
-	if (app_io->event_list_set) app_io->event_list_set(s->listen, nr->el, nr);
+	if (app_io->event_list_set) app_io->event_list_set(s->inst, nr->el, nr);
 
 	/*
 	 *	We use fr_log() here to avoid the "Network - " prefix.
 	 */
 	fr_log(nr->log, L_DBG, __FILE__, __LINE__, "Listening on %s bound to virtual server %s",
-	      s->listen->name, cf_section_name2(s->listen->server_cs));
+	      s->inst->name, cf_section_name2(s->inst->listen->server_cs));
 
-	DEBUG3("Using new socket %s with FD %d", s->listen->name, s->listen->fd);
+	DEBUG3("Using new socket %s with FD %d", s->inst->name, s->inst->fd);
+
+	return 0;
 }
 
 /** Handle a network control message callback for a new "watch directory"
  *
- * @param[in] ctx the network
  * @param[in] data the message
  * @param[in] data_size size of the data
  * @param[in] now the current time
+ * @param[in] uctx the network
  */
-static void fr_network_directory_callback(void *ctx, void const *data, size_t data_size, UNUSED fr_time_t now)
+static void fr_network_directory_callback(void const *data, size_t data_size, UNUSED fr_time_t now, void *uctx)
 {
 	int			num_messages;
-	fr_network_t		*nr = ctx;
+	size_t			size;
+	fr_network_t		*nr = talloc_get_type_abort(uctx, fr_network_t);
+	fr_listen_instance_t	*li = talloc_get_type_abort(*((void * const *)data), fr_listen_instance_t);
 	fr_network_socket_t	*s;
 	fr_app_io_t const	*app_io;
 	fr_event_vnode_func_t	funcs = { .extend = fr_network_vnode_extend };
 
-	fr_assert(data_size == sizeof(s->listen));
+	if (!fr_cond_assert(data_size == sizeof(li))) return;
 
-	if (data_size != sizeof(s->listen)) return;
+	memcpy(&li, data, sizeof(li));
 
 	s = talloc_zero(nr, fr_network_socket_t);
 	fr_assert(s != NULL);
+	talloc_steal(s, li);
 
 	s->nr = nr;
-	memcpy(&s->listen, data, sizeof(s->listen));
+	s->inst = li;
 	s->number = nr->num_sockets++;
 
 	MEM(s->waiting = fr_heap_alloc(s, waiting_cmp, fr_channel_data_t, channel.heap_id, 0));
@@ -1193,29 +1524,30 @@ static void fr_network_directory_callback(void *ctx, void const *data, size_t da
 	/*
 	 *	Allocate the ring buffer for messages and packets.
 	 */
-	num_messages = s->listen->num_messages;
-	if (num_messages < 8) num_messages = 8;
+	fr_network_limit_ringbuffer(s, &num_messages, &size);
 
 	s->ms = fr_message_set_create(s, num_messages,
 				      sizeof(fr_channel_data_t),
-				      s->listen->default_message_size * s->listen->num_messages);
+				      size, false);
 	if (!s->ms) {
 		PERROR("Failed creating message buffers for directory IO");
+		if (network_socket_close(s) < 0) PWARN("Failed removing event for socket %d", s->number);
 		talloc_free(s);
 		return;
 	}
 
-	app_io = s->listen->app_io;
+	app_io = s->inst->listen->app_io;
 
-	if (app_io->event_list_set) app_io->event_list_set(s->listen, nr->el, nr);
+	if (app_io->event_list_set) app_io->event_list_set(s->inst, nr->el, nr);
 
 	s->filter = FR_EVENT_FILTER_VNODE;
 
-	if (fr_event_filter_insert(nr, NULL, nr->el, s->listen->fd, s->filter,
+	if (fr_event_filter_insert(s, &s->ef, nr->el, s->inst->fd, s->filter,
 				   &funcs,
 				   app_io->error ? fr_network_error : NULL,
 				   s) < 0) {
 		PERROR("Failed adding directory monitor event loop");
+		if (network_socket_close(s) < 0) PWARN("Failed removing event for socket %d", s->number);
 		talloc_free(s);
 		return;
 	}
@@ -1223,39 +1555,47 @@ static void fr_network_directory_callback(void *ctx, void const *data, size_t da
 	(void) fr_rb_insert(nr->sockets, s);
 	(void) fr_rb_insert(nr->sockets_by_num, s);
 
-	DEBUG3("Using new socket with FD %d", s->listen->fd);
+	DEBUG3("Using new socket with FD %d", s->inst->fd);
 }
 
 /** Handle a network control message callback for a new worker
  *
- * @param[in] ctx the network
  * @param[in] data the message
  * @param[in] data_size size of the data
  * @param[in] now the current time
+ * @param[in] uctx the network
  */
-static void fr_network_worker_started_callback(void *ctx, void const *data, size_t data_size, UNUSED fr_time_t now)
+static void fr_network_worker_started_callback(void const *data, size_t data_size, UNUSED fr_time_t now, void *uctx)
 {
-	int i;
-	fr_network_t *nr = ctx;
+	unsigned int i;
+	fr_network_t *nr = uctx;
 	fr_worker_t *worker;
 	fr_network_worker_t *w;
+	fr_worker_config_t const *worker_config;
 
 	fr_assert(data_size == sizeof(worker));
 
+	if (nr->num_workers >= nr->max_workers) {
+		ERROR("Too many workers");
+		return;
+	}
+
 	memcpy(&worker, data, data_size);
 	(void) talloc_get_type_abort(worker, fr_worker_t);
+	worker_config = fr_worker_config(worker);
 
 	MEM(w = talloc_zero(nr, fr_network_worker_t));
 
 	w->worker = worker;
-	w->channel = fr_worker_channel_create(worker, w, nr->control);
+	w->reply_ms = fr_message_set_create(w, worker_config->message_set_size, sizeof(fr_channel_data_t),
+					    worker_config->ring_buffer_size, false);
+	fr_fatal_assert_msg(w->reply_ms, "Failed creating reply message set");
+	w->channel = fr_worker_channel_create(worker, w, nr->control, w->reply_ms);
+	w->predicted = fr_time_delta_from_msec(10);
 	fr_fatal_assert_msg(w->channel, "Failed creating new channel");
 
 	fr_channel_requestor_uctx_add(w->channel, w);
-	fr_channel_set_recv_reply(w->channel, nr, fr_network_recv_reply);
-
-	nr->num_workers++;
-	nr->started = true;
+	fr_channel_set_recv_reply(w->channel, fr_network_recv_reply, nr);
 
 	/*
 	 *	Insert the worker into the array of workers.
@@ -1264,32 +1604,28 @@ static void fr_network_worker_started_callback(void *ctx, void const *data, size
 		if (nr->workers[i]) continue;
 
 		nr->workers[i] = w;
+		nr->num_workers++;
 		return;
 	}
-
-	/*
-	 *	Run out of room to put workers!
-	 */
-	fr_assert(0 == 1);
 }
 
 /** Handle a network control message callback for a packet sent to a socket
  *
- * @param[in] ctx the network
  * @param[in] data the message
  * @param[in] data_size size of the data
  * @param[in] now the current time
+ * @param[in] uctx the network
  */
-static void fr_network_inject_callback(void *ctx, void const *data, size_t data_size, UNUSED fr_time_t now)
+static void fr_network_inject_callback(void const *data, size_t data_size, UNUSED fr_time_t now, void *uctx)
 {
-	fr_network_t *nr = ctx;
+	fr_network_t *nr = uctx;
 	fr_network_inject_t my_inject;
 	fr_network_socket_t *s;
 
 	fr_assert(data_size == sizeof(my_inject));
 
 	memcpy(&my_inject, data, data_size);
-	s = fr_rb_find(nr->sockets, &(fr_network_socket_t){ .listen = my_inject.listen });
+	fr_rb_find((void **)&s, nr->sockets, &(fr_network_socket_t){ .inst = my_inject.inst });
 	if (!s) {
 		talloc_free(my_inject.packet); /* MUST be it's own TALLOC_CTX */
 		return;
@@ -1299,8 +1635,9 @@ static void fr_network_inject_callback(void *ctx, void const *data, size_t data_
 	 *	Inject the packet, and then read it back from the
 	 *	network.
 	 */
-	if (s->listen->app_io->inject(s->listen, my_inject.packet, my_inject.packet_len, my_inject.recv_time) == 0) {
-		fr_network_read(nr->el, s->listen->fd, 0, s);
+	if (s->inst->listen->app_io->inject(s->inst, my_inject.packet, my_inject.packet_len,
+	    my_inject.recv_time) == 0) {
+		fr_network_read(nr->el, s->inst->fd, 0, s);
 	}
 
 	talloc_free(my_inject.packet);
@@ -1312,10 +1649,11 @@ static void fr_network_inject_callback(void *ctx, void const *data, size_t data_
  *  work, and tell the event code to return to the main loop if
  *  there's work to do.
  *
- * @param[in] wake the time when the event loop will wake up.
- * @param[in] uctx the network
+ * @param[in] now	the current time.
+ * @param[in] wake	the time when the event loop will wake up.
+ * @param[in] uctx	the network
  */
-static int fr_network_pre_event(UNUSED fr_time_t wake, void *uctx)
+static int fr_network_pre_event(UNUSED fr_time_t now, UNUSED fr_time_delta_t wake, void *uctx)
 {
 	fr_network_t *nr = talloc_get_type_abort(uctx, fr_network_t);
 
@@ -1339,17 +1677,17 @@ static void fr_network_post_event(UNUSED fr_event_list_t *el, UNUSED fr_time_t n
 	 *	Pull the replies off of our global heap, and try to
 	 *	push them to the individual sockets.
 	 */
-	while ((cd = fr_heap_pop(nr->replies)) != NULL) {
-		fr_listen_t *li;
+	while ((fr_heap_pop((void **)&cd, &nr->replies) == 0) && cd) {
+		fr_listen_instance_t *li;
 		fr_network_socket_t *s;
 
-		li = cd->listen;
+		li = cd->inst;
 
 		/*
 		 *	@todo - cache this somewhere so we don't need
 		 *	to do an rbtree lookup for every packet.
 		 */
-		s = fr_rb_find(nr->sockets, &(fr_network_socket_t){ .listen = li });
+		fr_rb_find((void **)&s, nr->sockets, &(fr_network_socket_t){ .inst = li });
 
 		/*
 		 *	This shouldn't happen, but be safe...
@@ -1387,18 +1725,54 @@ static void fr_network_post_event(UNUSED fr_event_list_t *el, UNUSED fr_time_t n
 			continue;
 		}
 
+		(void) fr_heap_insert(&s->waiting, cd);
+
 		/*
-		 *	No pending message, let's try writing it.
-		 *
-		 *	If there is a pending message, then we're
-		 *	waiting for IO write to become ready.
+		 *	No pending message, write it.  If there is a pending write, the message will be left
+		 *	in the waiting queue.
 		 */
 		if (!s->pending) {
 			fr_assert(!s->blocked);
-			(void) fr_heap_insert(s->waiting, cd);
-			fr_network_write(nr->el, s->listen->fd, 0, s);
+			fr_network_write(nr->el, s->inst->fd, 0, s);
 		}
 	}
+}
+
+static int fr_network_pre_close_event(UNUSED fr_time_t now, UNUSED fr_time_delta_t wake, void *uctx)
+{
+	fr_network_t *nr = talloc_get_type_abort(uctx, fr_network_t);
+
+	return (nr->num_workers == 0) ? 1 : 0;
+}
+
+static void fr_network_post_close_event(fr_event_list_t *el, UNUSED fr_time_t now, void *uctx)
+{
+	fr_network_t *nr = talloc_get_type_abort(uctx, fr_network_t);
+
+	if (nr->num_workers == 0) fr_event_loop_exit(el, SIGINT);
+}
+
+/** Add events to the loop which will exit when the number of workers has reached zero
+ */
+int fr_network_close_event_insert(fr_network_t *nr)
+{
+	if (fr_event_pre_insert(nr->el, fr_network_pre_close_event, nr) < 0) {
+		fr_strerror_const("Failed adding close pre-event to event list");
+		return -1;
+	}
+	if (fr_event_post_insert(nr->el, fr_network_post_close_event, nr) < 0) {
+		fr_strerror_const("Failed adding close post-event to event list");
+		return -1;
+	}
+	return 0;
+}
+
+/** Remove "close" events from the event loop.
+ */
+void fr_network_close_event_delete(fr_network_t *nr)
+{
+	fr_event_pre_delete(nr->el, fr_network_pre_close_event, nr);
+	fr_event_post_delete(nr->el, fr_network_post_close_event, nr);
 }
 
 /** Stop a network thread in an orderly way
@@ -1408,11 +1782,17 @@ static void fr_network_post_event(UNUSED fr_event_list_t *el, UNUSED fr_time_t n
 int fr_network_destroy(fr_network_t *nr)
 {
 	fr_channel_data_t	*cd;
+	int			ret = 0;
 
 	(void) talloc_get_type_abort(nr, fr_network_t);
 
 	/*
-	 *	Close the network sockets
+	 *	Close the network sockets, but leave them allocated.
+	 *
+	 *	Freeing a socket frees its message set, and the workers hold
+	 *	messages allocated from it until they ack the channel close
+	 *	signalled below.  fr_network() frees them after its loop, which
+	 *	already runs until every worker has acked.
 	 */
 	{
 		fr_network_socket_t	**sockets;
@@ -1422,7 +1802,12 @@ int fr_network_destroy(fr_network_t *nr)
 		if (fr_rb_flatten_inorder(nr, (void ***)&sockets, nr->sockets) < 0) return -1;
 		len = talloc_array_length(sockets);
 
-		for (i = 0; i < len; i++) talloc_free(sockets[i]);
+		for (i = 0; i < len; i++) {
+			if (network_socket_close(sockets[i]) < 0) {
+				PWARN("Failed removing event for socket %d", sockets[i]->number);
+				ret = -1;
+			}
+		}
 
 		talloc_free(sockets);
 	}
@@ -1446,9 +1831,15 @@ int fr_network_destroy(fr_network_t *nr)
 	 *	@todo - call transport "done" for the reply, so that
 	 *	it knows the replies are done, too.
 	 */
-	while ((cd = fr_heap_pop(nr->replies)) != NULL) {
+	while ((fr_heap_pop((void **)&cd, &nr->replies) == 0) && cd) {
 		fr_message_done(&cd->m);
 	}
+
+	/*
+	 *	Nothing may be queued from here on: a worker that has been
+	 *	signalled discards whatever arrives late, without a reply.
+	 */
+	nr->exiting = true;
 
 	/*
 	 *	Signal the workers that we're closing
@@ -1460,7 +1851,7 @@ int fr_network_destroy(fr_network_t *nr)
 	 *	loop (fr_network()) will exit.
 	 */
 	{
-		int i;
+		unsigned int i;
 
 		for (i = 0; i < nr->num_workers; i++) {
 			fr_network_worker_t *worker = nr->workers[i];
@@ -1473,7 +1864,7 @@ int fr_network_destroy(fr_network_t *nr)
 	(void) fr_event_post_delete(nr->el, fr_network_post_event, nr);
 	fr_event_fd_delete(nr->el, nr->signal_pipe[0], FR_EVENT_FILTER_IO);
 
-	return 0;
+	return ret;
 }
 
 /** Read handler for signal pipe
@@ -1489,7 +1880,7 @@ static void _signal_pipe_read(UNUSED fr_event_list_t *el, int fd, UNUSED int fla
 		return;
 	}
 
-	fr_assert(buff = 1);
+	fr_assert(buff == 1);
 
 	/*
 	 *	fr_network_stop() will signal the workers
@@ -1502,17 +1893,64 @@ static void _signal_pipe_read(UNUSED fr_event_list_t *el, int fd, UNUSED int fla
 	 *	exits.
 	 */
 	DEBUG2("Signalled to exit");
-	fr_network_destroy(nr);
+
+	if (unlikely(fr_network_destroy(nr) < 0)) {
+		PERROR("Failed stopping network");
+	}
 }
 
 /** The main network worker function.
  *
  * @param[in] nr the network data structure to run.
  */
+/** Announce we are about to block, then drain every channel one last time
+ *
+ * The mirror of worker_sleeping().  See fr_control_sleeping() for the
+ * ordering this relies on.
+ *
+ * @return
+ *	- true if a channel had replies, so the caller must not block.
+ *	- false if every channel was empty.
+ */
+static inline bool network_sleeping(fr_network_t *nr)
+{
+	unsigned int i;
+	bool received;
+
+	received = fr_control_sleeping(nr->control);
+
+	for (i = 0; i < nr->num_workers; i++) {
+		while (fr_channel_recv_reply(nr->workers[i]->channel)) received = true;
+	}
+
+	/*
+	 *	A responder may have pushed before it could see us
+	 *	sleeping, and skipped the signal.  We found that work,
+	 *	so we are not going to block after all.
+	 */
+	if (received) fr_control_awake(nr->control);
+
+	return received;
+}
+
 void fr_network(fr_network_t *nr)
 {
-	while (likely(((nr->num_workers > 0) || !nr->started))) {
+	/*
+	 *	Run until we're told to exit AND the number of
+	 *	workers has dropped to zero.
+	 *
+	 *	This is important as if we exit too early we
+	 *	free the channels out from underneath the
+	 *	workers and they read uninitialised memory.
+	 *
+	 *	Whenever a worker ACKs our close notification
+	 *	nr->num_workers is decremented, so when
+	 *	nr->num_workers == 0, all workers have ACKd
+	 *	our close and are no longer using the channel.
+	 */
+	while (likely(!(nr->exiting && (nr->num_workers == 0)))) {
 		bool wait_for_event;
+		bool announced = false;
 		int num_events;
 
 		/*
@@ -1520,24 +1958,67 @@ void fr_network(fr_network_t *nr)
 		 *	the event loop, but we don't wait for events.
 		 */
 		wait_for_event = (fr_heap_num_elements(nr->replies) == 0);
+		if (wait_for_event) {
+			/*
+			 *	Announce that we are about to block, so the
+			 *	responders know to signal us.  If the final
+			 *	drain turned up replies, don't block.
+			 */
+			announced = true;
+			if (network_sleeping(nr)) wait_for_event = false;
+		}
 
 		/*
 		 *	Check the event list.  If there's an error
 		 *	(e.g. exit), we stop looping and clean up.
 		 */
-		DEBUG3("Gathering events - %s", wait_for_event ? "will wait" : "Will not wait");
+		DEBUG4("Gathering events - %s", wait_for_event ? "will wait" : "Will not wait");
 		num_events = fr_event_corral(nr->el, fr_time(), wait_for_event);
-		DEBUG3("%u event(s) pending%s",
+
+		/*
+		 *	Whatever woke us, we are running again.
+		 */
+		if (announced) fr_control_awake(nr->control);
+
+		DEBUG4("%d event(s) pending%s",
 		       num_events == -1 ? 0 : num_events, num_events == -1 ? " - event loop exiting" : "");
 		if (num_events < 0) break;
 
 		/*
-		 *	Service outstanding events.
+		 *	Service outstanding events.  The post event callback
+		 *	writes the replies, so it has to run whenever there
+		 *	are replies to write, which the final drain before
+		 *	blocking may have found without the kernel reporting
+		 *	an event.
 		 */
-		if (num_events > 0) {
+		if ((num_events > 0) || !wait_for_event) {
 			DEBUG4("Servicing event(s)");
 			fr_event_service(nr->el);
 		}
+	}
+
+	/*
+	 *	Free the sockets.  The loop above only exits once every worker
+	 *	has acked, so the messages allocated from the sockets' message
+	 *	sets have all been returned, and fr_network_destroy() left the
+	 *	sockets closed but allocated for exactly this point.  It cannot do
+	 *	this itself, as it returns long before the first ack arrives.  The
+	 *	error exit above lands here too, where no ack is ever coming.
+	 */
+	{
+		fr_network_socket_t	**sockets;
+		size_t			len;
+		size_t			i;
+
+		if (fr_rb_flatten_inorder(nr, (void ***)&sockets, nr->sockets) < 0) {
+			PWARN("Failed enumerating sockets, leaving them to be freed with the network");
+			return;
+		}
+		len = talloc_array_length(sockets);
+
+		for (i = 0; i < len; i++) talloc_free(sockets[i]);
+
+		talloc_free(sockets);
 	}
 }
 
@@ -1597,65 +2078,59 @@ fr_network_t *fr_network_create(TALLOC_CTX *ctx, fr_event_list_t *el, char const
 	talloc_set_destructor(nr, _fr_network_free);
 
 	nr->name = talloc_strdup(nr, name);
+
+	nr->thread_id = pthread_self();
 	nr->el = el;
 	nr->log = logger;
 	nr->lvl = lvl;
+
 	nr->max_workers = MAX_WORKERS;
 	nr->num_workers = 0;
 	nr->signal_pipe[0] = -1;
 	nr->signal_pipe[1] = -1;
 	if (config) nr->config = *config;
 
-	nr->aq_control = fr_atomic_queue_alloc(nr, 1024);
-	if (!nr->aq_control) {
-		talloc_free(nr);
-		return NULL;
-	}
-
-	nr->control = fr_control_create(nr, el, nr->aq_control);
+	nr->control = fr_control_create(nr, el, FR_CONTROL_MAX_MESSAGES, FR_CONTROL_MAX_SIZE);
 	if (!nr->control) {
-		fr_strerror_const_push("Failed creating control queue");
+		fr_strerror_const_push("Failed creating control plane");
 	fail:
 		talloc_free(nr);
 		return NULL;
 	}
 
-	/*
-	 *	@todo - rely on thread-local variables.  And then the
-	 *	various users of this can check if (rb == nr->rb), and
-	 *	if so, skip the whole control plane / kevent /
-	 *	whatever roundabout thing.
-	 */
-	nr->rb = fr_ring_buffer_create(nr, FR_CONTROL_MAX_MESSAGES * FR_CONTROL_MAX_SIZE);
-	if (!nr->rb) {
-		fr_strerror_const_push("Failed creating ring buffer");
+	if (fr_channel_callbacks_add(nr->control, &fr_network_channel_callbacks, nr) < 0) {
+		fr_strerror_const_push("Failed adding channel callback");
 	fail2:
 		talloc_free(nr->control);
 		goto fail;
 	}
 
-	if (fr_control_callback_add(nr->control, FR_CONTROL_ID_CHANNEL, nr, fr_network_channel_callback) < 0) {
-		fr_strerror_const_push("Failed adding channel callback");
-		goto fail2;
-	}
-
-	if (fr_control_callback_add(nr->control, FR_CONTROL_ID_LISTEN, nr, fr_network_listen_callback) < 0) {
+	if (fr_control_callback_add(nr->control, FR_CONTROL_EVENTSET_NETWORK,
+				    FR_NETWORK_CONTROL_LISTEN, fr_network_listen_callback, nr) < 0) {
 		fr_strerror_const_push("Failed adding socket callback");
 		goto fail2;
 	}
 
-	if (fr_control_callback_add(nr->control, FR_CONTROL_ID_DIRECTORY, nr, fr_network_directory_callback) < 0) {
+	if (fr_control_callback_add(nr->control, FR_CONTROL_EVENTSET_NETWORK,
+				    FR_NETWORK_CONTROL_DIRECTORY, fr_network_directory_callback, nr) < 0) {
 		fr_strerror_const_push("Failed adding socket callback");
 		goto fail2;
 	}
 
-	if (fr_control_callback_add(nr->control, FR_CONTROL_ID_WORKER, nr, fr_network_worker_started_callback) < 0) {
+	if (fr_control_callback_add(nr->control, FR_CONTROL_EVENTSET_NETWORK,
+				    FR_NETWORK_CONTROL_WORKER, fr_network_worker_started_callback, nr) < 0) {
 		fr_strerror_const_push("Failed adding worker callback");
 		goto fail2;
 	}
 
-	if (fr_control_callback_add(nr->control, FR_CONTROL_ID_INJECT, nr, fr_network_inject_callback) < 0) {
+	if (fr_control_callback_add(nr->control, FR_CONTROL_EVENTSET_NETWORK,
+				    FR_NETWORK_CONTROL_INJECT, fr_network_inject_callback, nr) < 0) {
 		fr_strerror_const_push("Failed adding packet injection callback");
+		goto fail2;
+	}
+
+	if (fr_control_open(nr->control) < 0) {
+		fr_strerror_const_push("Failed opening control queue");
 		goto fail2;
 	}
 
@@ -1697,7 +2172,7 @@ fr_network_t *fr_network_create(TALLOC_CTX *ctx, fr_event_list_t *el, char const
 	if (fr_nonblock(nr->signal_pipe[0]) < 0) goto fail2;
 	if (fr_nonblock(nr->signal_pipe[1]) < 0) goto fail2;
 
-	if (fr_event_fd_insert(nr, nr->el, nr->signal_pipe[0], _signal_pipe_read, NULL, NULL, nr) < 0) {
+	if (fr_event_fd_insert(nr, NULL, nr->el, nr->signal_pipe[0], _signal_pipe_read, NULL, NULL, nr) < 0) {
 		fr_strerror_const("Failed inserting event for signal pipe");
 		goto fail2;
 	}
@@ -1710,7 +2185,7 @@ int fr_network_stats(fr_network_t const *nr, int num, uint64_t *stats)
 	if (num < 0) return -1;
 	if (num == 0) return 0;
 
-	if (num >= 1) stats[0] = nr->stats.in;
+	stats[0] = nr->stats.in;
 	if (num >= 2) stats[1] = nr->stats.out;
 	if (num >= 3) stats[2] = nr->stats.dup;
 	if (num >= 4) stats[3] = nr->stats.dropped;
@@ -1723,7 +2198,7 @@ int fr_network_stats(fr_network_t const *nr, int num, uint64_t *stats)
 
 void fr_network_stats_log(fr_network_t const *nr, fr_log_t const *log)
 {
-	int i;
+	unsigned int i;
 
 	/*
 	 *	Dump all of the channel statistics.
@@ -1752,17 +2227,17 @@ static int cmd_socket_list(FILE *fp, UNUSED FILE *fp_err, void *ctx, UNUSED fr_c
 {
 	fr_network_t const		*nr = ctx;
 	fr_rb_iter_inorder_t	iter;
-	fr_network_socket_t		*socket;
+	fr_network_socket_t		*s;
 
 	// @todo - note that this isn't thread-safe!
 
-	for (socket = fr_rb_iter_init_inorder(&iter, nr->sockets);
-	     socket;
-	     socket = fr_rb_iter_next_inorder(&iter)) {
-		if (!socket->listen->app_io->get_name) {
-			fprintf(fp, "%s\n", socket->listen->app_io->name);
+	for (s = fr_rb_iter_init_inorder(nr->sockets, &iter);
+	     s != NULL;
+	     s = fr_rb_iter_next_inorder(nr->sockets, &iter)) {
+		if (!s->inst->listen->app_io->get_name) {
+			fprintf(fp, "%s\n", s->inst->listen->app_io->common.name);
 		} else {
-			fprintf(fp, "%d\t%s\n", socket->number, socket->listen->app_io->get_name(socket->listen));
+			fprintf(fp, "%d\t%s\n", s->number, s->inst->listen->app_io->get_name(s->inst));
 		}
 	}
 	return 0;
@@ -1773,7 +2248,7 @@ static int cmd_stats_socket(FILE *fp, FILE *fp_err, void *ctx, fr_cmd_info_t con
 	fr_network_t const *nr = ctx;
 	fr_network_socket_t *s;
 
-	s = fr_rb_find(nr->sockets_by_num, &(fr_network_socket_t){ .number = info->box[0]->vb_uint32 });
+	fr_rb_find((void **)&s, nr->sockets_by_num, &(fr_network_socket_t){ .number = info->box[0]->vb_uint32 });
 	if (!s) {
 		fprintf(fp_err, "No such socket number '%s'.\n", info->argv[0]);
 		return -1;

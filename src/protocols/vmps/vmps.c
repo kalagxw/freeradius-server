@@ -25,21 +25,27 @@
 
 RCSID("$Id$")
 
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/util/dbuff.h>
-#include <freeradius-devel/util/udp.h>
-#include <freeradius-devel/protocol/vmps/vmps.h>
 #include <freeradius-devel/io/test_point.h>
+#include <freeradius-devel/protocol/vmps/vmps.h>
+#include <freeradius-devel/util/dbuff.h>
+#include <freeradius-devel/util/proto.h>
+#include <freeradius-devel/util/udp.h>
 
 #include "vmps.h"
 #include "attrs.h"
 
+/** Used as the decoder ctx
+ *
+ */
+typedef struct {
+	int		nothing;
+} fr_vmps_ctx_t;
+
 /*
  *  http://www.openbsd.org/cgi-bin/cvsweb/src/usr.sbin/tcpdump/print-vqp.c
  *
- *  Some of how it works:
- *
- *  http://www.hackingciscoexposed.com/pdf/chapter12.pdf
+ *  Chapter 12 of Hacking Cisco Networks Exposed (Vladimirov, Gavrilenko,
+ *  and Mikhailovsky, McGraw-Hill 2005)  describes some of how it works.
  *
  * VLAN Query Protocol (VQP)
  *
@@ -66,24 +72,11 @@ RCSID("$Id$")
  * VQP is layered over UDP.  The default destination port is 1589.
  *
  */
-char const *fr_vmps_codes[FR_VMPS_CODE_MAX] = {
+char const *fr_vmps_packet_names[FR_VMPS_CODE_MAX] = {
 	[FR_PACKET_TYPE_VALUE_JOIN_REQUEST] = "Join-Request",
 	[FR_PACKET_TYPE_VALUE_JOIN_RESPONSE] = "Join-Response",
 	[FR_PACKET_TYPE_VALUE_RECONFIRM_REQUEST] = "Reconfirm-Request",
 	[FR_PACKET_TYPE_VALUE_RECONFIRM_RESPONSE] = "Reconfirm-Response",
-};
-
-
-static size_t const fr_vmps_attr_sizes[FR_TYPE_MAX + 1][2] = {
-	[FR_TYPE_NULL]	= {~0, 0},	//!< Ensure array starts at 0 (umm?)
-
-	[FR_TYPE_STRING]	= {0, ~0},
-	[FR_TYPE_OCTETS]	= {0, ~0},
-
-	[FR_TYPE_IPV4_ADDR]	= {4, 4},
-	[FR_TYPE_ETHERNET]	= {6, 6},
-
-	[FR_TYPE_MAX]		= {~0, 0}	//!< Ensure array covers all types.
 };
 
 
@@ -119,20 +112,32 @@ bool fr_vmps_ok(uint8_t const *packet, size_t *packet_len)
 
 		/*
 		 *	Length is 2 bytes
-		 *
+		 */
+		attrlen = fr_nbo_to_uint16(ptr + 4);
+
+		/*
+		 *	Each attribute occupies a 6-byte header (4 type + 2 length) plus
+		 *	attrlen bytes of data.  Verify the full TLV fits in remaining data.
+		 */
+		if ((attrlen + 6) > data_len) {
+			fr_strerror_printf("Packet attributes cause total length "
+					   "plus header length to exceed packet length %lx",
+					   *packet_len);
+			return false;
+		}
+
+		/*
 		 *	We support short lengths, as there's no reason
 		 *	for bigger lengths to exist... admins won't be
 		 *	typing in a 32K vlan name.
 		 *
 		 *	It's OK for ethernet frames to be longer.
 		 */
-		if ((ptr[3] != 5) &&
-		    ((ptr[4] != 0) || (ptr[5] > 250))) {
+		if ((ptr[3] != 5) && (attrlen > 250)) {
 			fr_strerror_printf("Packet contains attribute with invalid length %02x %02x", ptr[4], ptr[5]);
 			return false;
 		}
 
-		attrlen = (ptr[4] << 8) | ptr[5];
 		ptr += 6 + attrlen;
 		data_len -= (6 + attrlen);
 	}
@@ -146,7 +151,7 @@ bool fr_vmps_ok(uint8_t const *packet, size_t *packet_len)
 }
 
 
-int fr_vmps_decode(TALLOC_CTX *ctx, uint8_t const *data, size_t data_len, fr_dcursor_t *cursor, unsigned int *code)
+ssize_t fr_vmps_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, uint8_t const *data, size_t data_len, unsigned int *code)
 {
 	uint8_t const  	*ptr, *end;
 	int		attr;
@@ -164,32 +169,28 @@ int fr_vmps_decode(TALLOC_CTX *ctx, uint8_t const *data, size_t data_len, fr_dcu
 	vp->vp_uint32 = data[1];
 	if (code) *code = data[1];
 	vp->vp_tainted = true;
-	DEBUG2("&%pP", vp);
-	fr_dcursor_append(cursor, vp);
+	fr_pair_append(out, vp);
 
 	vp = fr_pair_afrom_da(ctx, attr_error_code);
 	if (!vp) goto oom;
 	vp->vp_uint32 = data[2];
 	vp->vp_tainted = true;
-	DEBUG2("&%pP", vp);
-	fr_dcursor_append(cursor, vp);
+	fr_pair_append(out, vp);
 
 	vp = fr_pair_afrom_da(ctx, attr_sequence_number);
 	if (!vp) goto oom;
 
-	memcpy(&vp->vp_uint32, data + 4, 4);
-	vp->vp_uint32 = ntohl(vp->vp_uint32);
+	vp->vp_uint32 = fr_nbo_to_uint32(data + 4);
 	vp->vp_tainted = true;
-	DEBUG2("&%pP", vp);
-	fr_dcursor_append(cursor, vp);
+	fr_pair_append(out, vp);
 
 	ptr = data + FR_VQP_HDR_LEN;
 	end = data + data_len;
 
 	/*
-	 *	Note that vmps_recv() MUST ensure that the packet is
-	 *	formatted in a way we expect, and that vmps_recv() MUST
-	 *	be called before vmps_decode().
+	 *	Note that fr_vmps_ok() MUST ensure that the packet is
+	 *	formatted in a way we expect, and that fr_vmps_ok() MUST
+	 *	be called before fr_vmps_decode().
 	 */
 	while (ptr < end) {
 		if ((end - ptr) < 6) {
@@ -197,9 +198,11 @@ int fr_vmps_decode(TALLOC_CTX *ctx, uint8_t const *data, size_t data_len, fr_dcu
 			return -1;
 		}
 
-		attr = (ptr[2] << 8) | ptr[3];
-		attr_len = (ptr[4] << 8) | ptr[5];
+		attr = fr_nbo_to_uint16(ptr + 2);
+		attr_len = fr_nbo_to_uint16(ptr + 4);
 		ptr += 6;
+
+		if (!attr_len) continue;
 
 		/*
 		 *	fr_vmps_ok() should have checked this already,
@@ -224,15 +227,15 @@ int fr_vmps_decode(TALLOC_CTX *ctx, uint8_t const *data, size_t data_len, fr_dcu
 		 *
 		 *	@todo - if the attribute is malformed, create a "raw" one.
 		 */
-		if (fr_value_box_from_network(vp, &vp->data, vp->da->type, vp->da, ptr, attr_len, true) < 0) {
+		if (fr_value_box_from_network(vp, &vp->data, vp->vp_type, vp->da,
+					      &FR_DBUFF_TMP(ptr, attr_len), attr_len, true) < 0) {
 			talloc_free(vp);
 			return -1;
 		}
 
 		ptr += attr_len;
 		vp->vp_tainted = true;
-		DEBUG2("&%pP", vp);
-		fr_dcursor_append(cursor, vp);
+		fr_pair_append(out, vp);
 	}
 
 	/*
@@ -264,11 +267,11 @@ static int contents[5][VQP_MAX_ATTRIBUTES] = {
 #endif
 
 ssize_t fr_vmps_encode(fr_dbuff_t *dbuff, uint8_t const *original,
-		       int code, uint32_t seq_no, fr_dcursor_t *cursor)
+		       fr_vmps_packet_code_t code, uint32_t seq_no, fr_dcursor_t *cursor)
 {
 	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 	fr_pair_t 		*vp;
-	fr_dbuff_marker_t	hdr, io;
+	fr_dbuff_marker_t	hdr, m;
 	uint8_t			data_count = 0;
 
 	/*
@@ -276,7 +279,7 @@ ssize_t fr_vmps_encode(fr_dbuff_t *dbuff, uint8_t const *original,
 	 *	to let us write to to the encoding as needed.
 	 */
 	fr_dbuff_marker(&hdr, &work_dbuff);
-	fr_dbuff_marker(&io, &work_dbuff);
+	fr_dbuff_marker(&m, &work_dbuff);
 
 	/*
 	 *	Create the header
@@ -296,48 +299,30 @@ ssize_t fr_vmps_encode(fr_dbuff_t *dbuff, uint8_t const *original,
 	 *	Encode the VP's.
 	 */
 	while ((vp = fr_dcursor_current(cursor))) {
-		size_t len;
+		ssize_t slen;
 
 		if (vp->da == attr_packet_type) {
-			fr_dbuff_set(&io, fr_dbuff_current(&hdr) + 1);
-			fr_dbuff_in(&io, (uint8_t)vp->vp_uint32);
+			fr_dbuff_set(&m, fr_dbuff_current(&hdr) + 1);
+			FR_DBUFF_IN_RETURN(&m, (uint8_t)vp->vp_uint32);
 			fr_dcursor_next(cursor);
 			continue;
 		}
 
 		if (vp->da == attr_error_code) {
-			fr_dbuff_set(&io, fr_dbuff_current(&hdr) + 2);
-			fr_dbuff_in(&io, vp->vp_uint8);
+			fr_dbuff_set(&m, fr_dbuff_current(&hdr) + 2);
+			FR_DBUFF_IN_RETURN(&m, vp->vp_uint8);
 			fr_dcursor_next(cursor);
 			continue;
 		}
 
 		if (!original && (vp->da == attr_sequence_number)) {
-			fr_dbuff_set(&io, fr_dbuff_current(&hdr) + 4);
-			fr_dbuff_in(&io, vp->vp_uint32);
+			fr_dbuff_set(&m, fr_dbuff_current(&hdr) + 4);
+			FR_DBUFF_IN_RETURN(&m, vp->vp_uint32);
 			fr_dcursor_next(cursor);
 			continue;
 		}
 
-		DEBUG2("&%pP", vp);
-
-		switch (vp->vp_type) {
-		case FR_TYPE_IPV4_ADDR:
-			len = fr_vmps_attr_sizes[vp->vp_type][0];
-			break;
-
-		case FR_TYPE_ETHERNET:
-			len = fr_vmps_attr_sizes[vp->vp_type][0];
-			break;
-
-		case FR_TYPE_OCTETS:
-		case FR_TYPE_STRING:
-			len = vp->vp_length;
-			break;
-
-		default:
-			return -1;
-		}
+		if (!fr_type_is_leaf(vp->vp_type)) continue;
 
 		/*
 		 *	Type.  Note that we look at only the lower 8
@@ -349,26 +334,15 @@ ssize_t fr_vmps_encode(fr_dbuff_t *dbuff, uint8_t const *original,
 		FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, 0x00, 0x00, 0x0c, (vp->da->attr & 0xff));
 
 		/* Length */
-		FR_DBUFF_IN_RETURN(&work_dbuff, (uint16_t)len);
+		fr_dbuff_set(&m, fr_dbuff_current(&work_dbuff));
+		FR_DBUFF_IN_RETURN(&work_dbuff, (uint16_t) 0);
 
 		/* Data */
-		switch (vp->vp_type) {
-		case FR_TYPE_IPV4_ADDR:
-			FR_DBUFF_IN_MEMCPY_RETURN(&work_dbuff, (uint8_t *)&vp->vp_ipv4addr, len);
-			break;
+		slen = fr_value_box_to_network(&work_dbuff, &vp->data);
+		if (slen < 0) return slen;
 
-		case FR_TYPE_ETHERNET:
-			FR_DBUFF_IN_MEMCPY_RETURN(&work_dbuff, vp->vp_ether, len);
-			break;
+		FR_DBUFF_IN_RETURN(&m, (uint16_t) slen);
 
-		case FR_TYPE_OCTETS:
-		case FR_TYPE_STRING:
-			FR_DBUFF_IN_MEMCPY_RETURN(&work_dbuff, vp->vp_octets, len);
-			break;
-
-		default:
-			return -1;
-		}
 		data_count++;
 
 		fr_dcursor_next(cursor);
@@ -377,8 +351,8 @@ ssize_t fr_vmps_encode(fr_dbuff_t *dbuff, uint8_t const *original,
 	/*
 	 *	Update the Data Count
 	 */
-	fr_dbuff_set(&io, fr_dbuff_current(&hdr) + 3);
-	fr_dbuff_in(&io, data_count);
+	fr_dbuff_set(&m, fr_dbuff_current(&hdr) + 3);
+	FR_DBUFF_IN_RETURN(&m, data_count);
 
 	return fr_dbuff_set(dbuff, &work_dbuff);
 }
@@ -435,7 +409,7 @@ ssize_t fr_vmps_packet_size(uint8_t const *data, size_t data_len)
 		/*
 		 *	Length of the data NOT including the header.
 		 */
-		attr_len = (ptr[4] << 8) | ptr[5];
+		attr_len = fr_nbo_to_uint16(ptr + 4);
 
 		ptr += 6 + attr_len;
 
@@ -489,7 +463,7 @@ static void print_hex_data(uint8_t const *ptr, int attrlen, int depth)
  */
 void fr_vmps_print_hex(FILE *fp, uint8_t const *packet, size_t packet_len)
 {
-	int length;
+	uint32_t length;
 	uint8_t const *attr, *end;
 	uint32_t id;
 
@@ -497,14 +471,14 @@ void fr_vmps_print_hex(FILE *fp, uint8_t const *packet, size_t packet_len)
 
 	fprintf(fp, "  Version:\t\t%u\n", packet[0]);
 
-	if ((packet[1] > 0) && (packet[1] < FR_VMPS_CODE_MAX) && fr_vmps_codes[packet[1]]) {
-		fprintf(fp, "  OpCode:\t\t%s\n", fr_vmps_codes[packet[1]]);
+	if ((packet[1] > 0) && (packet[1] < FR_VMPS_CODE_MAX) && fr_vmps_packet_names[packet[1]]) {
+		fprintf(fp, "  OpCode:\t\t%s\n", fr_vmps_packet_names[packet[1]]);
 	} else {
 		fprintf(fp, "  OpCode:\t\t%u\n", packet[1]);
 	}
 
-	if ((packet[2] > 0) && (packet[2] < FR_VMPS_CODE_MAX) && fr_vmps_codes[packet[2]]) {
-		fprintf(fp, "  OpCode:\t\t%s\n", fr_vmps_codes[packet[2]]);
+	if ((packet[2] > 0) && (packet[2] < FR_VMPS_CODE_MAX) && fr_vmps_packet_names[packet[2]]) {
+		fprintf(fp, "  OpCode:\t\t%s\n", fr_vmps_packet_names[packet[2]]);
 	} else {
 		fprintf(fp, "  OpCode:\t\t%u\n", packet[2]);
 	}
@@ -520,49 +494,45 @@ void fr_vmps_print_hex(FILE *fp, uint8_t const *packet, size_t packet_len)
 
 	for (attr = packet + 8, end = packet + packet_len;
 	     attr < end;
-	     attr += length) {
+	     attr += (6 + length)) {
+		if ((end - attr) < 6) break;
 		memcpy(&id, attr, 4);
 		id = ntohl(id);
-
-		length = (attr[4] << 8) | attr[5];
-		if ((attr + length) > end) break;
+		length = fr_nbo_to_uint16(attr + 4);
+		if ((size_t)(end - attr) < (6 + (size_t)length)) break;
 
 		fprintf(fp, "\t\t%08x  %04x  ", id, length);
 
-		print_hex_data(attr + 5, length, 3);
+		print_hex_data(attr + 6, length, 3);
 	}
 }
 
 /*
  *	Test points for protocol decode
  */
-static ssize_t fr_vmps_decode_proto(TALLOC_CTX *ctx, fr_pair_list_t *list, uint8_t const *data, size_t data_len, UNUSED void *proto_ctx)
+static ssize_t fr_vmps_decode_proto(TALLOC_CTX *ctx, fr_pair_list_t *out,
+				    uint8_t const *data, size_t data_len, void *proto_ctx)
 {
-	fr_dcursor_t cursor;
-
-	fr_pair_list_init(list);
-	fr_dcursor_init(&cursor, list);
-
-	return fr_vmps_decode(ctx, data, data_len, &cursor, NULL);
+	return fr_vmps_decode(ctx, out, data, data_len, proto_ctx);
 }
 
 static int _decode_test_ctx(UNUSED fr_vmps_ctx_t *proto_ctx)
 {
-	fr_vmps_free();
+	fr_vmps_global_free();
 
 	return 0;
 }
 
-static int decode_test_ctx(void **out, TALLOC_CTX *ctx)
+static int decode_test_ctx(void **out, TALLOC_CTX *ctx, UNUSED fr_dict_t const *dict,
+			   UNUSED fr_dict_attr_t const *root_da)
 {
 	fr_vmps_ctx_t *test_ctx;
 
-	if (fr_vmps_init() < 0) return -1;
+	if (fr_vmps_global_init() < 0) return -1;
 
 	test_ctx = talloc_zero(ctx, fr_vmps_ctx_t);
 	if (!test_ctx) return -1;
 
-	test_ctx->root = fr_dict_root(dict_vmps);
 	talloc_set_destructor(test_ctx, _decode_test_ctx);
 
 	*out = test_ctx;
@@ -583,28 +553,28 @@ static ssize_t fr_vmps_encode_proto(UNUSED TALLOC_CTX *ctx, fr_pair_list_t *vps,
 {
 	fr_dcursor_t cursor;
 
-	fr_dcursor_talloc_iter_init(&cursor, vps, fr_proto_next_encodable, dict_vmps, fr_pair_t);
+	fr_pair_dcursor_iter_init(&cursor, vps, fr_proto_next_encodable, dict_vmps);
 
-	return fr_vmps_encode(&FR_DBUFF_TMP(data, data_len), NULL, -1, -1, &cursor);
+	return fr_vmps_encode(&FR_DBUFF_TMP(data, data_len), NULL, FR_VMPS_INVALID, -1, &cursor);
 }
 
 static int _encode_test_ctx(UNUSED fr_vmps_ctx_t *proto_ctx)
 {
-	fr_vmps_free();
+	fr_vmps_global_free();
 
 	return 0;
 }
 
-static int encode_test_ctx(void **out, TALLOC_CTX *ctx)
+static int encode_test_ctx(void **out, TALLOC_CTX *ctx, UNUSED fr_dict_t const *dict,
+			   UNUSED fr_dict_attr_t const *root_da)
 {
 	fr_vmps_ctx_t *test_ctx;
 
-	if (fr_vmps_init() < 0) return -1;
+	if (fr_vmps_global_init() < 0) return -1;
 
 	test_ctx = talloc_zero(ctx, fr_vmps_ctx_t);
 	if (!test_ctx) return -1;
 
-	test_ctx->root = fr_dict_root(dict_vmps);
 	talloc_set_destructor(test_ctx, _encode_test_ctx);
 
 	*out = test_ctx;

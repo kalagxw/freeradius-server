@@ -2,10 +2,11 @@ TARGETNAME	:= @targetname@
 VERSION		:= @version@
 
 ifneq "$(TARGETNAME)" ""
-TARGET		:= $(TARGETNAME).a
+TARGET		:= $(TARGETNAME)$(L)
 endif
+TGT_CATEGORY	:= lib-util
 
-SOURCES		:= base.c io.c
+SOURCES		:= base.c io.c xlat.c
 
 SRC_CFLAGS	:= @mod_cflags@
 

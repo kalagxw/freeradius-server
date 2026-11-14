@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -24,18 +24,17 @@
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_attr_filter (%s) - "
-#define LOG_PREFIX_ARGS dl_module_instance_name_by_data(inst)
+#define LOG_PREFIX mctx->mi->name
 
-#include	<freeradius-devel/server/base.h>
-#include	<freeradius-devel/server/module.h>
-#include	<freeradius-devel/util/debug.h>
-#include	<freeradius-devel/server/users_file.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/server/users_file.h>
 
-#include	<sys/stat.h>
+#include <sys/stat.h>
 
-#include	<ctype.h>
-#include	<fcntl.h>
+#include <ctype.h>
+#include <fcntl.h>
 
 /*
  *	Define a structure with the module configuration, so it can
@@ -43,15 +42,17 @@ RCSID("$Id$")
  */
 typedef struct {
 	char const	*filename;
-	tmpl_t		*key;
 	bool		relaxed;
 	PAIR_LIST_LIST	attrs;
 } rlm_attr_filter_t;
 
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_INPUT | FR_TYPE_REQUIRED, rlm_attr_filter_t, filename) },
-	{ FR_CONF_OFFSET("key", FR_TYPE_TMPL, rlm_attr_filter_t, key), .dflt = "&Realm", .quote = T_BARE_WORD },
-	{ FR_CONF_OFFSET("relaxed", FR_TYPE_BOOL, rlm_attr_filter_t, relaxed), .dflt = "no" },
+typedef struct {
+	fr_value_box_t	*key;
+} attr_filter_env_t;
+
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("filename", CONF_FLAG_FILE_READABLE | CONF_FLAG_REQUIRED, rlm_attr_filter_t, filename) },
+	{ FR_CONF_OFFSET("relaxed", rlm_attr_filter_t, relaxed), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -62,7 +63,7 @@ extern fr_dict_autoload_t rlm_attr_filter_dict[];
 fr_dict_autoload_t rlm_attr_filter_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_stripped_user_name;
@@ -78,7 +79,16 @@ fr_dict_attr_autoload_t rlm_attr_filter_dict_attr[] = {
 	{ .out = &attr_relax_filter, .name = "Relax-Filter", .type = FR_TYPE_BOOL, .dict = &dict_freeradius },
 
 	{ .out = &attr_vendor_specific, .name = "Vendor-Specific", .type = FR_TYPE_VSA, .dict = &dict_radius },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
+};
+
+static const call_env_method_t attr_filter_env = {
+	FR_CALL_ENV_METHOD_OUT(attr_filter_env_t),
+	.env = (call_env_parser_t[]) {
+		{ FR_CALL_ENV_OFFSET("key", FR_TYPE_STRING, CALL_ENV_FLAG_CONCAT | CALL_ENV_FLAG_NULLABLE, attr_filter_env_t, key),
+		  .pair.dflt = "Realm", .pair.dflt_quote = T_BARE_WORD },
+		CALL_ENV_TERMINATOR
+	}
 };
 
 static void check_pair(request_t *request, fr_pair_t *check_item, fr_pair_t *reply_item, int *pass, int *fail)
@@ -101,13 +111,13 @@ static void check_pair(request_t *request, fr_pair_t *check_item, fr_pair_t *rep
 	return;
 }
 
-static int attr_filter_getfile(TALLOC_CTX *ctx, rlm_attr_filter_t *inst, char const *filename, PAIR_LIST_LIST *pair_list)
+static int attr_filter_getfile(TALLOC_CTX *ctx, module_inst_ctx_t const *mctx, char const *filename, PAIR_LIST_LIST *pair_list)
 {
 	int rcode;
 	PAIR_LIST *entry = NULL;
 	map_t *map;
 
-	rcode = pairlist_read(ctx, dict_radius, filename, pair_list, 1);
+	rcode = pairlist_read(ctx, dict_radius, filename, pair_list, false);
 	if (rcode < 0) {
 		return -1;
 	}
@@ -119,31 +129,29 @@ static int attr_filter_getfile(TALLOC_CTX *ctx, rlm_attr_filter_t *inst, char co
 		/*
 		 *	We apply the rules in the reply items.
 		 */
-		if (!fr_dlist_empty(&entry->check)) {
+		if (!map_list_empty(&entry->check)) {
 			WARN("%s[%d] Check list is not empty for entry \"%s\".\n",
 			     filename, entry->lineno, entry->name);
 		}
 
 		map = NULL;
-		while ((map = fr_dlist_next(&entry->reply, map))) {
-			fr_dict_attr_t const *da;
-
+		while ((map = map_list_next(&entry->reply, map))) {
 			if (!tmpl_is_attr(map->lhs)) {
 				ERROR("%s[%d] Left side of filter %s is not an attribute",
 				      filename, entry->lineno, map->lhs->name);
 				return -1;
 			}
-			da = tmpl_da(map->lhs);
 
-			/*
-			 * If it's NOT a vendor attribute,
-			 * and it's NOT a wire protocol
-			 * and we ignore Fall-Through,
-			 * then bitch about it, giving a good warning message.
-			 */
-			if (fr_dict_attr_is_top_level(da) && (da->attr > 1000)) {
-				WARN("%s[%d] Check item \"%s\" was found in filter list for entry \"%s\".\n",
-				     filename, entry->lineno, da->name, entry->name);
+			if (tmpl_list(map->lhs) != request_attr_reply) {
+				ERROR("%s[%d] Left side of filter %s is not in the reply list",
+				      filename, entry->lineno, map->lhs->name);
+				return -1;
+			}
+
+			if (fr_assignment_op[map->op]) {
+				ERROR("%s[%d] Filter %s contains invalid operator '%s'",
+				      filename, entry->lineno, map->lhs->name, fr_tokens[map->op]);
+				return -1;
 			}
 
 			/*
@@ -154,23 +162,28 @@ static int attr_filter_getfile(TALLOC_CTX *ctx, rlm_attr_filter_t *inst, char co
 				      filename, entry->lineno, map->lhs->name);
 				return -1;
 			}
+
+			if (!tmpl_is_data(map->rhs)) {
+				ERROR("%s[%d] Right side of filter %s is not a static value",
+				      filename, entry->lineno, map->lhs->name);
+				return -1;
+			}
 		}
 	}
 
 	return 0;
 }
 
-
 /*
  *	(Re-)read the "attrs" file into memory.
  */
-static int mod_instantiate(void *instance, UNUSED CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_attr_filter_t *inst = instance;
+	rlm_attr_filter_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_attr_filter_t);
 	int rcode;
 	pairlist_list_init(&inst->attrs);
 
-	rcode = attr_filter_getfile(inst, inst, inst->filename, &inst->attrs);
+	rcode = attr_filter_getfile(inst, mctx, inst->filename, &inst->attrs);
 	if (rcode != 0) {
 		ERROR("Errors reading %s", inst->filename);
 
@@ -184,30 +197,23 @@ static int mod_instantiate(void *instance, UNUSED CONF_SECTION *conf)
 /*
  *	Common attr_filter checks
  */
-static unlang_action_t CC_HINT(nonnull(1,2)) attr_filter_common(rlm_rcode_t *p_result,
-								void const *instance, request_t *request,
-								fr_radius_packet_t *packet, fr_pair_list_t *list)
+static unlang_action_t CC_HINT(nonnull) attr_filter_common(TALLOC_CTX *ctx, unlang_result_t *p_result,
+							   module_ctx_t const *mctx, request_t *request,
+							   fr_pair_list_t *list)
 {
-	rlm_attr_filter_t const *inst = talloc_get_type_abort_const(instance, rlm_attr_filter_t);
+	rlm_attr_filter_t const *inst = talloc_get_type_abort_const(mctx->mi->data, rlm_attr_filter_t);
+	attr_filter_env_t	*env_data = talloc_get_type_abort(mctx->env_data, attr_filter_env_t);
 	fr_pair_list_t	output;
 	PAIR_LIST	*pl = NULL;
 	int		found = 0;
 	int		pass, fail = 0;
 	char const	*keyname = NULL;
-	char		buffer[256];
-	ssize_t		slen;
 
-	if (!packet) {
-		RETURN_MODULE_NOOP;
-	}
-
-	slen = tmpl_expand(&keyname, buffer, sizeof(buffer), request, inst->key, NULL, NULL);
-	if (slen < 0) {
-		RETURN_MODULE_FAIL;
-	}
-	if ((keyname == buffer) && is_truncated((size_t)slen, sizeof(buffer))) {
-		REDEBUG("Key too long, expected < " STRINGIFY(sizeof(buffer)) " bytes, got %zi bytes", slen);
-		RETURN_MODULE_FAIL;
+	/* The key expanded to nothing - use DEFAULT */
+	if (!env_data->key || env_data->key->type != FR_TYPE_STRING) {
+		keyname = "DEFAULT";
+	} else {
+		keyname = env_data->key->vb_strvalue;
 	}
 
 	/*
@@ -242,8 +248,36 @@ static unlang_action_t CC_HINT(nonnull(1,2)) attr_filter_common(rlm_rcode_t *p_r
 
 		fr_pair_list_init(&check_list);
 
-		while ((map = fr_dlist_next(&pl->reply, map))) {
-			if (map_to_vp(packet, &tmp_list, request, map, NULL) < 0) {
+		while ((map = map_list_next(&pl->reply, map))) {
+			/*
+			 *	Special case for !*
+			 */
+			if (map->op == T_OP_CMP_FALSE) {
+				RWDEBUG("Unsupported operator '!*'");
+				continue;
+			}
+
+			/*
+			 *	Create an empty attribute.  This functionality is used by the attr_filter module.
+			 */
+			if (map->op == T_OP_CMP_TRUE) {
+				fr_pair_t *vp;
+
+				MEM(vp = fr_pair_afrom_da(ctx, tmpl_attr_tail_da(map->lhs)));
+				vp->op = T_OP_CMP_TRUE;
+				fr_pair_append(&check_list, vp);
+				continue;
+			}
+
+			/*
+			 *	@todo - this use of map_to_vp is completely wrong.  Nothing else uses
+			 *	comparison operators for map_to_vp().  This module doesn't handle nested
+			 *	pairs, and dumps all pairs in one list no matter their depth.  It requires
+			 *	that map_to_vp() appends the pair, rather than respecting the operator.
+			 *
+			 *	i.e. it really only works for RADIUS. :(
+			 */
+			if (map_to_vp(ctx, &tmp_list, request, map, NULL) < 0) {
 				RPWARN("Failed parsing map %s for check item, skipping it", map->lhs->name);
 				continue;
 			}
@@ -256,7 +290,7 @@ static unlang_action_t CC_HINT(nonnull(1,2)) attr_filter_common(rlm_rcode_t *p_r
 					continue;
 				}
 		     	} else if (check_item->da == attr_relax_filter) {
-				relax_filter = check_item->vp_uint32;
+				relax_filter = check_item->vp_bool;
 		     	}
 
 			/*
@@ -345,7 +379,7 @@ static unlang_action_t CC_HINT(nonnull(1,2)) attr_filter_common(rlm_rcode_t *p_r
 	 */
 	if (!found) {
 		fr_assert(fr_pair_list_empty(&output));
-		RETURN_MODULE_NOOP;
+		RETURN_UNLANG_NOOP;
 	}
 
 	/*
@@ -354,33 +388,49 @@ static unlang_action_t CC_HINT(nonnull(1,2)) attr_filter_common(rlm_rcode_t *p_r
 	fr_pair_list_free(list);
 	fr_pair_list_append(list, &output);
 
-	RETURN_MODULE_UPDATED;
+	RETURN_UNLANG_UPDATED;
 }
 
-#define RLM_AF_FUNC(_x, _y, _z) static unlang_action_t CC_HINT(nonnull) mod_##_x(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request) \
+#define RLM_AF_FUNC(_x, _y) static unlang_action_t CC_HINT(nonnull) mod_##_x(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request) \
 	{ \
-		return attr_filter_common(p_result, mctx->instance, request, request->_y, &request->_z##_pairs); \
+		return attr_filter_common(request->_y##_ctx, p_result, mctx, request, &request->_y##_pairs); \
 	}
 
-RLM_AF_FUNC(authorize, packet, request)
-RLM_AF_FUNC(post_auth, reply, reply)
-
-RLM_AF_FUNC(preacct, packet, request)
-RLM_AF_FUNC(accounting, reply, reply)
+RLM_AF_FUNC(request, request)
+RLM_AF_FUNC(reply, reply)
+RLM_AF_FUNC(control, control)
+RLM_AF_FUNC(session, session_state)
 
 /* globally exported name */
-extern module_t rlm_attr_filter;
-module_t rlm_attr_filter = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "attr_filter",
-	.inst_size	= sizeof(rlm_attr_filter_t),
-	.config		= module_config,
-	.instantiate	= mod_instantiate,
-	.methods = {
-		[MOD_AUTHORIZE]		= mod_authorize,
-		[MOD_PREACCT]		= mod_preacct,
-		[MOD_ACCOUNTING]	= mod_accounting,
-		[MOD_POST_AUTH]		= mod_post_auth,
+extern module_rlm_t rlm_attr_filter;
+module_rlm_t rlm_attr_filter = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "attr_filter",
+		.inst_size	= sizeof(rlm_attr_filter_t),
+		.config		= module_config,
+		.instantiate	= mod_instantiate,
 	},
-};
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			/*
+			 *	Hack to support old configurations
+			 */
+			{ .section = SECTION_NAME("accounting", CF_IDENT_ANY),		.method = mod_reply,	.method_env = &attr_filter_env	},
+			{ .section = SECTION_NAME("authorize", CF_IDENT_ANY),		.method = mod_request, 	.method_env = &attr_filter_env	},
 
+			{ .section = SECTION_NAME("recv", CF_IDENT_ANY),		.method = mod_request, 	.method_env = &attr_filter_env	},
+
+			{ .section = SECTION_NAME("send", CF_IDENT_ANY),		.method = mod_reply, 	.method_env = &attr_filter_env	},
+
+			/*
+			 *	List name based methods
+			 */
+			{ .section = SECTION_NAME("request", CF_IDENT_ANY),		.method = mod_request, 	.method_env = &attr_filter_env	},
+			{ .section = SECTION_NAME("reply", CF_IDENT_ANY),		.method = mod_reply, 	.method_env = &attr_filter_env	},
+			{ .section = SECTION_NAME("control", CF_IDENT_ANY),		.method = mod_control, 	.method_env = &attr_filter_env	},
+			{ .section = SECTION_NAME("session-state", CF_IDENT_ANY),	.method = mod_session, 	.method_env = &attr_filter_env	},
+			MODULE_BINDING_TERMINATOR
+		}
+	}
+};

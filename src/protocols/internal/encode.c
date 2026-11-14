@@ -30,8 +30,9 @@
 #include <freeradius-devel/io/test_point.h>
 #include <freeradius-devel/util/net.h>
 #include <freeradius-devel/util/proto.h>
-#include <freeradius-devel/util/dbuff.h>
-#include <freeradius-devel/util/talloc.h>
+
+
+static fr_internal_encode_ctx_t	default_encode_ctx = { };
 
 /** We use the same header for all types
  *
@@ -52,18 +53,30 @@ static ssize_t internal_encode(fr_dbuff_t *dbuff,
 			       fr_da_stack_t *da_stack, unsigned int depth,
 			       fr_dcursor_t *cursor, void *encode_ctx)
 {
-	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
-	fr_dbuff_marker_t	enc_field, len_field, value_field;
-	fr_dbuff_t		value_dbuff;
-	fr_dict_attr_t const	*da = da_stack->da[depth];
-	fr_pair_t		*vp = fr_dcursor_current(cursor);
-	bool			unknown = false, internal = false;
+	fr_dbuff_t			work_dbuff = FR_DBUFF(dbuff);
+	fr_dbuff_marker_t		enc_field, len_field, value_field;
+	fr_dbuff_t			value_dbuff;
+	fr_dict_attr_t const		*da = da_stack->da[depth];
+	fr_pair_t			*vp = fr_dcursor_current(cursor);
+	bool				unknown = false, internal = false;
 
-	ssize_t			slen;
-	size_t			flen, vlen, mlen;
+	ssize_t				slen;
+	size_t				flen, vlen, mlen;
 
-	uint8_t			buff[sizeof(uint64_t)];
-	uint8_t			enc_byte = 0;
+	uint8_t				buff[sizeof(uint64_t)];
+	uint8_t				enc_byte = 0;
+	fr_internal_encode_ctx_t	*our_encode_ctx = encode_ctx;
+
+	if (!our_encode_ctx) our_encode_ctx = &default_encode_ctx;
+
+	/*
+	 *	Silently skip name only attributes if we're writing
+	 *	to a database or cache.
+	 */
+	if (!our_encode_ctx->allow_name_only && vp->da->flags.name_only) {
+		fr_dcursor_next(cursor);
+		return 0;
+	}
 
 	FR_PROTO_STACK_PRINT(da_stack, depth);
 
@@ -74,7 +87,7 @@ static ssize_t internal_encode(fr_dbuff_t *dbuff,
 	 */
 	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, 0x00);
 
-	switch (da->type) {
+	switch (vp->vp_type) {
 	/*
 	 *	Only leaf attributes can be tainted
 	 */
@@ -107,8 +120,9 @@ static ssize_t internal_encode(fr_dbuff_t *dbuff,
 	 *	Encode the type and write the width of the
 	 *	integer to the encoding byte.
 	 */
-	flen = fr_dbuff_in_uint64v(&work_dbuff, da->attr);
-	if (flen <= 0) return flen;
+	slen = fr_dbuff_in_uint64v(&work_dbuff, da->attr);
+	if (slen <= 0) return slen;
+	flen = (size_t) slen;
 	enc_byte |= ((flen - 1) << 5);
 
 	/*
@@ -116,7 +130,7 @@ static ssize_t internal_encode(fr_dbuff_t *dbuff,
 	 *	so we needn't move the encoded data.
 	 */
 	fr_dbuff_marker(&len_field, &work_dbuff);
-	FR_DBUFF_ADVANCE_RETURN(&work_dbuff, 1);
+	FR_DBUFF_ADVANCE_EXTEND_RETURN(&work_dbuff, 1);
 
 	/*
 	 *	Create dbuff to hold encoded data--the fr_dbuff_move() done
@@ -149,15 +163,17 @@ static ssize_t internal_encode(fr_dbuff_t *dbuff,
 	 */
 	case FR_TYPE_VSA:
 	case FR_TYPE_VENDOR:
-		slen = internal_encode(&value_dbuff, da_stack, depth + 1, cursor, encode_ctx);
-		if (slen < 0) return slen;
-		break;
 
 	/*
 	 *	Children of TLVs are encoded in the context
 	 *	of the TLV.
+	 *
+	 *	STRUCTs are encoded as TLVs, because the struct
+	 *	packing only applies to the original protocol, and not
+	 *	to our internal encoding.
 	 */
 	case FR_TYPE_TLV:
+	case FR_TYPE_STRUCT:
 		/*
 		 *	We've done the complete stack.
 		 *	Hopefully this TLV has some
@@ -167,7 +183,7 @@ static ssize_t internal_encode(fr_dbuff_t *dbuff,
 			fr_dcursor_t	children;
 			fr_pair_t	*child;
 
-			for (child = fr_dcursor_talloc_init(&children, &vp->vp_group, fr_pair_t);
+			for (child = fr_pair_dcursor_init(&children, &vp->vp_group);
 			     child;
 			     child = fr_dcursor_current(&children)) {
 
@@ -201,11 +217,12 @@ static ssize_t internal_encode(fr_dbuff_t *dbuff,
 	case FR_TYPE_GROUP:
 	{
 		fr_dcursor_t	children;
+		fr_pair_t	*child;
 
-		for (vp = fr_dcursor_talloc_init(&children, &vp->vp_group, fr_pair_t);
-		     vp;
-		     vp = fr_dcursor_current(&children)) {
-		     	FR_PROTO_TRACE("encode ctx changed %s -> %s", da->name, vp->da->name);
+		for (child = fr_pair_dcursor_init(&children, &vp->vp_group);
+		     child;
+		     child = fr_dcursor_current(&children)) {
+		     	FR_PROTO_TRACE("encode ctx changed %s -> %s", da->name, child->da->name);
 
 			slen = fr_internal_encode_pair(&value_dbuff, &children, encode_ctx);
 			if (slen < 0) return slen;
@@ -216,7 +233,7 @@ static ssize_t internal_encode(fr_dbuff_t *dbuff,
 
 	default:
 		fr_strerror_printf("%s: Unexpected attribute type \"%s\"",
-				   __FUNCTION__, fr_table_str_by_value(fr_value_box_type_table, da->type, "?Unknown?"));
+				   __FUNCTION__, fr_type_to_str(da->type));
 		return PAIR_ENCODE_FATAL_ERROR;
 	}
 
@@ -228,7 +245,7 @@ static ssize_t internal_encode(fr_dbuff_t *dbuff,
 	 *	the function.
 	 */
 	vlen = fr_dbuff_used(&value_dbuff);
-	flen = (ssize_t) fr_net_from_uint64v(buff, vlen);
+	flen = fr_nbo_from_uint64v(buff, vlen);
 
 	/*
 	 *	Ugh, it's a long one, need to move the data.
@@ -240,14 +257,14 @@ static ssize_t internal_encode(fr_dbuff_t *dbuff,
 		if (mlen < vlen) return -(vlen - mlen);
 	}
 
-	fr_dbuff_in_memcpy(&len_field, buff, flen);
+	FR_DBUFF_IN_MEMCPY_RETURN(&len_field, buff, flen);
 	enc_byte |= ((flen - 1) << 2);
-	fr_dbuff_in(&enc_field, enc_byte);
+	FR_DBUFF_IN_RETURN(&enc_field, enc_byte);
 
 	FR_PROTO_HEX_DUMP(fr_dbuff_start(&work_dbuff), fr_dbuff_used(&work_dbuff) - vlen, "header");
 
 	FR_PROTO_HEX_DUMP(fr_dbuff_start(&value_dbuff), vlen, "value %s",
-			  fr_table_str_by_value(fr_value_box_type_table, vp->vp_type, "<UNKNOWN>"));
+			  fr_type_to_str(vp->vp_type));
 
 	return fr_dbuff_set(dbuff, &work_dbuff);
 }
@@ -273,6 +290,34 @@ ssize_t fr_internal_encode_pair(fr_dbuff_t *dbuff, fr_dcursor_t *cursor, void *e
 	fr_proto_da_stack_build(&da_stack, vp->da);
 
 	return internal_encode(dbuff, &da_stack, 0, cursor, encode_ctx);
+}
+
+/** Encode a list of pairs using the internal encoder
+ *
+ * @param[out] dbuff		Where to write encoded data.
+ * @param[in] list		List of attributes to encode.
+ * @param[in] encode_ctx	Additional data to be used by the encoder.
+ * @return
+ *	- length of encoded data on success
+ *	- < 0 on failure
+ */
+ssize_t fr_internal_encode_list(fr_dbuff_t *dbuff, fr_pair_list_t const *list, void *encode_ctx)
+{
+	fr_pair_t		*vp;
+	fr_dcursor_t		dcursor;
+	ssize_t			ret = 0, len = 0;
+	fr_da_stack_t		da_stack;
+
+	for (vp = fr_pair_dcursor_init(&dcursor, list);
+	     vp;
+	     vp = fr_dcursor_current(&dcursor)) {
+		fr_proto_da_stack_build(&da_stack, vp->da);
+		ret = internal_encode(dbuff, &da_stack, 0, &dcursor, encode_ctx);
+		if (ret < 0) return ret;
+		len += ret;
+	}
+
+	return len;
 }
 
 /*

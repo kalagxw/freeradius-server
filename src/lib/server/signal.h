@@ -32,18 +32,36 @@ extern "C" {
 
 /** Signals that can be generated/processed by request signal handlers
  *
+ * This is a bitfield so that it can be used to specify signal masks.
  */
-typedef enum fr_state_signal_t {	/* server action */
-	FR_SIGNAL_INVALID = 0,
-	FR_SIGNAL_RUN,
-	FR_SIGNAL_CANCEL,		//!< Request has been cancelled.  If a module is signalled
-					///< with this, the module should stop processing
-					///< the request and cleanup anything it's done.
-	FR_SIGNAL_DUP,			//!< A duplicate request was received.
-	FR_SIGNAL_DETACH,		//!< Request is being detached from its parent.
-	FR_SIGNAL_RETRY,		//!< a retry timer has hit
-	FR_SIGNAL_TIMEOUT		//!< a retry timeout or max count has hit
-} fr_state_signal_t;
+DIAG_OFF(attributes) /* Stupid GCC */
+typedef enum CC_HINT(flag_enum) : uint8_t {	/* server action */
+	FR_SIGNAL_NONE		= 0x00,	//!< No signals.
+	FR_SIGNAL_CANCEL	= 0x01,	//!< Request has been cancelled.
+					///< If a module is signalled with this, the module
+					///< should stop processing the request and cleanup
+					///< anything it's done.
+	FR_SIGNAL_DUP		= 0x02,	//!< A duplicate request was received.
+	FR_SIGNAL_DETACH	= 0x04,	//!< Request is being detached from its parent.
+	FR_SIGNAL_RETRY		= 0x08,	//!< a retry timer has hit
+	FR_SIGNAL_TIMEOUT	= 0x10	//!< a retry timeout or max count has hit
+} fr_signal_t;
+DIAG_ON(attributes)
+
+/** Signal mask which blocks every signal except the ones in _signals
+ *
+ * The sigmask of a yield function lists the signals to block.  To allow a
+ * set of signals, the mask blocks the complement of that set.
+ *
+ * @param[in] _signals	to allow, e.g. FR_SIGNAL_CANCEL | FR_SIGNAL_DUP.
+ */
+#define FR_SIGNAL_ALLOW(_signals)	((fr_signal_t)~(_signals))
+
+#define fr_signal_is_cancel(_signal)	(_signal & FR_SIGNAL_CANCEL)
+#define fr_signal_is_dup(_signal)	(_signal & FR_SIGNAL_DUP)
+#define fr_signal_is_detach(_signal)	(_signal & FR_SIGNAL_DETACH)
+#define fr_signal_is_retry(_signal)	(_signal & FR_SIGNAL_RETRY)
+#define fr_signal_is_timeout(_signal)	(_signal & FR_SIGNAL_TIMEOUT)
 
 #ifdef __cplusplus
 }

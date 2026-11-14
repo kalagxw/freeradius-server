@@ -14,7 +14,7 @@
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-/** Common functions for test files which need to programatically create test dictionaries
+/** Common functions for test files which need to programmatically create test dictionaries
  *
  * @file src/lib/util/dict_test.c
  *
@@ -73,7 +73,15 @@ fr_dict_attr_t const *fr_dict_attr_test_vendor_string;
 
 fr_dict_attr_t const *fr_dict_attr_test_group;
 
+fr_dict_attr_t const *fr_dict_attr_test_nested_top_tlv;
+fr_dict_attr_t const *fr_dict_attr_test_nested_child_tlv;
+fr_dict_attr_t const *fr_dict_attr_test_nested_leaf_string;
+fr_dict_attr_t const *fr_dict_attr_test_nested_leaf_int32;
+
 fr_dict_attr_t const *fr_dict_attr_test_enum;
+
+static fr_value_box_t enum_test_0 = FR_VALUE_BOX_INITIALISER(enum_test_0, FR_TYPE_UINT32, .uint32, 123);
+static fr_value_box_t enum_test_1 = FR_VALUE_BOX_INITIALISER(enum_test_1, FR_TYPE_UINT32, .uint32, 321);
 
 fr_dict_test_attr_t const fr_dict_test_attrs[] = {
 	/*
@@ -112,7 +120,7 @@ fr_dict_test_attr_t const fr_dict_test_attrs[] = {
 
 	{ .attr = FR_TEST_ATTR_DATE, .da = &fr_dict_attr_test_date, .name = "Test-Date", .type = FR_TYPE_DATE },
 
-	{ .attr = FR_TEST_ATTR_TIME_DELTA, .da = &fr_dict_attr_test_date, .name = "Test-Time-Delta", .type = FR_TYPE_TIME_DELTA },
+	{ .attr = FR_TEST_ATTR_TIME_DELTA, .da = &fr_dict_attr_test_time_delta, .name = "Test-Time-Delta", .type = FR_TYPE_TIME_DELTA },
 
 	{ .attr = FR_TEST_ATTR_SIZE, .da = &fr_dict_attr_test_size, .name = "Test-Time-Size", .type = FR_TYPE_SIZE },
 
@@ -123,7 +131,7 @@ fr_dict_test_attr_t const fr_dict_test_attrs[] = {
 	{ .attr = FR_TEST_ATTR_TLV_STRING, .parent = &fr_dict_attr_test_tlv, .da = &fr_dict_attr_test_tlv_string, .name = "String", .type = FR_TYPE_STRING },
 
 	{ .attr = FR_TEST_ATTR_STRUCT, .da = &fr_dict_attr_test_struct, .name = "Test-Struct", .type = FR_TYPE_STRUCT },
-	{ .attr = 1, .parent = &fr_dict_attr_test_struct, .da = &fr_dict_attr_test_struct_uint32, .name = "uint32", .type = FR_TYPE_UINT32 },
+	{ .attr = (fr_dict_test_attr_number_t)1, .parent = &fr_dict_attr_test_struct, .da = &fr_dict_attr_test_struct_uint32, .name = "uint32", .type = FR_TYPE_UINT32 },
 
 	{ .attr = FR_TEST_ATTR_VSA, .da = &fr_dict_attr_test_vsa, .name = "Test-VSA", .type = FR_TYPE_VSA },
 	{ .attr = FR_TEST_ATTR_VENDOR, .parent = &fr_dict_attr_test_vsa, .da = &fr_dict_attr_test_vendor, .name = "Test-Vendor", .type = FR_TYPE_VENDOR },
@@ -132,12 +140,20 @@ fr_dict_test_attr_t const fr_dict_test_attrs[] = {
 	{ .attr = FR_TEST_ATTR_GROUP, .da = &fr_dict_attr_test_group, .name = "Test-Group", .type = FR_TYPE_GROUP },
 
 	/*
+	 *	Deeper nesting
+	 */
+	{ .attr = FR_TEST_ATTR_NESTED_TOP_TLV, .da = &fr_dict_attr_test_nested_top_tlv, .name = "Test-Nested-Top-TLV", .type = FR_TYPE_TLV },
+	{ .attr = FR_TEST_ATTR_NESTED_CHILD_TLV, .parent = &fr_dict_attr_test_nested_top_tlv, .da = &fr_dict_attr_test_nested_child_tlv, .name = "Child-TLV", .type = FR_TYPE_TLV },
+	{ .attr = FR_TEST_ATTR_NESTED_LEAF_STRING, .parent = &fr_dict_attr_test_nested_child_tlv, .da = &fr_dict_attr_test_nested_leaf_string, .name = "Leaf-String", .type = FR_TYPE_STRING },
+	{ .attr = FR_TEST_ATTR_NESTED_LEAF_INT32, .parent = &fr_dict_attr_test_nested_child_tlv, .da = &fr_dict_attr_test_nested_leaf_int32, .name = "Leaf-Int32", .type = FR_TYPE_INT32 },
+
+	/*
 	 *	Enumeration
 	 */
 	{ .attr = FR_TEST_ATTR_ENUM, .da = &fr_dict_attr_test_enum, .name = "Test-Enum", .type = FR_TYPE_UINT32,
 	  .values = (fr_dict_test_attr_value_t[]){
-		{ .key = "test123", .val = { .type = FR_TYPE_UINT32, .vb_uint32 = 123 } },
-		{ .key = "test321", .val = { .type = FR_TYPE_UINT32, .vb_uint32 = 321 } },
+		{ .key = "test123", .val = &enum_test_0},
+		{ .key = "test321", .val = &enum_test_1},
 		{ .key = NULL, },
 	  }
 	},
@@ -209,7 +225,7 @@ int fr_dict_test_attrs_init(fr_dict_t *dict, fr_dict_test_attr_t const *test_def
 
 			for (v = p->values;
 			     v->key != NULL;
-			     v++) fr_dict_enum_add_name(fr_dict_attr_unconst(attr), v->key, &v->val, false, false);
+			     v++) fr_dict_enum_add_name(fr_dict_attr_unconst(attr), v->key, v->val, false, false);
 		}
 
 		*p->da = attr;
@@ -234,7 +250,7 @@ int fr_dict_test_init(TALLOC_CTX *ctx, fr_dict_t **dict_p, fr_dict_test_attr_t c
 	fr_dict_gctx_t const	*our_dict_gctx;
 	fr_dict_t		*dict;
 
-	our_dict_gctx = fr_dict_global_ctx_init(ctx, "share/dictionary");
+	our_dict_gctx = fr_dict_global_ctx_init(ctx, false, "share/dictionary");
 	if (!our_dict_gctx) return -1;
 
 	if (!test_defs) test_defs = fr_dict_test_attrs;

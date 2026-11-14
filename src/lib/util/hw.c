@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License, version 2 of the
  *   License as published by the Free Software Foundation.
  *
@@ -23,7 +23,17 @@
 
 #define CACHE_LINE_DEFAULT	128
 
+/*
+ *	fr_hw_num_cores_active() on Linux reports a failure as 0 cores,
+ *	and does not use a default.
+ */
+#ifndef __linux__
+#  define CORES_DEFAULT		1
+#endif
+
 #include <freeradius-devel/util/hw.h>
+#include <freeradius-devel/util/syserror.h>
+#include <freeradius-devel/util/strerror.h>
 
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/sysctl.h>
@@ -37,8 +47,19 @@ size_t fr_hw_cache_line_size(void)
 	return cache_line_size;
 }
 
+uint32_t fr_hw_num_cores_active(void)
+{
+	uint32_t num_cores		= CORES_DEFAULT;
+	size_t num_cores_len		= sizeof(num_cores);
+
+	sysctlbyname("hw.physicalcpu", &num_cores, &num_cores_len, 0, 0);
+
+	return num_cores;
+}
+
 #elif defined(__linux__)
 #include <stdio.h>
+#include <unistd.h>
 size_t fr_hw_cache_line_size(void)
 {
 	FILE *file			= NULL;
@@ -46,7 +67,7 @@ size_t fr_hw_cache_line_size(void)
 
 	file = fopen("/sys/devices/system/cpu/cpu0/cache/index0/coherency_cache_line_size", "r");
 	if (file) {
-		if (fscanf(file, "%d", &cache_line_size) != 1) {
+		if (fscanf(file, "%u", &cache_line_size) != 1) {
 			cache_line_size = CACHE_LINE_DEFAULT;
 		}
 		fclose(file);
@@ -55,9 +76,62 @@ size_t fr_hw_cache_line_size(void)
 	return cache_line_size;
 }
 
+uint32_t fr_hw_num_cores_active(void)
+{
+	uint32_t lcores = 0, tsibs = 0;
+
+	char buff[32];
+	char path[64];
+
+	for (lcores = 0;;lcores++) {
+		FILE *cpu;
+
+		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u/topology/thread_siblings_list", lcores);
+
+		cpu = fopen(path, "r");
+		if (!cpu) break;
+
+		/*
+		 *	Each number is a sibling.  EOF is non-zero, so a
+		 *	test against zero does not stop at the end of the
+		 *	file.  Test for the one requested conversion.
+		 */
+		while (fscanf(cpu, "%31[0-9]", buff) == 1) {
+			tsibs++;
+			if (fgetc(cpu) != ',') break;
+		}
+
+		fclose(cpu);
+	}
+
+	/*
+	 *	Catch Linux weirdness.
+	 *
+	 *	You'd think this would be enough to quiet clang scan,
+	 *	but it's not.
+	 */
+	if (unlikely((tsibs == 0) || (lcores == 0) || (lcores > tsibs))) {
+		fr_strerror_printf("Failed retrieving cpu topology info: %s", fr_syserror(errno));
+		return 0;
+	}
+
+#ifdef STATIC_ANALYZER
+	/*
+	 *	Prevent static analyzer from warning about divide by zero
+	 */
+	if ((tsibs / lcores) == 0) return 0;
+#endif
+
+	return lcores / (tsibs / lcores);
+}
 #else
 size_t fr_hw_cache_line_size(void)
 {
 	return CACHE_LINE_DEFAULT;
+}
+
+uint32_t fr_hw_num_cores_active(void)
+{
+	return CORES_DEFAULT;
 }
 #endif

@@ -21,12 +21,13 @@
  * @author Jorge Pereira <jpereira@freeradius.org>
  *
  * @copyright 2021 The FreeRADIUS server project.
- * @copyright 2021 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2021 Network RADIUS SAS (legal@networkradius.com)
  */
 
 RCSID("$Id$")
 
-#include <freeradius-devel/util/base.h>
+#include <freeradius-devel/util/pair.h>
+
 #include "tftp.h"
 #include "attrs.h"
 
@@ -37,7 +38,7 @@ fr_dict_t const *dict_tftp;
 extern fr_dict_autoload_t libfreeradius_tftp[];
 fr_dict_autoload_t libfreeradius_tftp[] = {
 	{ .out = &dict_tftp, .proto = "tftp" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 fr_dict_attr_t const *attr_tftp_block;
@@ -64,7 +65,7 @@ fr_dict_attr_autoload_t libfreeradius_tftp_dict_attr[] = {
 
 	{ .out = &attr_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_tftp },
 
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 char const *fr_tftp_codes[FR_TFTP_MAX_CODE] = {
@@ -86,31 +87,34 @@ char const *fr_tftp_error_codes[FR_TFTP_MAX_ERROR_CODE] = {
 	[FR_ERROR_CODE_VALUE_NO_SUCH_USER] = "No such user"
 };
 
-int fr_tftp_init(void)
+int fr_tftp_global_init(void)
 {
 	if (instance_count > 0) {
 		instance_count++;
 		return 0;
 	}
 
+	instance_count++;
+
 	if (fr_dict_autoload(libfreeradius_tftp) < 0) {
-		fr_strerror_printf_push("Failed loading the 'tftp' dictionary");
+	fail:
+		instance_count--;
 		return -1;
 	}
 
 	if (fr_dict_attr_autoload(libfreeradius_tftp_dict_attr) < 0) {
-		fr_strerror_printf("Failed loading the 'tftp' attributes");
 		fr_dict_autofree(libfreeradius_tftp);
-		return -1;
+		goto fail;
 	}
 
-	instance_count++;
 
 	return 0;
 }
 
-void fr_tftp_free(void)
+void fr_tftp_global_free(void)
 {
+	fr_assert(instance_count > 0);
+
 	if (--instance_count > 0) return;
 
 	fr_dict_autofree(libfreeradius_tftp);

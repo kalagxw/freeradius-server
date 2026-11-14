@@ -22,15 +22,14 @@
 
 RCSID("$Id$")
 
-
 #include <freeradius-devel/server/cf_file.h>
+#include <freeradius-devel/server/main_config.h>
 #include <freeradius-devel/server/modpriv.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/util/atexit.h>
+#include <freeradius-devel/util/file.h>
 
 #include <freeradius-devel/util/conf.h>
-#include <freeradius-devel/util/base.h>
-
-#include <ctype.h>
 
 #ifdef HAVE_GETOPT_H
 #  include <getopt.h>
@@ -53,14 +52,14 @@ extern fr_dict_autoload_t unit_test_module_dict[];
 fr_dict_autoload_t unit_test_module_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 
 static NEVER_RETURNS void usage(char *argv[])
 {
 	fprintf(stderr, "usage: %s [OPTS] filename ...\n", argv[0]);
-	fprintf(stderr, "  -d <raddb>         Set user dictionary directory (defaults to " RADDBDIR ").\n");
+	fprintf(stderr, "  -d <confdir>       Set user dictionary directory (defaults to " CONFDIR ").\n");
 	fprintf(stderr, "  -D <dictdir>       Set main dictionary directory (defaults to " DICTDIR ").\n");
 	fprintf(stderr, "  -x                 Debugging mode.\n");
 	fprintf(stderr, "  -M                 Show program version information.\n");
@@ -74,22 +73,21 @@ static int process_file(char const *filename)
 	int		rcode;
 	char const	*name1, *name2;
 	CONF_SECTION	*cs;
-	fr_map_list_t	list;
+	map_list_t	list;
 	map_t		*map = NULL;
 	char		buffer[8192];
 
 	main_config_t	*config;
 
 	tmpl_rules_t	parse_rules = {
-		.dict_def = dict_radius,
-		.allow_foreign = true	/* Because we don't know what protocol we're operating with */
+		.attr = {
+			.dict_def = dict_radius,
+			.list_def = request_attr_request,
+			.allow_foreign = false, /* tests are in the RADIUS dictionary */
+		}
 	};
 
-	fr_map_list_init(&list);
-	/*
-	 *	Must be called first, so the handler is called last
-	 */
-	fr_atexit_global_setup();
+	map_list_init(&list);
 
 	config = main_config_alloc(NULL);
 	if (!config) {
@@ -97,8 +95,12 @@ static int process_file(char const *filename)
 		return EXIT_FAILURE;
 	}
 	config->root_cs = cf_section_alloc(config, NULL, "main", NULL);
-	if ((cf_file_read(config->root_cs, filename) < 0) || (cf_section_pass2(config->root_cs) < 0)) {
+	cf_section_set_unlang(config->root_cs);
+
+	if ((cf_file_read(config->root_cs, filename, true) < 0) || (cf_section_pass2(config->root_cs) < 0)) {
 		fprintf(stderr, "unit_test_map: Failed parsing %s\n", filename);
+	fail:
+		talloc_free(config);
 		return EXIT_FAILURE;
 	}
 
@@ -108,10 +110,7 @@ static int process_file(char const *filename)
 	 *	Always has to be an "update" section.
 	 */
 	cs = cf_section_find(config->root_cs, "update", CF_IDENT_ANY);
-	if (!cs) {
-		talloc_free(config->root_cs);
-		return EXIT_FAILURE;
-	}
+	if (!cs) goto fail;
 
 	/*
 	 *	Convert the update section to a list of maps.
@@ -119,11 +118,11 @@ static int process_file(char const *filename)
 	rcode = map_afrom_cs(cs, &list, cs, &parse_rules, &parse_rules, unlang_fixup_update, NULL, 128);
 	if (rcode < 0) {
 		cf_log_perr(cs, "map_afrom_cs failed");
-		return EXIT_FAILURE; /* message already printed */
+		goto fail;
 	}
-	if (fr_dlist_empty(&list)) {
+	if (map_list_empty(&list)) {
 		cf_log_err(cs, "'update' sections cannot be empty");
-		return EXIT_FAILURE;
+		goto fail;
 	}
 
 	buffer[0] = '\t';
@@ -140,7 +139,7 @@ static int process_file(char const *filename)
 		printf("%s %s {\n", name1, name2);
 	}
 
-	while ((map = fr_dlist_next(&list, map))) {
+	while ((map = map_list_next(&list, map))) {
 		map_print(&FR_SBUFF_OUT(buffer + 1, sizeof(buffer) - 1), map);
 		puts(buffer);
 	}
@@ -159,13 +158,12 @@ static int process_file(char const *filename)
 int main(int argc, char *argv[])
 {
 	int			c, ret = EXIT_SUCCESS;
-	char const		*raddb_dir = RADDBDIR;
+	char const		*confdir = CONFDIR;
 	char const		*dict_dir = DICTDIR;
 	fr_dict_t		*dict = NULL;
 	char const		*receipt_file = NULL;
 
 	TALLOC_CTX		*autofree;
-	fr_dict_gctx_t const	*dict_gctx = NULL;
 
 	/*
 	 *	Must be called first, so the handler is called last
@@ -174,12 +172,11 @@ int main(int argc, char *argv[])
 
 	autofree = talloc_autofree_context();
 
-#ifndef NDEBUG
-	if (fr_fault_setup(autofree, getenv("PANIC_ACTION"), argv[0]) < 0) {
+	if (fr_fault_setup(autofree, getenv("PANIC_ACTION"), argv[0], PANIC_ACTION_SIGNALS) < 0) {
 		fr_perror("unit_test_map");
 		fr_exit(EXIT_FAILURE);
 	}
-#else
+#ifdef NDEBUG
 	fr_disable_null_tracking_on_free(autofree);
 #endif
 
@@ -195,7 +192,7 @@ int main(int argc, char *argv[])
 
 	while ((c = getopt(argc, argv, "d:D:xMhr:")) != -1) switch (c) {
 		case 'd':
-			raddb_dir = optarg;
+			confdir = optarg;
 			break;
 
 		case 'D':
@@ -234,8 +231,7 @@ int main(int argc, char *argv[])
 		EXIT_WITH_FAILURE;
 	}
 
-	dict_gctx = fr_dict_global_ctx_init(autofree, dict_dir);
-	if (!dict_gctx) {
+	if (!fr_dict_global_ctx_init(NULL, true, dict_dir)) {
 		fr_perror("unit_test_map");
 		EXIT_WITH_FAILURE;
 	}
@@ -248,7 +244,7 @@ int main(int argc, char *argv[])
 	/*
 	 *	Load the custom dictionary
 	 */
-	if (fr_dict_read(dict, raddb_dir, FR_DICTIONARY_FILE) == -1) {
+	if (fr_dict_read(dict, confdir, FR_DICTIONARY_FILE) == -1) {
 		fr_strerror_const_push("Failed to initialize the dictionaries");
 		fr_perror("unit_test_map");
 		EXIT_WITH_FAILURE;
@@ -259,21 +255,31 @@ int main(int argc, char *argv[])
 		EXIT_WITH_FAILURE;
 	}
 
+	if (request_global_init() < 0) {
+		fr_perror("unit_test_module");
+		EXIT_WITH_FAILURE;
+	}
+
 	if (argc < 2) {
 		ret = process_file("-");
 
 	} else {
-		ret = process_file(argv[1]);
-	}
+		int i;
 
-	if (ret < 0) ret = 1; /* internal to Unix process return code */
+		for (i = 1; i < argc; i++) {
+			ret = process_file(argv[i]);
+			if (ret != EXIT_SUCCESS) break;
+		}
+	}
 
 cleanup:
 	/*
-	 *	Try really hard to free any allocated
-	 *	memory, so we get clean talloc reports.
+	 *	Ensure all thread local memory is cleaned up
+	 *	at the appropriate time.  This emulates what's
+	 *	done with worker/network threads in the
+	 *	scheduler.
 	 */
-	xlat_free();
+	fr_atexit_thread_trigger_all();
 
 	/*
 	 *	Free any autoload dictionaries
@@ -288,15 +294,16 @@ cleanup:
 		ret = EXIT_FAILURE;
 	}
 
-	if (fr_dict_global_ctx_free(dict_gctx) < 0) {
-		fr_perror("unit_test_map");
-		ret = EXIT_FAILURE;
-	}
-
 	if (receipt_file && (ret == EXIT_SUCCESS) && (fr_touch(NULL, receipt_file, 0644, true, 0755) <= 0)) {
 		fr_perror("unit_test_map");
 		ret = EXIT_FAILURE;
 	}
+
+	/*
+	 *	Ensure our atexit handlers run before any other
+	 *	atexit handlers registered by third party libraries.
+	 */
+	fr_atexit_global_trigger_all();
 
 	return ret;
 }

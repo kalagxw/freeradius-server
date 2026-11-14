@@ -1,0 +1,43 @@
+#
+#  Test static IP allocation not given to dynamic users
+#
+
+control.IP-Pool.Name := 'test_static_dynamic'
+
+#
+#  Add a static IP assigned to a calling station not in the request
+#
+%redis_ippool.address.assign(control.IP-Pool.Name, '192.168.0.10/32', 'aa:bb:cc:dd:ee:ff', '192.168.0.0')
+
+#
+#  Check allocation fails - pool only contains an address assigned to another owner
+#
+redis_ippool {
+	invalid = 1
+}
+if (!notfound) {
+	test_fail
+}
+
+#
+#  Add a dynamic IP addresses
+#
+%redis_ippool.subnet.add(control.IP-Pool.Name, '192.168.0.1/32')
+
+#
+#  Check allocation
+#
+redis_ippool {
+	invalid = 1
+}
+if (!updated) {
+	test_fail
+}
+
+if (!(reply.Framed-IP-Address == 192.168.0.1)) {
+	test_fail
+}
+
+reply := {}
+
+test_pass

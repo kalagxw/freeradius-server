@@ -1,5 +1,6 @@
+#pragma once
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -22,12 +23,15 @@
  * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  *
  * @copyright 2016-2019 The FreeRADIUS server project
- * @copyright 2016-2019 Network RADIUS SARL <sales@networkradius.com>
+ * @copyright 2016-2019 Network RADIUS SAS <legal.com>
  */
 RCSIDH(lib_eap_aka_sim_module_h, "$Id$")
 
 #include <freeradius-devel/server/cf_util.h>
+#include <freeradius-devel/server/virtual_servers.h>
 #include <freeradius-devel/eap/types.h>
+
+#include <freeradius-devel/tls/openssl_user_macros.h>
 #include <openssl/evp.h>
 
 #ifdef __cplusplus
@@ -35,7 +39,7 @@ extern "C" {
 #endif
 
 typedef struct {
-	CONF_SECTION    		*virtual_server;		//!< Virtual server.
+	virtual_server_t    		*virtual_server;		//!< Virtual server.
 
 	/** Whether we should include a bid-down prevention attribute by default
 	 *
@@ -73,11 +77,13 @@ typedef struct {
 							///< before validating.
 	size_t			response_hmac_extra_len;
 
+	unlang_result_t		virtual_server_result;
+
 	fr_aka_sim_checkcode_t	*checkcode_state;	//!< Digest of all identity packets we've seen.
 	fr_aka_sim_ctx_t	ctx;
 } eap_aka_sim_mod_session_t;
 
-unlang_action_t		eap_aka_sim_process(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request);
+unlang_action_t		eap_aka_sim_process(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request);
 
 #ifdef __cplusplus
 }

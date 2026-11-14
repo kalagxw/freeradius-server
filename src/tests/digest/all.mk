@@ -13,7 +13,7 @@ $(eval $(call TEST_BOOTSTRAP))
 #
 #  Ensure that the digest tests are run if the server or rlm_digest module changes
 #
-$(FILES.$(TEST)): $(BUILD_DIR)/lib/rlm_digest.la $(BUILD_DIR)/bin/radiusd $(BUILD_DIR)/bin/radclient
+$(FILES.$(TEST)): $(BUILD_DIR)/lib/rlm_digest.la $(BUILD_DIR)/lib/local/rlm_digest.la $(BUILD_DIR)/bin/radiusd$(E) $(BUILD_DIR)/bin/radclient$(E)
 
 #
 #	Config settings
@@ -28,25 +28,43 @@ DIGEST_GDB_LOG    := $(DIGEST_BUILD_DIR)/gdb.log
 CLIENT := radclient
 include src/tests/radiusd.mk
 $(eval $(call RADIUSD_SERVICE,digest,$(OUTPUT)))
+#
+#  The server loads its protocol and module libraries at run time, so make
+#  needs telling about them.  The list comes from the config itself.
+#
+$(eval $(call TEST_CONFIG_LIBS,$(DIR)/config/digest.conf,$(OUTPUT)/radiusd.pid))
+
+DIGEST_CMD = \
+	$(TEST_BIN)/radclient \
+	-f $(call SHELL_QUOTE,$@.request) \
+	-xF \
+	-d src/tests/digest/config \
+	-D share/dictionary \
+	127.0.0.1:$(digest_port) \
+	auth \
+	$(SECRET)
 
 #
 #	Run the digest commands against the radiusd.
 #
 $(OUTPUT)/%: $(DIR)/% | $(TEST).radiusd_kill $(TEST).radiusd_start
 	${Q} [ -f $(dir $@)/radiusd.pid ] || exit 1
-	$(eval TARGET := $(patsubst %.txt,%,$(notdir $@)))
+	$(eval TARGET := $(patsubst %.txt,%,$(notdir $@)$(E)))
 	${Q}for _num in $$(sed '/^#.*TESTS/!d; s/.*TESTS//g' $<); do	\
 		echo "DIGEST-TEST $(TARGET)_$${_num}";			\
 		cp -f $< $@.request;					\
 		echo "Vendor-Specific.Test.Test-Name = \"$(TARGET)\"" >> $@.request;		\
 		echo "Vendor-Specific.Test.Test-Number = \"$${_num}\"" >> $@.request;	\
-		if ! $(TEST_BIN)/radclient -f $@.request -xF -d src/tests/digest/config -D share/dictionary 127.0.0.1:$(PORT) auth $(SECRET) > $@.out; then \
-			echo "FAILED";					\
+		if ! $(DIGEST_CMD) > $@.out; then \
+			cat $(DIGEST_RADIUS_LOG);			\
+			echo "FAILED $(TARGET)";			\
 			cat $@.out;					\
 			rm -f $(BUILD_DIR)/tests/test.digest;           \
 			$(MAKE) --no-print-directory test.digest.radiusd_kill; \
-			echo "RADIUSD:   $(RADIUSD_RUN)";		\
-			echo "RADCLIENT: $(TEST_BIN)/radclient -f $@.request -xF -d src/tests/digest/config -D share/dictionary 127.0.0.1:$(PORT) auth $(SECRET)"; \
+			echo "# radiusd"; \
+			echo $(call SHELL_QUOTE,$(RADIUSD_CMD.test.digest)); \
+			echo "# radclient"; \
+			echo $(call SHELL_QUOTE,$(DIGEST_CMD)); \
 			exit 1;						\
 		fi;							\
 		touch $@;						\

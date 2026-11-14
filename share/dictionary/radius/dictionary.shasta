@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -16,7 +16,7 @@ VENDOR		Shasta				3199
 #
 BEGIN-VENDOR	Shasta
 
-ATTRIBUTE	User-Privilege				1	integer
+ATTRIBUTE	User-Privilege				1	uint32
 ATTRIBUTE	Service-Profile				2	string
 ATTRIBUTE	VPN-Name				3	string
 
@@ -25,3 +25,4 @@ VALUE	User-Privilege			Super-User		2
 VALUE	User-Privilege			SSuper-User		3
 
 END-VENDOR	Shasta
+ALIAS		Shasta					Vendor-Specific.Shasta

@@ -20,7 +20,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#include <freeradius-devel/tls/log.h>
+#include <freeradius-devel/tls/strerror.h>
 #include <freeradius-devel/util/proto.h>
 #include <openssl/evp.h>
 #include "common.h"
@@ -32,10 +32,10 @@
 static inline int aes_128_encrypt_block(EVP_CIPHER_CTX *evp_ctx,
 					uint8_t const key[16], uint8_t const in[16], uint8_t out[16])
 {
-	size_t len;
+	int len = 0;
 
 	if (unlikely(EVP_EncryptInit_ex(evp_ctx, EVP_aes_128_ecb(), NULL, key, NULL) != 1)) {
-		fr_tls_log_strerror_printf("Failed initialising AES-128-ECB context");
+		fr_tls_strerror_printf("Failed initialising AES-128-ECB context");
 		return -1;
 	}
 
@@ -50,11 +50,13 @@ static inline int aes_128_encrypt_block(EVP_CIPHER_CTX *evp_ctx,
 	 *	when decrypting.
 	 */
 	EVP_CIPHER_CTX_set_padding(evp_ctx, 0);
-	if (unlikely(EVP_EncryptUpdate(evp_ctx, out, (int *)&len, in, 16) != 1) ||
-	    unlikely(EVP_EncryptFinal_ex(evp_ctx, out + len, (int *)&len) != 1)) {
-		fr_tls_log_strerror_printf("Failed encrypting data");
+	if (unlikely(EVP_EncryptUpdate(evp_ctx, out, &len, in, 16) != 1) ||
+	    unlikely(EVP_EncryptFinal_ex(evp_ctx, out + len, &len) != 1)) {
+		fr_tls_strerror_printf("Failed encrypting data");
 		return -1;
 	}
+
+	EVP_CIPHER_CTX_reset(evp_ctx);
 
 	return 0;
 }
@@ -89,7 +91,7 @@ static int milenage_f1(uint8_t mac_a[MILENAGE_MAC_A_SIZE],
 
 	evp_ctx = EVP_CIPHER_CTX_new();
 	if (!evp_ctx) {
-		fr_tls_log_strerror_printf("Failed allocating EVP context");
+		fr_tls_strerror_printf("Failed allocating EVP context");
 		return -1;
 	}
 
@@ -164,7 +166,7 @@ static int milenage_f2345(uint8_t res[MILENAGE_RES_SIZE],
 
 	evp_ctx = EVP_CIPHER_CTX_new();
 	if (!evp_ctx) {
-		fr_tls_log_strerror_printf("Failed allocating EVP context");
+		fr_tls_strerror_printf("Failed allocating EVP context");
 		return -1;
 	}
 
@@ -249,7 +251,7 @@ int milenage_opc_generate(uint8_t opc[MILENAGE_OPC_SIZE],
 
 	evp_ctx = EVP_CIPHER_CTX_new();
 	if (!evp_ctx) {
-		fr_tls_log_strerror_printf("Failed allocating EVP context");
+		fr_tls_strerror_printf("Failed allocating EVP context");
 		return -1;
 	}
  	ret = aes_128_encrypt_block(evp_ctx, ki, op, tmp);
@@ -338,7 +340,7 @@ int milenage_auts(uint64_t *sqn,
 	if (milenage_f2345(NULL, NULL, NULL, NULL, ak, opc, ki, rand)) return -1;
 	for (i = 0; i < sizeof(sqn_buff); i++) sqn_buff[i] = auts[i] ^ ak[i];
 
-	if (milenage_f1(NULL, mac_s, opc, ki, rand, sqn_buff, amf) || CRYPTO_memcmp(mac_s, auts + 6, 8) != 0) return -1;
+	if (milenage_f1(NULL, mac_s, opc, ki, rand, sqn_buff, amf) || fr_digest_cmp(mac_s, auts + 6, 8) != 0) return -1;
 
 	*sqn = uint48_from_buff(sqn_buff);
 
@@ -433,7 +435,7 @@ int milenage_check(uint8_t ik[MILENAGE_IK_SIZE],
 	FR_PROTO_HEX_DUMP(autn, MILENAGE_AUTN_SIZE, "AUTN");
 	FR_PROTO_HEX_DUMP(rand, MILENAGE_RAND_SIZE, "RAND");
 
-	if (milenage_f2345(res, ck, ik, ak, NULL, opc, ki, rand)) return -1;
+	if (milenage_f2345(res, ik, ck, ak, NULL, opc, ki, rand)) return -1;
 
 	FR_PROTO_HEX_DUMP(res, MILENAGE_RES_SIZE, "RES");
 	FR_PROTO_HEX_DUMP(ck, MILENAGE_CK_SIZE, "CK");
@@ -444,7 +446,7 @@ int milenage_check(uint8_t ik[MILENAGE_IK_SIZE],
 	for (i = 0; i < 6; i++) rx_sqn[i] = autn[i] ^ ak[i];
 	FR_PROTO_HEX_DUMP(rx_sqn, MILENAGE_SQN_SIZE, "SQN");
 
-	if (CRYPTO_memcmp(rx_sqn, sqn_buff, sizeof(rx_sqn)) <= 0) {
+	if (memcmp(rx_sqn, sqn_buff, sizeof(rx_sqn)) <= 0) {
 		uint8_t auts_amf[MILENAGE_AMF_SIZE] = { 0x00, 0x00 }; /* TS 33.102 v7.0.0, 6.3.3 */
 
 		if (milenage_f2345(NULL, NULL, NULL, NULL, ak, opc, ki, rand)) return -1;
@@ -463,7 +465,7 @@ int milenage_check(uint8_t ik[MILENAGE_IK_SIZE],
 
 	FR_PROTO_HEX_DUMP(mac_a, MILENAGE_MAC_A_SIZE, "MAC_A");
 
-	if (CRYPTO_memcmp(mac_a, autn + 8, 8) != 0) {
+	if (fr_digest_cmp(mac_a, autn + 8, 8) != 0) {
 		FR_PROTO_HEX_DUMP(autn + 8, 8, "Received MAC_A");
 		fr_strerror_const("MAC mismatch");
 		return -1;
@@ -476,7 +478,7 @@ int milenage_check(uint8_t ik[MILENAGE_IK_SIZE],
 /*
  *  cc milenage.c -g3 -Wall -DHAVE_DLFCN_H -DTESTING_MILENAGE -DWITH_TLS -I../../../../ -I../../../ -I ../base/ -I /usr/local/opt/openssl/include/ -include ../include/build.h -L /usr/local/opt/openssl/lib/ -l ssl -l crypto -l talloc -L ../../../../../build/lib/local/.libs/ -lfreeradius-server -lfreeradius-tls -lfreeradius-util -o test_milenage && ./test_milenage
  */
-#include <freeradius-devel/util/acutest.h>
+#include <freeradius-devel/util/test/acutest.h>
 
 void test_set_1(void)
 {
@@ -553,7 +555,7 @@ void test_set_1(void)
 	TEST_CHECK(memcmp(ck_out, ck, sizeof(ck_out)) == 0);
 	TEST_CHECK(memcmp(ik_out, ik, sizeof(ik_out)) == 0);
 	TEST_CHECK(memcmp(ak_out, ak, sizeof(ak_out)) == 0);
-	TEST_CHECK(memcmp(ak_resync, ak_resync, sizeof(ak_resync_out)) == 0);
+	TEST_CHECK(memcmp(ak_resync_out, ak_resync, sizeof(ak_resync_out)) == 0);
 }
 
 void test_set_19(void)
@@ -632,7 +634,7 @@ void test_set_19(void)
 	TEST_CHECK(memcmp(ck_out, ck, sizeof(ck_out)) == 0);
 	TEST_CHECK(memcmp(ik_out, ik, sizeof(ik_out)) == 0);
 	TEST_CHECK(memcmp(ak_out, ak, sizeof(ak_out)) == 0);
-	TEST_CHECK(memcmp(ak_resync, ak_resync, sizeof(ak_resync_out)) == 0);
+	TEST_CHECK(memcmp(ak_resync_out, ak_resync, sizeof(ak_resync_out)) == 0);
 }
 
 TEST_LIST = {

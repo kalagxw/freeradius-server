@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2022 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -38,12 +38,11 @@ VALUE	Flags				Rev-Up-To-Date		0x02
 VALUE	Flags				Synthesized-Name	0x04
 VALUE	Flags				Using-Requested-FQDN	0x08
 
-
 ATTRIBUTE	Failover-Expiration-Time		120	date
 ATTRIBUTE	Failover-Max-Unacked-BNDUPD		121	uint32
 ATTRIBUTE	Failover-Max-Client-Lead-Time		122	uint32
-ATTRIBUTE	Failover-Max-Partner-Lifetime		123	uint32
-ATTRIBUTE	Failover-Partner-Lifetime-Sent		124	uint32
+ATTRIBUTE	Failover-Max-Partner-Lifetime		123	date
+ATTRIBUTE	Failover-Partner-Lifetime-Sent		124	date
 ATTRIBUTE	Failover-Partner-Down-Time		125	date
 ATTRIBUTE	Failover-Partner-Raw-CLT-Time		126	date
 ATTRIBUTE	Failover-Protocol-Version		127	struct
@@ -75,4 +74,4 @@ VALUE	Failover-Server-State		Resolution-Interrupted	9
 VALUE	Failover-Server-State		Conflict-Done		10
 
 ATTRIBUTE	Failover-Start-Time-Of-State		133	date
-ATTRIBUTE	Failover-State-Expiration-Time		134	uint32
+ATTRIBUTE	Failover-State-Expiration-Time		134	date

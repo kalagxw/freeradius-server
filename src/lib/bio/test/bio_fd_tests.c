@@ -1,0 +1,793 @@
+/*
+ *   This library is free software; you can redistribute it and/or
+ *   modify it under the terms of the GNU Lesser General Public
+ *   License as published by the Free Software Foundation; either
+ *   version 2.1 of the License, or (at your option) any later version.
+ *
+ *   This library is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ *   Lesser General Public License for more details.
+ *
+ *   You should have received a copy of the GNU Lesser General Public
+ *   License along with this library; if not, write to the Free Software
+ *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+/** Tests for the FD bio
+ *
+ * @file src/lib/bio/test/bio_fd_tests.c
+ *
+ * @copyright 2026 Network RADIUS SAS (legal@networkradius.com)
+ */
+#include <freeradius-devel/util/test/acutest_common_init.h>
+#include <freeradius-devel/util/test/acutest_helpers.h>
+
+#include <freeradius-devel/bio/bio_priv.h>
+#include <freeradius-devel/bio/fd.h>
+#include <freeradius-devel/bio/mem.h>
+#include <freeradius-devel/server/cf_parse.h>
+#include <freeradius-devel/server/cf_util.h>
+#include <freeradius-devel/util/syserror.h>
+
+#include <poll.h>
+
+static int	connected_count;
+static int	error_count;
+static int	timeout_count;
+
+static void	cb_connected(fr_bio_t *bio)	{ (void) bio; connected_count++; }
+static void	cb_error(fr_bio_t *bio)		{ (void) bio; error_count++; }
+static void	cb_timeout(fr_bio_t *bio)	{ (void) bio; timeout_count++; }
+
+/** Open a TCP socket listening on loopback
+ *
+ *  The kernel completes the TCP handshake for any listening socket, and the test needs only the
+ *  handshake.  The test never calls accept(), so the kernel holds the new connection in the backlog of
+ *  the listening socket.
+ *
+ * @param[out] port	the port which the kernel picked.
+ * @return
+ *	- >=0 the listening socket.
+ *	- <0 on error.
+ */
+static int loopback_listen(uint16_t *port)
+{
+	struct sockaddr_in	sin = {
+					.sin_family = AF_INET,
+					.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+				};
+	socklen_t		len = sizeof(sin);
+	int			fd;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return -1;
+
+	if ((bind(fd, (struct sockaddr *) &sin, sizeof(sin)) < 0) ||
+	    (listen(fd, 5) < 0) ||
+	    (getsockname(fd, (struct sockaddr *) &sin, &len) < 0)) {
+		close(fd);
+		return -1;
+	}
+
+	*port = ntohs(sin.sin_port);
+	return fd;
+}
+
+/** A deferred connect which succeeds has to call the connected callback
+ *
+ *  A non-blocking connect() to a listening loopback port can return EINPROGRESS.  On EINPROGRESS,
+ *  fr_bio_fd_connect_full() defers the connect, and the event loop calls fr_bio_fd_el_connect() once
+ *  the socket is writable.  fr_bio_fd_el_connect() then calls connect() a second time.  If the
+ *  handshake has finished, the second connect() can fail with EISCONN, so fr_bio_fd_try_connect() has
+ *  to treat EISCONN as success.
+ *
+ *  The test needs a connect which succeeds, because a connect which fails may not reach
+ *  fr_bio_fd_el_connect().  kqueue can report a refused connect with EV_EOF, and event.c passes EV_EOF
+ *  to the error callback, fr_bio_fd_el_error().
+ */
+static void test_deferred_connect_success_calls_connected_cb(void)
+{
+	TALLOC_CTX		*ctx = talloc_init_const("test");
+	fr_bio_fd_config_t	cfg;
+	fr_bio_t		*bio;
+	fr_event_list_t		*el;
+	fr_time_delta_t		timeout = fr_time_delta_from_sec(5);
+	uint16_t		port;
+	int			listen_fd;
+	int			rcode;
+
+	connected_count = 0;
+	error_count = 0;
+	timeout_count = 0;
+
+	listen_fd = loopback_listen(&port);
+	TEST_CHECK(listen_fd >= 0);
+	if (listen_fd < 0) goto done;
+
+	el = fr_event_list_alloc(ctx, NULL, NULL);
+	TEST_CHECK(el != NULL);
+	if (!el) goto done;
+
+	cfg = (fr_bio_fd_config_t) {
+		.type = FR_BIO_FD_CONNECTED,
+		.socket_type = SOCK_STREAM,
+		.transport_type = FR_BIO_FD_TRANSPORT_TCP,
+		.async = true,
+		.src_ipaddr = {
+			.af = AF_INET,
+			.addr.v4.s_addr = htonl(INADDR_LOOPBACK),
+			.prefix = 32,
+		},
+		.dst_port = port,
+	};
+	cfg.dst_ipaddr = cfg.src_ipaddr;
+
+	bio = fr_bio_fd_alloc(ctx, &cfg, 0);
+	TEST_CHECK(bio != NULL);
+	if (!bio) goto done;
+
+	rcode = fr_bio_fd_connect_full(bio, el, cb_connected, cb_error, &timeout, cb_timeout);
+
+	/*
+	 *	FreeBSD completes a loopback TCP handshake inside connect(), so the connect can
+	 *	finish at once (rcode 1).  Linux and macOS return EINPROGRESS and defer it (rcode 0).
+	 */
+	TEST_CHECK(rcode >= 0);
+	TEST_MSG("connect_full returned %d.  0 means deferred, 1 means connected at once, <0 means failed", rcode);
+	if (rcode < 0) goto done;
+
+	/*
+	 *	Wait in the event loop until one of the three callbacks runs.  The connect timeout
+	 *	is a timer, so a wait always ends, and a connect which never finishes cannot hang
+	 *	the test.
+	 */
+	while (!connected_count && !error_count && !timeout_count) {
+		if (fr_event_corral(el, fr_time(), true) < 0) break;
+		fr_event_service(el);
+	}
+
+	TEST_CASE("the connected callback ran");
+	TEST_CHECK(connected_count == 1);
+	TEST_MSG("connected_count = %d, error_count = %d, timeout_count = %d, connect_errno = %d",
+		 connected_count, error_count, timeout_count, fr_bio_fd_info(bio)->connect_errno);
+
+	TEST_CASE("neither the error callback nor the timeout callback ran");
+	TEST_CHECK(error_count == 0);
+	TEST_CHECK(timeout_count == 0);
+
+	TEST_CASE("the bio is open");
+	TEST_CHECK(fr_bio_fd_info(bio)->state == FR_BIO_FD_STATE_OPEN);
+
+done:
+	if (listen_fd >= 0) close(listen_fd);
+	talloc_free(ctx);
+}
+
+/** See if the IPv6 loopback address can be used
+ *
+ *  Some hosts and containers turn IPv6 off.  The socket() or bind() fails there.
+ *
+ * @return
+ *	- 0 the IPv6 loopback address can be used.
+ *	- the errno from the socket() or bind() which failed.  The errno is saved before close() can
+ *	  change it.
+ */
+static int ipv6_loopback_usable(void)
+{
+	struct sockaddr_in6	sin6 = {
+					.sin6_family = AF_INET6,
+					.sin6_addr = IN6ADDR_LOOPBACK_INIT,
+				};
+	int			fd;
+	int			error = 0;
+
+	fd = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (fd < 0) return errno;
+
+	if (bind(fd, (struct sockaddr *) &sin6, sizeof(sin6)) < 0) error = errno;
+	close(fd);
+
+	return error;
+}
+
+/** Read one packet through an unconnected UDP bio bound to the wildcard address
+ *
+ *  The local address of a bio bound to the wildcard address does not identify the address that a
+ *  packet was sent to.  fr_bio_fd_init_common() therefore installs fr_bio_fd_recvfromto4() or
+ *  fr_bio_fd_recvfromto6().  Those two functions read the destination address from a control message
+ *  (data which recvmsg() returns beside the packet), and copy the destination port from the port of
+ *  the bio.
+ *
+ *  fr_bio_fd_common_datagram() also enables receive timestamps, so each packet carries two control
+ *  messages.  If cbuf in fr_bio_fd_t is too small for both control messages, then the bio drops every
+ *  packet.
+ */
+static void recvfromto_test(int af)
+{
+	TALLOC_CTX		*ctx = talloc_init_const("test");
+	fr_bio_fd_config_t	cfg;
+	fr_bio_t		*bio;
+	fr_bio_fd_info_t const	*info;
+	fr_bio_fd_packet_ctx_t	packet_ctx = {};
+	fr_ipaddr_t		loopback;
+	struct sockaddr_storage	to;
+	socklen_t		to_len;
+	uint8_t			buffer[16];
+	ssize_t			rcode;
+	int			fd = -1;
+	struct timeval		recv_timeout = { .tv_sec = 5 };
+	int			error;
+
+	if ((af == AF_INET6) && ((error = ipv6_loopback_usable()) != 0)) {
+		TEST_SKIP("the IPv6 loopback address is not available: %s", fr_syserror(error));
+		talloc_free(ctx);
+		return;
+	}
+
+	cfg = (fr_bio_fd_config_t) {
+		.type = FR_BIO_FD_UNCONNECTED,
+		.socket_type = SOCK_DGRAM,
+		.transport_type = FR_BIO_FD_TRANSPORT_UDP,
+		.src_ipaddr = {
+			.af = af,
+			.prefix = (af == AF_INET) ? 32 : 128,
+		},
+	};
+
+	bio = fr_bio_fd_alloc(ctx, &cfg, 0);
+	TEST_CHECK(bio != NULL);
+	TEST_MSG("fr_bio_fd_alloc failed: %s", fr_strerror());
+	if (!bio) goto done;
+
+	info = fr_bio_fd_info(bio);
+	TEST_CHECK(info->socket.inet.src_port != 0);
+	TEST_MSG("the bio did not learn the port which the kernel picked");
+
+	/*
+	 *	Send one packet to the loopback address and the port of the bio.
+	 */
+	if (af == AF_INET) {
+		loopback = (fr_ipaddr_t) { .af = AF_INET, .prefix = 32, .addr.v4.s_addr = htonl(INADDR_LOOPBACK) };
+	} else {
+		loopback = (fr_ipaddr_t) { .af = AF_INET6, .prefix = 128, .addr.v6 = in6addr_loopback };
+	}
+
+	TEST_CHECK(fr_ipaddr_to_sockaddr(&to, &to_len, &loopback, info->socket.inet.src_port) == 0);
+
+	fd = socket(af, SOCK_DGRAM, 0);
+	TEST_CHECK(fd >= 0);
+	if (fd < 0) goto done;
+
+	/*
+	 *	A failed TEST_CHECK() calls printf(), which may change errno, so save errno first.
+	 */
+	rcode = sendto(fd, "x", 1, 0, (struct sockaddr *) &to, to_len);
+	error = errno;
+	TEST_CHECK(rcode == 1);
+	TEST_MSG("sendto failed: %s", fr_syserror(error));
+	if (rcode != 1) goto done;
+
+	/*
+	 *	The socket of the bio is blocking, so fr_bio_read() waits until the packet arrives.  The
+	 *	receive timeout stops the test from waiting forever if the packet never arrives.
+	 */
+	TEST_CHECK(setsockopt(info->socket.fd, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout)) == 0);
+
+	rcode = fr_bio_read(bio, &packet_ctx, buffer, sizeof(buffer));
+
+	TEST_CASE("the packet is read, not dropped");
+	TEST_CHECK(rcode == 1);
+	TEST_MSG("fr_bio_read returned %zd", rcode);
+	if (rcode != 1) goto done;
+
+	TEST_CASE("the destination is the loopback address and the port of the bio");
+	TEST_CHECK(fr_ipaddr_cmp(&packet_ctx.socket.inet.dst_ipaddr, &loopback) == 0);
+	TEST_CHECK(packet_ctx.socket.inet.dst_port == info->socket.inet.src_port);
+	TEST_MSG("dst_port = %u, expected %u", packet_ctx.socket.inet.dst_port, info->socket.inet.src_port);
+
+done:
+	if (fd >= 0) close(fd);
+	talloc_free(ctx);
+}
+
+static void test_recvfromto4(void)
+{
+	recvfromto_test(AF_INET);
+}
+
+static void test_recvfromto6(void)
+{
+	recvfromto_test(AF_INET6);
+}
+
+/** Accept a TCP connection through a listening bio
+ *
+ *  fr_bio_fd_accept() returns 0 when no connection is waiting, and 1 with a new connected bio when one
+ *  is.  The listening bio must not change: the new socket, its name, and its read and write routines
+ *  all belong to the new bio.
+ */
+static void test_listen_accept(void)
+{
+	TALLOC_CTX		*ctx = talloc_init_const("test");
+	fr_bio_fd_config_t	cfg;
+	fr_bio_t		*listener, *accepted = NULL;
+	fr_bio_fd_info_t const	*linfo, *ainfo;
+	fr_bio_fd_packet_ctx_t	packet_ctx = {};
+	fr_ipaddr_t		loopback = { .af = AF_INET, .prefix = 32, .addr.v4.s_addr = htonl(INADDR_LOOPBACK) };
+	struct sockaddr_storage	to;
+	socklen_t		to_len;
+	struct sockaddr_in	client_addr = {};
+	socklen_t		client_len = sizeof(client_addr);
+	struct pollfd		pfd;
+	char			buffer[16];
+	ssize_t			rcode;
+	int			client = -1;
+	int			fd;
+	uint16_t		port;
+
+	/*
+	 *	A server socket needs a port.  Ask the kernel for a free one, and release it.
+	 */
+	fd = loopback_listen(&port);
+	TEST_CHECK(fd >= 0);
+	if (fd < 0) goto done;
+	close(fd);
+
+	cfg = (fr_bio_fd_config_t) {
+		.type = FR_BIO_FD_LISTEN,
+		.socket_type = SOCK_STREAM,
+		.transport_type = FR_BIO_FD_TRANSPORT_TCP,
+		.async = true,		/* so that an accept() with nothing waiting does not block */
+		.src_ipaddr = loopback,
+		.src_port = port,
+	};
+
+	listener = fr_bio_fd_alloc(ctx, &cfg, 0);
+	TEST_CHECK(listener != NULL);
+	TEST_MSG("fr_bio_fd_alloc failed: %s", fr_strerror());
+	if (!listener) goto done;
+
+	linfo = fr_bio_fd_info(listener);
+	TEST_CASE("an accept with no connection waiting returns 0, and leaves the listener open");
+	rcode = fr_bio_fd_accept(ctx, &accepted, listener);
+	TEST_CHECK(rcode == 0);
+	TEST_MSG("fr_bio_fd_accept returned %zd", rcode);
+	TEST_CHECK(accepted == NULL);
+	TEST_CHECK(fcntl(linfo->socket.fd, F_GETFD) >= 0);
+	if ((rcode != 0) || accepted) goto done;
+
+	TEST_CHECK(fr_ipaddr_to_sockaddr(&to, &to_len, &loopback, linfo->socket.inet.src_port) == 0);
+	client = socket(AF_INET, SOCK_STREAM, 0);
+	TEST_CHECK(client >= 0);
+	if (client < 0) goto done;
+	TEST_CHECK(connect(client, (struct sockaddr *) &to, to_len) == 0);
+	TEST_CHECK(getsockname(client, (struct sockaddr *) &client_addr, &client_len) == 0);
+
+	/*
+	 *	connect() can return before the connection is queued on the listener.  A listening
+	 *	socket becomes readable once a connection is waiting, so wait for that.
+	 */
+	pfd = (struct pollfd) { .fd = linfo->socket.fd, .events = POLLIN };
+	TEST_CHECK(poll(&pfd, 1, 5000) == 1);
+
+	TEST_CASE("an accept with a connection waiting returns 1 and a connected bio");
+	rcode = fr_bio_fd_accept(ctx, &accepted, listener);
+	TEST_CHECK(rcode == 1);
+	TEST_MSG("fr_bio_fd_accept returned %zd", rcode);
+	TEST_CHECK(accepted != NULL);
+	if ((rcode != 1) || !accepted) goto done;
+
+	ainfo = fr_bio_fd_info(accepted);
+	TEST_CHECK(ainfo->type == FR_BIO_FD_CONNECTED);
+	TEST_CHECK(ainfo->state == FR_BIO_FD_STATE_OPEN);
+	TEST_CHECK((ainfo->socket.fd >= 0) && (ainfo->socket.fd != linfo->socket.fd));
+	TEST_CHECK(ainfo->name != NULL);
+
+	TEST_CASE("the remote end of the new bio is the client");
+	TEST_CHECK(fr_ipaddr_cmp(&ainfo->socket.inet.dst_ipaddr, &loopback) == 0);
+	TEST_CHECK(ainfo->socket.inet.dst_port == ntohs(client_addr.sin_port));
+	TEST_MSG("dst_port = %u, expected %u", ainfo->socket.inet.dst_port, ntohs(client_addr.sin_port));
+
+	TEST_CASE("the listener is unchanged");
+	TEST_CHECK(linfo->type == FR_BIO_FD_LISTEN);
+	TEST_CHECK(fr_bio_read(listener, &packet_ctx, buffer, sizeof(buffer)) < 0);
+
+	TEST_CASE("the new bio carries data in both directions");
+	TEST_CHECK(fr_bio_write(accepted, &packet_ctx, "x", 1) == 1);
+	TEST_CHECK(recv(client, buffer, sizeof(buffer), 0) == 1);
+	TEST_CHECK(buffer[0] == 'x');
+
+	TEST_CHECK(send(client, "y", 1, 0) == 1);
+
+	/*
+	 *	The new socket is non-blocking, so wait until the byte has arrived.
+	 */
+	pfd = (struct pollfd) { .fd = ainfo->socket.fd, .events = POLLIN };
+	TEST_CHECK(poll(&pfd, 1, 5000) == 1);
+	TEST_CHECK(fr_bio_read(accepted, &packet_ctx, buffer, sizeof(buffer)) == 1);
+	TEST_CHECK(buffer[0] == 'y');
+
+done:
+	if (client >= 0) close(client);
+	talloc_free(ctx);
+}
+
+static int	blocked_count;
+
+static int	cb_write_blocked(fr_bio_t *bio)	{ (void) bio; blocked_count++; return 1; }
+
+/** Open a non-blocking TCP bio to a listening socket which never calls accept()
+ *
+ *  The listening socket has a small receive buffer, and the bio has a small send buffer, so a few
+ *  kilobytes of writes fill both buffers.  The kernel then has no room for another byte.
+ *
+ * @param[in] ctx	to allocate the bio in.
+ * @param[out] listen_out	the listening socket.  The caller closes the socket.
+ * @param[out] bio_out		the connected FD bio.
+ * @return
+ *	- 0 on success.
+ *	- <0 on error.
+ */
+static int blocked_connect(TALLOC_CTX *ctx, int *listen_out, fr_bio_t **bio_out)
+{
+	struct sockaddr_in	sin = {
+					.sin_family = AF_INET,
+					.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+				};
+	socklen_t		len = sizeof(sin);
+	int			rcvbuf = 4096;
+	static fr_bio_fd_config_t cfg;	//!< the FD bio keeps a pointer to this, and outlives this function
+	fr_bio_t		*bio;
+	fr_event_list_t		*el;
+	fr_time_delta_t		timeout = fr_time_delta_from_sec(5);
+	int			fd;
+
+	connected_count = 0;
+	error_count = 0;
+	timeout_count = 0;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return -1;
+
+	(void) setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+	if ((bind(fd, (struct sockaddr *) &sin, sizeof(sin)) < 0) ||
+	    (listen(fd, 5) < 0) ||
+	    (getsockname(fd, (struct sockaddr *) &sin, &len) < 0)) {
+		close(fd);
+		return -1;
+	}
+
+	el = fr_event_list_alloc(ctx, NULL, NULL);
+	if (!el) {
+		close(fd);
+		return -1;
+	}
+
+	cfg = (fr_bio_fd_config_t) {
+		.type = FR_BIO_FD_CONNECTED,
+		.socket_type = SOCK_STREAM,
+		.transport_type = FR_BIO_FD_TRANSPORT_TCP,
+		.async = true,
+		.src_ipaddr = {
+			.af = AF_INET,
+			.addr.v4.s_addr = htonl(INADDR_LOOPBACK),
+			.prefix = 32,
+		},
+		.dst_port = ntohs(sin.sin_port),
+		.send_buff = 4096,
+		.send_buff_is_set = true,
+	};
+	cfg.dst_ipaddr = cfg.src_ipaddr;
+
+	bio = fr_bio_fd_alloc(ctx, &cfg, 0);
+	if (!bio) {
+		close(fd);
+		return -1;
+	}
+
+	if (fr_bio_fd_connect_full(bio, el, cb_connected, cb_error, &timeout, cb_timeout) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	while (!connected_count && !error_count && !timeout_count && (fr_bio_fd_info(bio)->state != FR_BIO_FD_STATE_OPEN)) {
+		if (fr_event_corral(el, fr_time(), true) < 0) break;
+		fr_event_service(el);
+	}
+
+	if (fr_bio_fd_info(bio)->state != FR_BIO_FD_STATE_OPEN) {
+		close(fd);
+		return -1;
+	}
+
+	*listen_out = fd;
+	*bio_out = bio;
+	return 0;
+}
+
+/** Write one byte at a time until the socket has no room
+ *
+ *  A one byte write cannot be partial.  The kernel either takes the byte, or fails the write with
+ *  EAGAIN.  The test therefore exercises the "no bytes accepted" path of the FD bio, which is
+ *  different from the "some bytes accepted" path.
+ *
+ * @return
+ *	- the number of bytes written before the bio blocked.
+ *	- <0 if the bio never blocked, or returned an error other than "would block".
+ */
+static ssize_t write_until_blocked(fr_bio_t *bio)
+{
+	ssize_t	total = 0;
+	int	i;
+
+	for (i = 0; i < (16 * 1024 * 1024); i++) {
+		ssize_t slen;
+
+		slen = fr_bio_write(bio, NULL, "x", 1);
+		if (slen == fr_bio_error(IO_WOULD_BLOCK)) return total;
+		if (slen < 0) return slen;
+
+		total += slen;
+	}
+
+	return -1;
+}
+
+/** A write which blocks with no bytes accepted has to run the write_blocked callback of the head bio
+ *
+ *  The application sets write_blocked on the head of the chain, not on the FD bio.  The FD bio runs
+ *  fr_bio_write_blocked() when a write is partial.  When the socket has no room at all, the write fails
+ *  with EAGAIN, and the FD bio has to run fr_bio_write_blocked() for that case, too.
+ */
+static void test_eagain_calls_head_write_blocked_cb(void)
+{
+	TALLOC_CTX	*ctx = talloc_init_const("test");
+	fr_bio_t	*fd_bio = NULL, *mem;
+	int		listen_fd = -1;
+	ssize_t		written;
+
+	if (blocked_connect(ctx, &listen_fd, &fd_bio) < 0) {
+		TEST_CHECK(0);
+		TEST_MSG("failed opening the connection: %s", fr_strerror());
+		goto done;
+	}
+
+	mem = fr_bio_mem_alloc(ctx, 4096, 4096, fd_bio);
+	TEST_CHECK(mem != NULL);
+	if (!mem) goto done;
+
+	blocked_count = 0;
+	fr_bio_cb_set(mem, &(fr_bio_cb_funcs_t) { .write_blocked = cb_write_blocked });
+
+	written = write_until_blocked(mem);
+	TEST_CHECK(written > 0);
+	TEST_MSG("wrote %zd bytes before the bio blocked", written);
+
+	TEST_CASE("the FD bio is blocked");
+	TEST_CHECK(fr_bio_fd_info(fd_bio)->write_blocked);
+
+	TEST_CASE("the write_blocked callback of the head bio ran once");
+	TEST_CHECK(blocked_count == 1);
+	TEST_MSG("blocked_count = %d", blocked_count);
+
+done:
+	if (listen_fd >= 0) close(listen_fd);
+	talloc_free(ctx);
+}
+
+/** The write_blocked callback of an FD bio with no other bios still runs on EAGAIN
+ *
+ *  The FD bio is the head of the chain, so the head callback is the callback of the FD bio.
+ */
+static void test_eagain_calls_fd_write_blocked_cb(void)
+{
+	TALLOC_CTX	*ctx = talloc_init_const("test");
+	fr_bio_t	*fd_bio = NULL;
+	int		listen_fd = -1;
+	ssize_t		written;
+
+	if (blocked_connect(ctx, &listen_fd, &fd_bio) < 0) {
+		TEST_CHECK(0);
+		TEST_MSG("failed opening the connection: %s", fr_strerror());
+		goto done;
+	}
+
+	blocked_count = 0;
+	fr_bio_cb_set(fd_bio, &(fr_bio_cb_funcs_t) { .write_blocked = cb_write_blocked });
+
+	written = write_until_blocked(fd_bio);
+	TEST_CHECK(written > 0);
+	TEST_MSG("wrote %zd bytes before the bio blocked", written);
+
+	TEST_CASE("the write_blocked callback ran once");
+	TEST_CHECK(blocked_count == 1);
+	TEST_MSG("blocked_count = %d", blocked_count);
+
+done:
+	if (listen_fd >= 0) close(listen_fd);
+	talloc_free(ctx);
+}
+
+/** One key / value pair in the transport subsection of a test configuration
+ */
+typedef struct {
+	char const	*name;
+	char const	*value;
+} cfg_pair_t;
+
+/** Parse "transport" and the transport subsection with fr_bio_fd_client_config
+ *
+ *  The caller sets the socket type before the parse.  rlm_radius sets the type of the socket in the
+ *  same way, as the "mode" decides if the sockets are connected.
+ *
+ * @param[in] ctx	to allocate the configuration in.
+ * @param[out] cfg	where to write the parsed configuration.
+ * @param[in] type	of the socket, set before the parse.
+ * @param[in] transport	name of the transport, which is also the name of the subsection.
+ * @param[in] pairs	for the subsection, terminated by an entry with a NULL name.  May be NULL.
+ * @return
+ *	- 0 on success.
+ *	- <0 on error.
+ */
+static int parse_client_config(TALLOC_CTX *ctx, fr_bio_fd_config_t *cfg, fr_bio_fd_type_t type,
+			       char const *transport, cfg_pair_t const *pairs)
+{
+	CONF_SECTION	*cs, *subcs;
+	int		rcode;
+
+	*cfg = (fr_bio_fd_config_t) { .type = type };
+
+	cs = cf_section_alloc(ctx, NULL, "test", NULL);
+	if (!cs) return -1;
+
+	if (!cf_pair_alloc(cs, "transport", transport, T_OP_EQ, T_BARE_WORD, T_BARE_WORD)) return -1;
+
+	subcs = cf_section_alloc(cs, cs, transport, NULL);
+	if (!subcs) return -1;
+
+	for (; pairs && pairs->name; pairs++) {
+		if (!cf_pair_alloc(subcs, pairs->name, pairs->value, T_OP_EQ, T_BARE_WORD, T_BARE_WORD)) return -1;
+	}
+
+	if (cf_section_rules_push(cs, fr_bio_fd_client_config) < 0) return -1;
+
+	rcode = cf_section_parse(ctx, cfg, cs);
+	talloc_free(cs);
+	return rcode;
+}
+
+/** A client configuration for an unconnected socket accepts "udp"
+ */
+static void test_client_config_unconnected_udp(void)
+{
+	TALLOC_CTX		*ctx = talloc_init_const("test");
+	fr_bio_fd_config_t	cfg;
+	cfg_pair_t const	pairs[] = {
+					{ "src_ipaddr", "127.0.0.1" },
+					{ NULL, NULL }
+				};
+
+	TEST_CHECK(parse_client_config(ctx, &cfg, FR_BIO_FD_UNCONNECTED, "udp", pairs) == 0);
+	TEST_MSG("failed parsing: %s", fr_strerror());
+
+	TEST_CHECK(cfg.socket_type == SOCK_DGRAM);
+	TEST_CHECK(cfg.transport_type == FR_BIO_FD_TRANSPORT_UDP);
+	TEST_CHECK(cfg.src_ipaddr.af == AF_INET);
+
+	talloc_free(ctx);
+}
+
+/** A client configuration for an unconnected socket accepts "tcp"
+ *
+ *  The destination of the socket is not in the configuration, as the caller sets the destination later.
+ */
+static void test_client_config_unconnected_tcp(void)
+{
+	TALLOC_CTX		*ctx = talloc_init_const("test");
+	fr_bio_fd_config_t	cfg;
+	cfg_pair_t const	pairs[] = {
+					{ "src_ipaddr", "127.0.0.1" },
+					{ NULL, NULL }
+				};
+
+	TEST_CHECK(parse_client_config(ctx, &cfg, FR_BIO_FD_UNCONNECTED, "tcp", pairs) == 0);
+	TEST_MSG("failed parsing: %s", fr_strerror());
+
+	TEST_CASE("the socket is a stream socket");
+	TEST_CHECK(cfg.socket_type == SOCK_STREAM);
+	TEST_CHECK(cfg.transport_type == FR_BIO_FD_TRANSPORT_TCP);
+
+	TEST_CASE("the source address is parsed");
+	TEST_CHECK(cfg.src_ipaddr.af == AF_INET);
+
+	TEST_CASE("the socket stays unconnected, with no destination");
+	TEST_CHECK(cfg.type == FR_BIO_FD_UNCONNECTED);
+	TEST_CHECK(cfg.dst_ipaddr.af == AF_UNSPEC);
+
+	talloc_free(ctx);
+}
+
+/** The "tcp" subsection of an unconnected socket takes the stream socket options
+ */
+static void test_client_config_unconnected_tcp_options(void)
+{
+	TALLOC_CTX		*ctx = talloc_init_const("test");
+	fr_bio_fd_config_t	cfg;
+	cfg_pair_t const	pairs[] = {
+					{ "src_ipaddr", "127.0.0.1" },
+					{ "delay_tcp_writes", "yes" },
+					{ "send_buff", "8192" },
+					{ NULL, NULL }
+				};
+
+	TEST_CHECK(parse_client_config(ctx, &cfg, FR_BIO_FD_UNCONNECTED, "tcp", pairs) == 0);
+	TEST_MSG("failed parsing: %s", fr_strerror());
+
+	TEST_CHECK(cfg.tcp_delay == true);
+	TEST_CHECK(cfg.send_buff_is_set == true);
+	TEST_CHECK(cfg.send_buff == 8192);
+
+	talloc_free(ctx);
+}
+
+/** A client configuration for an unconnected socket rejects every transport except "udp" and "tcp"
+ */
+static void test_client_config_unconnected_rejects_other_transports(void)
+{
+	TALLOC_CTX		*ctx = talloc_init_const("test");
+	fr_bio_fd_config_t	cfg;
+	cfg_pair_t const	pairs[] = {
+					{ "filename", "/tmp/unconnected.sock" },
+					{ NULL, NULL }
+				};
+
+	TEST_CHECK(parse_client_config(ctx, &cfg, FR_BIO_FD_UNCONNECTED, "unix", pairs) < 0);
+
+	TEST_CASE("the same holds for a file");
+	TEST_CHECK(parse_client_config(ctx, &cfg, FR_BIO_FD_UNCONNECTED, "file", pairs) < 0);
+
+	talloc_free(ctx);
+}
+
+/** A client configuration for a connected socket still takes the destination of the "tcp" subsection
+ *
+ *  The unconnected sockets have their own "tcp" subsection with no destination, and the change must
+ *  leave the connected sockets alone.
+ */
+static void test_client_config_connected_tcp(void)
+{
+	TALLOC_CTX		*ctx = talloc_init_const("test");
+	fr_bio_fd_config_t	cfg;
+	cfg_pair_t const	pairs[] = {
+					{ "ipaddr", "127.0.0.1" },
+					{ "port", "2083" },
+					{ NULL, NULL }
+				};
+
+	TEST_CHECK(parse_client_config(ctx, &cfg, FR_BIO_FD_CONNECTED, "tcp", pairs) == 0);
+	TEST_MSG("failed parsing: %s", fr_strerror());
+
+	TEST_CHECK(cfg.socket_type == SOCK_STREAM);
+	TEST_CHECK(cfg.transport_type == FR_BIO_FD_TRANSPORT_TCP);
+	TEST_CHECK(cfg.dst_ipaddr.af == AF_INET);
+	TEST_CHECK(cfg.dst_port == 2083);
+
+	talloc_free(ctx);
+}
+
+TEST_LIST = {
+	{ "deferred_connect_success_calls_connected_cb",	test_deferred_connect_success_calls_connected_cb },
+	{ "recvfromto4",					test_recvfromto4 },
+	{ "recvfromto6",					test_recvfromto6 },
+	{ "listen_accept",					test_listen_accept },
+	{ "eagain_calls_head_write_blocked_cb",			test_eagain_calls_head_write_blocked_cb },
+	{ "eagain_calls_fd_write_blocked_cb",			test_eagain_calls_fd_write_blocked_cb },
+	{ "client_config_unconnected_udp",			test_client_config_unconnected_udp },
+	{ "client_config_unconnected_tcp",			test_client_config_unconnected_tcp },
+	{ "client_config_unconnected_tcp_options",		test_client_config_unconnected_tcp_options },
+	{ "client_config_unconnected_rejects_other_transports",	test_client_config_unconnected_rejects_other_transports },
+	{ "client_config_connected_tcp",			test_client_config_connected_tcp },
+	TEST_TERMINATOR
+};

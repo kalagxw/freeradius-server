@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -12,11 +12,12 @@ VENDOR		Unix				4
 
 BEGIN-VENDOR	Unix
 
-ATTRIBUTE	FTP-UID					10	integer
-ATTRIBUTE	FTP-GID					11	integer
+ATTRIBUTE	FTP-UID					10	uint32
+ATTRIBUTE	FTP-GID					11	uint32
 ATTRIBUTE	FTP-Home				12	string
 ATTRIBUTE	FTP-Shell				13	string
 ATTRIBUTE	FTP-Group-Names				14	string
 ATTRIBUTE	FTP-Group-Ids				15	string
 
 END-VENDOR	Unix
+ALIAS		Unix					Vendor-Specific.Unix

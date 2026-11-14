@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -21,8 +21,8 @@
 #
 ##############################################################################
 
-ATTRIBUTE	Sip-Method				101	integer
-ATTRIBUTE	Sip-Response-Code			102	integer
+ATTRIBUTE	Sip-Method				101	uint32
+ATTRIBUTE	Sip-Response-Code			102	uint32
 ATTRIBUTE	Sip-Cseq				103	string
 ATTRIBUTE	Sip-To-Tag				104	string
 ATTRIBUTE	Sip-From-Tag				105	string
@@ -43,3 +43,4 @@ VALUE	Sip-Method			INVITE			1
 VALUE	Sip-Method			CANCEL			2
 VALUE	Sip-Method			ACK			4
 VALUE	Sip-Method			BYE			8
+ALIAS  Vendor-Specific.

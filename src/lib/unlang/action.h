@@ -32,16 +32,21 @@ extern "C" {
  *
  * These deal exclusively with control flow.
  */
-typedef enum {
+typedef enum : int8_t {
 	UNLANG_ACTION_FAIL = -1,		//!< Encountered an unexpected error.
+						/* 0 interntionally left unused to avoid initialisation errors */
 	UNLANG_ACTION_CALCULATE_RESULT = 1,	//!< Calculate a new section #rlm_rcode_t value.
 	UNLANG_ACTION_EXECUTE_NEXT,    		//!< Execute the next #unlang_t.
 	UNLANG_ACTION_PUSHED_CHILD,		//!< #unlang_t pushed a new child onto the stack,
 						//!< execute it instead of continuing.
-	UNLANG_ACTION_UNWIND,			//!< Break out of the current group.
 	UNLANG_ACTION_YIELD,			//!< Temporarily pause execution until an event occurs.
-	UNLANG_ACTION_STOP_PROCESSING		//!< Break out of processing the current request (unwind).
 } unlang_action_t;
+
+#define RETURN_UNLANG_ACTION_FATAL \
+do { \
+	unlang_interpret_signal(request, FR_SIGNAL_CANCEL); \
+	return UNLANG_ACTION_FAIL; \
+} while (0)
 
 #ifdef __cplusplus
 }

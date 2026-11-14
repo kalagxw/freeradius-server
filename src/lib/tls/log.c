@@ -27,13 +27,14 @@ RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #ifdef WITH_TLS
-#define LOG_PREFIX "tls - "
+#define LOG_PREFIX "tls"
 
-#include <freeradius-devel/server/base.h>
 #include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/atexit.h>
+#include <freeradius-devel/tls/strerror.h>
+#include <freeradius-devel/tls/utils.h>
 
 #include "log.h"
-#include "utils.h"
 
 /** Holds the state of a log BIO
  *
@@ -67,6 +68,16 @@ static BIO_METHOD	*tls_request_log_meth;
  */
 static BIO_METHOD	*tls_global_log_meth;
 
+/** Counter for users of the request log bio
+ *
+ */
+static _Atomic(uint32_t) tls_request_log_ref;
+
+/** Counter for users of the global log bio
+ *
+ */
+static _Atomic(uint32_t) tls_global_log_ref;
+
 /** Thread local request log BIO
  */
 static _Thread_local	fr_tls_log_bio_t	*request_log_bio;
@@ -75,25 +86,6 @@ static _Thread_local	fr_tls_log_bio_t	*request_log_bio;
  */
 static _Thread_local	fr_tls_log_bio_t	*global_log_bio;
 
-static void _tls_ctx_print_cert_line(char const *file, int line,
-				     request_t *request, fr_log_type_t log_type, int idx, X509 *cert)
-{
-	char		subject[1024];
-
-	X509_NAME_oneline(X509_get_subject_name(cert), subject, sizeof(subject));
-	subject[sizeof(subject) - 1] = '\0';
-
-	if (request) {
-		log_request(log_type, fr_debug_lvl, request, file, line,
-			    "[%i] %s %s", idx, fr_tls_utils_x509_pkey_type(cert), subject);
-	} else {
-		fr_log(LOG_DST, log_type, file, line,
-		       "[%i] %s %s", idx, fr_tls_utils_x509_pkey_type(cert), subject);
-	}
-}
-
-DIAG_OFF(DIAG_UNKNOWN_PRAGMAS)
-DIAG_OFF(used-but-marked-unused)	/* fix spurious warnings for sk macros */
 /** Print out the current stack of certs
  *
  * @param[in] file	File where this function is being called.
@@ -103,102 +95,69 @@ DIAG_OFF(used-but-marked-unused)	/* fix spurious warnings for sk macros */
  * @param[in] chain	The certificate chain.
  * @param[in] cert	The leaf certificate.
  */
-void _fr_tls_log_certificate_chain(char const *file, int line,
-				   request_t *request, fr_log_type_t log_type, STACK_OF(X509) *chain, X509 *cert)
+void _fr_tls_chain_log(char const *file, int line,
+		       request_t *request, fr_log_type_t log_type,
+		       STACK_OF(X509) *chain, X509 *cert)
 {
-	int i;
-
-	for (i = sk_X509_num(chain); i > 0 ; i--) {
-		_tls_ctx_print_cert_line(file, line, request, log_type, i, sk_X509_value(chain, i - 1));
+	/*
+	 *	Dump to the thread local buffer
+	 */
+	fr_strerror_clear();
+	_fr_tls_strerror_push_chain(file, line, chain, cert);
+	if (request) {
+		log_request_perror(log_type, L_DBG_LVL_OFF, request, file, line, NULL);
+	} else {
+		fr_perror(NULL);
 	}
-	_tls_ctx_print_cert_line(file, line, request, log_type, i, cert);
 }
-DIAG_ON(used-but-marked-unused)
-DIAG_ON(DIAG_UNKNOWN_PRAGMAS)
 
-DIAG_OFF(format-nonliteral)
-/** Print errors in the TLS thread local error stack
+/** Print out the current stack of certs
  *
- * Drains the thread local OpenSSL error queue, and prints out errors.
- *
- * @param[in] request	The current request (may be NULL).
- * @param[in] msg	Error message describing the operation being attempted.
- * @param[in] ap	Arguments for msg.
- * @return the number of errors drained from the stack.
+ * @param[in] file	File where this function is being called.
+ * @param[in] line	Line where this function is being called.
+ * @param[in] request	Current request, may be NULL.
+ * @param[in] log_type	The type of log message to produce L_INFO, L_ERR, L_DBG etc...
+ * @param[in] chain	The certificate chain.
+ * @param[in] cert	The leaf certificate.
+ * @param[in] marker	The certificate we want to mark.
  */
-static int fr_tls_log_error_va(request_t *request, char const *msg, va_list ap)
+void _fr_tls_chain_marker_log(char const *file, int line,
+			      request_t *request, fr_log_type_t log_type,
+			      STACK_OF(X509) *chain, X509 *cert, X509 *marker)
 {
-	unsigned long	error;
-	char		*p;
-	int		in_stack = 0;
-	char		buffer[256];
-
-	int		line;
-	char const	*file;
-	char const	*data;
-	int		flags = 0;
-
 	/*
-	 *	Pop the first error, so ERR_peek_error()
-	 *	can be used to determine if there are
-	 *	multiple errors.
+	 *	Dump to the thread local buffer
 	 */
-	error = ERR_get_error_line_data(&file, &line, &data, &flags);
-	if (!(flags & ERR_TXT_STRING)) data = NULL;
-
-	if (msg) {
-		p = talloc_vasprintf(request, msg, ap);
-
-		/*
-		 *	Single line mode (there's only one error)
-		 */
-		if (error && !ERR_peek_error()) {
-			ERR_error_string_n(error, buffer, sizeof(buffer));
-
-			/* Extra verbose */
-			if ((request && RDEBUG_ENABLED3) || DEBUG_ENABLED3) {
-				ROPTIONAL(REDEBUG, ERROR, "%s: %s[%i]:%s%c%s", p, file, line, buffer,
-					  data ? ':' : '\0', data ? data : "");
-			} else {
-				ROPTIONAL(REDEBUG, ERROR, "%s: %s%c%s", p, buffer,
-					  data ? ':' : '\0', data ? data : "");
-			}
-
-			talloc_free(p);
-
-			return 1;
-		}
-
-		/*
-		 *	Print the error we were given, irrespective
-		 *	of whether there were any OpenSSL errors.
-		 */
-		ROPTIONAL(RERROR, ERROR, "%s", p);
-		talloc_free(p);
+	fr_strerror_clear();
+	_fr_tls_strerror_push_chain_marker(file, line, chain, cert, marker);
+	if (request) {
+		log_request_perror(log_type, L_DBG_LVL_OFF, request, file, line, NULL);
+	} else {
+		fr_perror(NULL);
 	}
-
-	/*
-	 *	Stack mode (there are multiple errors)
-	 */
-	if (!error) return 0;
-	do {
-		if (!(flags & ERR_TXT_STRING)) data = NULL;
-
-		ERR_error_string_n(error, buffer, sizeof(buffer));
-		/* Extra verbose */
-		if ((request && RDEBUG_ENABLED3) || DEBUG_ENABLED3) {
-			ROPTIONAL(REDEBUG, ERROR, "%s[%i]:%s%c%s", file, line, buffer,
-				  data ? ':' : '\0', data ? data : "");
-		} else {
-			ROPTIONAL(REDEBUG, ERROR, "%s%c%s", buffer,
-				  data ? ':' : '\0', data ? data : "");
-		}
-		in_stack++;
-	} while ((error = ERR_get_error_line_data(&file, &line, &data, &flags)));
-
-	return in_stack;
 }
-DIAG_ON(format-nonliteral)
+
+/** Print out the current stack of X509 objects (certificates only)
+ *
+ * @param[in] file		File where this function is being called.
+ * @param[in] line		Line where this function is being called.
+ * @param[in] request		Current request, may be NULL.
+ * @param[in] log_type		The type of log message to produce L_INFO, L_ERR, L_DBG etc...
+ * @param[in] objects		A stack of X509 objects
+ */
+void _fr_tls_x509_objects_log(char const *file, int line,
+			      request_t *request, fr_log_type_t log_type,
+			      STACK_OF(X509_OBJECT) *objects)
+{
+
+	fr_strerror_clear();
+	_fr_tls_strerror_push_x509_objects(file, line, objects);
+	if (request) {
+		log_request_perror(log_type, L_DBG_LVL_OFF, request, file, line, NULL);
+	} else {
+		fr_perror(NULL);
+	}
+}
 
 /** Print errors raised by OpenSSL I/O functions
  *
@@ -214,27 +173,35 @@ DIAG_ON(format-nonliteral)
  *   - SSL_write
  *
  * @param request	The current request (may be NULL).
- * @param session	The current tls_session.
- * @param ret		from the I/O operation.
- * @param msg		Error message describing the operation being attempted.
+ * @param err		returned from SSL_get_error().
+ * @param fmt		Error message describing the operation being attempted.
  * @param ...		Arguments for msg.
  * @return
  *	- 0 TLS session may still be viable.
  *	- -1 TLS session cannot continue.
  */
-int fr_tls_log_io_error(request_t *request, fr_tls_session_t *session, int ret, char const *msg, ...)
+int fr_tls_log_io_error(request_t *request, int err, char const *fmt, ...)
 {
-	int	error;
-	va_list	ap;
+	static fr_table_num_ordered_t const ssl_io_error_table[] = {
+		{ L("SSL_ERROR_NONE"),			SSL_ERROR_NONE			},
+		{ L("SSL_ERROR_ZERO_RETURN"),		SSL_ERROR_ZERO_RETURN		},
+		{ L("SSL_ERROR_WANT_READ"),		SSL_ERROR_WANT_READ		},
+		{ L("SSL_ERROR_WANT_WRITE"),		SSL_ERROR_WANT_WRITE		},
+		{ L("SSL_ERROR_WANT_CONNECT"),		SSL_ERROR_WANT_CONNECT		},
+		{ L("SSL_ERROR_WANT_ACCEPT"),		SSL_ERROR_WANT_ACCEPT		},
+		{ L("SSL_ERROR_WANT_X509_LOOKUP"),	SSL_ERROR_WANT_X509_LOOKUP	},
+		{ L("SSL_ERROR_WANT_ASYNC"),		SSL_ERROR_WANT_ASYNC		},
+		{ L("SSL_ERROR_WANT_ASYNC_JOB"),	SSL_ERROR_WANT_ASYNC_JOB	},
+		{ L("SSL_ERROR_WANT_CLIENT_HELLO_CB"),	SSL_ERROR_WANT_CLIENT_HELLO_CB	},
+		{ L("SSL_ERROR_SYSCALL"),		SSL_ERROR_SYSCALL		},
+		{ L("SSL_ERROR_SSL"),			SSL_ERROR_SSL			}
+	};
+	static size_t ssl_io_error_table_len = NUM_ELEMENTS(ssl_io_error_table);
 
-	if (ERR_peek_error()) {
-		va_start(ap, msg);
-		fr_tls_log_error_va(request, msg, ap);
-		va_end(ap);
-	}
+	va_list ap;
+	char *msg = NULL;
 
-	error = SSL_get_error(session->ssl, ret);
-	switch (error) {
+	switch (err) {
 	/*
 	 *	These seem to be harmless and already "dealt
 	 *	with" by our non-blocking environment. NB:
@@ -252,6 +219,15 @@ int fr_tls_log_io_error(request_t *request, fr_tls_session_t *session, int ret, 
 	case SSL_ERROR_WANT_WRITE:
 	case SSL_ERROR_WANT_X509_LOOKUP:
 	case SSL_ERROR_ZERO_RETURN:
+		if (DEBUG_ENABLED2 || RDEBUG_ENABLED2) {
+			va_start(ap, fmt);
+			msg = fr_vasprintf(NULL, fmt, ap);
+			va_end(ap);
+
+			ROPTIONAL(RDEBUG2, DEBUG2, "(TLS) %s - %s (%i)",
+				  msg, fr_table_str_by_value(ssl_io_error_table, err, "<UNKNOWN>"), err);
+			talloc_free(msg);
+		}
 		break;
 
 	/*
@@ -260,11 +236,26 @@ int fr_tls_log_io_error(request_t *request, fr_tls_session_t *session, int ret, 
 	 *	being regarded as "dead".
 	 */
 	case SSL_ERROR_SYSCALL:
-		ROPTIONAL(REDEBUG, ERROR, "System call (I/O) error (%i)", ret);
+		va_start(ap, fmt);
+		msg = fr_vasprintf(NULL, fmt, ap);
+		va_end(ap);
+
+		ROPTIONAL(REDEBUG, ERROR, "(TLS) %s - System call (I/O) error - %s (%i)",
+			  msg, fr_table_str_by_value(ssl_io_error_table, err, "<UNKNOWN>"), err);
+
+		talloc_free(msg);
 		return -1;
 
+	/*
+	 *	Docs say a more verbose error is available
+	 *	in the normal error stack.
+	 */
 	case SSL_ERROR_SSL:
-		ROPTIONAL(REDEBUG, ERROR, "TLS protocol error (%i)", ret);
+		va_start(ap, fmt);
+		(void)fr_tls_strerror_vprintf(fmt, ap);
+		va_end(ap);
+
+		ROPTIONAL(RPERROR, PERROR, " ");
 		return -1;
 
 	/*
@@ -274,118 +265,89 @@ int fr_tls_log_io_error(request_t *request, fr_tls_session_t *session, int ret, 
 	 *	the code needs updating here.
 	 */
 	default:
-		ROPTIONAL(REDEBUG, ERROR, "TLS session error %i (%i)", error, ret);
+		va_start(ap, fmt);
+		msg = fr_vasprintf(NULL, fmt, ap);
+		va_end(ap);
+
+		ROPTIONAL(REDEBUG, ERROR, "(TLS) %s - TLS session error - %s (%i)",
+			  msg, fr_table_str_by_value(ssl_io_error_table, err, "<UNKNOWN>"), err);
+
+		talloc_free(msg);
+
 		return -1;
 	}
 
 	return 0;
 }
 
-/** Print errors in the TLS thread local error stack
+
+/** Drain the error stack and print it, under a caller supplied prefix
  *
- * Drains the thread local OpenSSL error queue, and prints out errors.
+ * The prefix is what separates the two callers below, and nothing else does,
+ * so they share this.
+ *
+ * @param[in] request	to log through, or NULL for the global log.
+ * @param[in] prefix	printed ahead of the drained stack.
+ * @param[in] msg	describing the operation which failed.
+ * @param[in] ap	arguments for msg.
+ * @return the number of errors drained from the stack.
+ */
+static int tls_log_vperror(request_t *request, char const *prefix, char const *msg, va_list ap)
+{
+	int ret;
+
+	ret = fr_tls_strerror_vprintf(msg, ap);
+
+	ROPTIONAL(RPERROR, PERROR, "%s", prefix);
+
+	return ret;
+}
+
+/** Print errors in the TLS thread local error stack, for a TLS connection
+ *
+ * Drains the thread local OpenSSL error queue, and prints out errors under a
+ * `(TLS) ` prefix.
+ *
+ * Use fr_openssl_log_perror() for an OpenSSL call which has nothing to do
+ * with a TLS connection.
  *
  * @param[in] request	The current request (may be NULL).
  * @param[in] msg	Error message describing the operation being attempted.
  * @param[in] ...	Arguments for msg.
  * @return the number of errors drained from the stack.
  */
-int fr_tls_log_error(request_t *request, char const *msg, ...)
+int fr_tls_log_perror(request_t *request, char const *msg, ...)
 {
 	va_list ap;
 	int ret;
 
 	va_start(ap, msg);
-	ret = fr_tls_log_error_va(request, msg, ap);
+	ret = tls_log_vperror(request, "(TLS) ", msg, ap);
 	va_end(ap);
 
 	return ret;
 }
 
-DIAG_OFF(format-nonliteral)
-/** Print errors in the TLS thread local error stack
+/** Print the OpenSSL error stack, for a call which has nothing to do with a TLS connection
  *
- * Drains the thread local OpenSSL error queue, and prints out the first error
- * storing it in libfreeradius's error buffer.
+ * The same as fr_tls_log_perror(), without the `(TLS) ` prefix.  A module
+ * which signs a value, hashes a password, or reads a certificate from disk is
+ * calling OpenSSL without a TLS connection anywhere in sight, and marking
+ * those messages as TLS sends a reader looking for a connection which does
+ * not exist.
  *
- * @param[in] msg	Error message describing the operation being attempted.
- * @param[in] ap	Arguments for msg.
+ * @param[in] request	to log through, or NULL for the global log.
+ * @param[in] msg	describing the operation which failed.
+ * @param[in] ...	arguments for msg.
  * @return the number of errors drained from the stack.
  */
-static int tls_strerror_vasprintf(char const *msg, va_list ap)
-{
-	unsigned long	error;
-	char		*p = NULL;
-	int		drained = 0;
-	char		buffer[256];
-
-	int		line;
-	char const	*file;
-	char const	*data;
-	int		flags = 0;
-
-	/*
-	 *	Pop the first error, so ERR_peek_error()
-	 *	can be used to determine if there are
-	 *	multiple errors.
-	 */
-	error = ERR_get_error_line_data(&file, &line, &data, &flags);
-	if (!(flags & ERR_TXT_STRING)) data = NULL;
-
-	if (msg) {
-		/*
-		 *	Print the error we were passed, and
-		 *	OpenSSL's error.
-		 */
-		p = talloc_vasprintf(NULL, msg, ap);
-		if (error) {
-			ERR_error_string_n(error, buffer, sizeof(buffer));
-			fr_strerror_printf("%s: %s%c%s", p, buffer, data ? ':' : '\0', data ? data : "");
-			talloc_free(p);
-			drained++;
-		/*
-		 *	Print the error we were given, irrespective
-		 *	of whether there were any OpenSSL errors.
-		 */
-		} else {
-			fr_strerror_printf("%s", p);
-			talloc_free(p);
-		}
-	} else if (error) {
-		ERR_error_string_n(error, buffer, sizeof(buffer));
-		fr_strerror_printf("%s%c%s", buffer, data ? ':' : '\0', data ? data : "");
-		drained++;
-	} else {
-		return 0;
-	}
-
-	while ((error = ERR_get_error_line_data(&file, &line, &data, &flags))) {
-		if (!(flags & ERR_TXT_STRING)) data = NULL;
-
-		ERR_error_string_n(error, buffer, sizeof(buffer));
-		fr_strerror_printf_push("%s%c%s", buffer, data ? ':' : '\0', data ? data : "");
-		drained++;
-	}
-
-	return drained;
-}
-DIAG_ON(format-nonliteral)
-
-/** Wrapper around fr_strerror_printf to log error messages for library functions calling libssl
- *
- * @note Will only drain the first error.
- *
- * @param[in] msg	Error message describing the operation being attempted.
- * @param[in] ...	Arguments for msg.
- * @return the number of errors drained from the stack.
- */
-int fr_tls_log_strerror_printf(char const *msg, ...)
+int fr_openssl_log_perror(request_t *request, char const *msg, ...)
 {
 	va_list ap;
 	int ret;
 
 	va_start(ap, msg);
-	ret = tls_strerror_vasprintf(msg, ap);
+	ret = tls_log_vperror(request, " ", msg, ap);
 	va_end(ap);
 
 	return ret;
@@ -394,9 +356,19 @@ int fr_tls_log_strerror_printf(char const *msg, ...)
 /** Clear errors in the TLS thread local error stack
  *
  */
-void tls_log_clear(void)
+void fr_tls_log_clear(void)
 {
 	while (ERR_get_error() != 0);
+}
+
+/** Increment the bio meth reference counter
+ *
+ */
+static int tls_log_request_bio_create_cb(BIO *bio)
+{
+	atomic_fetch_add(&tls_request_log_ref, 1);
+	BIO_set_init(bio, 1);
+	return 1;
 }
 
 /** Converts BIO_write() calls to request log calls
@@ -412,6 +384,7 @@ static int tls_log_request_bio_write_cb(BIO *bio, char const *in, int len)
 	fr_tls_log_bio_t	*lb = talloc_get_type_abort(BIO_get_data(bio), fr_tls_log_bio_t);
 	request_t		*request = talloc_get_type_abort(lb->request, request_t);
 	log_request_func_t	func;
+	ssize_t			slen;
 	char			*le;
 
 	/*
@@ -428,7 +401,15 @@ static int tls_log_request_bio_write_cb(BIO *bio, char const *in, int len)
 	 *	to aggregate it, then look for new line chars
 	 *	as an indication we need to print the line.
 	 */
-	fr_sbuff_in_bstrncpy(&lb->sbuff, in, len);
+	slen = fr_sbuff_in_bstrncpy(&lb->sbuff, in, len);
+	if (unlikely(slen < 0)) {
+		/*
+		 *	We failed to copy the data into the buffer
+		 *	so we can't do anything with it.
+		 */
+		REDEBUG2("(TLS) Failed copying %d bytes into TLS log aggregation buffer - buffer is too small.", len);
+		return 0;
+	}
 
 	/*
 	 *	Split incoming data on new lines
@@ -456,7 +437,7 @@ static int tls_log_request_bio_write_cb(BIO *bio, char const *in, int len)
 	/*
 	 *	Clear out printed data
 	 */
-	fr_sbuff_shift(&lb->sbuff, fr_sbuff_used(&lb->logged_m));
+	fr_sbuff_shift(&lb->sbuff, fr_sbuff_used(&lb->logged_m), false);
 
 	return len;	/* Amount of data written */
 }
@@ -470,7 +451,27 @@ static int tls_log_request_bio_write_cb(BIO *bio, char const *in, int len)
  */
 static int tls_log_request_bio_puts_cb(BIO *bio, char const *in)
 {
-	return tls_log_request_bio_write_cb(bio, in, strlen(in));
+	return tls_log_request_bio_write_cb(bio, in, (int)strlen(in));
+}
+
+/** Decrement the bio meth reference counter
+ *
+ */
+static int tls_log_request_bio_free_cb(BIO *bio)
+{
+	atomic_fetch_sub(&tls_request_log_ref, 1);
+	BIO_set_init(bio, 0);
+	return 1;
+}
+
+/** Increment the bio meth reference counter
+ *
+ */
+static int tls_log_global_bio_create_cb(BIO *bio)
+{
+	atomic_fetch_add(&tls_global_log_ref, 1);
+	BIO_set_init(bio, 1);
+	return 1;
 }
 
 /** Converts BIO_write() calls to global log calls
@@ -491,7 +492,7 @@ static int tls_log_global_bio_write_cb(BIO *bio, char const *in, int len)
 	 *	to aggregate it, then look for new line chars
 	 *	as an indication we need to print the line.
 	 */
-	fr_sbuff_in_bstrncpy(&lb->sbuff, in, len);
+	if (fr_sbuff_in_bstrncpy(&lb->sbuff, in, len) < 0) return 0;
 
 	/*
 	 *	Split incoming data on new lines
@@ -520,7 +521,7 @@ static int tls_log_global_bio_write_cb(BIO *bio, char const *in, int len)
 	/*
 	 *	Clear out printed data
 	 */
-	fr_sbuff_shift(&lb->sbuff, fr_sbuff_used(&lb->logged_m));
+	fr_sbuff_shift(&lb->sbuff, fr_sbuff_used(&lb->logged_m), false);
 
 	return len;	/* Amount of data written */
 }
@@ -534,19 +535,29 @@ static int tls_log_global_bio_write_cb(BIO *bio, char const *in, int len)
  */
 static int tls_log_global_bio_puts_cb(BIO *bio, char const *in)
 {
-	return tls_log_global_bio_write_cb(bio, in, strlen(in));
+	return tls_log_global_bio_write_cb(bio, in, (int)strlen(in));
+}
+
+/** Decrement the bio meth reference counter
+ *
+ */
+static int tls_log_global_bio_free_cb(BIO *bio)
+{
+	atomic_fetch_sub(&tls_global_log_ref, 1);
+	BIO_set_init(bio, 0);
+	return 1;
 }
 
 /** Frees a logging bio and its underlying OpenSSL BIO *
  *
  */
-static void _fr_tls_log_bio_free(void *log_bio)
+static int _fr_tls_log_bio_free(void *log_bio)
 {
 	fr_tls_log_bio_t	*our_log_bio = talloc_get_type_abort(log_bio, fr_tls_log_bio_t);
 
 	BIO_free(our_log_bio->bio);
 	our_log_bio->bio = NULL;
-	talloc_free(our_log_bio);
+	return talloc_free(our_log_bio);
 }
 
 /** Return a request log BIO to use with OpenSSL logging functions
@@ -558,7 +569,7 @@ static void _fr_tls_log_bio_free(void *log_bio)
  * @note The returned BIO should be assumed to be invalid if the request yields.
  *
  * @param[in] file	of caller.
- * @Parma[in] line	of caller.
+ * @param[in] line	of caller.
  * @param[in] request	to temporarily associate with logging BIO.
  * @param[in] type	to temporarily assign to logging bio.
  * @param[in] lvl	to temporarily assign to logging bio.
@@ -585,9 +596,8 @@ BIO *_fr_tls_request_log_bio(char const *file, int line, request_t *request, fr_
 		fr_sbuff_marker(&lb->logged_m, &lb->sbuff);
 		return lb->bio;
 	}
-
-	fr_sbuff_set(&request_log_bio->logged_m, fr_sbuff_start(&request_log_bio->sbuff));
 	fr_sbuff_reset_talloc(&request_log_bio->sbuff);	/* Reset to initial size */
+	fr_sbuff_marker(&request_log_bio->logged_m, &request_log_bio->sbuff);
 	request_log_bio->request = request;
 	request_log_bio->type = type;
 	request_log_bio->lvl = lvl;
@@ -606,7 +616,7 @@ BIO *_fr_tls_request_log_bio(char const *file, int line, request_t *request, fr_
  * @note The returned BIO should be assumed to be invalid if the current request yields.
  *
  * @param[in] file	of caller.
- * @Parma[in] line	of caller.
+ * @param[in] line	of caller.
  * @param[in] type	to temporarily assign to logging bio.
  * @param[in] lvl	to temporarily assign to logging bio.
  * @return A thread local BIO to pass to OpenSSL logging functions.
@@ -632,8 +642,8 @@ BIO *_fr_tls_global_log_bio(char const *file, int line, fr_log_type_t type, fr_l
 		return lb->bio;
 	}
 
-	fr_sbuff_set(&global_log_bio->logged_m, fr_sbuff_start(&global_log_bio->sbuff));
-	fr_sbuff_reset_talloc(&request_log_bio->sbuff);	/* Reset to initial size */
+	fr_sbuff_reset_talloc(&global_log_bio->sbuff);	/* Reset to initial size */
+	fr_sbuff_marker(&global_log_bio->logged_m, &global_log_bio->sbuff);
 	global_log_bio->type = type;
 	global_log_bio->lvl = lvl;
 	global_log_bio->file = file;
@@ -660,8 +670,10 @@ int fr_tls_log_init(void)
 	tls_request_log_meth = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "fr_tls_request_log");
 	if (unlikely(!tls_request_log_meth)) return -1;
 
+	BIO_meth_set_create(tls_request_log_meth, tls_log_request_bio_create_cb);
 	BIO_meth_set_write(tls_request_log_meth, tls_log_request_bio_write_cb);
 	BIO_meth_set_puts(tls_request_log_meth, tls_log_request_bio_puts_cb);
+	BIO_meth_set_destroy(tls_request_log_meth, tls_log_request_bio_free_cb);
 
 	tls_global_log_meth = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "fr_tls_global_log");
 	if (unlikely(!tls_global_log_meth)) {
@@ -670,8 +682,10 @@ int fr_tls_log_init(void)
 		return -1;
 	}
 
+	BIO_meth_set_create(tls_global_log_meth, tls_log_global_bio_create_cb);
 	BIO_meth_set_write(tls_global_log_meth, tls_log_global_bio_write_cb);
 	BIO_meth_set_puts(tls_global_log_meth, tls_log_global_bio_puts_cb);
+	BIO_meth_set_destroy(tls_global_log_meth, tls_log_global_bio_free_cb);
 
 	return 0;
 }
@@ -681,6 +695,14 @@ int fr_tls_log_init(void)
  */
 void fr_tls_log_free(void)
 {
+	/*
+	 *	These must be freed first else
+	 *      we get crashes in the OpenSSL
+	 *	code when we try to free them.
+	 */
+	fr_assert_msg(atomic_load(&tls_request_log_ref) == 0, "request log BIO refs remaining %u", atomic_load(&tls_request_log_ref));
+	fr_assert_msg(atomic_load(&tls_global_log_ref) == 0, "global log BIO refs remaining %u", atomic_load(&tls_global_log_ref));
+
 	if (tls_request_log_meth) {
 		BIO_meth_free(tls_request_log_meth);
 		tls_request_log_meth = NULL;

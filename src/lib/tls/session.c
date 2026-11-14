@@ -20,46 +20,48 @@
  * @file tls/session.c
  * @brief Initialise OpenSSL sessions, and read/write data to/from them.
  *
- * @copyright 2001 hereUare Communications, Inc. (raghud@hereuare.com)
- * @copyright 2003 Alan DeKok (aland@freeradius.org)
- * @copyright 2006-2016 The FreeRADIUS server project
+ * @copyright 2026 Network RADIUS SAS (legal@networkradius.com)
  */
 #ifdef WITH_TLS
-#define LOG_PREFIX "tls - "
+#define LOG_PREFIX "tls"
+#define _TLS_PRIVATE 1
 
 #include <freeradius-devel/server/pair.h>
+#include <freeradius-devel/server/log.h>
 
 #include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/math.h>
 #include <freeradius-devel/util/base16.h>
-#include <freeradius-devel/util/misc.h>
+#include <freeradius-devel/util/skip.h>
 #include <freeradius-devel/util/pair_legacy.h>
 
 #include <freeradius-devel/protocol/freeradius/freeradius.internal.h>
 
+#include <freeradius-devel/unlang/action.h>
+#include <freeradius-devel/unlang/call.h>
 #include <freeradius-devel/unlang/interpret.h>
+#include <freeradius-devel/unlang/subrequest.h>
 
-#include <openssl/x509v3.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
-#include <openssl/ssl.h>
-#include <ctype.h>
+#include <freeradius-devel/protocol/tls/freeradius.h>
 
 #include "attrs.h"
 #include "base.h"
+#include "dtls.h"
 #include "log.h"
+
+#include <openssl/x509v3.h>
+#include <openssl/ssl.h>
 
 static char const *tls_version_str[] = {
 	[SSL2_VERSION]				= "SSL 2.0",
 	[SSL3_VERSION]				= "SSL 3.0",
 	[TLS1_VERSION]				= "TLS 1.0",
-#ifdef TLS1_1_VERSION
 	[TLS1_1_VERSION]			= "TLS 1.1",
-#endif
-#ifdef TLS1_2_VERSION
 	[TLS1_2_VERSION]			= "TLS 1.2",
-#endif
-#ifdef TLS1_3_VERSION
 	[TLS1_3_VERSION]			= "TLS 1.3",
-#endif
 #ifdef TLS1_4_VERSION
 	[TLS1_4_VERSION]			= "TLS 1.4",
 #endif
@@ -177,69 +179,6 @@ static char const *tls_handshake_type_str[] = {
 #endif
 };
 
-/** Clear a record buffer
- *
- * @param record buffer to clear.
- */
-inline static void record_init(fr_tls_record_t *record)
-{
-	record->used = 0;
-}
-
-/** Destroy a record buffer
- *
- * @param record buffer to destroy clear.
- */
-inline static void record_close(fr_tls_record_t *record)
-{
-	record->used = 0;
-}
-
-/** Copy data to the intermediate buffer, before we send it somewhere
- *
- * @param[in] record	buffer to write to.
- * @param[in] in	data to write.
- * @param[in] inlen	Length of data to write.
- * @return the amount of data written to the record buffer.
- */
-inline static unsigned int record_from_buff(fr_tls_record_t *record, void const *in, unsigned int inlen)
-{
-	unsigned int added = FR_TLS_MAX_RECORD_SIZE - record->used;
-
-	if (added > inlen) added = inlen;
-	if (added == 0) return 0;
-
-	memcpy(record->data + record->used, in, added);
-	record->used += added;
-
-	return added;
-}
-
-/** Take data from the buffer, and give it to the caller
- *
- * @param[in] record	buffer to read from.
- * @param[out] out	where to write data from record buffer.
- * @param[in] outlen	The length of the output buffer.
- * @return the amount of data written to the output buffer.
- */
-inline static unsigned int record_to_buff(fr_tls_record_t *record, void *out, unsigned int outlen)
-{
-	unsigned int taken = record->used;
-
-	if (taken > outlen) taken = outlen;
-	if (taken == 0) return 0;
-	if (out) memcpy(out, record->data, taken);
-
-	record->used -= taken;
-
-	/*
-	 *	This is pretty bad...
-	 */
-	if (record->used > 0) memmove(record->data, record->data + taken, record->used);
-
-	return taken;
-}
-
 /** Return the static private key password we have configured
  *
  * @param[out] buf	Where to write the password to.
@@ -262,17 +201,17 @@ int fr_tls_session_password_cb(char *buf, int size, int rwflag UNUSED, void *u)
 	 *	from stdin (causes server to block).
 	 */
 	if (!u) {
-		ERROR("Certificate encrypted but no private_key_password configured");
+		ERROR("Private key encrypted but no private_key_password configured");
 		return 0;
 	}
 
 	len = strlcpy(buf, (char *)u, size);
-	if (len > (size_t)size) {
+	if (len >= (size_t)size) {
 		ERROR("Password too long.  Maximum length is %i bytes", size - 1);
 		return 0;
 	}
 
-	return len;
+	return (int)len;
 }
 
 #ifdef PSK_MAX_IDENTITY_LEN
@@ -290,7 +229,7 @@ static bool session_psk_identity_is_safe(const char *identity)
 	if (!identity) return true;
 
 	while ((c = *(identity++)) != '\0') {
-		if (isalpha((int) c) || isdigit((int) c) || isspace((int) c) ||
+		if (isalpha((uint8_t) c) || isdigit((uint8_t) c) || isspace((uint8_t) c) ||
 		    (c == '@') || (c == '-') || (c == '_') || (c == '.')) {
 			continue;
 		}
@@ -321,17 +260,33 @@ unsigned int fr_tls_session_psk_client_cb(SSL *ssl, UNUSED char const *hint,
 	conf = (fr_tls_conf_t *)SSL_get_ex_data(ssl, FR_TLS_EX_INDEX_CONF);
 	if (!conf) return 0;
 
-	psk_len = strlen(conf->psk_password);
-	if (psk_len > (2 * max_psk_len)) return 0;
+	psk_len = talloc_array_length(conf->psk.key);
+	if (psk_len > max_psk_len) return 0;
 
-	strlcpy(identity, conf->psk_identity, max_identity_len);
+	strlcpy(identity, conf->psk.identity, max_identity_len);
+	memcpy(psk, conf->psk.key, psk_len);
 
-	return fr_base16_decode(NULL,
-			  &FR_DBUFF_TMP((uint8_t *)psk, (size_t)max_psk_len),
-			  &FR_SBUFF_IN(conf->psk_password, (size_t)psk_len), false);
+	return psk_len;
+}
+
+/** Forget the result of `load psk`, so that the next handshake starts with no pending call
+ *
+ * @param[in] tls_session	The TLS session that the section ran for.
+ */
+static void tls_session_psk_reset(fr_tls_session_t *tls_session)
+{
+	TALLOC_FREE(tls_session->psk.key);
+	tls_session->psk.key_len = 0;
+	tls_session->psk.state = FR_TLS_PSK_INIT;
 }
 
 /** Determine the PSK to use for an incoming connection
+ *
+ * When the virtual server has a `load psk` section, the callback pauses
+ * the handshake.  tls_session_async_handshake_cont() then pushes the
+ * section with fr_tls_session_psk_pending_push().  Once the section has
+ * finished, the callback returns the key that the section placed in
+ * `reply.TLS-PSK-Key`.
  *
  * @param[in] ssl		session.
  * @param[in] identity		The identity of the PSK to search for.
@@ -352,78 +307,283 @@ unsigned int fr_tls_session_psk_server_cb(SSL *ssl, const char *identity,
 	if (!conf) return 0;
 
 	request = fr_tls_session_request(ssl);
-	if (request && conf->psk_query) {
-		size_t hex_len;
-		fr_pair_t *vp;
-		char buffer[2 * PSK_MAX_PSK_LEN + 4]; /* allow for too-long keys */
+	if (request && conf->load_psk) {
+		fr_tls_session_t	*tls_session = fr_tls_session(ssl);
+		fr_pair_t		*vp;
 
 		/*
 		 *	The passed identity is weird.  Deny it.
 		 */
 		if (!session_psk_identity_is_safe(identity)) {
-			RWDEBUG("Invalid characters in PSK identity %s", identity);
+			RWDEBUG("(TLS) Invalid characters in PSK identity %s", identity);
+			fr_tls_session_error_add(request, FR_ERROR_VALUE_PSK_IDENTITY_INVALID);
 			return 0;
 		}
 
+		/*
+		 *	The `TLS-PSK-Identity` pair stays in the request after the handshake,
+		 *	so that policies can read the identity.  fr_tls_session_psk_pending_push()
+		 *	copies the pair into the `load psk` subrequest.
+		 */
 		MEM(pair_update_request(&vp, attr_tls_psk_identity) >= 0);
-		if (fr_pair_value_from_str(vp, identity, -1, '\0', true) < 0) {
+		if (fr_pair_value_from_str(vp, identity, strlen(identity), NULL, true) < 0) {
 			RPWDEBUG2("Failed parsing TLS PSK Identity");
 			talloc_free(vp);
 			return 0;
 		}
 
-		hex_len = xlat_eval(buffer, sizeof(buffer), request, conf->psk_query, NULL, NULL);
-		if (!hex_len) {
-			RWDEBUG("PSK expansion returned an empty string.");
+		/*
+		 *	OpenSSL runs the handshake, including the PSK callback, on a fibre whose
+		 *	stack OpenSSL sizes.  The unlang interpreter never runs on that stack, so
+		 *	the section runs on the request's own stack:
+		 *
+		 *	1. The callback records that `load psk` needs to run, and pauses the
+		 *	   handshake.
+		 *	2. Control returns to tls_session_async_handshake_cont(), which pushes the
+		 *	   section with fr_tls_session_psk_pending_push().
+		 *	3. Once the section has finished, tls_session_async_handshake_cont() resumes
+		 *	   the handshake.
+		 *	4. Execution continues after the ASYNC_pause_job() call below.
+		 *
+		 *	The `verify certificate` and session cache sections pause the handshake the
+		 *	same way.
+		 */
+		if (!fr_cond_assert_msg(tls_session->can_pause,
+					"Unexpected call to %s. tls_session_async_handshake_cont must be in call stack",
+					__FUNCTION__)) return 0;
+
+		fr_assert(tls_session->psk.state == FR_TLS_PSK_INIT);
+		tls_session->psk.state = FR_TLS_PSK_REQUESTED;
+		TLS_PENDING_SET(tls_session, FR_TLS_PENDING_PSK);
+		tls_session->psk.max_psk_len = max_psk_len;
+
+		ASYNC_pause_job();
+
+		/*
+		 *	If the request was cancelled while the handshake was paused,
+		 *	the section may not have run.
+		 */
+		if (unlang_request_is_cancelled(request)) {
+			tls_session_psk_reset(tls_session);
+			return 0;
+		}
+
+		switch (tls_session->psk.state) {
+		case FR_TLS_PSK_SUCCESS:
+			break;
+
+		case FR_TLS_PSK_FAILED:
+			tls_session_psk_reset(tls_session);
+			return 0;
+
+		case FR_TLS_PSK_INIT:
+		case FR_TLS_PSK_REQUESTED:
+			fr_assert_msg(0, "Handshake resumed with `load psk` in state %u",
+				      tls_session->psk.state);
+			tls_session_psk_reset(tls_session);
 			return 0;
 		}
 
 		/*
-		 *	The returned key is truncated at MORE than
-		 *	OpenSSL can handle.  That way we can detect
-		 *	the truncation, and complain about it.
+		 *	_tls_session_psk_load_resume() checked the key, so the
+		 *	callback only copies the key into the `psk` buffer that
+		 *	OpenSSL passed.
 		 */
-		if (hex_len > (2 * max_psk_len)) {
-			RWDEBUG("Returned PSK is too long (%u > %u)", (unsigned int) hex_len, 2 * max_psk_len);
-			return 0;
-		}
+		psk_len = tls_session->psk.key_len;
+		memcpy(psk, tls_session->psk.key, psk_len);
+		tls_session_psk_reset(tls_session);
 
-		/*
-		 *	Leave the TLS-PSK-Identity in the request, and
-		 *	convert the expansion from printable string
-		 *	back to hex.
-		 */
-		return fr_base16_decode(NULL,
-				  &FR_DBUFF_TMP((uint8_t *)psk, (size_t)max_psk_len),
-				  &FR_SBUFF_IN(buffer, hex_len), false);
+		return (unsigned int)psk_len;
 	}
 
-	if (!conf->psk_identity) {
-		DEBUG("No static PSK identity set.  Rejecting the user");
+	if (!conf->psk.identity) {
+		DEBUG("Rejecting the client, no fixed psk.identity set");
 		return 0;
 	}
 
 	/*
-	 *	No request_t, or no dynamic query.  Just look for a
-	 *	static identity.
+	 *	Compare the identity against the fixed `psk.identity`, then
+	 *	copy the fixed `psk.key` into the `psk` buffer that OpenSSL
+	 *	passed.
 	 */
-	if (strcmp(identity, conf->psk_identity) != 0) {
-		ERROR("Supplied PSK identity %s does not match configuration.  Rejecting.",
-		      identity);
+	if (strcmp(identity, conf->psk.identity) != 0) {
+		fr_tls_log_error("Supplied PSK identity %s does not match configuration.  Rejecting.",
+				 identity);
+		fr_tls_session_error_add(request, FR_ERROR_VALUE_PSK_IDENTITY_UNKNOWN);
 		return 0;
 	}
 
-	psk_len = strlen(conf->psk_password);
-	if (psk_len > (2 * max_psk_len)) return 0;
+	psk_len = talloc_array_length(conf->psk.key);
+	if (psk_len > max_psk_len) return 0;
 
-	return fr_base16_decode(NULL,
-			  &FR_DBUFF_TMP((uint8_t *)psk, (size_t)max_psk_len),
-			  &FR_SBUFF_IN(conf->psk_password, psk_len), false);
+	memcpy(psk, conf->psk.key, psk_len);
+
+	return (unsigned int)psk_len;
+}
+
+/** Process the result of `load psk`
+ *
+ * The function runs in the subrequest, once the section has finished.
+ * The interpreter frees the subrequest when the function returns, so the
+ * function copies the key out of the reply and into the session.  The
+ * function logs every error, because the function runs on the request's
+ * own stack rather than on the OpenSSL fibre.  fr_tls_session_psk_server_cb()
+ * then only copies the key into the `psk` buffer that OpenSSL passed.
+ *
+ * @param[in] request		The subrequest that ran the section.
+ * @param[in] uctx		The #fr_tls_session_t that the section ran for.
+ * @return UNLANG_ACTION_CALCULATE_RESULT
+ */
+static unlang_action_t _tls_session_psk_load_resume(request_t *request, void *uctx)
+{
+	fr_tls_session_t	*tls_session = talloc_get_type_abort(uctx, fr_tls_session_t);
+	fr_pair_t		*vp;
+
+	fr_assert(tls_session->psk.state == FR_TLS_PSK_REQUESTED);
+
+	vp = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_tls_packet_type);
+	if (!vp || (vp->vp_uint32 != enum_tls_packet_type_success->vb_uint32)) {
+		RWDEBUG("(TLS) Failed loading the pre-shared key, `load psk` did not return success");
+
+		/*
+		 *	`notfound` says that the policy does not know the
+		 *	identity, and an unknown identity is the peer's error.
+		 *	Any other failure is the policy's error.
+		 */
+		fr_tls_session_error_add(request->parent,
+					 (vp && (vp->vp_uint32 == enum_tls_packet_type_notfound->vb_uint32)) ?
+					 FR_ERROR_VALUE_PSK_IDENTITY_UNKNOWN :
+					 FR_ERROR_VALUE_LOAD_PSK_FAILED);
+	failed:
+		tls_session->psk.state = FR_TLS_PSK_FAILED;
+		return UNLANG_ACTION_CALCULATE_RESULT;
+	}
+
+	vp = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_tls_psk_key);
+	if (!vp || (vp->vp_length == 0)) {
+		RWDEBUG("(TLS) `load psk` returned success, but reply.TLS-PSK-Key is missing or empty");
+		fr_tls_session_error_add(request->parent, FR_ERROR_VALUE_PSK_EMPTY);
+		goto failed;
+	}
+
+	if (vp->vp_length > tls_session->psk.max_psk_len) {
+		RWDEBUG("(TLS) Rejecting reply.TLS-PSK-Key of %zu bytes, OpenSSL accepts at most %u bytes", vp->vp_length,
+			tls_session->psk.max_psk_len);
+		fr_tls_session_error_add(request->parent, FR_ERROR_VALUE_PSK_TOO_LONG);
+		goto failed;
+	}
+
+	MEM(tls_session->psk.key = talloc_memdup(tls_session, vp->vp_octets, vp->vp_length));
+	tls_session->psk.key_len = vp->vp_length;
+	tls_session->psk.state = FR_TLS_PSK_SUCCESS;
+
+	RDEBUG2("(TLS) Loaded a %zu-byte pre-shared key", vp->vp_length);
+
+	return UNLANG_ACTION_CALCULATE_RESULT;
+}
+
+/** Push a `load psk` call into the current request, using a subrequest
+ *
+ * tls_session_async_handshake_cont() calls the function once the
+ * handshake has paused, after the pushes for pending session cache
+ * sections and before the push for a pending `verify certificate`
+ * section.
+ *
+ * @param[in] request		The current request.
+ * @param[in] tls_session	The current TLS session.
+ * @return
+ *	- UNLANG_ACTION_CALCULATE_RESULT on noop.
+ *	- UNLANG_ACTION_PUSHED_CHILD on success.
+ *	- UNLANG_ACTION_FAIL on failure.
+ */
+unlang_action_t fr_tls_session_psk_pending_push(request_t *request, fr_tls_session_t *tls_session)
+{
+	fr_tls_conf_t		*conf = tls_session->conf;
+	request_t		*child;
+	fr_pair_t		*identity;
+	unlang_action_t		ua;
+
+	if (tls_session->psk.state != FR_TLS_PSK_REQUESTED) return UNLANG_ACTION_CALCULATE_RESULT;
+
+	fr_assert(conf->virtual_server);
+
+	/*
+	 *	fr_tls_session_psk_server_cb() added the `TLS-PSK-Identity` pair to
+	 *	the request before pausing the handshake.
+	 */
+	identity = fr_pair_find_by_da(&request->request_pairs, NULL, attr_tls_psk_identity);
+	fr_assert(identity);
+
+	RDEBUG2("(TLS) Loading the pre-shared key for identity \"%pV\"", &identity->data);
+
+	MEM(child = tls_subrequest_alloc(request, enum_tls_packet_type_load_psk->vb_uint32,
+					 &tls_session->session_id));
+
+	/*
+	 *	Add extra pairs to the subrequest
+	 */
+	fr_tls_session_extra_pairs_copy_to_child(child, tls_session);
+
+	fr_pair_append(&child->request_pairs, fr_pair_copy(child->request_ctx, identity));
+
+	/*
+	 *	Push the call to the TLS virtual server into the child.
+	 */
+	ua = fr_tls_call_push(child, _tls_session_psk_load_resume, conf, tls_session, false);
+	if (ua == UNLANG_ACTION_FAIL) {
+		REDEBUG("(TLS) Failed calling TLS virtual server");
+		talloc_free(child);
+		return UNLANG_ACTION_FAIL;
+	}
+
+	return ua;
 }
 #endif /* PSK_MAX_IDENTITY_LEN */
 
-DIAG_OFF(DIAG_UNKNOWN_PRAGMAS)
-DIAG_OFF(used-but-marked-unused)	/* Fix spurious warnings for sk_ macros */
+/** Record a TLS alert in a pair list
+ *
+ * A TLS Alert says why the handshake ended, so we only keep the last one.
+ *
+ * A peer can send multiple alerts, and if we left earlier `Alert` in
+ * the list, the policies would be looking at the wrong one.
+ *
+ * When we receive a TLS Alert, it gets copied into the `request`
+ * list.  When we send a TLS Alert, it gets copied into the `reply`
+ * list.
+ *
+ * We also update `session-state.Error` to describe the TLS Alert.
+ * See fr_tls_session_error_add().
+ *
+ * @param[in] request		to log through.  A NULL request is ignored,
+ *				because several OpenSSL callbacks run without one.
+ * @param[in] list_ctx		the pair which holds the list, either
+ *				`request->request_ctx` or `request->reply_ctx`.
+ * @param[in] prefix		names the list in the log line.
+ * @param[in] level		of the alert, warning or fatal.
+ * @param[in] description	of the alert.
+ */
+static void tls_session_alert_pair_add(request_t *request, fr_pair_t *list_ctx, char const *prefix,
+				       uint8_t level, uint8_t description)
+{
+	fr_pair_t *alert, *vp;
+
+	if (!request) return;
+
+	fr_pair_delete_by_da(&list_ctx->vp_group, attr_tls_alert);
+
+	MEM(fr_pair_append_by_da(list_ctx, &alert, &list_ctx->vp_group, attr_tls_alert) >= 0);
+
+	MEM(fr_pair_append_by_da(alert, &vp, &alert->vp_group, attr_tls_alert_level) >= 0);
+	vp->vp_uint8 = level;
+
+	MEM(fr_pair_append_by_da(alert, &vp, &alert->vp_group, attr_tls_alert_description) >= 0);
+	vp->vp_uint8 = description;
+
+	RDEBUG2("(TLS) Adding %s%pP", prefix, alert);
+}
+
+
+DIAG_OFF_OPTIONAL(used-but-marked-unused)	/* Fix spurious warnings for sk_ macros */
 /** Record session state changes
  *
  * Called by OpenSSL whenever the session state changes, an alert is received or an error occurs.
@@ -438,6 +598,12 @@ void fr_tls_session_info_cb(SSL const *ssl, int where, int ret)
 {
 	char const	*role, *state;
 	request_t	*request = SSL_get_ex_data(ssl, FR_TLS_EX_INDEX_REQUEST);
+
+	/*
+	 *	OpenSSL runs the info callback from inside a handshake round,
+	 *	and the library binds the request across a round.
+	 */
+	fr_assert(request != NULL);
 
 	if ((where & ~SSL_ST_MASK) & SSL_ST_CONNECT) {
 		role = "Client ";
@@ -461,7 +627,7 @@ void fr_tls_session_info_cb(SSL const *ssl, int where, int ret)
 			len = strlen(abbrv);
 			if ((len > 1) && (abbrv[len - 1] == ' ')) len--;
 
-			RDEBUG3("Handshake state [%.*s] - %s%s", (int)len, abbrv, role, state);
+			RDEBUG3("(TLS) Handshake state [%.*s] - %s%s", (int)len, abbrv, role, state);
 
 #ifdef OPENSSL_NO_SSL_TRACE
 	        	{
@@ -482,19 +648,18 @@ void fr_tls_session_info_cb(SSL const *ssl, int where, int ret)
 					int num_ciphers;
 					const SSL_CIPHER *this_cipher;
 
-
 					server_ciphers = SSL_get_ciphers(ssl);
 					/*
 					 *	These are printed on startup, so not usually
 					 *      required.
 					 */
-					RDEBUG4("Our preferred ciphers (by priority)");
+					RDEBUG4("(TLS) Our preferred ciphers (by priority)");
 					if (RDEBUG_ENABLED4) {
 						RINDENT();
 						num_ciphers = sk_SSL_CIPHER_num(server_ciphers);
 						for (i = 0; i < num_ciphers; i++) {
 							this_cipher = sk_SSL_CIPHER_value(server_ciphers, i);
-							RDEBUG4("[%i] %s", i, SSL_CIPHER_get_name(this_cipher));
+							RDEBUG4("(TLS) [%i] %s", i, SSL_CIPHER_get_name(this_cipher));
 						}
 						REXDENT();
 					}
@@ -504,12 +669,12 @@ void fr_tls_session_info_cb(SSL const *ssl, int where, int ret)
 					 *      handshake message.
 					 */
 					if (RDEBUG_ENABLED3) {
-						RDEBUG3("Client's preferred ciphers (by priority)");
+						RDEBUG3("(TLS) Client's preferred ciphers (by priority)");
 						RINDENT();
 						num_ciphers = sk_SSL_CIPHER_num(client_ciphers);
 						for (i = 0; i < num_ciphers; i++) {
 							this_cipher = sk_SSL_CIPHER_value(client_ciphers, i);
-							RDEBUG3("[%i] %s", i, SSL_CIPHER_get_name(this_cipher));
+							RDEBUG3("(TLS) [%i] %s", i, SSL_CIPHER_get_name(this_cipher));
 						}
 						REXDENT();
 					}
@@ -517,7 +682,7 @@ void fr_tls_session_info_cb(SSL const *ssl, int where, int ret)
 			}
 #  endif
 		} else {
-			RDEBUG2("Handshake state - %s%s (%i)", role, state, SSL_get_state(ssl));
+			RDEBUG2("(TLS) Handshake state - %s%s (%u)", role, state, SSL_get_state(ssl));
 		}
 		return;
 	}
@@ -529,17 +694,15 @@ void fr_tls_session_info_cb(SSL const *ssl, int where, int ret)
 		 *	We got an alert...
 		 */
 		if (where & SSL_CB_READ) {
-			fr_pair_t *vp;
-
-			REDEBUG("Client sent %s TLS alert (%i) - %s", SSL_alert_type_string_long(ret),
-			        ret & 0xff, SSL_alert_desc_string_long(ret));
+			REDEBUG("(TLS) Client sent %s TLS alert (%i) - %s", SSL_alert_type_string_long(ret),
+				ret & 0xff, SSL_alert_desc_string_long(ret));
 
 			/*
 			 *	Offer helpful advice... Should be expanded.
 			 */
 			switch (ret & 0xff) {
 			case TLS1_AD_UNKNOWN_CA:
-				REDEBUG("Verify the client has a copy of the server's Certificate "
+				REDEBUG("(TLS) Verify the client has a copy of the server's Certificate "
 					"Authority (CA) installed, and trusts that CA");
 				break;
 
@@ -547,51 +710,69 @@ void fr_tls_session_info_cb(SSL const *ssl, int where, int ret)
 				break;
 			}
 
-			MEM(pair_update_request(&vp, attr_tls_client_error_code) >= 0);
-			vp->vp_uint8 = ret & 0xff;
-			RDEBUG2("&TLS-Client-Error-Code := %pV", &vp->data);
+			/*
+			 *      The alert level is packed into the high octet of `ret`.  The alert
+			 *      description is packed into the low octet.
+			 *
+			 *      A peer can send alerts are multiple points in the handshake, so
+			 *      earlier alerts are removed before the latest one is added.
+			 *
+			 *      We could just find an earlier alert and update its members, but that's
+			 *      more code.
+			 */
+			tls_session_alert_pair_add(request, request->request_ctx, "",
+						   (ret >> 8) & 0xff, ret & 0xff);
+			fr_tls_session_error_add(request, FR_ERROR_VALUE_RECEIVED_ALERT);
 		/*
 		 *	We're sending the client an alert.
 		 */
 		} else {
-			REDEBUG("Sending client %s TLS alert (%i) - %s", SSL_alert_type_string_long(ret),
-				ret & 0xff, SSL_alert_desc_string_long(ret));
+			REDEBUG("(TLS) Sending client %s TLS alert (%i) - %s",
+				SSL_alert_type_string_long(ret), ret & 0xff, SSL_alert_desc_string_long(ret));
 
 			/*
 			 *	Offer helpful advice... Should be expanded.
 			 */
 			switch (ret & 0xff) {
 			case TLS1_AD_PROTOCOL_VERSION:
-				REDEBUG("Client requested a TLS protocol version that is not enabled or not supported. "
-				        "Upgrade FreeRADIUS + OpenSSL to their latest versions and/or adjust "
-				        "'tls_max_version'/'tls_min_version' if you want authentication to "
-				        "succeed");
+				REDEBUG("(TLS) Client requested a TLS protocol version that is not "
+					"enabled or not supported. Upgrade FreeRADIUS + OpenSSL to their latest "
+					"versions and/or adjust 'tls_max_version'/'tls_min_version' if you want "
+					"authentication to succeed");
 				break;
 
 			default:
 				break;
 			}
+
+			/*
+			 *	A sent alert goes in the reply list, where a received one
+			 *	goes in the request list.  `ret` packs the two octets the
+			 *	same way in both directions.
+			 */
+			tls_session_alert_pair_add(request, request->reply_ctx, "reply.",
+						   (ret >> 8) & 0xff, ret & 0xff);
+			fr_tls_session_error_add(request, FR_ERROR_VALUE_SENT_ALERT);
 		}
 		return;
 	}
 
 	if (where & SSL_CB_EXIT) {
 		if (ret == 0) {
-			REDEBUG("Handshake exit state %s%s", role, state);
+			REDEBUG("(TLS) Handshake exit state %s%s", role, state);
 			return;
 		}
 
 		if (ret < 0) {
 			if (SSL_want_read(ssl)) {
-				RDEBUG2("Need more data from client"); /* State same as previous call, don't print */
+				RDEBUG2("(TLS) Need more data from client"); /* State same as previous call, don't print */
 				return;
 			}
-			REDEBUG("Handshake exit state %s%s", role, state);
+			REDEBUG("(TLS) Handshake exit state %s%s", role, state);
 		}
 	}
 }
-DIAG_ON(used-but-marked-unused)
-DIAG_ON(DIAG_UNKNOWN_PRAGMAS)
+DIAG_ON_OPTIONAL(used-but-marked-unused)
 
 /** Print a message to the request or global log detailing handshake state
  *
@@ -610,6 +791,12 @@ static void session_msg_log(request_t *request, fr_tls_session_t *tls_session, u
 	char		unknown_handshake_type[32];
 
 	/*
+	 *	Both callers hold a request: fr_tls_session_msg_cb() takes it
+	 *	off the SSL *, and fr_tls_session_alert_send() is handed one.
+	 */
+	fr_assert(request != NULL);
+
+	/*
 	 *	Don't print this out in the normal course of
 	 *	operations.
 	 */
@@ -617,7 +804,8 @@ static void session_msg_log(request_t *request, fr_tls_session_t *tls_session, u
 
 	if (((size_t)tls_session->info.version >= NUM_ELEMENTS(tls_version_str)) ||
 	    !tls_version_str[tls_session->info.version]) {
-		sprintf(unknown_version, "unknown_tls_version_0x%04x", tls_session->info.version);
+		snprintf(unknown_version, sizeof(unknown_version), "unknown_tls_version_0x%04x",
+			 (unsigned int) tls_session->info.version);
 		version = unknown_version;
 	} else {
 		version = tls_version_str[tls_session->info.version];
@@ -628,7 +816,8 @@ static void session_msg_log(request_t *request, fr_tls_session_t *tls_session, u
 	 */
 	if (((size_t)tls_session->info.content_type >= NUM_ELEMENTS(tls_content_type_str)) ||
 	    !tls_content_type_str[tls_session->info.content_type]) {
-		sprintf(unknown_content_type, "unknown_content_type_0x%04x", tls_session->info.content_type);
+		snprintf(unknown_content_type, sizeof(unknown_content_type),
+			 "unknown_content_type_0x%04x", (unsigned int) tls_session->info.content_type);
 		content_type = unknown_content_type;
 	} else {
 		content_type = tls_content_type_str[tls_session->info.content_type];
@@ -645,16 +834,16 @@ static void session_msg_log(request_t *request, fr_tls_session_t *tls_session, u
 				break;
 
 			default:
-				sprintf(unknown_alert_level,
-					"unknown_alert_level_0x%04x", tls_session->info.alert_level);
+				snprintf(unknown_alert_level, sizeof(unknown_alert_level),
+					 "unknown_alert_level_0x%04x", tls_session->info.alert_level);
 				str_details1 = unknown_alert_level;
 				break;
 			}
 
 			if (((size_t)tls_session->info.alert_description >= NUM_ELEMENTS(tls_alert_description_str)) ||
 			    !tls_alert_description_str[tls_session->info.alert_description]) {
-				sprintf(unknown_alert_description,
-					"unknown_alert_0x%04x", tls_session->info.alert_description);
+				snprintf(unknown_alert_description, sizeof(unknown_alert_description),
+					 "unknown_alert_0x%04x", tls_session->info.alert_description);
 				str_details2 = unknown_alert_description;
 			} else {
 				str_details2 = tls_alert_description_str[tls_session->info.alert_description];
@@ -672,8 +861,8 @@ static void session_msg_log(request_t *request, fr_tls_session_t *tls_session, u
 			 *	and underlying type.
 			 */
 			if (!tls_handshake_type_str[tls_session->info.handshake_type]) {
-				sprintf(unknown_handshake_type,
-					"unknown_handshake_type_0x%02x", tls_session->info.handshake_type);
+				snprintf(unknown_handshake_type, sizeof(unknown_handshake_type),
+					 "unknown_handshake_type_0x%02x", tls_session->info.handshake_type);
 				str_details1 = unknown_handshake_type;
 			} else {
 				str_details1 = tls_handshake_type_str[tls_session->info.handshake_type];
@@ -697,9 +886,9 @@ static void session_msg_log(request_t *request, fr_tls_session_t *tls_session, u
 	 *	data at higher debug levels.
 	 */
 	if (RDEBUG_ENABLED4) {
-		RHEXDUMP4(data, data_len, "%s", tls_session->info.info_description);
+		RHEXDUMP4(data, data_len, "(TLS) %s", tls_session->info.info_description);
 	} else {
-		RDEBUG2("%s", tls_session->info.info_description);
+		RDEBUG2("(TLS) %s", tls_session->info.info_description);
 	}
 }
 
@@ -741,10 +930,20 @@ void fr_tls_session_msg_cb(int write_p, int msg_version, int content_type,
 	request_t		*request = fr_tls_session_request(tls_session->ssl);
 
 	/*
+	 *	OpenSSL runs the message callback for every record it reads
+	 *	or writes, and every one of those happens while the library
+	 *	has the request bound.  _fr_dtls_timer_expired() binds across
+	 *	DTLSv1_handle_timeout() for exactly this reason.
+	 */
+	fr_assert(request != NULL);
+
+	/*
 	 *	Mostly to check for memory corruption...
 	 */
-	if (!fr_cond_assert(tls_session->ssl = ssl)) {
-		ERROR("fr_tls_session_t and ssl arg do not match in fr_tls_session_msg_cb");
+	if (!fr_cond_assert(tls_session->ssl == ssl)) {
+		REDEBUG("(TLS) fr_tls_session_t and ssl arg do not match in fr_tls_session_msg_cb");
+		fr_tls_session_error_alert(request, tls_session,
+					   FR_ERROR_VALUE_SESSION_MISMATCH, SSL_AD_INTERNAL_ERROR);
 		tls_session->invalid = true;
 		return;
 	}
@@ -756,7 +955,9 @@ void fr_tls_session_msg_cb(int write_p, int msg_version, int content_type,
 	 */
 #ifdef SSL2_VERSION
 	if (!fr_cond_assert(msg_version != SSL2_VERSION)) {
-		ROPTIONAL(REDEBUG, ERROR, "Invalid version (SSLv2) in handshake");
+		REDEBUG("(TLS) Invalid version (SSLv2) in handshake");
+		fr_tls_session_error_alert(request, tls_session,
+					   FR_ERROR_VALUE_INVALID_VERSION_SSLV2, SSL_AD_PROTOCOL_VERSION);
 		tls_session->invalid = true;
 		return;
 	}
@@ -764,7 +965,9 @@ void fr_tls_session_msg_cb(int write_p, int msg_version, int content_type,
 
 #ifdef SSL3_VERSION
 	if (!fr_cond_assert(msg_version != SSL3_VERSION)) {
-		ROPTIONAL(REDEBUG, ERROR, "Invalid version (SSLv3) in handshake");
+		REDEBUG("(TLS) Invalid version (SSLv3) in handshake");
+		fr_tls_session_error_alert(request, tls_session,
+					   FR_ERROR_VALUE_INVALID_VERSION_SSLV3, SSL_AD_PROTOCOL_VERSION);
 		tls_session->invalid = true;
 		return;
 	}
@@ -776,13 +979,13 @@ void fr_tls_session_msg_cb(int write_p, int msg_version, int content_type,
 	 *	the SSL Session state.
 	 */
 	if ((msg_version == 0) && (content_type > UINT8_MAX)) {
-		DEBUG4("Ignoring fr_tls_session_msg_cb call with pseudo content type %i, version %i",
-		       content_type, msg_version);
+		REDEBUG4("(TLS) Ignoring fr_tls_session_msg_cb call with pseudo content type %i, version %i",
+			 content_type, msg_version);
 		return;
 	}
 
 	if ((write_p != 0) && (write_p != 1)) {
-		DEBUG4("Ignoring fr_tls_session_msg_cb call with invalid write_p %d", write_p);
+		REDEBUG4("(TLS) Ignoring fr_tls_session_msg_cb call with invalid write_p %d", write_p);
 		return;
 	}
 
@@ -798,12 +1001,23 @@ void fr_tls_session_msg_cb(int write_p, int msg_version, int content_type,
 
 	switch (content_type) {
 	case SSL3_RT_ALERT:
+		if (len < 2) {
+		invalid_alert:
+			REDEBUG("(TLS) Invalid TLS Alert.  Closing connection");
+			fr_tls_session_error_alert(request, tls_session,
+						   FR_ERROR_VALUE_INVALID_RECORD_LENGTH, SSL_AD_DECODE_ERROR);
+			tls_session->invalid = true;
+			return;
+		}
+
 		tls_session->info.alert_level = buf[0];
 		tls_session->info.alert_description = buf[1];
 		tls_session->info.handshake_type = 0x00;
 		break;
 
 	case SSL3_RT_HANDSHAKE:
+		if (!len) goto invalid_alert;
+
 		tls_session->info.handshake_type = buf[0];
 		tls_session->info.alert_level = 0x00;
 		tls_session->info.alert_description = 0x00;
@@ -816,10 +1030,12 @@ void fr_tls_session_msg_cb(int write_p, int msg_version, int content_type,
 		if ((len >= 3) && (p[0] == 1)) {
 			size_t payload_len;
 
-			payload_len = (p[1] << 8) | p[2];
+			payload_len = fr_nbo_to_uint16(p + 1);
 			if ((payload_len + 3) > len) {
 				tls_session->invalid = true;
-				ROPTIONAL(REDEBUG, ERROR, "OpenSSL Heartbeat attack detected.  Closing connection");
+				REDEBUG("(TLS) OpenSSL Heartbeat attack detected.  Closing connection");
+				fr_tls_session_error_alert(request, tls_session,
+							   FR_ERROR_VALUE_HEARTBEAT_OVERFLOW, SSL_AD_DECODE_ERROR);
 				return;
 			}
 		}
@@ -829,16 +1045,204 @@ void fr_tls_session_msg_cb(int write_p, int msg_version, int content_type,
 		break;
 	}
 
+	/*
+	 *	Manually track when records are encrypted.  Once records are encrypted, we can't manually
+	 *	create a TLS alert.  OpenSSL doesn't have an API to send alerts.  And it doesn't have an API
+	 *	to tell us when the records are encrypted.
+	 */
+	switch (content_type) {
+	/*
+	 *	Everything after ChangeCipherSpec is encrypted.
+	 */
+	case SSL3_RT_CHANGE_CIPHER_SPEC:
+		if (write_p != TLS_INFO_ORIGIN_RECORD_SENT) break;
+		if (tls_session->write_encrypted) break;
+
+		tls_session->write_encrypted = true;
+		RDEBUG3("(TLS) The records we write are encrypted, from the ChangeCipherSpec onwards");
+		break;
+
+	/*
+	 *	For TLS 1.3, everything after ServerHello is encrypted.  After ServerHello, SSL_version()
+	 *	finally returns the correct TLS version number which was negotiated.  Before ServerHello,
+	 *	SSL_version() returns the highest allowed TLS version.
+	 */
+	case SSL3_RT_HANDSHAKE:
+		if (tls_session->info.handshake_type != SSL3_MT_SERVER_HELLO) break;
+		if (SSL_version(ssl) < TLS1_3_VERSION) break;
+
+		/*
+		 *	We allow one session ticket, which is fine for TLS 1.2.  The tickets are sent in the
+		 *	header.  For TLS 1.3 and stateful session tickets, the server also sends the ticket
+		 *	immediately.  For EAP, the `store session` code is delayed until after the inner
+		 *	methods succeed.  So it doesn't matter if the peer has a ticket.
+		 */
+		if (tls_session->conf->delayed_tickets && (tls_session->conf->cache.mode & FR_TLS_TICKET_STATELESS) &&
+		    SSL_is_server(ssl)) {
+			RDEBUG3("(TLS) TLS 1.3 session ticket is delayed until inner tunnel indicates success");
+			SSL_set_num_tickets(ssl, 0);
+		}
+
+		if (tls_session->write_encrypted) break;
+
+		tls_session->write_encrypted = true;
+		RDEBUG3("(TLS) The records we write are encrypted, from the ServerHello onwards");
+		break;
+
+	default:
+		break;
+	}
+
 	session_msg_log(request, tls_session, (uint8_t const *)inbuf, len);
 
 #ifndef OPENSSL_NO_SSL_TRACE
-	if (RDEBUG_ENABLED3) SSL_trace(tls_session->info.origin,
-				       tls_session->info.version,
-				       tls_session->info.content_type,
-				       inbuf, len,
-				       ssl,
-				       fr_tls_request_log_bio(request, L_DBG, L_DBG_LVL_3));
+	if (RDEBUG_ENABLED3) {
+		SSL_trace(tls_session->info.origin,
+			  tls_session->info.version,
+			  tls_session->info.content_type,
+			  inbuf, len,
+			  ssl,
+			  request ?
+			  	fr_tls_request_log_bio(request, L_DBG, L_DBG_LVL_3) :
+				fr_tls_global_log_bio(L_DBG, L_DBG_LVL_3));
+	}
 #endif
+}
+
+/*
+ *  By setting the environment variable SSLKEYLOGFILE to a filename keying
+ *  material will be exported that you may use with Wireshark to decode any
+ *  TLS flows. Please see the following for more details:
+ *
+ *	https://gitlab.com/wireshark/wireshark/-/wikis/TLS#tls-decryption
+ *
+ *  An example logging session is (you should delete the file on each run):
+ *
+ *	rm -f /tmp/sslkey.log; env SSLKEYLOGFILE=/tmp/sslkey.log freeradius -X | tee /tmp/debug
+ *
+ *  Note that we rely on the OS to check file permissions.  If the
+ *  caller can run radiusd, then they can only write to files which
+ *  they own.  If radiusd is running as root, then only root can
+ *  change the environment variables for radiusd.
+ */
+void fr_tls_session_keylog_cb(const SSL *ssl, const char *line)
+{
+	int fd;
+	size_t len;
+	const char *filename;
+	char buffer[64 + 2*SSL3_RANDOM_SIZE + 2*SSL_MAX_MASTER_KEY_LENGTH];
+
+	/*
+	 *	Prefer the environment variable definition to the
+	 *	configuration file.  This allows for "one-shot"
+	 *	dumping of EAP keys when you know you're not using
+	 *	RadSec, and you don't want to edit the configuration.
+	 */
+	filename = getenv("SSLKEYLOGFILE");
+	if (!filename) {
+		fr_tls_conf_t *conf;
+
+		conf = (fr_tls_conf_t *)SSL_get_ex_data(ssl, FR_TLS_EX_INDEX_CONF);
+		if (!conf || !conf->keylog_file || !*conf->keylog_file) return;
+
+		filename = conf->keylog_file;
+	}
+
+	/*
+	 *	We write all of the data at once.  This is *generally*
+	 *	atomic on most systems.
+	 */
+	len = strlen(line);
+	if ((len + 1) > sizeof(buffer)) {
+		DEBUG("SSLKEYLOGFILE buffer not large enough, max %lu, required %lu", sizeof(buffer), len + 1);
+		return;
+	}
+
+	/*
+	 *	Add a \n, which means that in order to write() the
+	 *	buffer AND the trailing \n, we have to place both
+	 *	strings into the same buffer.
+	 */
+	memcpy(buffer, line, len);
+	buffer[len] = '\n';
+
+	fd = open(filename, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR);
+	if (fd < 0) {
+		DEBUG("Failed to open file %s: %s", filename, strerror(errno));
+		return;
+	}
+
+	/*
+	 *	This should work in most situations.
+	 */
+	if (write(fd, buffer, len + 1) < 0) {
+		DEBUG("Failed to write to file %s: %s", filename, strerror(errno));
+	}
+
+	close(fd);
+}
+
+/** Check if all TLS initialization has finished.
+ *
+ * SSL_is_init_finished() tells us if the TLS handshake has finished,
+ * which is enough for TLS 1.2, or TLS 1.3 without session tickets, or
+ * TLS 1.3 with stateful session tickets.
+ *
+ * For TLS 1.3 with stateless session tickets, the ticket is sent
+ * after the handshake has completed.  The application gets to
+ * send/recv its application data only after the handshake has
+ * finished, the stateless session ticket has been received, and after
+ * the `load session` has been run.
+ *
+ * Callers outside this library MUST use this function rather than
+ * SSL_is_init_finished().
+ *
+ * @param[in] tls_session	to check.
+ * @return
+ *	- true if every part of the setup has finished.
+ *	- false if OpenSSL is still handshaking, or a `load session` which
+ *	  the caller has to wait for has not run yet.
+ */
+bool fr_tls_session_is_init_finished(fr_tls_session_t *tls_session)
+{
+	fr_tls_conf_t *conf;
+
+	if (!SSL_is_init_finished(tls_session->ssl)) return false;
+
+	/*
+	 *	TLS 1.3 servers send the session ticket (stateless or stateful) after the handshake has
+	 *	finished.  That adds a step after the TLS handshake is done.  If we're not doing TLS 1.3, or
+	 *	we're not using tickets, then we're done all negotiation, and application data can flow.
+	 */
+	if (tls_session->info.version != TLS1_3_VERSION) return true;
+
+	if (!tls_session->cache) return true;
+
+	/*
+	 *	If we're not a server, then we're a client, and we need to receive a ticket.  For TLS 1.3, the
+	 *	TLS handshake is finished, and then we might fet a ticket (stateless or stateful).
+	 *
+	 *	We can either wait for a ticket (with timeout), or notice that receiption of application data
+	 *	means that the ticket was sent (or not).
+	 */
+	if (!SSL_is_server(tls_session->ssl)) {
+		return tls_session->session_ticket_received || tls_session->seen_application_data;
+	}
+
+	/*
+	 *	A server which keeps its sessions in a cache has no
+	 *	`load session` to wait for after the handshake.
+	 */
+	conf = tls_session->conf;
+	if (!(conf->cache.mode & FR_TLS_TICKET_STATELESS)) return true;
+
+	/*
+	 *	Something has requested `load session`, but it hasn't
+	 *	yet been run.  Once that section completes, its state
+	 *	returns to INIT.  A session which never sends a ticket
+	 *	is therefore also marked as finished.
+	 */
+	return (tls_session->cache->load.state != FR_TLS_TICKET_STATEFUL_REQUESTED);
 }
 
 /** Decrypt application data
@@ -858,80 +1262,88 @@ int fr_tls_session_recv(request_t *request, fr_tls_session_t *tls_session)
 {
 	int ret;
 
-	fr_tls_session_request_bind(tls_session->ssl, request);
-
-	if (!SSL_is_init_finished(tls_session->ssl)) {
-		REDEBUG("Attempted to read application data before handshake completed");
-	error:
-		ret = -1;
-		goto finish;
-	}
-
-	/*
-	 *	Decrypt the complete record.
-	 */
-	if (tls_session->dirty_in.used) {
-		ret = BIO_write(tls_session->into_ssl, tls_session->dirty_in.data, tls_session->dirty_in.used);
-		if (ret != (int) tls_session->dirty_in.used) {
-			record_init(&tls_session->dirty_in);
-			REDEBUG("Failed writing %zd bytes to SSL BIO: %d", tls_session->dirty_in.used, ret);
-			goto error;
+	if (!tls_session->seen_application_data) {
+		if (!SSL_is_init_finished(tls_session->ssl)) {
+			REDEBUG("(TLS) Attempted to read application data before handshake completed");
+			fr_tls_session_error_add(request, FR_ERROR_VALUE_APPLICATION_DATA_TOO_EARLY);
+			return -1;
 		}
 
-		record_init(&tls_session->dirty_in);
+		/*
+		 *	The handshake is over and we are about to move application
+		 *	data, so we are past the point where a session ticket is
+		 *	wanted.  tls_ticket_stateful_store_cb() refuses any which arrive from
+		 *	here on.
+		 */
+		tls_session->seen_application_data = true;
 	}
 
+	fr_tls_session_request_bind(tls_session->ssl, request);
+
 	/*
-	 *      Clear the dirty buffer now that we are done with it
-	 *      and init the clean_out buffer to store decrypted data
+	 *	Nothing is copied here.  The caller filled dirty_in, which
+	 *	is into_ssl's producer cursor, so OpenSSL can already see
+	 *	the record, and the BIO read callback reclaims the space as
+	 *	OpenSSL consumes it.
+	 *
+	 *	Init the clean_out buffer to store the decrypted data.
 	 */
-	record_init(&tls_session->clean_out);
+	fr_tls_record_init(&tls_session->clean_out);
+
+	/*
+	 *	Prevent spurious errors on the thread local error
+	 *	stack causing SSL_get_error() to return SSL_ERROR_SSL
+	 *	instead of what of the SSL_ERROR_WANT_* values.
+	 */
+	ERR_clear_error();
 
 	/*
 	 *      Read (and decrypt) the tunneled data from the
 	 *      SSL session, and put it into the decrypted
 	 *      data buffer.
 	 */
-	ret = SSL_read(tls_session->ssl, tls_session->clean_out.data, sizeof(tls_session->clean_out.data));
+	ret = SSL_read(tls_session->ssl, fr_dbuff_current(&tls_session->clean_out),
+		       (int)fr_dbuff_remaining(&tls_session->clean_out));
 	if (ret < 0) {
 		int code;
 
 		code = SSL_get_error(tls_session->ssl, ret);
 		switch (code) {
 		case SSL_ERROR_WANT_READ:
-			RWDEBUG("Peer indicated record was complete, but OpenSSL returned SSL_WANT_READ. "
+			RWDEBUG("(TLS) Peer indicated record was complete, but OpenSSL returned SSL_WANT_READ. "
 				"Attempting to continue");
 			ret = 1;
 			goto finish;
 
 		case SSL_ERROR_WANT_WRITE:
-			REDEBUG("Error in fragmentation logic: SSL_WANT_WRITE");
-			goto error;
+			REDEBUG("(TLS) Error in fragmentation logic: SSL_WANT_WRITE");
+		error:
+			ret = -1;
+			goto finish;
 
 		case SSL_ERROR_NONE:
-			RDEBUG2("No application data received.  Assuming handshake is continuing...");
+			RDEBUG2("(TLS) No application data received.  Assuming handshake is continuing...");
 			ret = 0;
 			break;
 
 		default:
-			REDEBUG("Error in fragmentation logic");
-			fr_tls_log_io_error(request, tls_session, ret, "Failed in SSL_read");
+			REDEBUG("(TLS) Error in fragmentation logic");
+			fr_tls_log_io_error(request, code, "SSL_read (%s)", __FUNCTION__);
 			goto error;
 		}
-
 	}
 
 	/*
 	 *	Passed all checks, successfully decrypted data
 	 */
-	tls_session->clean_out.used = ret;
+	fr_dbuff_advance(&tls_session->clean_out, (size_t) ret);
 	ret = 0;
 
 	if (RDEBUG_ENABLED3) {
-		RHEXDUMP3(tls_session->clean_out.data, tls_session->clean_out.used,
-			 "Decrypted TLS application data (%zu bytes)", tls_session->clean_out.used);
+		RHEXDUMP3(fr_dbuff_start(&tls_session->clean_out), fr_dbuff_used(&tls_session->clean_out),
+			 "(TLS) Decrypted TLS application data (%zu bytes)", fr_dbuff_used(&tls_session->clean_out));
 	} else {
-		RDEBUG2("Decrypted TLS application data (%zu bytes)", tls_session->clean_out.used);
+		RDEBUG2("(TLS) Decrypted TLS application data (%zu bytes)", fr_dbuff_used(&tls_session->clean_out));
 	}
 finish:
 	fr_tls_session_request_unbind(tls_session->ssl);
@@ -956,13 +1368,17 @@ int fr_tls_session_send(request_t *request, fr_tls_session_t *tls_session)
 {
 	int ret = 0;
 
-	fr_tls_session_request_bind(tls_session->ssl, request);
+	if (!tls_session->seen_application_data) {
+		if (!SSL_is_init_finished(tls_session->ssl)) {
+			REDEBUG("(TLS) Attempted to write application data before handshake completed");
+			fr_tls_session_error_add(request, FR_ERROR_VALUE_APPLICATION_DATA_TOO_EARLY);
+			return -1;
+		}
 
-	if (!SSL_is_init_finished(tls_session->ssl)) {
-		REDEBUG("Attempted to write application data before handshake completed");
-		ret = -1;
-		goto finish;
+		tls_session->seen_application_data = true;
 	}
+
+	fr_tls_session_request_bind(tls_session->ssl, request);
 
 	/*
 	 *	If there's un-encrypted data in 'clean_in', then write
@@ -973,26 +1389,48 @@ int fr_tls_session_send(request_t *request, fr_tls_session_t *tls_session)
 	 *	Based on Server's logic this clean_in is expected to
 	 *	contain the data to send to the client.
 	 */
-	if (tls_session->clean_in.used > 0) {
+	if (fr_dbuff_used(&tls_session->clean_in) > 0) {
+		size_t used = fr_dbuff_used(&tls_session->clean_in);
+
+		/*
+		 *	Ensure spurious errors aren't printed
+		 */
+		ERR_clear_error();
+
 		if (RDEBUG_ENABLED3) {
-			RHEXDUMP3(tls_session->clean_in.data, tls_session->clean_in.used,
-				 "TLS application data to encrypt (%zu bytes)", tls_session->clean_in.used);
+			RHEXDUMP3(fr_dbuff_start(&tls_session->clean_in), used,
+				 "(TLS) TLS application data to encrypt (%zu bytes)", used);
 		} else {
-			RDEBUG2("TLS application data to encrypt (%zu bytes)", tls_session->clean_in.used);
+			RDEBUG2("(TLS) TLS application data to encrypt (%zu bytes)", used);
 		}
 
-		ret = SSL_write(tls_session->ssl, tls_session->clean_in.data, tls_session->clean_in.used);
-		record_to_buff(&tls_session->clean_in, NULL, ret);
-
-		/* Get the dirty data from Bio to send it */
-		ret = BIO_read(tls_session->from_ssl, tls_session->dirty_out.data,
-			       sizeof(tls_session->dirty_out.data));
-		if (ret > 0) {
-			tls_session->dirty_out.used = ret;
-			ret = 0;
-		} else {
-			if (fr_tls_log_io_error(request, tls_session, ret, "Failed in SSL_write") < 0) ret = -1;
+		ret = SSL_write(tls_session->ssl, fr_dbuff_start(&tls_session->clean_in), (int)used);
+		if (ret < 0) {
+			/*
+			 *	ret<0 means that we have a real error.
+			 *
+			 *	ret=0 means the "error" is SSL_WANT_READ, SSL_WANT_WRITE, etc.
+			 */
+			ret = fr_tls_log_io_error(request, SSL_get_error(tls_session->ssl, ret),
+						  "SSL_write (%s)", __FUNCTION__);
+			goto finish;
 		}
+
+		/*
+		 *	SSL_MODE_ENABLE_PARTIAL_WRITE is not set, so SSL_write()
+		 *	either takes everything or fails.  The whole buffer is
+		 *	therefore consumed.
+		 */
+		fr_assert((size_t) ret == used);
+		fr_tls_record_init(&tls_session->clean_in);
+
+		/*
+		 *	SSL_write() passes the encrypted record in
+		 *	dirty_in to the BIO callback, which put the
+		 *	output data into from_ssl.  We're therefore
+		 *	done here.
+		 */
+		ret = 0;
 	}
 
 finish:
@@ -1001,17 +1439,124 @@ finish:
 	return ret;
 }
 
+/** Create a TLS 1.3 session ticket after the handshake, and queue the ticket for the peer
+ *
+ * SSL_new_session_ticket() queues a ticket, and we need to call SSL_do_handshake() to put the ticket into
+ * dirty_out for writing.
+ *
+ * The ticket creation callback runs inside SSL_do_handshake().  It cannot pause the request, so the caller
+ * MUST have run `encode session` already, and set tls_session->app_data_ready.
+ *
+ * @param[in] request		bound to the session for the duration of the call.
+ * @param[in] tls_session	to create a ticket for.  Must be a server, and TLS 1.3.
+ * @return
+ *	- 0 on success.  tls_session->session_ticket_created says if OpenSSL made a ticket.
+ *	- -1 on failure.
+ */
+int fr_tls_session_ticket_write(request_t *request, fr_tls_session_t *tls_session)
+{
+	int ret;
+
+	fr_tls_session_request_bind(tls_session->ssl, request);
+
+	ERR_clear_error();
+
+	tls_session->session_ticket_created = false;
+
+	if (SSL_new_session_ticket(tls_session->ssl) != 1) {
+		fr_tls_log_perror(request, "SSL_new_session_ticket failed");
+		tls_session->app_data_ready = false;
+		fr_tls_session_request_unbind(tls_session->ssl);
+		return -1;
+	}
+
+	ret = SSL_do_handshake(tls_session->ssl);
+	if (ret <= 0) {
+		ret = fr_tls_log_io_error(request, SSL_get_error(tls_session->ssl, ret),
+					  "SSL_do_handshake (%s)", __FUNCTION__);
+		if (ret < 0) {
+			tls_session->app_data_ready = false;
+			fr_tls_session_request_unbind(tls_session->ssl);
+			return -1;
+		}
+	}
+
+	/*
+	 *	The app_data_set() callback clears the flag when the callback uses the data.  If the flag is
+	 *	still set, then OpenSSL did not create a ticket.  Don't leave stale data for the next ticket.
+	 */
+	if (tls_session->app_data_ready) {
+		RWDEBUG("(TLS) OpenSSL did not create a session ticket");
+		tls_session->app_data_ready = false;
+	}
+
+	fr_tls_session_request_unbind(tls_session->ssl);
+	return 0;
+}
+
+/** Record a failure which FreeRADIUS itself decided
+ *
+ * The `session-state` list is where these go, because the list is what
+ * survives from one round of the handshake to the next, and because it is
+ * the list which `fail session { ... }` is given.
+ *
+ * Errors append rather than replace.  A record which FreeRADIUS refuses
+ * marks the session invalid, and the round after that reports
+ * `Session-Invalid`.  Replacing would keep that second report and lose the
+ * refusal which caused it, which is the part an administrator needs.
+ *
+ * @param[in] request	to add the error to.  A NULL request is ignored,
+ *			because several OpenSSL callbacks run without one.
+ * @param[in] error	an `FR_ERROR_VALUE_*` value from
+ *			`protocol/tls/freeradius.h`, which is generated from
+ *			`share/dictionary/tls/dictionary.freeradius`.
+ */
+void fr_tls_session_error_add(request_t *request, uint32_t error)
+{
+	fr_pair_t *vp;
+
+	if (!request) return;
+
+	MEM(pair_append_request(&vp, attr_tls_error) >= 0);
+	vp->vp_uint32 = error;
+
+	RDEBUG2("(TLS) request.%pP", vp);
+}
+
 /** Instruct fr_tls_session_async_handshake to create a synthesised TLS alert record and send it to the peer
  *
  */
-int fr_tls_session_alert(UNUSED request_t *request, fr_tls_session_t *session, uint8_t level, uint8_t description)
+int fr_tls_session_alert(request_t *request, fr_tls_session_t *session, uint8_t level, uint8_t description)
 {
-	if (session->alerts_sent > 3) return -1;		/* Some kind of sate machine brokenness */
+	fr_assert(request != NULL);
+
+	if (session->alerts_sent > 3) return -1;		/* Some kind of state machine brokenness */
 
 	/*
-	 *	Ignore less severe alerts
+	 *	Ignore an alert which has lower severity than the one already queued.
+	 *
+	 *	Two alerts of the same severity means the first one is the cause, and the second one is a
+	 *	later round noticing the damage.  fr_tls_session_msg_cb() refuses a record and marks the
+	 *	session invalid, and the round after that reports FR_ERROR_VALUE_SESSION_INVALID.  The first
+	 *	alert says what was wrong with the record, which is the part the peer can act on.
 	 */
-	if (session->pending_alert && (level < session->pending_alert_level)) return 0;
+	if (session->pending_alert && (level <= session->pending_alert_level)) return 0;
+
+	/*
+	 *	Check our internal flag is write_encrypted.  We track that above in fr_tls_session_msg_cb()
+	 *
+	 *	Refusing here rather than when the alert is sent lets the caller act on the refusal.  A caller
+	 *	which queued the alert in order to reject the session has to fail the session some other way,
+	 *	and both callers outside this file already check the return code.
+	 *
+	 *	The caller still records the error, so `fail session { ... }` reports the same reason either
+	 *	way.  However, the peer never gets the alert.
+	 */
+	if (session->write_encrypted) {
+		RDEBUG2("(TLS) Not sending TLS alert (%u), the records we write are already encrypted",
+			description);
+		return -1;
+	}
 
 	session->pending_alert = true;
 	session->pending_alert_level = level;
@@ -1020,8 +1565,36 @@ int fr_tls_session_alert(UNUSED request_t *request, fr_tls_session_t *session, u
 	return 0;
 }
 
+/** Record an application error, and queue a fatal TLS alert for sending to the peer.
+ *
+ * We can refuse handshakes for a number of policy or application-layer reasons.  RFC9846 Section 6.2 says
+ * that we should send an alert to the peer, and then close the connection.
+ *
+ * This function should be used only when OpenSSL hasn't already sent an alert of its own.
+ *
+ * fr_tls_session_alert_send() builds the alert by hand, and overwrites whatever OpenSSL left in
+ * the buffer.
+ *
+ * @param[in] request		to add the error to.
+ * @param[in] session		to queue the alert on.
+ * @param[in] error		an `FR_ERROR_VALUE_*` value, as for
+ *				fr_tls_session_error_add().
+ * @param[in] description	the TLS alert description to send.  Pass
+ *				`SSL_AD_INTERNAL_ERROR` where no more specific
+ *				description fits the rule which was broken.
+ */
+void fr_tls_session_error_alert(request_t *request, fr_tls_session_t *session,
+				uint32_t error, uint8_t description)
+{
+	fr_tls_session_error_add(request, error);
+
+	(void) fr_tls_session_alert(request, session, SSL3_AL_FATAL, description);
+}
+
 static void fr_tls_session_alert_send(request_t *request, fr_tls_session_t *session)
 {
+	ssize_t slen;
+
 	/*
 	 *	Update our internal view of the session
 	 */
@@ -1030,34 +1603,254 @@ static void fr_tls_session_alert_send(request_t *request, fr_tls_session_t *sess
 	session->info.alert_level = session->pending_alert_level;
 	session->info.alert_description = session->pending_alert_description;
 
-	session->dirty_out.data[0] = session->info.content_type;
-	session->dirty_out.data[1] = 3;
-	session->dirty_out.data[2] = 1;
-	session->dirty_out.data[3] = 0;
-	session->dirty_out.data[4] = 2;
-	session->dirty_out.data[5] = session->pending_alert_level;
-	session->dirty_out.data[6] = session->pending_alert_description;
+	/*
+	 *	session_msg_log() reads both of these, and decodes the
+	 *	level and the description only when the length says two.
+	 *	Without them the log line reports whatever record came
+	 *	before this one, which is not the alert it claims to
+	 *	describe.  They have to agree with the record written
+	 *	below.
+	 */
+	session->info.version = TLS1_VERSION;
+	session->info.record_len = 2;
 
-	session->dirty_out.used = 7;
+	/*
+	 *	Sending an alert over-rides whatever was in the
+	 *	buffer, waiting to be sent.  But for nearly all cases,
+	 *	the from_ssl buffer will already be empty.
+	 *
+	 *	The application then sees the data, and writes it to
+	 *	the peer.
+	 */
+	fr_tls_bio_dbuff_clear(session->from_ssl);
+
+	slen = fr_dbuff_in_bytes(fr_tls_bio_dbuff_in(session->from_ssl),
+				 (uint8_t) session->info.content_type,
+				 (uint8_t) 3, (uint8_t) 1, (uint8_t) 0, (uint8_t) 2,
+				 session->pending_alert_level,
+				 session->pending_alert_description);
+	if (!fr_cond_assert(slen == 7)) return;
+
+	/*
+	 *	We're building the TLS Alert manually, so we have to
+	 *	manually record it here.
+	 */
+	tls_session_alert_pair_add(request, request->reply_ctx, "reply.",
+				   session->pending_alert_level, session->pending_alert_description);
+	fr_tls_session_error_add(request, FR_ERROR_VALUE_SENT_ALERT);
 
 	session->pending_alert = false;
 	session->alerts_sent++;
 
 	SSL_clear(session->ssl);	/* Reset the SSL *, to allow the client to restart the session */
 
-	session_msg_log(request, session, session->dirty_out.data, session->dirty_out.used);
+	session_msg_log(request, session, fr_dbuff_current(session->dirty_out),
+			fr_dbuff_remaining(session->dirty_out));
+}
+
+/** Tell the peer about any pending errors before we close the connection.
+ *
+ * A connection which is about to close sends a `close_notify`, as RFC 9846 Section 6.1 says "Each party MUST
+ * send a 'close_notify' alert before closing its write side of the connection, unless it has already sent
+ * some error alert."  If there's an error alert, then don't send that.
+ *
+ * - A queued fatal alert is an error, and we send that.  The end of a handshake round sends any queued alert.
+ *   An error path does not reach the end of the round, so the "send alert" function has to be called
+ *   explicitly.
+ *
+ * - if there's no queued alert, then we just send a close_notify alert.  OpenSSL doesn't provide any other
+ *   way to send a TLS alert to the peer.
+ *
+ * - If the handshake doesn't finish, then we can't send anything.  The connection is likely not TLS, and
+ *   sending a TLS alert won't help.
+ *
+ * The application should send the remaining data, and then close the socket.
+ *
+ * @param[in] request	to log against, and to bind while OpenSSL runs.
+ * @param[in] session	which is closing.
+ */
+void fr_tls_session_close_send(request_t *request, fr_tls_session_t *session)
+{
+	bool	bound;
+	int	ret;
+
+	if (session->pending_alert) {
+		fr_tls_session_alert_send(request, session);
+		return;
+	}
+
+	/*
+	 *	We've already sent an error alert, and RFC 9846 Section 6.1 says we don't need to follow that
+	 *	with a close_notify.  OpenSSL alerts don't need to be counted, because they result in
+	 *	handshake failures, and this function is never reached.
+	 */
+	if (session->alerts_sent > 0) return;
+
+	if (!SSL_is_init_finished(session->ssl)) return;
+
+	/*
+	 *	Make this function idempotent.  The source of the fatal error calls us, and we might be called
+	 *	again after `fail sessions { ... }` finishes.  The application doesn't know what's up, so it
+	 *	calls us just to be safe.
+	 */
+	if (SSL_get_shutdown(session->ssl) & SSL_SENT_SHUTDOWN) return;
+
+	/*
+	 *	A failure inside of a handshake results in fr_tls_session_msg_cb() being called, and it needs
+	 *	the request bound.  Do that here, if it wasn't already done/
+	 */
+	bound = (fr_tls_session_request(session->ssl) != NULL);
+	if (!bound) fr_tls_session_request_bind(session->ssl, request);
+
+	/*
+	 *	Disable the OpenSSL quiet shutdown, so it sends close_notify.  We need to do that on our
+	 *	timeframe, so the quiet shutdown is on by default.
+	 *
+	 *	OpenSSL drops a session from its internal cache (and maybe ours) when a connection closes
+	 *	without seeing a `close_notify`.
+	 */
+	SSL_set_quiet_shutdown(session->ssl, 0);
+
+	ret = SSL_shutdown(session->ssl);
+
+	/*
+	 *	We're non-blocking, so a zero return is "we sent it, but we didn't see a response from the
+	 *	peer", which is expected.
+	 */
+	if (ret < 0) {
+		RDEBUG2("(TLS) Failed sending close_notify");
+		ERR_clear_error();
+	} else {
+		RDEBUG2("(TLS) Sending close_notify");
+	}
+
+	if (!bound) fr_tls_session_request_unbind(session->ssl);
+}
+
+/** Push an `establish session { ... }` call into the current request, using a subrequest
+ *
+ * @param[in] request		The current request.
+ * @param[in] conf		TLS configuration.
+ * @param[in] tls_session	The current TLS session.
+ * @return
+ *	- UNLANG_ACTION_PUSHED_CHILD on success.
+ *      - UNLANG_ACTION_FAIL on failure.
+ */
+static inline CC_HINT(always_inline)
+unlang_action_t tls_establish_session_push(request_t *request, fr_tls_conf_t *conf, fr_tls_session_t *tls_session)
+{
+	request_t	*child;
+	unlang_action_t	ua;
+
+	fr_assert(conf->virtual_server);
+
+	MEM(child = tls_subrequest_alloc(request, enum_tls_packet_type_establish_session->vb_uint32,
+					 &tls_session->session_id));
+
+	/*
+	 *	Allocate a child, and set it up to call
+	 *      the TLS virtual server.
+	 */
+	ua = fr_tls_call_push(child, NULL, conf, tls_session, false);
+	if (ua == UNLANG_ACTION_FAIL) {
+		talloc_free(child);
+		return UNLANG_ACTION_FAIL;
+	}
+
+	return ua;
+}
+
+/** Discard the session, once `fail session { ... }` has run
+ *
+ */
+static unlang_action_t tls_session_fail_clear(request_t *request, void *uctx)
+{
+	fr_tls_session_t	*tls_session = talloc_get_type_abort(uctx, fr_tls_session_t);
+
+	return fr_tls_ticket_stateful_clear_session(request, tls_session);
+}
+
+/** Discard the session without clearing the cached session, once `fail session { ... }` has run
+ *
+ */
+static unlang_action_t tls_session_fail_discard(request_t *request, void *uctx)
+{
+	fr_tls_session_t	*tls_session = talloc_get_type_abort(uctx, fr_tls_session_t);
+
+	return fr_tls_ticket_stateful_discard_session(request, tls_session);
+}
+
+/** The TLS session failed
+ *
+ * Runs `fail session { ... }`, so that the admin can run policies on
+ * TLS connection failure.  When `fail session { ... }` has finished, the function runs
+ * `clear session { ... }` to remove any cached session information, unless `clear` is false.
+ *
+ * Pass `clear` as false after a network failure.  A network failure is normal, and shouldn't invalidate the
+ * session ticket.
+ *
+ * When `clear` is false, the function cancels any pending `store session { ... }`.  A `clear session { ... }`
+ * that was already queued for the loaded session still runs to invalidate the previous ticket, and any other
+ * queued clear is dropped.
+ *
+ * A session can fail without session tickets, and a session ticket can be removed without a TLS
+ * negotiation failure.
+ *
+ * @note The caller MUST set the caller's own unlang result before calling
+ *	 `fr_tls_session_fail_session()`.  A pushed child returns to the caller's
+ *	 caller with that result already in place.
+ *
+ * @param[in] request		to run the sections in.
+ * @param[in] tls_session	which failed.
+ * @param[in] clear		true to run `clear session { ... }` for a loaded session, false to
+ *				keep the cached session.
+ * @return
+ *	- UNLANG_ACTION_PUSHED_CHILD	- the sections are running.
+ *	- UNLANG_ACTION_CALCULATE_RESULT - there is no `fail session { ... }` section, and no
+ *	  `clear session { ... }` was pushed.
+ *	- UNLANG_ACTION_FAIL		- a frame could not be pushed.
+ */
+unlang_action_t fr_tls_session_fail_session(request_t *request, fr_tls_session_t *tls_session, bool clear)
+{
+	fr_tls_conf_t		*conf = tls_session->conf;
+	request_t		*child;
+	unlang_action_t		ua;
+	unlang_function_no_result_t	finish = clear ? tls_session_fail_clear : tls_session_fail_discard;
+
+	if (!conf->fail_session) return finish(request, tls_session);
+
+	if (unlang_function_push(request,
+				 NULL,
+				 finish,
+				 NULL, FR_SIGNAL_NONE, UNLANG_SUB_FRAME, tls_session) == UNLANG_ACTION_FAIL) {
+		return UNLANG_ACTION_FAIL;
+	}
+
+	/*
+	 *	A session which failed before OpenSSL established one has
+	 *	no ID to report, which tls_subrequest_alloc() handles.
+	 */
+	MEM(child = tls_subrequest_alloc(request, enum_tls_packet_type_fail_session->vb_uint32,
+					 &tls_session->session_id));
+
+	ua = fr_tls_call_push(child, NULL, conf, tls_session, false);
+	if (!fr_cond_assert(ua == UNLANG_ACTION_PUSHED_CHILD)) {
+		talloc_free(child);
+		unlang_interpet_frame_discard(request);
+		return UNLANG_ACTION_FAIL;
+	}
+
+	return ua;
 }
 
 /** Finish off a handshake round, possibly adding attributes to the request
  *
  */
-static unlang_action_t tls_session_async_handshake_done_round(UNUSED rlm_rcode_t *p_result, UNUSED int *priority,
-							      request_t *request, void *uctx)
+static unlang_action_t tls_session_async_handshake_done_round(request_t *request, void *uctx)
 {
 	fr_tls_session_t	*tls_session = talloc_get_type_abort(uctx, fr_tls_session_t);
-	int			ret;
 
-	RDEBUG3("entered state %s", __FUNCTION__);
+	RDEBUG3("(TLS) entered state %s", __FUNCTION__);
 
 	/*
 	 *	This only occurs once per session, where calling
@@ -1076,6 +1869,18 @@ static unlang_action_t tls_session_async_handshake_done_round(UNUSED rlm_rcode_t
 		char cipher_desc[256], cipher_desc_clean[256];
 		char *p = cipher_desc, *q = cipher_desc_clean;
 
+		/*
+		 *	Check if ALPN was successfully negotiated.  We
+		 *	can do this without caring about session
+		 *	tickets.
+		 */
+		if (fr_tls_session_alpn_check(request, tls_session) < 0) {
+			fr_tls_session_close_send(request, tls_session);
+			tls_session->result = FR_TLS_RESULT_ERROR;
+			fr_tls_session_request_unbind(tls_session->ssl);
+			return UNLANG_ACTION_CALCULATE_RESULT;
+		}
+
 		cipher = SSL_get_current_cipher(tls_session->ssl);
 		SSL_CIPHER_description(cipher, cipher_desc, sizeof(cipher_desc));
 
@@ -1084,26 +1889,21 @@ static unlang_action_t tls_session_async_handshake_done_round(UNUSED rlm_rcode_t
 		 *	Seems to print info in a tabular format.
 		 */
 		while (*p != '\0') {
-			if (isspace(*p)) {
-				*q++ = *p;
-				fr_skip_whitespace(p);
+			if (isspace((uint8_t) *p)) {
+				p++;
 				continue;
 			}
 			*q++ = *p++;
 		}
 		*q = '\0';
 
-		RDEBUG2("Cipher suite: %s", cipher_desc_clean);
+		RDEBUG2("(TLS) Cipher suite: %s", cipher_desc_clean);
 
-		RDEBUG2("Adding TLS session information to request");
-		vp = fr_pair_afrom_da(request->session_state_ctx, attr_tls_session_cipher_suite);
-		if (vp) {
-			fr_pair_value_strdup(vp,  SSL_CIPHER_get_name(cipher));
-			fr_pair_append(&request->session_state_pairs, vp);
-			RINDENT();
-			RDEBUG2("&session-state.%pP", vp);
-			REXDENT();
-		}
+		RDEBUG2("(TLS) Adding TLS session information to request");
+		RINDENT();
+		MEM(pair_update_session_state(&vp, attr_tls_session_cipher_suite) >= 0);
+		fr_pair_value_strdup(vp,  SSL_CIPHER_get_name(cipher), false);
+		RDEBUG2("(TLS) session-state.%pP", vp);
 
 		if (((size_t)tls_session->info.version >= NUM_ELEMENTS(tls_version_str)) ||
 		    !tls_version_str[tls_session->info.version]) {
@@ -1112,14 +1912,10 @@ static unlang_action_t tls_session_async_handshake_done_round(UNUSED rlm_rcode_t
 			version = tls_version_str[tls_session->info.version];
 		}
 
-		vp = fr_pair_afrom_da(request->session_state_ctx, attr_tls_session_version);
-		if (vp) {
-			fr_pair_value_strdup(vp, version);
-			fr_pair_append(&request->session_state_pairs, vp);
-			RINDENT();
-			RDEBUG2("&session-state.TLS-Session-Version := \"%s\"", version);
-			REXDENT();
-		}
+		MEM(pair_update_session_state(&vp, attr_tls_session_version) >= 0);
+		fr_pair_value_strdup(vp, version, false);
+		RDEBUG2("(TLS) session-state.%pP", vp);
+		REXDENT();
 
 		/*
 		 *	Cache the SSL_SESSION pointer.
@@ -1128,9 +1924,14 @@ static unlang_action_t tls_session_async_handshake_done_round(UNUSED rlm_rcode_t
 		 */
 		if (!tls_session->session) {
 			tls_session->session = SSL_get_session(tls_session->ssl);
+			if (tls_session->session) {
+				tls_session_id_cache(tls_session, tls_session->session);
+			}
 			if (!tls_session->session) {
-				REDEBUG("Failed getting TLS session");
-			error:
+				REDEBUG("(TLS) Failed getting TLS session");
+				fr_tls_session_error_alert(request, tls_session,
+							   FR_ERROR_VALUE_SESSION_MISSING, SSL_AD_INTERNAL_ERROR);
+				fr_tls_session_close_send(request, tls_session);
 				tls_session->result = FR_TLS_RESULT_ERROR;
 				fr_tls_session_request_unbind(tls_session->ssl);
 				return UNLANG_ACTION_CALCULATE_RESULT;
@@ -1140,8 +1941,7 @@ static unlang_action_t tls_session_async_handshake_done_round(UNUSED rlm_rcode_t
 		if (RDEBUG_ENABLED3) {
 			if (SSL_SESSION_print(fr_tls_request_log_bio(request, L_DBG, L_DBG_LVL_3),
 					      tls_session->session) != 1) {
-			} else {
-				RDEBUG3("Failed retrieving session data");
+				RDEBUG3("(TLS) Failed retrieving session data");
 			}
 		}
 
@@ -1158,26 +1958,15 @@ static unlang_action_t tls_session_async_handshake_done_round(UNUSED rlm_rcode_t
 	}
 
 	/*
-	 *	Get data to pack and send back to the TLS peer.
+	 *	Get the data to send to the peer.  OpenSSL already did
+	 *	it's magic, so we can just do ours here.
+	 *
+	 *	No encrypted data means that OpenSSL produced no TLS
+	 *	content, so the output is likely application data.
 	 */
-	ret = BIO_ctrl_pending(tls_session->from_ssl);
-	if (ret > 0) {
-		ret = BIO_read(tls_session->from_ssl, tls_session->dirty_out.data,
-			       sizeof(tls_session->dirty_out.data));
-		if (ret > 0) {
-			tls_session->dirty_out.used = ret;
-		} else if (BIO_should_retry(tls_session->from_ssl)) {
-			record_init(&tls_session->dirty_in);
-			RDEBUG2("Asking for more data in tunnel");
-
-		} else {
-			fr_tls_log_error(NULL, NULL);
-			record_init(&tls_session->dirty_in);
-			goto error;
-		}
-	} else {
+	if (fr_dbuff_remaining(tls_session->dirty_out) == 0) {
 		/* Its clean application data, do whatever we want */
-		record_init(&tls_session->clean_out);
+		fr_tls_record_init(&tls_session->clean_out);
 	}
 
 	/*
@@ -1190,11 +1979,12 @@ static unlang_action_t tls_session_async_handshake_done_round(UNUSED rlm_rcode_t
 	 */
 	if (tls_session->pending_alert) fr_tls_session_alert_send(request, tls_session);
 
-	/* We are done with dirty_in, reinitialize it */
-	record_init(&tls_session->dirty_in);
-
 	tls_session->result = FR_TLS_RESULT_SUCCESS;
 	fr_tls_session_request_unbind(tls_session->ssl);
+	if (SSL_is_init_finished(tls_session->ssl)) {
+		fr_tls_conf_t	*conf = tls_session->conf;
+		if (conf->establish_session) return tls_establish_session_push(request, conf, tls_session);
+	}
 	return UNLANG_ACTION_CALCULATE_RESULT;
 }
 
@@ -1204,15 +1994,18 @@ static unlang_action_t tls_session_async_handshake_done_round(UNUSED rlm_rcode_t
  *
  * @param[in] request	being cancelled.
  * @param[in] action	we're being signalled with.
- * @param[in] uctx	the SSL * to cancell.
+ * @param[in] uctx	the SSL * to cancel.
  */
-static void tls_session_async_handshake_signal(UNUSED request_t *request, fr_state_signal_t action, void *uctx)
+static void tls_session_async_handshake_signal(UNUSED request_t *request, UNUSED fr_signal_t action, void *uctx)
 {
-	SSL			*ssl = uctx;
-	fr_tls_session_t	*tls_session = fr_tls_session(ssl);
+	fr_tls_session_t	*tls_session = talloc_get_type_abort(uctx, fr_tls_session_t);
 	int			ret;
 
-	if (action != FR_SIGNAL_CANCEL) return;
+	/*
+	 *	We might want to set can_pause = false here
+	 *	but that would trigger asserts in the
+	 *	cache code.
+	 */
 
 	/*
 	 *	If SSL_get_error returns SSL_ERROR_WANT_ASYNC
@@ -1228,8 +2021,8 @@ static void tls_session_async_handshake_signal(UNUSED request_t *request, fr_sta
 	 */
 	for (ret = tls_session->last_ret;
 	     SSL_get_error(tls_session->ssl, ret) == SSL_ERROR_WANT_ASYNC;
-	     ret = SSL_read(tls_session->ssl, tls_session->clean_out.data + tls_session->clean_out.used,
-        		    sizeof(tls_session->clean_out.data) - tls_session->clean_out.used));
+	     ret = SSL_read(tls_session->ssl, fr_dbuff_current(&tls_session->clean_out),
+			    (int)fr_dbuff_remaining(&tls_session->clean_out)));
 
 	/*
 	 *	Unbind the cancelled request from the SSL *
@@ -1237,24 +2030,103 @@ static void tls_session_async_handshake_signal(UNUSED request_t *request, fr_sta
 	fr_tls_session_request_unbind(tls_session->ssl);
 }
 
-/** Call SSL_read() to continue the TLS state machine
+/** Push the section for one bit of #fr_tls_pending_t
+ *
+ */
+typedef unlang_action_t (*fr_tls_pending_push_t)(request_t *request, fr_tls_session_t *tls_session);
+
+/** Push the section for every raised bit, then call SSL_read() to continue the TLS state machine
  *
  * This function may be called multiple times, once after every asynchronous request.
  *
- * @param[in,out] p_result	UNUSED.
- * @param[out] priority		UNUSED
  * @param[in] request		The current request.
  * @param[in] uctx		#fr_tls_session_t to continue.
  * @return
- *	- UNLANG_ACTION_CALCULATE_RESULT - We're done with this round.
+ *	- UNLANG_ACTION_CALCULATE_RESULT - We're done with this round, or a push
+ *	  failed and `tls_session->result` is FR_TLS_RESULT_ERROR.
  *	- UNLANG_ACTION_PUSHED_CHILD - Need to perform more asynchronous actions.
  */
-static unlang_action_t tls_session_async_handshake_cont(rlm_rcode_t *p_result, int *priority,
-							request_t *request, void *uctx)
+static unlang_action_t tls_session_async_handshake_cont(request_t *request, void *uctx)
 {
+	/*
+	 *	`push[idx]` is the push function for bit `1 << idx`.
+	 */
+	static fr_tls_pending_push_t const push[] = {
+		[0] = fr_tls_ticket_stateful_pending_push,	/* FR_TLS_PENDING_STATEFUL_TICKET */
+		[1] = fr_tls_ticket_stateless_pending_push,	/* FR_TLS_PENDING_STATELESS_TICKET */
+#ifdef PSK_MAX_IDENTITY_LEN
+		[2] = fr_tls_session_psk_pending_push,		/* FR_TLS_PENDING_PSK */
+#endif
+		[3] = fr_tls_verify_cert_pending_push,		/* FR_TLS_PENDING_VERIFY */
+	};
 	fr_tls_session_t	*tls_session = talloc_get_type_abort(uctx, fr_tls_session_t);
+	int			err;
 
-	RDEBUG3("(re-)entered state %s", __FUNCTION__);
+	RDEBUG3("(TLS) (re-)entered state %s", __FUNCTION__);
+
+again:
+	while (tls_session->pending) {
+		unsigned int		idx = fr_low_bit_pos(tls_session->pending) - 1;
+		fr_tls_pending_t	bit = (fr_tls_pending_t)(UINT64_C(1) << idx);
+		unlang_action_t		ua;
+
+		fr_assert(idx < NUM_ELEMENTS(push));
+		fr_assert(push[idx]);
+
+		/*
+		 *	Each bit is one shot.  The push function is called once for
+		 *	the bit, and raises the bit again if the callback asks again.
+		 */
+		TLS_PENDING_CLEAR(tls_session, bit);
+
+		/*
+		 *	Set this function as the repeat function before the push, so
+		 *	the frame runs this function again once the section has finished.
+		 */
+		if (unlikely(unlang_function_repeat_set(request, tls_session_async_handshake_cont) < 0)) {
+		error:
+			tls_session->result = FR_TLS_RESULT_ERROR;
+			goto finish;
+		}
+
+		ua = push[idx](request, tls_session);
+		switch (ua) {
+		case UNLANG_ACTION_PUSHED_CHILD:
+			return ua;
+
+		case UNLANG_ACTION_FAIL:
+			IGNORE(unlang_function_clear(request), int);
+			goto error;
+
+		default:
+			/*
+			 *	The push function found nothing to push for this bit, so the
+			 *	repeat function never runs.  Clear the repeat function and
+			 *	service the next raised bit.
+			 */
+			IGNORE(unlang_function_repeat_clear(request), int);
+			break;
+		}
+	}
+
+	/*
+	 *	Clear OpenSSL's thread local error stack.
+	 *
+	 *	Why do we need to do this here?  Although SSL_get_error
+	 *	takes an `SSL *`, which would make you _think_ it was
+	 *	operating on the error stack for that SSL, it will also
+	 *	return SSL_ERROR_SSL if there are any errors in the stack.
+	 *
+	 *	When operating normally SSL_read() can return < 0, to
+	 *	indicate it wants more data, or that we need to perform
+	 *	asynchronous processing.
+	 *
+	 *	If spurious errors have been left on the thread local
+	 *	stack they MUST be cleared before we can call SSL_get_error
+	 *	otherwise stale errors mask the async notifications
+	 *	and cause random handshake failures.
+	 */
+	ERR_clear_error();
 
 	/*
 	 *	Magic/More magic? Although SSL_read is normally
@@ -1276,10 +2148,19 @@ static unlang_action_t tls_session_async_handshake_cont(rlm_rcode_t *p_result, i
 	 *	If acting as a server SSL_set_accept_state must have
 	 *	been called before this function.
 	 */
-	tls_session->last_ret = SSL_read(tls_session->ssl, tls_session->clean_out.data + tls_session->clean_out.used,
-					 sizeof(tls_session->clean_out.data) - tls_session->clean_out.used);
+	tls_session->can_pause = true;
+	tls_session->last_ret = SSL_read(tls_session->ssl, fr_dbuff_current(&tls_session->clean_out),
+					 (int)fr_dbuff_remaining(&tls_session->clean_out));
+	tls_session->can_pause = false;
 	if (tls_session->last_ret > 0) {
-		tls_session->clean_out.used += tls_session->last_ret;
+		fr_dbuff_advance(&tls_session->clean_out, (size_t) tls_session->last_ret);
+
+		/*
+		 *	We've received application data.  This is a positive
+		 *	signal that all session tickets have been sent.
+		 *	This flag informs fr_tls_session_is_init_finished().
+		 */
+		tls_session->seen_application_data = true;
 
 		/*
 		 *	Round successful, and we don't need to do any
@@ -1287,8 +2168,45 @@ static unlang_action_t tls_session_async_handshake_cont(rlm_rcode_t *p_result, i
 		 */
 		tls_session->result = FR_TLS_RESULT_SUCCESS;
 	finish:
+		/*
+		 *	Was bound by caller
+		 */
 		fr_tls_session_request_unbind(tls_session->ssl);
 		return UNLANG_ACTION_CALCULATE_RESULT;
+	}
+
+	/*
+	 *	Bug in OpenSSL 3.0 - Normal handshaking behaviour
+	 *	results in spurious "BIO_R_UNSUPPORTED_METHOD"
+	 *	errors.
+	 *
+	 *	SSL_get_error apparently returns SSL_ERROR_SSL if
+	 *	there are any errors in the stack.  This masks
+	 *	SSL_ERROR_WANT_ASYNC and causes the handshake to
+	 *	fail.
+	 *
+	 *	Note: We may want some version of this code
+	 *	included for all OpenSSL versions.
+	 *
+	 *	It would call ERR_GET_FATAL() on each of the errors
+	 *	in the stack to drain non-fatal errors and prevent
+	 *	the other (more useful) return codes of
+	 *	SSL_get_error from being masked.  I guess we'll see
+	 *	if this occurs in other scenarios.
+	 */
+	if (SSL_get_error(tls_session->ssl, tls_session->last_ret) == SSL_ERROR_SSL) {
+		unsigned long ssl_err;
+
+		/*
+		 *	Some weird OpenSSL thing marking ERR_GET_REASON
+		 *	as "unused".  Unclear why this is done as it's
+		 *	not deprecated.
+		 */
+DIAG_OFF_OPTIONAL(used-but-marked-unused)
+		while ((ssl_err = ERR_peek_error()) && (ERR_GET_REASON(ssl_err) == BIO_R_UNSUPPORTED_METHOD)) {
+			(void) ERR_get_error();
+		}
+DIAG_ON_OPTIONAL(used-but-marked-unused)
 	}
 
 	/*
@@ -1298,56 +2216,12 @@ static unlang_action_t tls_session_async_handshake_cont(rlm_rcode_t *p_result, i
 	 *	it'd like to perform the operation
 	 *	asynchronously.
 	 */
-	switch (SSL_get_error(tls_session->ssl, tls_session->last_ret)) {
+	switch (err = SSL_get_error(tls_session->ssl, tls_session->last_ret)) {
 	case SSL_ERROR_WANT_ASYNC:	/* Certification validation or cache loads */
-	{
-		unlang_action_t ua;
-
-		RDEBUG3("Performing async action for OpenSSL");
-
-		/*
-		 *	Call this function again once we're done
-		 *	asynchronously satisfying the load request.
-		 */
-		if (unlikely(unlang_function_repeat_set(request, tls_session_async_handshake_cont) < 0)) {
-		error:
-			tls_session->result = FR_TLS_RESULT_ERROR;
-			goto finish;
-		}
-
-		/*
-		 *	First service any pending cache actions
-		 */
-		ua = fr_tls_cache_pending_push(request, tls_session);
-		switch (ua) {
-		case UNLANG_ACTION_FAIL:
-			if (unlang_function_clear(request) < 0) goto error;
-			goto error;
-
-		case UNLANG_ACTION_PUSHED_CHILD:
-			return ua;
-
-		default:
-			break;
-		}
-
-		/*
-		 *	Next service any pending certificate
-		 *	validation actions.
-		 */
-		ua = fr_tls_verify_client_cert_pending_push(request, tls_session);
-		switch (ua) {
-		case UNLANG_ACTION_FAIL:
-			if (unlang_function_clear(request) < 0) goto error;
-			goto error;
-
-		default:
-			return ua;
-		}
-	}
+		goto again;
 
 	case SSL_ERROR_WANT_ASYNC_JOB:
-		RERROR("No async jobs available in pool, increase thread.openssl_async_pool_max");
+		REDEBUG("(TLS) No async jobs available in pool, increase thread.openssl_async_pool_max");
 		goto error;
 
 	default:
@@ -1355,9 +2229,9 @@ static unlang_action_t tls_session_async_handshake_cont(rlm_rcode_t *p_result, i
 		 *	Returns 0 if we can continue processing the handshake
 		 *	Returns -1 if we encountered a fatal error.
 		 */
-		if (fr_tls_log_io_error(request, tls_session,
-					tls_session->last_ret, "Failed in SSL_read") < 0) goto error;
-		return tls_session_async_handshake_done_round(p_result, priority, request, uctx);
+		if (fr_tls_log_io_error(request,
+					err, "SSL_read (%s)", __FUNCTION__) < 0) goto error;
+		return tls_session_async_handshake_done_round(request, uctx);
 	}
 }
 
@@ -1370,61 +2244,133 @@ static unlang_action_t tls_session_async_handshake_cont(rlm_rcode_t *p_result, i
  * #tls_session_async_handshake_read is split out because we may need to call
  * it multiple times, once after every async action.
  *
- * @param[in,out] p_result	UNUSED.
- * @param[out] priority		UNUSED
  * @param[in] request		The current request.
  * @param[in] uctx		#fr_tls_session_t to continue.
  * @return
  *	- UNLANG_ACTION_CALCULATE_RESULT - We're done with this round.
  *	- UNLANG_ACTION_PUSHED_CHILD - Need to perform more asynchronous actions.
  */
-static unlang_action_t tls_session_async_handshake(rlm_rcode_t *p_result, int *priority,
-						   request_t *request, void *uctx)
+static unlang_action_t tls_session_handshake_round(request_t *request, void *uctx)
 {
 	fr_tls_session_t *tls_session = talloc_get_type_abort(uctx, fr_tls_session_t);
-	int ret;
 
-	RDEBUG3("entered state %s", __FUNCTION__);
+	RDEBUG3("(TLS) entered state %s", __FUNCTION__);
 
 	tls_session->result = FR_TLS_RESULT_IN_PROGRESS;
 
-	fr_tls_session_request_bind(tls_session->ssl, request);
+	fr_tls_session_request_bind(tls_session->ssl, request);		/* May be unbound in this function or asynchronously */
 
 	/*
-	 *	This is a logic error.  fr_tls_session_async_handshake
-	 *	must not be called if the handshake is
-	 *	complete fr_tls_session_recv must be
-	 *	called instead.
+	 *	This is a logic error.
+	 *	fr_tls_session_async_handshake() must not be called if
+	 *	the handshake is complete.  fr_tls_session_recv() must
+	 *	be called instead.
+	 *
+	 *	Check for full init finished, including TLS 1.3 for a
+	 *	client with stateless session tickets.  Those arrive
+	 *	after the TLS handshake has completed.
 	 */
-	if (SSL_is_init_finished(tls_session->ssl)) {
-		REDEBUG("Attempted to continue TLS handshake, but handshake has completed");
+	if (fr_tls_session_is_init_finished(tls_session)) {
+		REDEBUG("(TLS) Attempted to continue TLS handshake, but handshake has completed");
+		fr_tls_session_error_alert(request, tls_session,
+					   FR_ERROR_VALUE_HANDSHAKE_FINISHED, SSL_AD_INTERNAL_ERROR);
 	error:
+		/*
+		 *	The end of the round is what normally sends a
+		 *	queued alert, and this exit does not reach it.
+		 *	EAP has no other chance: it pushes the handshake
+		 *	itself and never touches fr_tls_connection_t.
+		 */
+		fr_tls_session_close_send(request, tls_session);
 		tls_session->result = FR_TLS_RESULT_ERROR;
-		fr_tls_session_request_unbind(tls_session->ssl);
+		fr_tls_session_request_unbind(tls_session->ssl);	/* Was bound in this function */
 		return UNLANG_ACTION_CALCULATE_RESULT;
 	}
 
 	if (tls_session->invalid) {
-		REDEBUG("Preventing invalid session from continuing");
+		REDEBUG("(TLS) Preventing invalid session from continuing");
+		fr_tls_session_error_alert(request, tls_session,
+					   FR_ERROR_VALUE_SESSION_INVALID, SSL_AD_INTERNAL_ERROR);
 		goto error;
 	}
 
 	/*
-	 *	Feed dirty data into OpenSSL, so that is can either
-	 *	process it as Application data (decrypting it)
-	 *	or continue the TLS handshake.
+	 *	This function runs once per handshake message, and
+	 *	only for handshake messages.  Count the number of
+	 *	handshakes, and if there are too many, then forcibly
+	 *	stop the TLS negotiation.
 	 */
-	if (tls_session->dirty_in.used) {
-		ret = BIO_write(tls_session->into_ssl, tls_session->dirty_in.data, tls_session->dirty_in.used);
-		if (ret != (int)tls_session->dirty_in.used) {
-			REDEBUG("Failed writing %zd bytes to TLS BIO: %d", tls_session->dirty_in.used, ret);
-			record_init(&tls_session->dirty_in);
-			goto error;
-		}
-		record_init(&tls_session->dirty_in);
+	tls_session->rounds++;
+	if (tls_session->rounds >= FR_TLS_MAX_ROUNDS) {
+		REDEBUG("(TLS) Failing TLS session due to too many handshake rounds (limit %u)", FR_TLS_MAX_ROUNDS);
+		fr_tls_session_error_alert(request, tls_session,
+					   FR_ERROR_VALUE_TOO_MANY_ROUNDS, SSL_AD_INTERNAL_ERROR);
+		goto error;
 	}
 
-	return tls_session_async_handshake_cont(p_result, priority, request, uctx);
+	/*
+	 *	OpenSSL does it's magic to convert the encrypted
+	 *	dirty_in data to clean_out application data.
+	 */
+	return tls_session_async_handshake_cont(request, uctx);	/* Must unbind request, possibly asynchronously */
+}
+
+/** Ask the virtual server for a session to resume, then start the handshake
+ *
+ * Only a client picks a session to resume before the handshake starts.  A
+ * server is asked for one by OpenSSL, part way through the handshake, and
+ * answers from tls_ticket_stateful_load_cb().
+ *
+ * Nothing is bound to the SSL * yet, so the `load session { ... }` section can
+ * push a subrequest without the handshake holding the SSL * while that
+ * subrequest runs.
+ */
+static unlang_action_t tls_session_load_session(request_t *request, void *uctx)
+{
+	fr_tls_session_t	*tls_session = talloc_get_type_abort(uctx, fr_tls_session_t);
+	unlang_action_t		ua;
+
+	/*
+	 *	The round runs next whatever happens here, so arm it before
+	 *	pushing anything.  unlang_function_repeat_set() only works
+	 *	while this frame is on top of the stack, and pushing a child
+	 *	puts another frame on top.
+	 */
+	if (unlikely(unlang_function_repeat_set(request, tls_session_handshake_round) < 0)) {
+	error:
+		tls_session->result = FR_TLS_RESULT_ERROR;
+		return UNLANG_ACTION_CALCULATE_RESULT;
+	}
+
+	ua = fr_tls_ticket_stateful_load_client_push(request, tls_session);
+	if (ua == UNLANG_ACTION_PUSHED_CHILD) return ua;
+	if (ua == UNLANG_ACTION_FAIL) goto error;
+
+	return tls_session_handshake_round(request, uctx);
+}
+
+/** Run one round of the handshake, and the policy which precedes the first one
+ *
+ * The caller pushes this once per round, so the work which happens only once
+ * is keyed off the round counter.  `tls_session->rounds` is incremented by
+ * tls_session_handshake_round(), so a zero here means no round has run yet.
+ *
+ * `new session { ... }` is not run here.  That section runs before the
+ * session is allocated, so that it can set control attributes which decide how
+ * the session is allocated, such as EAP-TLS-Require-Client-Cert.  By the time
+ * a handshake round runs, the session already exists and the decision has been
+ * taken.  Running `new session { ... }` from here would be too late, so the
+ * caller runs it.
+ */
+static unlang_action_t tls_session_async_handshake(request_t *request, void *uctx)
+{
+	fr_tls_session_t *tls_session = talloc_get_type_abort(uctx, fr_tls_session_t);
+
+	if ((tls_session->rounds == 0) && !SSL_is_server(tls_session->ssl)) {
+		return tls_session_load_session(request, uctx);
+	}
+
+	return tls_session_handshake_round(request, uctx);
 }
 
 /** Push a handshake call onto the stack
@@ -1448,8 +2394,106 @@ unlang_action_t fr_tls_session_async_handshake_push(request_t *request, fr_tls_s
 				    tls_session_async_handshake,
 				    NULL,
 				    tls_session_async_handshake_signal,
+				    FR_SIGNAL_ALLOW(FR_SIGNAL_CANCEL),
 				    UNLANG_SUB_FRAME,
 				    tls_session);
+}
+
+/** Will this handshake negotiate TLS 1.3?
+ *
+ * OpenSSL decides whether to send a TLS 1.2 ticket while it parses the ClientHello extensions, so which means that
+ * we need to check TLS versions in the ClientHello callback.
+ *
+ * TLS 1.3 is negotiated when the server allows it, and the client lists it in `supported_versions`.
+ * A client which sends no `supported_versions` extension (including a DTLS client) cannot do TLS 1.3.
+ *
+ * @param[in] ssl	to check.  Must be inside the ClientHello callback.
+ * @return
+ *	- true if TLS 1.3 will be negotiated.
+ *	- false if TLS 1.2 or earlier will be negotiated.
+ */
+static bool tls_client_hello_is_tls13(SSL *ssl)
+{
+	uint8_t const	*p;
+	size_t		len, i;
+	int		max = SSL_get_max_proto_version(ssl);
+
+	if (max && (max < TLS1_3_VERSION)) return false;
+
+	if (SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_supported_versions, &p, &len) != 1) return false;
+
+	/*
+	 *	One byte of length, then a list of two byte versions.
+	 */
+	if ((len < 1) || (p[0] != (len - 1)) || (p[0] & 0x01)) return false;
+
+	for (i = 1; (i + 1) < len; i += 2) {
+		if (((p[i] << 8) | p[i + 1]) == TLS1_3_VERSION) return true;
+	}
+
+	return false;
+}
+
+/** Callback run during ClientHello phase of handshake
+ *
+ * The SSL_client_hello* functions can only be called inside a callback like this.
+ */
+static int fr_tls_session_client_hello_cb(SSL *ssl, UNUSED int *al, UNUSED void *arg)
+{
+	fr_tls_conf_t		*conf = fr_tls_session_conf(ssl);
+	request_t		*request = SSL_get_ex_data(ssl, FR_TLS_EX_INDEX_REQUEST);
+
+	/*
+	 *	Is there a session_ticket extension in the CLientHello?
+	 *	If not, the client doesn't support session tickets - disable them.
+	 */
+	if (conf->cache.mode != FR_TLS_TICKET_DISABLED) {
+		if (SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_session_ticket, NULL, NULL) == 1) {
+			fr_tls_session_t *tls_session = fr_tls_session(ssl);
+			tls_session->session_ticket_supported = true;
+		} else {
+			long ssl_options = SSL_get_options(ssl);
+			RDEBUG2("(TLS) Session ticket extension not found in ClientHello");
+			ssl_options |= SSL_OP_NO_TICKET;
+			SSL_set_options(ssl, ssl_options);
+		}
+
+		/*
+		 *	Session tickets interact badly with EAP.  For EAP success, we would ideally like to
+		 *	send the session ticket only after the inner-tunnel method has succeeded.  However,
+		 *	for TLS 1.2, the ticket it sent during the TLS handshake, and there's nothing we can
+		 *	do about that.
+		 *
+		 *	So for stateful session tickets, we just skip `store session` if the inner-tunnel
+		 *	method fails.  The peer has a ticket (with an ID), but the server doesn't know about
+		 *	that ticket or ID, and therefore won't be able to resume the session.
+		 *
+		 *	For TLS 1.3, the session ticket is sent after the TLS handshake has completed.
+		 *	HOWEVER, the EAP peers will process that ticket only in a few situations.  (1) if they
+		 *	see the ticket immediately after the TLS handshake has completed, or (2) when the
+		 *	ticket arrives with expected inner-tunnel "success" from the server.
+		 *
+		 *	i.e. for EAP-TLS, with the inner "protected success indicator".  For PEAP / TTLS /
+		 *	FAST, with the MS-CHAPv2 success.  For TTLS with PAP or CHAP, you're out of luck.
+		 *
+		 *	Overall, stateless session tickets are poorly tested with TLS 1.2, even outside of EAP.
+		 *
+		 *	All of the above menas that We allow stateless session tickets only when TLS 1.3 has
+		 *	been negotiated.  In `auto` mode with TLS 1.2, we forced the use of stateful session
+		 *	IDs.
+		 */
+		if ((conf->cache.mode & FR_TLS_TICKET_STATELESS) && !tls_client_hello_is_tls13(ssl)) {
+			fr_tls_session_t *tls_session = fr_tls_session(ssl);
+
+			RDEBUG2("(TLS) Stateless session tickets are not used below TLS 1.3");
+			SSL_set_options(ssl, SSL_get_options(ssl) | SSL_OP_NO_TICKET);
+			tls_session->session_ticket_supported = false;
+		}
+	}
+
+	if (conf->client_hello_parse) return fr_tls_session_client_hello_pairs(ssl, request);
+
+	return SSL_CLIENT_HELLO_SUCCESS;
 }
 
 /** Free a TLS session and any associated OpenSSL data
@@ -1459,9 +2503,45 @@ unlang_action_t fr_tls_session_async_handshake_push(request_t *request, fr_tls_s
  */
 static int _fr_tls_session_free(fr_tls_session_t *session)
 {
+	/*
+	 *	The application can free the session before the cache operations have run, for example
+	 *	when the peer closes the connection after the handshake has finished.  A cache section
+	 *	needs a request to run, and no request exists in this destructor.  Because of that, the
+	 *	cache destructor discards the queued operations.
+	 *
+	 *	A discarded `store session` is harmless.  Because the server never stored the session
+	 *	that the ticket names, the peer cannot resume from the ticket.  A discarded
+	 *	`clear session` leaves the session in the cache until the cache entry for the session
+	 *	expires.
+	 */
+	if (fr_tls_ticket_stateful_pending(session->cache)) {
+		DEBUG2("(TLS) Discarding queued cache operations, session freed before the operations ran");
+	}
+
 	if (session->ssl) {
+		/*
+		 *  The OpenSSL docs state:
+		 *
+		 *	SSL_shutdown() can be modified to only set the
+		 *	connection to "shutdown" state but not actually
+		 *	send the "close notify" alert messages, see
+		 *	SSL_CTX_set_quiet_shutdown(3). When "quiet shutdown"
+		 *	is enabled, SSL_shutdown() will always succeed and
+		 *	return 1.
+		 *
+		 *  This is only partially correct.  This call does mean
+		 *  we don't notify the other party, but the SSL_shutdown
+		 *  call can still fail if the handshake hasn't begun, leaving
+		 *  spurious errors on the thread local error stack.
+		 */
 		SSL_set_quiet_shutdown(session->ssl, 1);
-		SSL_shutdown(session->ssl);
+
+		/*
+		 *  Don't leave spurious errors raised by SSL_shutdown on
+		 *  the error stack.
+		 */
+		if (SSL_shutdown(session->ssl) != 1) ERR_clear_error();
+
 		SSL_free(session->ssl);
 		session->ssl = NULL;
 	}
@@ -1469,53 +2549,40 @@ static int _fr_tls_session_free(fr_tls_session_t *session)
 	return 0;
 }
 
-static void session_init(fr_tls_session_t *session)
-{
-	session->ssl = NULL;
-	session->into_ssl = session->from_ssl = NULL;
-	record_init(&session->clean_in);
-	record_init(&session->clean_out);
-	record_init(&session->dirty_in);
-	record_init(&session->dirty_out);
-
-	memset(&session->info, 0, sizeof(session->info));
-
-	session->mtu = 0;
-	session->opaque = NULL;
-}
-
-/** Create a new client TLS session
+/** Allocate a new #fr_tls_session_t and initialize it
  *
- * Configures a new client TLS session, configuring options, setting callbacks etc...
- *
- * @param[in] ctx 	to alloc session data in. Should usually be NULL unless the lifetime of the
- *			session is tied to another talloc'd object.
- * @param[in] ssl_ctx	containing the base configuration for this session.
- * @return
- *	- A new session on success.
- *	- NULL on error.
  */
-fr_tls_session_t *fr_tls_session_alloc_client(TALLOC_CTX *ctx, SSL_CTX *ssl_ctx)
+static fr_tls_session_t *tls_session_alloc(TALLOC_CTX *ctx, request_t *request, SSL_CTX *ssl_ctx)
 {
-	int			ret;
-	int			verify_mode;
-	fr_tls_session_t	*tls_session = NULL;
-	request_t		*request;
-	fr_tls_conf_t		*conf = fr_tls_ctx_conf(ssl_ctx);
+	fr_tls_session_t *tls_session;
 
-	MEM(tls_session = talloc_zero(ctx, fr_tls_session_t));
-	talloc_set_destructor(tls_session, _fr_tls_session_free);
-	fr_pair_list_init(&tls_session->extra_pairs);
+	tls_session = talloc_zero(ctx, fr_tls_session_t);
+	if (!tls_session) return NULL;
+
+	/*
+	 *	The socket type determines whether we use TLS or DTLS.
+	 */
+	tls_session->socket_type = (SSL_CTX_get_ssl_method(ssl_ctx) == DTLS_method()) ? SOCK_DGRAM : SOCK_STREAM;
+
+	/*
+	 *	Cache the configuration pointer, because it doesn't change during the lifetime of the
+	 *	connection.
+	 */
+	tls_session->conf = fr_tls_ctx_conf(ssl_ctx);
+
+	tls_session->ctx = ssl_ctx;
 
 	tls_session->ssl = SSL_new(ssl_ctx);
 	if (!tls_session->ssl) {
 		talloc_free(tls_session);
+		fr_tls_log_perror(request, "Error creating new TLS session");
 		return NULL;
 	}
 
-	request = request_alloc_internal(tls_session, NULL);
+	talloc_set_destructor(tls_session, _fr_tls_session_free);
+	fr_pair_list_init(&tls_session->extra_pairs);
 
-	fr_tls_session_request_bind(tls_session->ssl, request);
+	fr_value_box_init_null(&tls_session->session_id);
 
 	/*
 	 *	Add the message callback to identify what type of
@@ -1525,29 +2592,191 @@ fr_tls_session_t *fr_tls_session_alloc_client(TALLOC_CTX *ctx, SSL_CTX *ssl_ctx)
 	SSL_set_msg_callback_arg(tls_session->ssl, tls_session);
 	SSL_set_info_callback(tls_session->ssl, fr_tls_session_info_cb);
 
-	/*
-	 *	Always verify the peer certificate.
-	 */
-	DEBUG2("Requiring Server certificate");
-	verify_mode = SSL_VERIFY_PEER;
-	verify_mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
-	SSL_set_verify(tls_session->ssl, verify_mode, fr_tls_verify_cert_cb);
-
-	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_CONF, (void *)conf);
 	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_TLS_SESSION, (void *)tls_session);
 
-	ret = SSL_connect(tls_session->ssl);
-	if (ret <= 0) {
-		fr_tls_log_io_error(NULL, tls_session, ret, "Failed in SSL_connect");
-		fr_tls_session_request_unbind(tls_session->ssl);
-		talloc_free(tls_session);
+	/*
+	 *	The client sometimes doesn't have a request.  The server always has one.
+	 */
+	if (!request) return tls_session;
 
+	/*
+	 *	If there is a request, then allocate the record buffers and
+	 *	create the BIOs.  Otherwise leave the record buffers empty and
+	 *	the bio handles as NULL, so that any accidental use
+	 *	causes problems.
+	 */
+	{
+		fr_dbuff_t	*record[] = { &tls_session->clean_in, &tls_session->clean_out };
+		size_t		i;
+
+		for (i = 0; i < NUM_ELEMENTS(record); i++) {
+			uint8_t *buff;
+
+			MEM(buff = talloc_array(tls_session, uint8_t, SSL3_RT_MAX_PLAIN_LENGTH));
+			fr_dbuff_init(record[i], buff, (size_t) SSL3_RT_MAX_PLAIN_LENGTH);
+		}
+	}
+
+	/*
+	 *	Create & hook the BIOs to handle the dirty side of the
+	 *	SSL.  The caller writes encrypted data into the
+	 *	"dirty_in" side via some external mechanism, and
+	 *	writes encrypted data out of the "dirty_out" side via
+	 *	an external mechanism.  This design allows us to use
+	 *	the same TLS code for both RadSec, and for all
+	 *	TLS-enabled EAP methods.
+	 *
+	 *	OpenSSL either reads "dirty_in" and writes
+	 *	"clean_out", or reads "clean_in" and writes
+	 *	"dirty_out".
+	 *
+	 *	We allocate a fixed size buffer going into_ssl,
+	 *	because an extensible buffer could allow the peer to
+	 *	send us unbounded data.  A fixed size buffer allows
+	 *	this code to limit that usage.
+	 *
+	 *	@todo - make the input buffer extendable, but with
+	 *	a maximum limit, and only after all TLS negotiation
+	 *	has completed, and the session is fully authenticated.
+	 *
+	 *	The size is FR_TLS_MAX_PACKET_SIZE and not
+	 *	SSL3_RT_MAX_PLAIN_LENGTH.  Data OpenSSL has not used
+	 *	stay in the buffer, as they are generally partial TLS
+	 *	records.  But the buffer has to be large enough to
+	 *	hold an entire TLS record.
+	 *
+	 *	init and max are the same, so the buffer is allocated
+	 *	once and never moves.
+	 *
+	 *	We don't limit the data coming out of from_ssl,
+	 *	because OpenSSL decides how much it writes.  Multiple
+	 *	handshakes could carry a long certificate chain, which
+	 *	exceeds one record in size.
+	 */
+	{
+		BIO	*rbio, *wbio;
+
+		/*
+		 *	free_buff is false because tls_session is the talloc
+		 *	parent of the buffer as well as of the
+		 *	fr_tls_bio_dbuff_t.  talloc frees the buffer with the
+		 *	session, and a destructor which freed it too would
+		 *	free it twice.
+		 */
+		MEM(rbio = fr_tls_bio_dbuff_alloc(&tls_session->into_ssl, tls_session, tls_session,
+						  FR_TLS_MAX_PACKET_SIZE, FR_TLS_MAX_PACKET_SIZE, false));
+		MEM(wbio = fr_tls_bio_dbuff_alloc(&tls_session->from_ssl, tls_session, tls_session,
+						  SSL3_RT_MAX_PLAIN_LENGTH, 0, false));
+
+		tls_session->dirty_in = fr_tls_bio_dbuff_in(tls_session->into_ssl);
+		tls_session->dirty_out = fr_tls_bio_dbuff_out(tls_session->from_ssl);
+
+		/*
+		 *	SSL_set_bio() takes ownership of both BIOs, and the
+		 *	fr_tls_bio_dbuff_t destructor frees its own BIO.  Give
+		 *	each owner a reference to drop.
+		 */
+		BIO_up_ref(rbio);
+		BIO_up_ref(wbio);
+		SSL_set_bio(tls_session->ssl, rbio, wbio);
+	}
+
+	return tls_session;
+}
+
+/** Create a new client TLS session
+ *
+ * Configures a new client TLS session, configuring options, setting callbacks etc...
+ *
+ * If request is not passed, the caller gets a bare SSL*, and owns
+ * the transport itself.  The session has no memory BIOs, and OpenSSL
+ * does the certificate validation on its own.  This API is used by
+ * hiredis, which needs direct access to the bare SSL*
+ *
+ * If a request is passed, the session management follows the server
+ * session path.  Data goes through memory BIOs,
+ * fr_tls_session_async_handshake_push() is run for each round, and
+ * certificate verification calls the `verify certificate` section of
+ * the configured virtual_server.
+ *
+ * @param[in] ctx 	to alloc session data in. Should usually be NULL unless the lifetime of the
+ *			session is tied to another talloc'd object.
+ * @param[in] ssl_ctx	containing the base configuration for this session.
+ * @param[in] request	which the handshake runs under, or NULL for a session whose transport
+ *			is owned by the caller.
+ * @return
+ *	- A new session on success.
+ *	- NULL on error.
+ */
+fr_tls_session_t *fr_tls_session_alloc_client(TALLOC_CTX *ctx, SSL_CTX *ssl_ctx, request_t *request)
+{
+	int			verify_mode;
+	fr_tls_session_t	*tls_session;
+	fr_tls_conf_t		*conf = fr_tls_ctx_conf(ssl_ctx);
+
+	tls_session = tls_session_alloc(ctx, request, ssl_ctx);
+	if (!tls_session) return NULL;
+
+	/*
+	 *	In Client mode we only connect.
+	 *
+	 *	This sets up the SSL session to work correctly with
+	 *	fr_tls_session_handshake.
+	 */
+	SSL_set_connect_state(tls_session->ssl);
+
+	/*
+	 *	Always verify the peer, but only require a certificate
+	 *	when we're doing certificate authentication.
+	 *
+	 *	PSK doesn't use certs, so we can't require certs if
+	 *	we're using PSK.
+	 */
+	verify_mode = SSL_VERIFY_PEER;
+	if (!conf->psk.identity) {
+		ROPTIONAL(RDEBUG2, DEBUG2, "Requiring Server certificate");
+		verify_mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+	}
+
+	if (request) {
+		/*
+		 *	fr_tls_verify_cert_cb() pauses the handshake and runs
+		 *	the `verify certificate` section.  It needs a request,
+		 *	and it needs to be called from inside
+		 *	tls_session_async_handshake_cont().
+		 */
+		tls_session->verify_peer_cert = true;
+		SSL_set_verify(tls_session->ssl, verify_mode, fr_tls_verify_cert_cb);
+	} else {
+		/*
+		 *	With no request there is nowhere to run a policy, so
+		 *	OpenSSL does the validating.  When the callback is
+		 *	NULL OpenSSL uses its own validation function, and the
+		 *	flags modify that function's behaviour.
+		 */
+		SSL_set_verify(tls_session->ssl, verify_mode, NULL);
+	}
+
+	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_CONF, (void *)conf);
+
+	/*
+	 *	Datagrams need to be limited to a pre-configured MTU.  So we remember that, and tell OpenSSL
+	 *	to limit the MTU.
+	 */
+	if ((tls_session->socket_type == SOCK_DGRAM) && (fr_dtls_session_init(tls_session, conf) < 0)) {
+		talloc_free(tls_session);
 		return NULL;
 	}
 
-	tls_session->mtu = conf->fragment_size;
-
-	fr_tls_session_request_unbind(tls_session->ssl);
+	/*
+	 *	Session resumption needs somewhere to keep its state, and is
+	 *	driven by the caller.  See fr_tls_ticket_stateful_load_client_push() and
+	 *	fr_tls_ticket_stateful_pending_push().
+	 */
+	if (request && (conf->cache.mode != FR_TLS_TICKET_DISABLED)) {
+		tls_session->allow_session_resumption = true;	/* otherwise it's false */
+		fr_tls_ticket_stateful_session_alloc(tls_session);
+	}
 
 	return tls_session;
 }
@@ -1568,59 +2797,17 @@ fr_tls_session_t *fr_tls_session_alloc_client(TALLOC_CTX *ctx, SSL_CTX *ssl_ctx)
  */
 fr_tls_session_t *fr_tls_session_alloc_server(TALLOC_CTX *ctx, SSL_CTX *ssl_ctx, request_t *request, bool client_cert)
 {
-	fr_tls_session_t	*tls_session = NULL;
-	SSL			*ssl = NULL;
+	fr_tls_session_t	*tls_session;
 	int			verify_mode = 0;
 	fr_pair_t		*vp;
 	fr_tls_conf_t		*conf = fr_tls_ctx_conf(ssl_ctx);
 
-	RDEBUG2("Initiating new TLS session");
+	RDEBUG2("(TLS) Initiating new TLS session");
 
-	MEM(tls_session = talloc_zero(ctx, fr_tls_session_t));
+	tls_session = tls_session_alloc(ctx, request, ssl_ctx);
+	if (!tls_session) return NULL;
 
-	ssl = SSL_new(ssl_ctx);
-	if (ssl == NULL) {
-		fr_tls_log_error(request, "Error creating new TLS session");
-		return NULL;
-	}
-	fr_pair_list_init(&tls_session->extra_pairs);
-
-	session_init(tls_session);
-	tls_session->ctx = ssl_ctx;
-	tls_session->ssl = ssl;
-	talloc_set_destructor(tls_session, _fr_tls_session_free);
-
-	fr_tls_session_request_bind(tls_session->ssl, request);
-
-	/*
-	 *	Initialize callbacks
-	 */
-	tls_session->record_init = record_init;
-	tls_session->record_close = record_close;
-	tls_session->record_from_buff = record_from_buff;
-	tls_session->record_to_buff = record_to_buff;
-
-	/*
-	 *	Create & hook the BIOs to handle the dirty side of the
-	 *	SSL.  This is *very important* as we want to handle
-	 *	the transmission part.  Now the only IO interface
-	 *	that SSL is aware of, is our defined BIO buffers.
-	 *
-	 *	This means that all SSL IO is done to/from memory,
-	 *	and we can update those BIOs from the packets we've
-	 *	received.
-	 */
-	MEM(tls_session->into_ssl = BIO_new(BIO_s_mem()));
-	MEM(tls_session->from_ssl = BIO_new(BIO_s_mem()));
-	SSL_set_bio(tls_session->ssl, tls_session->into_ssl, tls_session->from_ssl);
-
-	/*
-	 *	Add the message callback to identify what type of
-	 *	message/handshake is passed
-	 */
-	SSL_set_msg_callback(ssl, fr_tls_session_msg_cb);
-	SSL_set_msg_callback_arg(ssl, tls_session);
-	SSL_set_info_callback(ssl, fr_tls_session_info_cb);
+	fr_tls_session_request_bind(tls_session->ssl, request);	/* Is unbound in this function */
 
 	/*
 	 *	This sets the context sessions can be resumed in.
@@ -1638,27 +2825,26 @@ fr_tls_session_t *fr_tls_session_alloc_server(TALLOC_CTX *ctx, SSL_CTX *ssl_ctx,
 	 *	This seems to only be used for stateful session resumption
 	 *	not session-tickets
 	 */
-	if (conf->cache.mode != FR_TLS_CACHE_DISABLED) {
+	if (conf->cache.mode != FR_TLS_TICKET_DISABLED) {
 		char		*context_id;
 		EVP_MD_CTX	*md_ctx;
 		uint8_t		digest[SHA256_DIGEST_LENGTH];
 
-		fr_assert(conf->cache.id_name);
-
 		static_assert(sizeof(digest) <= SSL_MAX_SSL_SESSION_ID_LENGTH,
 			      "SSL_MAX_SSL_SESSION_ID_LENGTH must be >= SHA256_DIGEST_LENGTH");
+		fr_assert(conf->cache.id_name);
 
 		if (tmpl_aexpand(tls_session, &context_id, request, conf->cache.id_name, NULL, NULL) < 0) {
-			RPEDEBUG("Failed expanding session ID");
+			RPEDEBUG("(TLS) Failed expanding session ID");
 		error:
-			fr_tls_session_request_unbind(tls_session->ssl);
+			fr_tls_session_request_unbind(tls_session->ssl);	/* Was bound in this function */
 			talloc_free(tls_session);
 			return NULL;
 		}
 
 		MEM(md_ctx = EVP_MD_CTX_create());
 		EVP_DigestInit_ex(md_ctx, EVP_sha256(), NULL);
-		EVP_DigestUpdate(md_ctx, context_id, talloc_array_length(context_id) - 1);
+		EVP_DigestUpdate(md_ctx, context_id, talloc_strlen(context_id));
 		EVP_DigestFinal_ex(md_ctx, digest, NULL);
 		EVP_MD_CTX_destroy(md_ctx);
 		talloc_free(context_id);
@@ -1670,24 +2856,24 @@ fr_tls_session_t *fr_tls_session_alloc_server(TALLOC_CTX *ctx, SSL_CTX *ssl_ctx,
 	/*
 	 *	Add the session certificate to the session.
 	 */
-	vp = fr_pair_find_by_da(&request->control_pairs, attr_tls_session_cert_file, 0);
+	vp = fr_pair_find_by_da(&request->control_pairs, NULL, attr_tls_session_cert_file);
 	if (vp) {
-		RDEBUG2("Loading TLS session certificate \"%pV\"", &vp->data);
+		RDEBUG2("(TLS) Loading TLS session certificate \"%pV\"", &vp->data);
 
 		if (SSL_use_certificate_file(tls_session->ssl, vp->vp_strvalue, SSL_FILETYPE_PEM) != 1) {
-			fr_tls_log_error(request, "Failed loading TLS session certificate \"%s\"",
+			fr_tls_log_perror(request, "Failed loading TLS session certificate \"%s\"",
 				      vp->vp_strvalue);
 			goto error;
 		}
 
 		if (SSL_use_PrivateKey_file(tls_session->ssl, vp->vp_strvalue, SSL_FILETYPE_PEM) != 1) {
-			fr_tls_log_error(request, "Failed loading TLS session certificate \"%s\"",
+			fr_tls_log_perror(request, "Failed loading TLS session certificate \"%s\"",
 				      vp->vp_strvalue);
 			goto error;
 		}
 
 		if (SSL_check_private_key(tls_session->ssl) != 1) {
-			fr_tls_log_error(request, "Failed validating TLS session certificate \"%s\"",
+			fr_tls_log_perror(request, "Failed validating TLS session certificate \"%s\"",
 				      vp->vp_strvalue);
 			goto error;
 		}
@@ -1697,12 +2883,14 @@ fr_tls_session_t *fr_tls_session_alloc_server(TALLOC_CTX *ctx, SSL_CTX *ssl_ctx,
 	 */
 	} else {
 		if (!conf->chains || !conf->chains[0]->private_key_file) {
-			ERROR("TLS Server requires a private key file");
+			REDEBUG("(TLS) Server requires a private key file");
+			fr_tls_session_error_add(request, FR_ERROR_VALUE_NO_SERVER_PRIVATE_KEY);
 			goto error;
 		}
 
 		if (!conf->chains || !conf->chains[0]->certificate_file) {
-			ERROR("TLS Server requires a certificate file");
+			REDEBUG("(TLS) Server requires a certificate file");
+			fr_tls_session_error_add(request, FR_ERROR_VALUE_NO_SERVER_CERTIFICATE);
 			goto error;
 		}
 	}
@@ -1712,14 +2900,14 @@ fr_tls_session_t *fr_tls_session_alloc_server(TALLOC_CTX *ctx, SSL_CTX *ssl_ctx,
 	 * This is mainly used for testing in environments where we can't
 	 * get test credentials for the host.
 	 */
-	vp = fr_pair_find_by_da(&request->control_pairs, attr_tls_session_require_client_cert, 0);
+	vp = fr_pair_find_by_da(&request->control_pairs, NULL, attr_tls_session_require_client_cert);
 	if (vp) client_cert = vp->vp_bool;
 
 	/*
 	 *	In Server mode we only accept.
 	 *
 	 *	This sets up the SSL session to work correctly with
-	 *	fr_tls_session_handhsake.
+	 *	fr_tls_session_handshake.
 	 */
 	SSL_set_accept_state(tls_session->ssl);
 
@@ -1727,43 +2915,97 @@ fr_tls_session_t *fr_tls_session_alloc_server(TALLOC_CTX *ctx, SSL_CTX *ssl_ctx,
 	 *	Verify the peer certificate, if asked.
 	 */
 	if (client_cert) {
-		RDEBUG2("Setting verify mode to require certificate from client");
+		RDEBUG2("(TLS) Setting verify mode to require certificate from client");
 		verify_mode = SSL_VERIFY_PEER;
 		verify_mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
 		verify_mode |= SSL_VERIFY_CLIENT_ONCE;
 	}
-	tls_session->verify_client_cert = client_cert;
+	tls_session->verify_peer_cert = client_cert;
 
 	SSL_set_verify(tls_session->ssl, verify_mode, fr_tls_verify_cert_cb);
 	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_CONF, (void *)conf);
-	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_TLS_SESSION, (void *)tls_session);
 
 	/*
-	 *	We use default fragment size, unless the Framed-MTU
-	 *	tells us it's too big.  Note that we do NOT account
-	 *	for the EAP-TLS headers if conf->fragment_size is
-	 *	large, because that config item looks to be confusing.
-	 *
-	 *	i.e. it should REALLY be called MTU, and the code here
-	 *	should figure out what that means for TLS fragment size.
-	 *	asking the administrator to know the internal details
-	 *	of EAP-TLS in order to calculate fragment sizes is
-	 *	just too much.
+	 *	Datagrams need to be limited to a pre-configured MTU.  So we remember that, and tell OpenSSL
+	 *	to limit the MTU.
 	 */
-	tls_session->mtu = conf->fragment_size;
-	vp = fr_pair_find_by_da(&request->request_pairs, attr_framed_mtu, 0);
-	if (vp && (vp->vp_uint32 > 100) && (vp->vp_uint32 < tls_session->mtu)) {
-		RDEBUG2("Setting fragment_len to %u from &Framed-MTU", vp->vp_uint32);
-		tls_session->mtu = vp->vp_uint32;
+	if ((tls_session->socket_type == SOCK_DGRAM) && (fr_dtls_session_init(tls_session, conf) < 0)) {
+		goto error;
 	}
 
-	if (conf->cache.mode != FR_TLS_CACHE_DISABLED) {
-		tls_session->allow_session_resumption = true; /* otherwise it's false */
-		fr_tls_cache_session_alloc(tls_session);
+	SSL_CTX_set_client_hello_cb(ssl_ctx, fr_tls_session_client_hello_cb, NULL);
+
+	if (conf->cache.mode != FR_TLS_TICKET_DISABLED) {
+		tls_session->allow_session_resumption = true;	/* otherwise it's false */
+		if (conf->cache.mode & FR_TLS_TICKET_STATEFUL) fr_tls_ticket_stateful_session_alloc(tls_session);
 	}
 
-	fr_tls_session_request_unbind(tls_session->ssl);
+	fr_tls_session_request_unbind(tls_session->ssl);	/* Was bound in this function */
 
 	return tls_session;
+}
+
+static unlang_action_t tls_new_session_result(request_t *request, UNUSED void *uctx)
+{
+	request_t	*parent = request->parent;
+
+	fr_assert(parent);
+
+	/*
+	 *	Copy control attributes back to the parent.
+	 */
+	if (fr_pair_list_copy(parent->control_ctx, &parent->control_pairs, &request->control_pairs) < 0) return UNLANG_ACTION_FAIL;
+
+	return UNLANG_ACTION_CALCULATE_RESULT;
+}
+
+unlang_action_t fr_tls_new_session_push(request_t *request, fr_tls_conf_t const *tls_conf)
+{
+	request_t	*child;
+	fr_value_box_t	id;
+
+	/*
+	 *	There is no session yet, so there is no ID to report.
+	 */
+	fr_value_box_init_null(&id);
+
+	MEM(child = tls_subrequest_alloc(request, enum_tls_packet_type_new_session->vb_uint32, &id));
+
+	if (unlang_subrequest_child_push(NULL, child, request, true, UNLANG_SUB_FRAME) < 0) {
+		/*
+		 *	The child hasn't run, so we shouldn't call
+		 *	unlang_subrequest_detach_and_free().
+		 */
+		fr_assert(!request_is_detachable(child));
+		talloc_free(child);
+		return UNLANG_ACTION_FAIL;
+	}
+
+	if (!fr_cond_assert(unlang_function_push(child,
+						 NULL,
+						 tls_new_session_result,
+						 NULL, FR_SIGNAL_NONE,
+						 UNLANG_SUB_FRAME, NULL) == UNLANG_ACTION_PUSHED_CHILD)) {
+		/*
+		 *	We just pushed the child frame onto the stack.
+		 *	We don't want the subrequest to execute, if we then
+		 *	failed to push the function that executes after it
+		 *	returns.
+		 */
+	error:
+		unlang_interpet_frame_discard(request);
+		fr_assert(!request_is_detachable(child));
+		talloc_free(child);
+		return UNLANG_ACTION_FAIL;
+	}
+
+	/*
+	 *	unlang_call_push() fails when the virtual server was never
+	 *	compiled, not only when memory runs out.  So this is a
+	 *	configuration error, and is reachable.
+	 */
+	if (unlang_call_push(NULL, child, tls_conf->virtual_server, UNLANG_SUB_FRAME) < 0) goto error;
+
+	return UNLANG_ACTION_PUSHED_CHILD;
 }
 #endif /* WITH_TLS */

@@ -1,0 +1,277 @@
+#pragma once
+/*
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+#ifdef WITH_TLS
+/**
+ * $Id$
+ *
+ * @file lib/tls/conf.h
+ * @brief Structures for session-resumption management.
+ *
+ * @copyright 2021 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ */
+RCSIDH(conf_h, "$Id$")
+
+#include "openssl_user_macros.h"
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct fr_tls_conf_s fr_tls_conf_t;
+#ifdef __cplusplus
+}
+#endif
+
+#include "verify.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/** Different chain building modes
+ *
+ */
+typedef enum : uint8_t {
+	FR_TLS_CHAIN_VERIFY_INVALID = 0,
+
+	FR_TLS_CHAIN_VERIFY_HARD,			//!< Fail if we can't build a complete chain from
+							///< the leaf cert back to a root.
+	FR_TLS_CHAIN_VERIFY_SOFT,			//!< Warn if we can't build a complete chain from
+							///< the leaf cert back to a root.
+	FR_TLS_CHAIN_VERIFY_NONE			//!< Don't verify/build the chain.
+} fr_tls_chain_verify_mode_t;
+
+/** Structure representing a certificate chain configuration
+ *
+ */
+typedef struct {
+	int				file_format;			//!< Whether the file is expected to be PEM encoded.
+									///< This allows us to load multiple chained PEM certificates
+									///< from a single file.
+
+	char const			*certificate_file;		//!< Path to certificate.
+
+	char const			*password;			//!< Password to decrypt the certificate(s).
+	char const			*private_key_file;		//!< Path to certificate.
+
+	char const			**ca_files;			//!< Extra certificates to load.
+	fr_tls_chain_verify_mode_t	verify_mode;			//!< How hard we try to build up a complete certificate
+									///< chain.
+	bool				include_root_ca;		//!< Include the root ca in the chain we built.
+
+	/** @name Certificate data
+	 *
+	 * @{
+	 */
+	X509				*leaf;				//!< The certificate that we present to the peer, the
+									///< first certificate in `certificate_file`.
+	STACK_OF(X509)			*extra;				//!< The remaining certificates in `certificate_file`,
+									///< then one certificate from each `ca_file`.
+	EVP_PKEY			*private_key;			//!< The private key from `private_key_file`.
+	fr_unix_time_t			valid_until;			//!< The earliest notAfter of any certificate in `leaf` or `extra`.
+	/** @} */
+} fr_tls_chain_conf_t;
+
+/** Control what types of session resumption we allow
+ *
+ */
+typedef enum {
+	FR_TLS_TICKET_DISABLED	= 0x00,			//!< Disabled
+	FR_TLS_TICKET_STATEFUL	= 0x01,			//!< Session resumption information is stored on the server
+							///< and an identifier is provided to the client.
+	FR_TLS_TICKET_STATELESS	= 0x02,			//!< A session ticket is provided to the client.
+	FR_TLS_TICKET_AUTO	= FR_TLS_TICKET_STATEFUL |	//!< We pick the correct cache type
+								///< based on the TLS version and current
+				  FR_TLS_TICKET_STATELESS	///< configuration.
+} fr_tls_ticket_mode_t;
+
+/** Maximum lifetime of a TLS session ticket.
+ *
+ * RFC 8446 mandates this for TLS.  RFC 9190 mandates it for EAP-TLS.
+ */
+#define FR_TLS_MAX_SESSION_LIFETIME (7 * 86400)
+
+/** TLS 1.3 allows for padding, but it needs to be limited.
+ *
+ * Records will be padded to a multiple of the block size.  It doesn't
+ * make a lot of sense to allow for large amounts of padding, so we
+ * limit that here.
+ */
+#define FR_TLS_MAX_BLOCK_PADDING (256)
+
+/** TLS 1.3 block sizes are a multiple of 16
+ *
+ * If we padd to any other multiple, then it will end up being 16 anyways.
+ */
+#define FR_TLS_BLOCK_PADDING_MULTIPLE (16)
+
+/** Cache configuration
+ *
+ */
+typedef struct {
+	fr_tls_ticket_mode_t mode;			//!< What type of session resumption we're going to use.
+	bool		mode_is_auto;			//!< The configuration said `auto`.  `mode` may have been
+							///< rewritten to `stateless`, and this field keeps the original.
+
+	tmpl_t		*id_name;			//!< Context ID to allow multiple sessions stores to be defined.
+	char		context_id[SSL_MAX_SSL_SESSION_ID_LENGTH];
+
+	fr_time_delta_t	lifetime;			//!< The maximum period a session can be resumed after.
+
+	fr_time_delta_t	min_lifetime;			//!< The minimum lifetime of a session ticket.
+							///< Tickets which has less than this lifetime are not resumed.
+	bool		min_lifetime_is_set;		//!< Whether `min_lifetime` came from the configuration
+
+	bool		require_extms;			//!< Only allow session resumption if the client/server
+							//!< supports the extended master session key.  This protects
+							//!< against the triple handshake attack.
+
+	bool		require_pfs;			//!< Only allow session resumption if a cipher suite that
+							//!< supports perfect forward secrecy.
+
+	uint8_t	const	*session_ticket_key;		//!< Raw input data.  Is fed through HKDF to produce the
+							///< actual session key we use.
+} fr_tls_ticket_conf_t;
+
+/** Certificate verification configuration
+ *
+ */
+typedef struct {
+	fr_tls_verify_mode_t mode;			//!< What certificates we apply OpenSSL's pre-validation
+							///< mode to.
+
+	fr_tls_verify_mode_t attribute_mode;		//!< What set of certificates we're going to convert to
+							///< pairs for verification.
+
+	bool		der_decode;			//!< Should certificates be passed to the DER decoder.
+} fr_tls_verify_conf_t;
+
+#ifdef PSK_MAX_IDENTITY_LEN
+/** A fixed pre-shared key
+ *
+ * A client sends the identity and uses the key.  A server does not
+ * accept any other identity, and uses the key.
+ */
+typedef struct {
+	char const	*identity;			//!< The identity that selects the key.
+	uint8_t const	*key;				//!< The key as raw bytes.  talloc_array_length()
+							///< gives the length.
+} fr_tls_psk_conf_t;
+#endif
+
+/* configured values goes right here */
+struct fr_tls_conf_s {
+	CONF_SECTION	*virtual_server;		//!< The virtual server containing certificate validation
+							///< policies, and cache control sections.
+
+	fr_tls_chain_conf_t	**chains;		//!< One or more certificates
+
+	char const	*random_file;			//!< If set, we read 10K of data (or the complete file)
+							//!< and use it to seed OpenSSL's PRNG.
+	char const	*ca_path;
+	char const	*ca_file;
+
+	char const	*dh_file;			//!< File to load DH Parameters from.
+
+	uint32_t	verify_depth;			//!< Maximum number of certificates we can traverse
+							//!< when attempting to reach the presented certificate
+							//!< from our Root CA.
+	bool		disable_single_dh_use;
+
+	float		tls_max_version;		//!< Maximum TLS version allowed.
+	float		tls_min_version;		//!< Minimum TLS version allowed.
+
+	uint32_t	fragment_size;			//!< Maximum record fragment, or record size.
+	uint32_t	padding_block_size;		//!< for TLS 1.3, pad blocks to multiple of this size.
+							///< Zero means no padding.
+
+	char const	*cipher_list;			//!< Acceptable ciphers.
+	char const	*cipher_suites;			//!< Acceptable TLS 1.3 cipher suites.
+	bool		cipher_server_preference;	//!< use server preferences for cipher selection
+#ifdef SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS
+	bool		allow_renegotiation;		//!< Whether or not to allow cipher renegotiation.
+#endif
+	char const	*group_list;			//!< Supported groups.
+
+	bool		require_client_cert;
+
+#ifndef OPENSSL_NO_ECDH
+	char const		*ecdh_curve;
+#endif
+
+#ifdef PSK_MAX_IDENTITY_LEN
+	fr_tls_psk_conf_t	psk;			//!< A fixed pre-shared key.  Both fields are NULL when the
+							///< configuration sets neither `identity` nor `key`.
+#endif
+
+	char const		*keylog_file;		//!< for SSLKEYLOGFILE functionality.
+
+	fr_tls_ticket_conf_t	cache;			//!< Session cache configuration.
+	fr_tls_verify_conf_t	verify;
+
+	bool		delayed_tickets;		//!< do we delay session tickets to after application data?
+	bool		verify_certificate;		//!< Does the "verify certificate" section exist.
+	bool		new_session;			//!< Does the "new session" section exist.
+	bool		establish_session;		//!< Does the "establish session" section exist.
+	bool		fail_session;			//!< Does the "fail session" section exist.
+
+	bool		encode_session;			//!< Does the "encode session" section exist.
+	bool		decode_session;			//!< Does the "decode session" section exist.
+	bool		load_session;			//!< Does the "load session" section exist.
+	bool		store_session;			//!< Does the "store session" section exist.
+	bool		clear_session;			//!< Does the "clear session" section exist.
+#ifdef PSK_MAX_IDENTITY_LEN
+	bool		load_psk;			//!< Does the "load psk" section exist.
+#endif
+	bool		client_hello_parse;		//!< Should attributes be extracted from Client Hello.
+
+	/** Application Layer Protocol Negotiation
+	 *
+	 *  The ALPN strings (for now) must be set by the application.  Only the application knows what the
+	 *  ALPN strings mean, and how to interpret them.  Plus, the ALPN format used by OpenSSL is the raw
+	 *  wire format, which has a "length" prefix followed by the actual data.  That's not trivially
+	 *  supportable by the configuration file parser.
+	 *
+	 *  What we'd like to do is for the application to provide some kind of array of allowed ALPN
+	 *  strings, and then use that.  The TLS code can then set a flag indicating which string was
+	 *  negotiated.
+	 */
+	unsigned char const	*alpn;			//!< Protocol names, in the wire format ALPN uses: each
+							///< name is one length octet followed by that many
+							///< octets.  NULL means we don't use ALPN.
+	size_t			sizeof_alpn;		//!< Length of `alpn`, which carries no terminator.
+	bool			alpn_required;		//!< Fail if no ALPN was negotiated.
+
+	/** Underlying transport.
+	 *
+	 *  The TLS library does NOT manage any IO itself.  However, it
+	 *  does need to know whether it's supposed to do TLS or DTLS.
+	 *  Instead of having a separate flag / enum, we just re-use
+	 *  SOCK_*.  Only the application knows what IO method it's using,
+	 *  so it has to this field manually, just as with ALPN.
+	 *
+	 *  If it's unset (i.e. zero), then we default to SOCK_STREAM.
+	 */
+	int			socket_type;
+};
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* WITH_TLS */

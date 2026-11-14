@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2022 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -11,7 +11,7 @@
 ##############################################################################
 
 ATTRIBUTE	Bootfile-URL				59	string
-ATTRIBUTE	Bootfile-Param				60	string array
+ATTRIBUTE	Bootfile-Param				60	string length=uint16,array
 ATTRIBUTE	Client-Arch-Type			61	uint16 array
 
 VALUE	Client-Arch-Type		x86-BIOS		0

@@ -25,7 +25,8 @@
  */
 RCSIDH(detail_h, "$Id$")
 
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/io/application.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/util/retry.h>
 #include <freeradius-devel/util/dlist.h>
 
@@ -35,11 +36,10 @@ extern "C" {
 
 typedef struct {
 	CONF_SECTION			*server_cs;			//!< server CS for this listener
-	CONF_SECTION			*cs;				//!< my configuration
 	fr_app_t			*self;				//!< child / parent linking issues
 	char const			*type;				//!< packet type name
 
-	dl_module_inst_t		*io_submodule;			//!< As provided by the transport_parse
+	module_instance_t		*io_submodule;			//!< As provided by the transport_parse
 									///< callback.  Broken out into the
 									///< app_io_* fields below for convenience.
 
@@ -48,7 +48,7 @@ typedef struct {
 	CONF_SECTION			*app_io_conf;			//!< Easy access to the app_io's config section.
 //	proto_detail_app_io_t		*app_io_private;		//!< Internal interface for proto_radius.
 
-	dl_module_inst_t		*work_submodule;		//!< the worker
+	module_instance_t		*work_submodule;		//!< the worker
 
 	fr_app_io_t const		*work_io;			//!< Easy access to the app_io handle.
 	void				*work_io_instance;		//!< Easy access to the app_io instance.
@@ -62,9 +62,13 @@ typedef struct {
 	uint32_t			num_messages;			//!< for message ring buffer
 	uint32_t			priority;			//!< for packet processing, larger == higher
 
+	/** Hacked in functionality to allow easy testing of the detail reader.
+	 */
+	bool				exit_when_done;			//!< exit when done reading the current file.
+
 	fr_schedule_t			*sc;				//!< the scheduler, where we insert new readers
 
-	fr_listen_t			*listen;			//!< The listener structure which describes
+	fr_listen_instance_t		*listen;			//!< The listener structure which describes
 									//!< the I/O path.
 } proto_detail_t;
 
@@ -94,7 +98,7 @@ struct proto_detail_work_s {
 
 	fr_rb_node_t			filename_node;		//!< for dedup
 
-	RADCLIENT			*client;		//!< so the rest of the server doesn't complain
+	fr_client_t			*client;		//!< so the rest of the server doesn't complain
 };
 
 typedef struct proto_detail_work_thread_s proto_detail_work_thread_t;
@@ -108,7 +112,8 @@ struct proto_detail_work_thread_s {
 
 	fr_event_list_t			*el;			//!< for various timers
 	fr_network_t			*nr;			//!< for Linux-specific callbacks
-	fr_listen_t			*listen;		//!< talloc_parent() is slow
+	fr_listen_instance_t		*li;			//!< talloc_parent() is slow
+	fr_listen_t			*work_listen;		//!< I/O path, every work file read is a socket of it.
 	proto_detail_work_thread_t	*file_parent;		//!< thread instance of the directory reader that spawned us
 
 	char const			*filename_work;		//!< work file name
@@ -128,12 +133,13 @@ struct proto_detail_work_thread_s {
 
 	size_t				last_search;		//!< where we last searched in the buffer
 								//!< MUST be offset, as the buffers can change.
+	unsigned int			last_line;		//!< line number of the last record read.
 
 	off_t				file_size;		//!< size of the file
 	off_t				header_offset;		//!< offset of the current header we're reading
 	off_t				read_offset;		//!< where we're reading from in filename_work
 
-	fr_event_timer_t const		*ev;			//!< for detail file timers.
+	fr_timer_t			*ev;			//!< for detail file timers.
 
 	pthread_mutex_t			worker_mutex;		//!< for the workers
 	int				num_workers;		//!< number of workers

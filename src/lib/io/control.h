@@ -25,8 +25,6 @@
  */
 RCSIDH(control_h, "$Id$")
 
-#include <freeradius-devel/io/atomic_queue.h>
-#include <freeradius-devel/io/ring_buffer.h>
 #include <freeradius-devel/util/time.h>
 #include <freeradius-devel/util/event.h>
 
@@ -37,41 +35,68 @@ extern "C" {
 #endif
 
 /**
- *  A one-way control plane signal.
+ *  A one-way control plane.
  *
- *  Multiple-producer, single consumer.
+ *  Multiple-producer, single consumer.  Messages are copied into a
+ *  queue the receiver owns, and a byte on a unix socket wakes the
+ *  receiver.  When the socket is full the reader has wakeups it has
+ *  not consumed, so further bytes are not needed.
  */
 typedef struct fr_control_s fr_control_t;
-typedef	void (*fr_control_callback_t)(void *ctx, void const *data, size_t data_size, fr_time_t now);
+typedef	void (*fr_control_callback_t)(void const *data, size_t data_size, fr_time_t now, void *uctx);
+
+/** A callback for a message which carries a socket
+ *
+ *  The callback owns the socket and must close it.  The descriptor
+ *  number is a new one, not the sender's.
+ */
+typedef	void (*fr_control_socket_callback_t)(int sock, fr_time_t now, void *uctx);
+
+/** Who defines control plane events
+ *
+ *  Each event set has its own dispatch table on every control, and
+ *  numbers its own events from zero.  A message is addressed by
+ *  event set and event, so the code behind one set never needs to
+ *  know what any other set registered.
+ */
+typedef enum fr_control_eventset_t : uint16_t {
+	FR_CONTROL_EVENTSET_NETWORK = 0,	//!< Events the network defines.
+	FR_CONTROL_EVENTSET_WORKER,		//!< Events a worker defines.
+	FR_CONTROL_EVENTSET_CHANNEL,		//!< Events channels define.
+	FR_CONTROL_EVENTSET_COORD,		//!< Events the coordinator defines.
+	FR_CONTROL_EVENTSET_MAX
+} fr_control_eventset_t;
 
 /*
- *	A suggestion for max # of messages, and max message size.
+ *	Defaults for the number of messages a control plane can hold
+ *	unread, and the largest message it accepts.  A message and its
+ *	header fit two to a cache line in the receiver's queue.
  */
 #define FR_CONTROL_MAX_MESSAGES (1024)
-#define FR_CONTROL_MAX_SIZE	(64)
+#define FR_CONTROL_MAX_SIZE	(48)
 
-/*
- *	A list of pre-allocated IDs, so that the callers don't have to manage their own.
- */
-#define FR_CONTROL_ID_CHANNEL	(1)
-#define FR_CONTROL_ID_LISTEN	(2)
-#define FR_CONTROL_ID_WORKER	(3)
-#define FR_CONTROL_ID_DIRECTORY (4)
-#define FR_CONTROL_ID_INJECT 	(5)
+fr_control_t *fr_control_create(TALLOC_CTX *ctx, fr_event_list_t *el, uint16_t slots, uint16_t max_size);
 
-fr_control_t *fr_control_create(TALLOC_CTX *ctx, fr_event_list_t *el, fr_atomic_queue_t *aq) CC_HINT(nonnull(3));
+int fr_control_open(fr_control_t *c);
 
-int fr_control_gc(fr_control_t *c, fr_ring_buffer_t *rb) CC_HINT(nonnull);
+int fr_control_message_send(fr_control_t *c, fr_control_eventset_t es, uint16_t ev,
+			    void const *data, size_t data_size) CC_HINT(nonnull);
+int fr_control_socket_send(fr_control_t *c, fr_control_eventset_t es, uint16_t ev, int sock) CC_HINT(nonnull);
 
-int fr_control_message_send(fr_control_t *c, fr_ring_buffer_t *rb, uint32_t id, void *data, size_t data_size) CC_HINT(nonnull);
+int fr_control_callback_add(fr_control_t *c, fr_control_eventset_t es, uint16_t ev,
+			    fr_control_callback_t callback, void *uctx) CC_HINT(nonnull(1,4));
+int fr_control_socket_callback_add(fr_control_t *c, fr_control_eventset_t es, uint16_t ev,
+				   fr_control_socket_callback_t callback, void *uctx) CC_HINT(nonnull(1,4));
+int fr_control_callback_delete(fr_control_t *c, fr_control_eventset_t es, uint16_t ev) CC_HINT(nonnull);
+int fr_control_socket_callback_delete(fr_control_t *c, fr_control_eventset_t es, uint16_t ev) CC_HINT(nonnull);
 
-int fr_control_message_push(fr_control_t *c, fr_ring_buffer_t *rb, uint32_t id, void *data, size_t data_size) CC_HINT(nonnull);
-ssize_t fr_control_message_pop(fr_atomic_queue_t *aq, uint32_t *p_id, void *data, size_t data_size) CC_HINT(nonnull);
+int fr_control_same_thread(fr_control_t *c) CC_HINT(nonnull);
 
-int fr_control_callback_add(fr_control_t *c, uint32_t id, void *ctx, fr_control_callback_t callback) CC_HINT(nonnull(1,4));
-int fr_control_callback_delete(fr_control_t *c, uint32_t id) CC_HINT(nonnull);
+bool fr_control_sleeping(fr_control_t *c) CC_HINT(nonnull);
+void fr_control_awake(fr_control_t *c) CC_HINT(nonnull);
+bool fr_control_is_sleeping(fr_control_t *c) CC_HINT(nonnull);
 
-int fr_control_same_thread(fr_control_t *c);
+void fr_control_wait(fr_control_t *c) CC_HINT(nonnull);
 
 #ifdef __cplusplus
 }

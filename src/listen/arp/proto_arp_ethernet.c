@@ -23,15 +23,11 @@
  * @copyright 2016 Alan DeKok (aland@deployingradius.com)
  */
 #include <netdb.h>
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/protocol.h>
-#include <freeradius-devel/util/net.h>
+#include <freeradius-devel/server/util.h>
 #include <freeradius-devel/util/trie.h>
-#include <freeradius-devel/io/base.h>
+#include <freeradius-devel/util/pcap.h>
 #include <freeradius-devel/io/application.h>
-#include <freeradius-devel/io/listen.h>
 #include <freeradius-devel/io/schedule.h>
-#include <freeradius-devel/util/debug.h>
 
 #include "proto_arp.h"
 
@@ -52,16 +48,17 @@ typedef struct {
 /** How to parse an ARP listen section
  *
  */
-static CONF_PARSER const arp_listen_config[] = {
-	{ FR_CONF_OFFSET("interface", FR_TYPE_STRING | FR_TYPE_NOT_EMPTY, proto_arp_ethernet_t,
+static conf_parser_t const arp_listen_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("interface", CONF_FLAG_NOT_EMPTY, proto_arp_ethernet_t,
 			  interface), .dflt = "eth0" },
 
-	{ FR_CONF_OFFSET("filter", FR_TYPE_STRING, proto_arp_ethernet_t, filter) },
+	{ FR_CONF_OFFSET("filter", proto_arp_ethernet_t, filter) },
 
 	CONF_PARSER_TERMINATOR
 };
 
-static ssize_t mod_read(fr_listen_t *li, UNUSED void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer, size_t buffer_len, size_t *leftover, UNUSED uint32_t *priority, UNUSED bool *is_dup)
+static ssize_t mod_read(fr_listen_instance_t *li, UNUSED void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer,
+			size_t buffer_len, size_t *leftover)
 {
 	proto_arp_ethernet_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_arp_ethernet_thread_t);
 	int				ret;
@@ -110,8 +107,9 @@ static ssize_t mod_read(fr_listen_t *li, UNUSED void **packet_ctx, fr_time_t *re
 }
 
 
-static ssize_t mod_write(fr_listen_t *li, UNUSED void *packet_ctx, UNUSED fr_time_t request_time,
-			 uint8_t *buffer, size_t buffer_len, UNUSED size_t written)
+static ssize_t mod_write(fr_listen_instance_t *li, UNUSED void *packet_ctx, UNUSED fr_time_t request_time,
+			 uint8_t *buffer,
+			 size_t buffer_len, UNUSED size_t written)
 {
 	proto_arp_ethernet_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_arp_ethernet_thread_t);
 
@@ -169,22 +167,27 @@ static ssize_t mod_write(fr_listen_t *li, UNUSED void *packet_ctx, UNUSED fr_tim
 /** Open a pcap file for ARP
  *
  */
-static int mod_open(fr_listen_t *li)
+static int mod_open(fr_listen_instance_t *li)
 {
-	proto_arp_ethernet_t const      *inst = talloc_get_type_abort_const(li->app_io_instance, proto_arp_ethernet_t);
+	proto_arp_ethernet_t const      *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_arp_ethernet_t);
 	proto_arp_ethernet_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_arp_ethernet_thread_t);
 
 	char const			*filter;
 	char				*our_filter = NULL;
+	int				rcode;
 
 	thread->pcap = fr_pcap_init(thread, inst->interface, PCAP_INTERFACE_IN);
 	if (!thread->pcap) {
-		PERROR("Failed initializing pcap handle.");
+		cf_log_err(li->listen->cs, "Failed initializing pcap - %s", fr_strerror());
 		return -1;
 	}
 
-	if (fr_pcap_open(thread->pcap) < 0) {
-		PERROR("Failed opening interface %s", inst->interface);
+	rad_suid_up();
+	rcode = fr_pcap_open(thread->pcap);
+	rad_suid_down();
+	if (rcode < 0) {
+		cf_log_err(li->listen->cs, "Failed opening interface %s - %s", inst->interface, fr_strerror());
 		return -1;
 	}
 
@@ -198,7 +201,7 @@ static int mod_open(fr_listen_t *li)
 	}
 
 	if (fr_pcap_apply_filter(thread->pcap, filter) < 0) {
-		PERROR("Failed applying pcap filter '%s'", filter);
+		cf_log_err(li->listen->cs, "Failed applying pcap filter '%s' - %s", filter, fr_strerror());
 		talloc_free(our_filter);
 		return -1;
 	}
@@ -206,13 +209,19 @@ static int mod_open(fr_listen_t *li)
 
 	li->fd = thread->pcap->fd;
 
+	/*
+	 *	Replies are injected whole, so there is nothing to wait
+	 *	for.  A BPF device also refuses a kqueue write filter.
+	 */
+	li->listen->no_write_callback = true;
+
 	fr_assert(cf_parent(inst->cs) != NULL);	/* listen { ... } */
 
 	thread->name = talloc_asprintf(thread, "arp on interface %s", inst->interface);
 	return 0;
 }
 
-static char const *mod_name(fr_listen_t *li)
+static char const *mod_name(fr_listen_instance_t *li)
 {
 	proto_arp_ethernet_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_arp_ethernet_thread_t);
 
@@ -220,24 +229,24 @@ static char const *mod_name(fr_listen_t *li)
 }
 
 
-static int mod_bootstrap(void *instance, CONF_SECTION *cs)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	proto_arp_ethernet_t	*inst = talloc_get_type_abort(instance, proto_arp_ethernet_t);
+	proto_arp_ethernet_t 	*inst = talloc_get_type_abort(mctx->mi->data, proto_arp_ethernet_t);
 
-	inst->cs = cs;
+	inst->cs = mctx->mi->conf;
 
 	return 0;
 }
 
-
 fr_app_io_t proto_arp_ethernet = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "arp_ethernet",
-	.config			= arp_listen_config,
-	.inst_size		= sizeof(proto_arp_ethernet_t),
-	.thread_inst_size	= sizeof(proto_arp_ethernet_thread_t),
-	.bootstrap		= mod_bootstrap,
-
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "arp_ethernet",
+		.config			= arp_listen_config,
+		.inst_size		= sizeof(proto_arp_ethernet_t),
+		.thread_inst_size	= sizeof(proto_arp_ethernet_thread_t),
+		.bootstrap		= mod_instantiate
+	},
 	.default_message_size	= FR_ARP_PACKET_SIZE,
 
 	.open			= mod_open,

@@ -1,0 +1,195 @@
+# -*- text -*-
+# Copyright (C) 2025 The FreeRADIUS Server project and contributors
+# This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
+# Version $Id$
+#
+#  For encoding / decoding, just have an associated array which
+#  contains a series of uint16_t offsets into the packet.
+#  these offsets contain valid targets for compressed pointers.
+#
+DEFINE	Header						struct
+MEMBER		ID					uint16
+MEMBER		Query					bit[1]
+MEMBER		Opcode					bit[4]
+MEMBER		Authoritative				bit[1]
+MEMBER		Truncated-Response			bit[1]
+MEMBER		Recursion-Desired			bit[1]
+MEMBER		Recursion-Available			bit[1]
+MEMBER		Reserved				bit[1]
+MEMBER		Authentic-Data				bit[1]
+MEMBER		Checking-Disabled			bit[1]
+MEMBER		Rcode					bit[4]
+
+VALUE	Query				Query			0
+VALUE	Query				Response		1
+
+VALUE	Opcode				Query			0
+VALUE	Opcode				Inverse-Query		1
+VALUE	Opcode				Status			2
+VALUE	Opcode				Notify			4
+VALUE	Opcode				Update			5
+VALUE	Opcode				Stateful-Operation	6
+
+VALUE	Rcode				No-Error		0
+VALUE	Rcode				Format-error		1
+VALUE	Rcode				Server-Failure		2
+VALUE	Rcode				Name-error		3
+VALUE	Rcode				Not-implemented		4
+VALUE	Rcode				Refused			5
+VALUE	Rcode				YX-Domain		6
+VALUE	Rcode				YX-Resource-Record-Set	7
+VALUE	Rcode				NX-Resource-Record-Set	8
+VALUE	Rcode				Not-Auth		9
+VALUE	Rcode				Not-Zone		10
+VALUE	Rcode				DSO-Type-Not-Implemented 11
+VALUE	Rcode				Bad-Signature		16
+VALUE	Rcode				Bad-Key			17
+VALUE	Rcode				Bad-Time		18
+VALUE	Rcode				Bad-Mode		19
+VALUE	Rcode				Bad-name		20
+VALUE	Rcode				Bad-Algorithm		21
+VALUE	Rcode				Bad-Truncation		22
+VALUE	Rcode				Bad-Cookie		23
+
+MEMBER		Question-Count				uint16
+MEMBER		Answer-Count				uint16
+MEMBER		Name-Server-Count			uint16
+MEMBER		Additional-Records-Count		uint16
+
+DEFINE	Question					struct
+MEMBER		Name					string	dns_label
+MEMBER		Type					uint16  # from packet.type
+MEMBER		Class					uint16
+
+#
+#  QTYPEs.  A superset of the Resource-Record types: IXFR, AXFR and
+#  Any are only valid in a question, never in a resource record.
+#
+VALUE	Type				A			1
+VALUE	Type				NS			2
+VALUE	Type				CNAME			5
+VALUE	Type				SOA			6
+VALUE	Type				PTR			12
+VALUE	Type				MX			15
+VALUE	Type				TXT			16
+VALUE	Type				AAAA			28
+VALUE	Type				SRV			33
+VALUE	Type				DHCID			49
+VALUE	Type				SPF			99
+VALUE	Type				IXFR			251
+VALUE	Type				AXFR			252
+VALUE	Type				Any			255
+VALUE	Type				CAA			257
+
+VALUE	Class				Internet		1
+VALUE	Class				Chaos			3
+VALUE	Class				Hesiod			4
+VALUE	Class				None			254
+VALUE	Class				Any			255
+
+DEFINE	Resource-Record					struct
+MEMBER		Name					string	dns_label
+MEMBER		Type					uint16	key
+MEMBER		Class					uint16 enum=@.Question.Class
+MEMBER		TTL					time_delta
+MEMBER		RDATA					union	key=Type
+
+######################################################################
+#
+#  Now we have resource records
+#
+######################################################################
+BEGIN Resource-Record.RDATA
+ATTRIBUTE	A					1	struct length=uint16
+MEMBER		IP					ipaddr
+
+ATTRIBUTE	NS					2	struct length=uint16
+MEMBER		Domain-Name				string	dns_label
+
+ATTRIBUTE	CNAME					5	struct length=uint16
+MEMBER		Domain-Name				string	dns_label
+
+ATTRIBUTE	SOA					6	struct length=uint16
+MEMBER		Master-Name				string	dns_label
+MEMBER		Responsible-Name			string	dns_label
+MEMBER		Serial					uint32
+MEMBER		Refresh					time_delta
+MEMBER		Retry					time_delta
+MEMBER		Expire					time_delta
+MEMBER		Minimum					time_delta
+
+ATTRIBUTE	PTR					12	struct length=uint16
+MEMBER		Domain-Name				string	dns_label
+
+ATTRIBUTE	MX					15	struct length=uint16
+MEMBER		Preference				uint16
+MEMBER		Domain-Name				string	dns_label
+
+ATTRIBUTE	TXT					16	struct length=uint16
+MEMBER		Data					string
+
+ATTRIBUTE	AAAA					28	struct length=uint16
+MEMBER		IP					ipv6addr
+
+ATTRIBUTE	DHCID					49	struct length=uint16
+MEMBER		Identifier-Type-Code			uint16
+MEMBER		Digest-Type-Code			uint8
+MEMBER		Digest					octets
+
+VALUE	Identifier-Type-Code		CHAddr			0
+VALUE	Identifier-Type-Code		DHCPv4-Client-Identifier 1
+VALUE	Identifier-Type-Code		DHCPv6-Client-Duid	2
+
+VALUE	Digest-Type-Code		SHA-256			1
+
+#
+#  opt MUST have:
+#
+#  1 octet 0 - name is root
+#  2 octets class - requestors UDP payload size
+#  4 octets TTL - extended Rcode and flags
+#  2 octets RDLEN
+#  RRDATA of 16 bits code, 16 bits length of data, data
+ATTRIBUTE	Opt					41	struct length=uint16
+MEMBER		Options					tlv
+
+ATTRIBUTE	LLQ					.1	struct
+MEMBER		Version					uint16
+MEMBER		Opcode					uint16
+MEMBER		Error					uint16
+MEMBER		ID					uint64
+MEMBER		Lease					time_delta
+
+#ATTRIBUTE	UL					.2
+ATTRIBUTE	NSID					.3	octets
+
+ATTRIBUTE	EDNS-Client-Subnet			.8	struct
+MEMBER		Family					uint16
+MEMBER		Source-Prefix-Length			uint8
+MEMBER		Scope-Prefix-Length			uint8
+# MUST be truncated to bytes determined by source-prefix-length
+MEMBER		IP					combo-ip
+
+# existence signals EXPIRE
+ATTRIBUTE	Expire					.9	bool
+
+# https://datatracker.ietf.org/doc/html/rfc7873
+ATTRIBUTE	Cookie					.10	struct
+
+# pseudo-random-function(client ip, server ip, client secret)
+MEMBER		Client					octets[8]
+
+# pseudo-random-function(client ip, client cookie, server secret), at least 64 bits
+MEMBER		Server					octets
+
+ATTRIBUTE	EDNS0-Tcp-Keepalive			.11	uint16 # time_delta in units of 100 milliseconds
+
+ATTRIBUTE	Padding					.12	octets
+
+END Resource-Record.RDATA
+
+#  Name server RR
+DEFINE	Name-Server					struct	clone=@.Resource-Record
+
+#  additional "glue" RR, or OPT RR for peer signalling
+DEFINE	Additional-Record				struct	clone=@.Resource-Record

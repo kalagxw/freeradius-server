@@ -18,12 +18,11 @@
  *
  * @file src/lib/util/lst.c
  *
- * @copyright 2021 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2021 Network RADIUS SAS (legal@networkradius.com)
  */
 RCSID("$Id$")
 
 #include <freeradius-devel/util/lst.h>
-#include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/rand.h>
 #include <freeradius-devel/util/strerror.h>
 
@@ -66,13 +65,13 @@ struct fr_lst_s {
 	pivot_stack_t	s;		//!< Stack of pivots, always with depth >= 1.
 	fr_fast_rand_t	rand_ctx;	//!< Seed for random choices.
 	char const	*type;		//!< Type of elements.
-	fr_lst_cmp_t	cmp;		//!< Comparator function.
+	fr_cmp_t	cmp;		//!< Comparator function.
 };
 
-static inline fr_lst_index_t stack_item(pivot_stack_t *s, stack_index_t idx) CC_HINT(always_inline, nonnull);
-static inline stack_index_t lst_length(fr_lst_t *lst, stack_index_t stack_index) CC_HINT(always_inline, nonnull);
+static inline fr_lst_index_t stack_item(pivot_stack_t const *s, stack_index_t idx) CC_HINT(always_inline, nonnull);
+static inline stack_index_t lst_length(fr_lst_t const *lst, stack_index_t stack_index) CC_HINT(always_inline, nonnull);
 
-static inline CC_HINT(always_inline, nonnull) void *index_addr(fr_lst_t *lst, void *data)
+static inline CC_HINT(always_inline, nonnull) void *index_addr(fr_lst_t const *lst, void *data)
 {
 	return ((uint8_t *)data) + (lst)->offset;
 }
@@ -88,12 +87,12 @@ static inline CC_HINT(always_inline, nonnull) void *index_addr(fr_lst_t *lst, vo
  *
  * fr_item_insert() needs to see the value actually stored, hence raw_item_index().
  */
-static inline CC_HINT(always_inline, nonnull) fr_lst_index_t raw_item_index(fr_lst_t *lst, void *data)
+static inline CC_HINT(always_inline, nonnull) fr_lst_index_t raw_item_index(fr_lst_t const *lst, void *data)
 {
 	return *(fr_lst_index_t *)index_addr(lst, data);
 }
 
-static inline CC_HINT(always_inline, nonnull) fr_lst_index_t item_index(fr_lst_t *lst, void *data)
+static inline CC_HINT(always_inline, nonnull) fr_lst_index_t item_index(fr_lst_t const *lst, void *data)
 {
 	return  raw_item_index(lst, data) - 1;
 }
@@ -103,13 +102,13 @@ static inline CC_HINT(always_inline, nonnull) void item_index_set(fr_lst_t *lst,
 	(*(fr_lst_index_t *)index_addr(lst, data)) = idx + 1;
 }
 
-static inline CC_HINT(always_inline, nonnull) fr_lst_index_t index_reduce(fr_lst_t *lst, fr_lst_index_t idx)
+static inline CC_HINT(always_inline, nonnull) fr_lst_index_t index_reduce(fr_lst_t const *lst, fr_lst_index_t idx)
 {
 	return idx & ((lst)->capacity - 1);
 }
 
 static inline CC_HINT(always_inline, nonnull)
-bool is_equivalent(fr_lst_t *lst, fr_lst_index_t idx1, fr_lst_index_t idx2)
+bool is_equivalent(fr_lst_t const *lst, fr_lst_index_t idx1, fr_lst_index_t idx2)
 {
 	return (index_reduce(lst, idx1 - idx2) == 0);
 }
@@ -119,12 +118,12 @@ static inline CC_HINT(always_inline, nonnull) void item_set(fr_lst_t *lst, fr_ls
 	lst->p[index_reduce(lst, idx)] = data;
 }
 
-static inline CC_HINT(always_inline, nonnull) void *item(fr_lst_t *lst, fr_lst_index_t idx)
+static inline CC_HINT(always_inline, nonnull) void *item(fr_lst_t const *lst, fr_lst_index_t idx)
 {
 	return (lst->p[index_reduce(lst, idx)]);
 }
 
-static inline CC_HINT(always_inline, nonnull) void *pivot_item(fr_lst_t *lst, stack_index_t idx)
+static inline CC_HINT(always_inline, nonnull) void *pivot_item(fr_lst_t const *lst, stack_index_t idx)
 {
 	return item(lst, stack_item(&lst->s, idx));
 }
@@ -149,7 +148,7 @@ static inline CC_HINT(always_inline, nonnull) void *pivot_item(fr_lst_t *lst, st
  * The index is visible for the size and length functions, since they need
  * to know the subtree they're working on.
  */
-static inline CC_HINT(always_inline, nonnull) bool is_bucket(fr_lst_t *lst, stack_index_t idx)
+static inline CC_HINT(always_inline, nonnull) bool is_bucket(fr_lst_t const *lst, stack_index_t idx)
 {
 	return lst_length(lst, idx) == 1;
 }
@@ -180,8 +179,8 @@ static bool stack_expand(fr_lst_t *lst, pivot_stack_t *s)
 
 	n = talloc_realloc(lst, s->data, fr_lst_index_t, n_size);
 	if (unlikely(!n)) {
-		fr_strerror_printf("Failed expanding lst stack to %u elements (%u bytes)",
-				   n_size, n_size * (unsigned int)sizeof(fr_lst_index_t));
+		fr_strerror_printf("Failed expanding lst stack to %u elements (%zu bytes)",
+				   n_size, n_size * sizeof(fr_lst_index_t));
 		return false;
 	}
 
@@ -203,12 +202,12 @@ static inline CC_HINT(always_inline, nonnull) void stack_pop(pivot_stack_t *s, u
 	s->depth -= n;
 }
 
-static inline CC_HINT(always_inline, nonnull) stack_index_t stack_depth(pivot_stack_t *s)
+static inline CC_HINT(always_inline, nonnull) stack_index_t stack_depth(pivot_stack_t const *s)
 {
 	return s->depth;
 }
 
-static inline fr_lst_index_t stack_item(pivot_stack_t *s, stack_index_t idx)
+static inline fr_lst_index_t stack_item(pivot_stack_t const *s, stack_index_t idx)
 {
 	return s->data[idx];
 }
@@ -219,7 +218,7 @@ void stack_set(pivot_stack_t *s, stack_index_t idx, fr_lst_index_t new_value)
 	s->data[idx] = new_value;
 }
 
-fr_lst_t *_fr_lst_alloc(TALLOC_CTX *ctx, fr_lst_cmp_t cmp, char const *type, size_t offset, fr_lst_index_t init)
+fr_lst_t *_fr_lst_alloc(TALLOC_CTX *ctx, fr_cmp_t cmp, char const *type, size_t offset, fr_lst_index_t init)
 {
 	fr_lst_t	*lst;
 	pivot_stack_t	*s;
@@ -284,7 +283,7 @@ fr_lst_t *_fr_lst_alloc(TALLOC_CTX *ctx, fr_lst_cmp_t cmp, char const *type, siz
 /** The length function for LSTs (how many buckets it contains)
  *
  */
-static inline stack_index_t lst_length(fr_lst_t *lst, stack_index_t stack_index)
+static inline stack_index_t lst_length(fr_lst_t const *lst, stack_index_t stack_index)
 {
 	return stack_depth(&lst->s) - stack_index;
 }
@@ -327,7 +326,7 @@ static inline CC_HINT(always_inline, nonnull) void lst_move(fr_lst_t *lst, fr_ls
 	item_index_set(lst, data, index_reduce(lst, location));
 }
 
-/**  Add data to the bucket of a specified (sub)tree..
+/** Add data to the bucket of a specified (sub)tree.
  *
  */
 static void bucket_add(fr_lst_t *lst, stack_index_t stack_index, void *data)
@@ -418,8 +417,8 @@ static bool lst_expand(fr_lst_t *lst)
 
 	n = talloc_realloc(lst, lst->p, void *, n_capacity);
 	if (unlikely(!n)) {
-		fr_strerror_printf("Failed expanding lst to %u elements (%u bytes)",
-				   n_capacity, n_capacity * (unsigned int)sizeof(void *));
+		fr_strerror_printf("Failed expanding lst to %u elements (%zu bytes)",
+				   n_capacity, n_capacity * sizeof(void *));
 		return false;
 	}
 
@@ -438,7 +437,7 @@ static bool lst_expand(fr_lst_t *lst)
 	return true;
 }
 
-static inline CC_HINT(always_inline, nonnull) fr_lst_index_t bucket_lwb(fr_lst_t *lst, stack_index_t stack_index)
+static inline CC_HINT(always_inline, nonnull) fr_lst_index_t bucket_lwb(fr_lst_t const *lst, stack_index_t stack_index)
 {
 	if (is_bucket(lst, stack_index)) return lst->idx;
 
@@ -448,7 +447,7 @@ static inline CC_HINT(always_inline, nonnull) fr_lst_index_t bucket_lwb(fr_lst_t
 /*
  * Note: buckets can be empty,
  */
-static inline CC_HINT(always_inline, nonnull) fr_lst_index_t bucket_upb(fr_lst_t *lst, stack_index_t stack_index)
+static inline CC_HINT(always_inline, nonnull) fr_lst_index_t bucket_upb(fr_lst_t const *lst, stack_index_t stack_index)
 {
 	return stack_item(&lst->s, stack_index) - 1;
 }
@@ -458,7 +457,7 @@ static inline CC_HINT(always_inline, nonnull) fr_lst_index_t bucket_upb(fr_lst_t
  * It's only called for trees that are a single nonempty bucket;
  * if it's a subtree, it is thus necessarily the leftmost.
  */
-static void partition(fr_lst_t *lst, stack_index_t stack_index)
+static int partition(fr_lst_t *lst, stack_index_t stack_index)
 {
 	fr_lst_index_t	low = bucket_lwb(lst, stack_index);
 	fr_lst_index_t	high = bucket_upb(lst, stack_index);
@@ -471,8 +470,7 @@ static void partition(fr_lst_t *lst, stack_index_t stack_index)
 	 * Hoare partition doesn't do the trivial case, so catch it here.
 	 */
 	if (is_equivalent(lst, low, high)) {
-		stack_push(lst, &lst->s, low);
-		return;
+		return (stack_push(lst, &lst->s, low) < 0) ? -1 : 0;
 	}
 
 	pivot_index = low + (fr_fast_rand(&lst->rand_ctx) % (high + 1 - low));
@@ -490,8 +488,17 @@ static void partition(fr_lst_t *lst, stack_index_t stack_index)
 	l = low - 1;
 	h = high + 1;
 	for (;;) {
-		while (lst->cmp(item(lst, --h), pivot) > 0) ;
-		while (lst->cmp(item(lst, ++l), pivot) < 0) ;
+		fr_cmp_ret_t c;
+
+		/*
+		 *	CMP_ERR is negative, so the error must be matched
+		 *	exactly: treating an error as "less than" would send
+		 *	the second scan out of the bucket bounds.
+		 */
+		while ((c = lst->cmp(item(lst, --h), pivot)) == CMP_GT) ;
+		if (unlikely(c == CMP_ERR)) return -1;
+		while ((c = lst->cmp(item(lst, ++l), pivot)) == CMP_LT) ;
+		if (unlikely(c == CMP_ERR)) return -1;
 		if (l >= h) break;
 		temp = item(lst, l);
 		lst_move(lst, l, item(lst, h));
@@ -522,7 +529,7 @@ static void partition(fr_lst_t *lst, stack_index_t stack_index)
 		lst_move(lst, h, pivot);
 	}
 
-	stack_push(lst, &lst->s, h);
+	return (stack_push(lst, &lst->s, h) < 0) ? -1 : 0;
 }
 
 /*
@@ -579,18 +586,19 @@ static void bucket_delete(fr_lst_t *lst, stack_index_t stack_index, void *data)
  *	Else
  *		Return ExtractMin(L)
  */
-static inline CC_HINT(nonnull) void *_fr_lst_pop(fr_lst_t *lst, stack_index_t stack_index)
+static inline CC_HINT(nonnull) int _fr_lst_pop(void **out, fr_lst_t *lst, stack_index_t stack_index)
 {
-	if (is_bucket(lst, stack_index)) partition(lst, stack_index);
+	if (is_bucket(lst, stack_index) && (partition(lst, stack_index) < 0)) return -1;
 	++stack_index;
 	if (lst_size(lst, stack_index) == 0) {
 		void *min = pivot_item(lst, stack_index);
 
 		lst_flatten(lst, stack_index);
 		bucket_delete(lst, stack_index, min);
-		return min;
+		*out = min;
+		return 0;
 	}
-	return _fr_lst_pop(lst, stack_index);
+	return _fr_lst_pop(out, lst, stack_index);
 }
 
 /*
@@ -603,12 +611,15 @@ static inline CC_HINT(nonnull) void *_fr_lst_pop(fr_lst_t *lst, stack_index_t st
  *	Else
  *		Return FindMin(L)
  */
-static inline CC_HINT(nonnull) void *_fr_lst_peek(fr_lst_t *lst, stack_index_t stack_index)
+static inline CC_HINT(nonnull) int _fr_lst_peek(void **out, fr_lst_t *lst, stack_index_t stack_index)
 {
-	if (is_bucket(lst, stack_index)) partition(lst, stack_index);
+	if (is_bucket(lst, stack_index) && (partition(lst, stack_index) < 0)) return -1;
 	++stack_index;
-	if (lst_size(lst, stack_index) == 0) return pivot_item(lst, stack_index);
-	return _fr_lst_peek(lst, stack_index);
+	if (lst_size(lst, stack_index) == 0) {
+		*out = pivot_item(lst, stack_index);
+		return 0;
+	}
+	return _fr_lst_peek(out, lst, stack_index);
 }
 
 /*
@@ -625,24 +636,26 @@ static inline CC_HINT(nonnull) void *_fr_lst_peek(fr_lst_t *lst, stack_index_t s
  *			Flatten T into bucket(B′′) // O(1)
  *			Remove x from bucket B′′ // O(depth)
  */
-static inline CC_HINT(nonnull) void _fr_lst_extract(fr_lst_t *lst,  stack_index_t stack_index, void *data)
+static inline CC_HINT(nonnull) int _fr_lst_extract(fr_lst_t *lst, stack_index_t stack_index, void *data)
 {
-	int8_t	cmp;
+	fr_cmp_ret_t	cmp;
 
 	if (is_bucket(lst, stack_index)) {
 		bucket_delete(lst, stack_index, data);
-		return;
+		return 0;
 	}
 	stack_index++;
 	cmp = lst->cmp(data, pivot_item(lst, stack_index));
-	if (cmp < 0) {
-		_fr_lst_extract(lst, stack_index, data);
-	} else if (cmp > 0) {
+	if (unlikely(cmp == CMP_ERR)) return -1;
+	if (cmp == CMP_LT) {
+		return _fr_lst_extract(lst, stack_index, data);
+	} else if (cmp == CMP_GT) {
 		bucket_delete(lst, stack_index - 1, data);
 	} else {
 		lst_flatten(lst, stack_index);
 		bucket_delete(lst, stack_index, data);
 	}
+	return 0;
 }
 
 /*
@@ -660,7 +673,7 @@ static inline CC_HINT(nonnull) void _fr_lst_extract(fr_lst_t *lst,  stack_index_
  *			Flatten T into bucket(B′) // O(1)
  *			Add x to bucket B′ // O(depth)
  */
-static inline CC_HINT(nonnull) void _fr_lst_insert(fr_lst_t *lst, stack_index_t stack_index, void *data)
+static inline CC_HINT(nonnull) int _fr_lst_insert(fr_lst_t *lst, stack_index_t stack_index, void *data)
 {
 #ifndef TALLOC_GET_TYPE_ABORT_NOOP
 	if (lst->type) (void)_talloc_get_type_abort(data, lst->type, __location__);
@@ -668,12 +681,15 @@ static inline CC_HINT(nonnull) void _fr_lst_insert(fr_lst_t *lst, stack_index_t 
 
 	if (is_bucket(lst, stack_index)) {
 		bucket_add(lst, stack_index, data);
-		return;
+		return 0;
 	}
 	stack_index++;
 	if (fr_fast_rand(&lst->rand_ctx) % (lst_size(lst, stack_index) + 1) != 0) {
-		if (lst->cmp(data, pivot_item(lst, stack_index)) < 0) {
-			_fr_lst_insert(lst, stack_index, data);
+		fr_cmp_ret_t cmp = lst->cmp(data, pivot_item(lst, stack_index));
+
+		if (unlikely(cmp == CMP_ERR)) return -1;
+		if (cmp == CMP_LT) {
+			return _fr_lst_insert(lst, stack_index, data);
 		} else {
 			bucket_add(lst, stack_index - 1, data);
 		}
@@ -681,6 +697,7 @@ static inline CC_HINT(nonnull) void _fr_lst_insert(fr_lst_t *lst, stack_index_t 
 		lst_flatten(lst, stack_index);
 		bucket_add(lst, stack_index, data);
 	}
+	return 0;
 }
 
 /*
@@ -692,16 +709,18 @@ static inline CC_HINT(nonnull) void _fr_lst_insert(fr_lst_t *lst, stack_index_t 
  * (2) check preconditions
  */
 
-void *fr_lst_pop(fr_lst_t *lst)
+int fr_lst_pop(void **out, fr_lst_t *lst)
 {
-	if (unlikely(lst->num_elements == 0)) return NULL;
-	return _fr_lst_pop(lst, 0);
+	*out = NULL;
+	if (unlikely(lst->num_elements == 0)) return 0;
+	return _fr_lst_pop(out, lst, 0);
 }
 
-void *fr_lst_peek(fr_lst_t *lst)
+int fr_lst_peek(void **out, fr_lst_t *lst)
 {
-	if (unlikely(lst->num_elements == 0)) return NULL;
-	return _fr_lst_peek(lst, 0);
+	*out = NULL;
+	if (unlikely(lst->num_elements == 0)) return 0;
+	return _fr_lst_peek(out, lst, 0);
 }
 
 /** Remove an element from an LST
@@ -724,8 +743,7 @@ int fr_lst_extract(fr_lst_t *lst, void *data)
 		return -1;
 	}
 
-	_fr_lst_extract(lst, 0, data);
-	return 0;
+	return _fr_lst_extract(lst, 0, data);
 }
 
 int fr_lst_insert(fr_lst_t *lst, void *data)
@@ -743,8 +761,7 @@ int fr_lst_insert(fr_lst_t *lst, void *data)
 		return -1;
 	}
 
-	_fr_lst_insert(lst, 0, data);
-	return 0;
+	return _fr_lst_insert(lst, 0, data);
 }
 
 unsigned int fr_lst_num_elements(fr_lst_t *lst)
@@ -789,3 +806,150 @@ void *fr_lst_iter_next(fr_lst_t *lst, fr_lst_iter_t *iter)
 
 	return item(lst, *iter);
 }
+
+#ifndef TALLOC_GET_TYPE_ABORT_NOOP
+void fr_lst_verify(char const *file, int line, fr_lst_t const *lst)
+{
+	fr_lst_index_t	fake_pivot_index, reduced_fake_pivot_index, reduced_end;
+	stack_index_t	depth = stack_depth(&(lst->s));
+	int		bucket_size_sum;
+	bool		pivots_in_order = true;
+	bool		pivot_indices_in_order = true;
+
+	fr_fatal_assert_msg(lst, "CONSISTENCY CHECK FAILED %s[%i]: LST pointer NULL", file, line);
+	talloc_get_type_abort(lst, fr_lst_t);
+
+	/*
+	 *	There must be at least the fictitious pivot.
+	 */
+	fr_fatal_assert_msg(depth >= 1, "CONSISTENCY CHECK FAILED %s[%i]: LST pivot stack empty", file, line);
+
+	/*
+	 *	Modulo circularity, idx + the number of elements should be the index
+	 *	of the fictitious pivot.
+	 */
+	fake_pivot_index = stack_item(&(lst->s), 0);
+	reduced_fake_pivot_index = index_reduce(lst, fake_pivot_index);
+	reduced_end = index_reduce(lst, lst->idx + lst->num_elements);
+	fr_fatal_assert_msg(reduced_fake_pivot_index == reduced_end,
+			    "CONSISTENCY CHECK FAILED %s[%i]: fictitious pivot doesn't point past last element",
+			    file, line);
+
+	/*
+	 *	Bucket sizes must make sense.
+	 */
+	if (lst->num_elements) {
+		bucket_size_sum = 0;
+
+		for (stack_index_t stack_index = 0; stack_index < depth; stack_index++)  {
+			fr_lst_index_t bucket_size = bucket_upb(lst, stack_index) - bucket_lwb(lst, stack_index) + 1;
+			fr_fatal_assert_msg(bucket_size <= lst->num_elements,
+					    "CONSISTENCY CHECK FAILED %s[%i]: bucket %u size %u is invalid",
+					    file, line, stack_index, bucket_size);
+			bucket_size_sum += bucket_size;
+		}
+
+		fr_fatal_assert_msg(bucket_size_sum + depth - 1 == lst->num_elements,
+				    "CONSISTENCY CHECK FAILED %s[%i]: buckets inconsistent with number of elements",
+				    file, line);
+	}
+
+	/*
+	 *	No elements should be NULL;
+	 *	they should have the correct index stored,
+	 *	and if a type is specified, they should point at something of that type,
+	 */
+	for (fr_lst_index_t i = 0; i < lst->num_elements; i++) {
+		void	*element = item(lst, lst->idx + i);
+
+		fr_fatal_assert_msg(element, "CONSISTENCY CHECK FAILED %s[%i]: null element pointer at %u",
+				    file, line, lst->idx + i);
+		fr_fatal_assert_msg(is_equivalent(lst, lst->idx + i, item_index(lst, element)),
+				    "CONSISTENCY CHECK FAILED %s[%i]: element %u index mismatch", file, line, i);
+		if (lst->type)  (void) _talloc_get_type_abort(element, lst->type, __location__);
+	}
+
+	/*
+	 * There's nothing more to check for a one-bucket tree.
+	 */
+	if (is_bucket(lst, 0)) return;
+
+	/*
+	 * Otherwise, first, pivots from left to right (aside from the fictitious
+	 * one) should be in ascending order.
+	 */
+	for (stack_index_t stack_index = 1; stack_index + 1 < depth; stack_index++) {
+		void	*current_pivot = pivot_item(lst, stack_index);
+		void	*next_pivot = pivot_item(lst, stack_index + 1);
+
+		if (current_pivot && next_pivot) {
+			fr_cmp_ret_t c = lst->cmp(current_pivot, next_pivot);
+
+			fr_fatal_assert_msg(c != CMP_ERR, "CONSISTENCY CHECK FAILED %s[%i]: comparator error: %s",
+					    file, line, fr_strerror());
+			if (c == CMP_LT) pivots_in_order = false;
+		}
+	}
+	fr_fatal_assert_msg(pivots_in_order, "CONSISTENCY CHECK FAILED %s[%i]: pivots not in ascending order",
+			    file, line);
+
+	/*
+	 * Next, the stacked pivot indices should decrease as you ascend from
+	 * the bottom of the pivot stack. Here we *do* include the fictitious
+	 * pivot; we're just comparing indices.
+	 */
+	for (stack_index_t stack_index = 0; stack_index + 1 < depth; stack_index++) {
+		fr_lst_index_t current_pivot_index = stack_item(&(lst->s), stack_index);
+		fr_lst_index_t previous_pivot_index = stack_item(&(lst->s), stack_index + 1);
+
+		if (previous_pivot_index >= current_pivot_index) pivot_indices_in_order = false;
+	}
+	fr_fatal_assert_msg(pivot_indices_in_order, "CONSISTENCY CHECK FAILED %s[%i]: pivots indices not in order",
+			    file, line);
+
+	/*
+	 * Finally...
+	 * values in buckets shouldn't "follow" the pivot to the immediate right (if it exists)
+	 * and shouldn't "precede" the pivot to the immediate left (if it exists)
+	 */
+	for (stack_index_t stack_index = 0; stack_index < depth; stack_index++) {
+		fr_lst_index_t	lwb, upb, pivot_index;
+		void		*pivot_item, *element;
+
+		if (stack_index > 0) {
+			lwb = (stack_index + 1 == depth) ? lst->idx : stack_item(&(lst->s), stack_index + 1);
+			pivot_index = upb = stack_item(&(lst->s), stack_index);
+			pivot_item = item(lst, pivot_index);
+			for (fr_lst_index_t index = lwb; index < upb; index++) {
+				fr_cmp_ret_t c;
+
+				element = item(lst, index);
+				c = (!element || !pivot_item) ? CMP_EQ : lst->cmp(element, pivot_item);
+				fr_fatal_assert_msg(c != CMP_ERR,
+						    "CONSISTENCY CHECK FAILED %s[%i]: comparator error: %s",
+						    file, line, fr_strerror());
+				fr_fatal_assert_msg(c != CMP_GT,
+						    "CONSISTENCY CHECK FAILED %s[%i]: element at %u > pivot at %u",
+						    file, line, index, pivot_index);
+			}
+		}
+		if (stack_index + 1 < depth) {
+			upb = stack_item(&(lst->s), stack_index);
+			lwb = pivot_index = stack_item(&(lst->s), stack_index + 1);
+			pivot_item = item(lst, pivot_index);
+			for (fr_lst_index_t index = lwb; index < upb; index++) {
+				fr_cmp_ret_t c;
+
+				element = item(lst, index);
+				c = (!element || !pivot_item) ? CMP_EQ : lst->cmp(pivot_item, element);
+				fr_fatal_assert_msg(c != CMP_ERR,
+						    "CONSISTENCY CHECK FAILED %s[%i]: comparator error: %s",
+						    file, line, fr_strerror());
+				fr_fatal_assert_msg(c != CMP_GT,
+						    "CONSISTENCY CHECK FAILED %s[%i]: element at %u < pivot at %u",
+						    file, line, index, pivot_index);
+			}
+		}
+	}
+}
+#endif

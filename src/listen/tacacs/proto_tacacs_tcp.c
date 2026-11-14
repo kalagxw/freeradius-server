@@ -21,29 +21,23 @@
  * @author Jorge Pereira <jpereira@freeradius.org>
  *
  * @copyright 2020 The FreeRADIUS server project.
- * @copyright 2020 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2020 Network RADIUS SAS (legal@networkradius.com)
  */
 
 #include <netdb.h>
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/protocol.h>
-#include <freeradius-devel/server/tcp.h>
 #include <freeradius-devel/util/trie.h>
-#include <freeradius-devel/io/base.h>
 #include <freeradius-devel/io/application.h>
 #include <freeradius-devel/io/listen.h>
 #include <freeradius-devel/io/schedule.h>
-#include <freeradius-devel/util/debug.h>
 #include "proto_tacacs.h"
 
 extern fr_app_io_t proto_tacacs_tcp;
 
+#define TACACS_MAX_ATTRIBUTES 256
+
 typedef struct {
 	char const			*name;			//!< socket name
 	int				sockfd;
-
-	bool				seen_first_packet;
-	bool				single_connection;
 
 	fr_io_address_t			*connection;		//!< for connected sockets.
 
@@ -68,36 +62,42 @@ typedef struct {
 	bool				recv_buff_is_set;	//!< Whether we were provided with a recv_buff
 	bool				dynamic_clients;	//!< whether we have dynamic clients
 
-	RADCLIENT_LIST			*clients;		//!< local clients
+	fr_client_list_t		*clients;		//!< local clients
 
 	fr_trie_t			*trie;			//!< for parsed networks
 	fr_ipaddr_t			*allow;			//!< allowed networks for dynamic clients
 	fr_ipaddr_t			*deny;			//!< denied networks for dynamic clients
+
+	bool				read_hexdump;		//!< Do we debug hexdump read packets.
+	bool				write_hexdump;		//!< Do we debug hexdump write packets.
 } proto_tacacs_tcp_t;
 
-static const CONF_PARSER networks_config[] = {
-	{ FR_CONF_OFFSET("allow", FR_TYPE_COMBO_IP_PREFIX | FR_TYPE_MULTI, proto_tacacs_tcp_t, allow) },
-	{ FR_CONF_OFFSET("deny", FR_TYPE_COMBO_IP_PREFIX | FR_TYPE_MULTI, proto_tacacs_tcp_t, deny) },
+static const conf_parser_t networks_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("allow", FR_TYPE_COMBO_IP_PREFIX , CONF_FLAG_MULTI, proto_tacacs_tcp_t, allow) },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("deny", FR_TYPE_COMBO_IP_PREFIX , CONF_FLAG_MULTI, proto_tacacs_tcp_t, deny) },
 
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER tcp_listen_config[] = {
-	{ FR_CONF_OFFSET("ipaddr", FR_TYPE_COMBO_IP_ADDR, proto_tacacs_tcp_t, ipaddr) },
-	{ FR_CONF_OFFSET("ipv4addr", FR_TYPE_IPV4_ADDR, proto_tacacs_tcp_t, ipaddr) },
-	{ FR_CONF_OFFSET("ipv6addr", FR_TYPE_IPV6_ADDR, proto_tacacs_tcp_t, ipaddr) },
+static const conf_parser_t tcp_listen_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("ipaddr", FR_TYPE_COMBO_IP_ADDR, 0, proto_tacacs_tcp_t, ipaddr) },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("ipv4addr", FR_TYPE_IPV4_ADDR, 0, proto_tacacs_tcp_t, ipaddr) },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("ipv6addr", FR_TYPE_IPV6_ADDR, 0, proto_tacacs_tcp_t, ipaddr) },
 
-	{ FR_CONF_OFFSET("interface", FR_TYPE_STRING, proto_tacacs_tcp_t, interface) },
-	{ FR_CONF_OFFSET("port_name", FR_TYPE_STRING, proto_tacacs_tcp_t, port_name) },
+	{ FR_CONF_OFFSET("interface", proto_tacacs_tcp_t, interface) },
+	{ FR_CONF_OFFSET("port_name", proto_tacacs_tcp_t, port_name) },
 
-	{ FR_CONF_OFFSET("port", FR_TYPE_UINT16, proto_tacacs_tcp_t, port), .dflt = "49" },
-	{ FR_CONF_OFFSET_IS_SET("recv_buff", FR_TYPE_UINT32, proto_tacacs_tcp_t, recv_buff) },
+	{ FR_CONF_OFFSET("port", proto_tacacs_tcp_t, port), .dflt = "49" },
+	{ FR_CONF_OFFSET_IS_SET("recv_buff", FR_TYPE_UINT32, 0, proto_tacacs_tcp_t, recv_buff) },
 
-	{ FR_CONF_OFFSET("dynamic_clients", FR_TYPE_BOOL, proto_tacacs_tcp_t, dynamic_clients) } ,
-	{ FR_CONF_POINTER("networks", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) networks_config },
+	{ FR_CONF_OFFSET("dynamic_clients", proto_tacacs_tcp_t, dynamic_clients) } ,
+	{ FR_CONF_POINTER("networks", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) networks_config },
 
-	{ FR_CONF_OFFSET("max_packet_size", FR_TYPE_UINT32, proto_tacacs_tcp_t, max_packet_size), .dflt = "4096" } ,
-	{ FR_CONF_OFFSET("max_attributes", FR_TYPE_UINT32, proto_tacacs_tcp_t, max_attributes), .dflt = STRINGIFY(TACACS_MAX_ATTRIBUTES) } ,
+	{ FR_CONF_OFFSET("max_packet_size", proto_tacacs_tcp_t, max_packet_size), .dflt = "4096" } ,
+	{ FR_CONF_OFFSET("max_attributes", proto_tacacs_tcp_t, max_attributes), .dflt = STRINGIFY(TACACS_MAX_ATTRIBUTES) } ,
+
+	{ FR_CONF_OFFSET("read_hexdump", proto_tacacs_tcp_t, read_hexdump) },
+	{ FR_CONF_OFFSET("write_hexdump", proto_tacacs_tcp_t, write_hexdump) },
 
 	CONF_PARSER_TERMINATOR
 };
@@ -108,19 +108,75 @@ static const char *packet_name[] = {
 	[FR_TAC_PLUS_ACCT] = "Accounting",
 };
 
-static ssize_t mod_read(fr_listen_t *li, UNUSED void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer, size_t buffer_len, size_t *leftover, UNUSED uint32_t *priority, UNUSED bool *is_dup)
+/** Read TACACS data from a TCP connection
+ *
+ * @param[in] li		representing a client connection.
+ * @param[in] packet_ctx	UNUSED.
+ * @param[out] recv_time_p	When we read the packet.
+ *				For some protocols we get this for free (but not here).
+ * @param[out] buffer		to read into.
+ * @param[in] buffer_len	Maximum length of the buffer.
+ * @param[in,out] leftover	If the previous read didn't yield a complete packet
+ *				we will have written how many bytes we read in leftover
+ *				and returned 0.  On the next call, we use the
+ *				value of leftover to offset the position we start
+ *				writing into the buffer.
+ *				*leftover must be subtracted from buffer_len when
+ *				calculating free space in the buffer.
+ * @return
+ *	- >0 when a packet was read successfully.
+ *	- 0 when we read a partial packet.
+ * 	- <0 on error (socket should be closed).
+ */
+static ssize_t mod_read(fr_listen_instance_t *li, UNUSED void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer,
+			size_t buffer_len, size_t *leftover)
 {
-	// proto_tacacs_tcp_t const       	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_tacacs_tcp_t);
 	proto_tacacs_tcp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_tacacs_tcp_thread_t);
-	ssize_t				data_size;
-	size_t				packet_len, in_buffer;
+	ssize_t				data_size, packet_len;
+	size_t				in_buffer;
+
+	/*
+	 *	We may have read multiple packets in the previous read.  In which case the buffer may already
+	 *	have packets remaining.  In that case, we can return packets directly from the buffer, and
+	 *	skip the read().
+	 */
+	if (*leftover >= FR_HEADER_LENGTH) {
+		packet_len = fr_tacacs_length(buffer, *leftover);
+		if (packet_len < 0) goto invalid;
+
+		if (packet_len <= ((ssize_t) *leftover)) {
+			data_size = 0;
+			goto have_packet;
+		}
+
+		/*
+		 *	Else we don't have a full packet, try to read more data from the network.
+		 */
+	}
 
 	/*
 	 *      Read data into the buffer.
 	 */
-	data_size = read(thread->sockfd, buffer + *leftover, buffer_len - *leftover);
+	data_size = read(thread->sockfd, buffer + (*leftover), buffer_len - (*leftover));
 	if (data_size < 0) {
-		PDEBUG2("proto_tacacs_tcp got read error %zd", data_size);
+		switch (errno) {
+#if defined(EWOULDBLOCK) && (EWOULDBLOCK != EAGAIN)
+		case EWOULDBLOCK:
+#endif
+		case EAGAIN:
+			/*
+			 *	We didn't read any data leave the buffers alone.
+			 *
+			 *	i.e. if we had a partial packet in the buffer and we didn't read any data,
+			 *	then the partial packet is still left in the buffer.
+			 */
+			return 0;
+
+		default:
+			break;
+		}
+
+		ERROR("proto_tacacs_tcp got read error (%zd) - %s", data_size, fr_syserror(errno));
 		return data_size;
 	}
 
@@ -138,39 +194,45 @@ static ssize_t mod_read(fr_listen_t *li, UNUSED void **packet_ctx, fr_time_t *re
 		return -1;
 	}
 
+have_packet:
+	/*
+	 *	Represents all the data we've read since we last
+	 *	decoded a complete packet.
+	 */
 	in_buffer = *leftover + data_size;
 
 	/*
-	 *	We don't have a complete TACACS+ packet.  Tell the
-	 *	caller that we need to read more.
+	 *	Figure out how big the complete TACACS packet should be.
+	 *	If we don't have enough data it'll likely come
+	 *	through in the next fragment.
 	 */
 	packet_len = fr_tacacs_length(buffer, in_buffer);
-	if (in_buffer < packet_len) {
+	if (packet_len < 0) {
+	invalid:
+		PERROR("Invalid TACACS packet");
+		return -1;	/* Malformed, close the socket */
+	}
+
+	/*
+	 *	We don't have a complete TACACS+ packet.  Tell the
+	 *	caller that we need to read more, but record
+	 *	how much we read in leftover.
+	 */
+	if (in_buffer < (size_t) packet_len) {
 		*leftover = in_buffer;
+		DEBUG3("proto_tacacs_tcp - Received packet fragment of %zu bytes (%zu bytes now pending)",
+		       (size_t)packet_len, *leftover);
 		return 0;
 	}
 
 	/*
-	 *	We've read more than one packet.  Tell the caller that
+	 *	We've read at least one packet.  Tell the caller that
 	 *	there's more data available, and return only one packet.
 	 */
-	if (in_buffer > packet_len) {
-		*leftover = in_buffer - packet_len;
-	}
+	*leftover = in_buffer - packet_len;
 
 	*recv_time_p = fr_time();
 	thread->stats.total_requests++;
-
-	/*
-	 *	See if we negotiated multiple sessions on a single
-	 *	connection.
-	 */
-	if (!thread->seen_first_packet) {
-		fr_tacacs_packet_t *pkt = (fr_tacacs_packet_t *) buffer;
-
-		thread->seen_first_packet = true;
-		thread->single_connection = ((pkt->hdr.flags & FR_FLAGS_VALUE_SINGLE_CONNECT) != 0);
-	}
 
 	/*
 	 *	proto_tacacs sets the priority
@@ -181,19 +243,32 @@ static ssize_t mod_read(fr_listen_t *li, UNUSED void **packet_ctx, fr_time_t *re
 	 */
 	FR_PROTO_HEX_DUMP(buffer, packet_len, "tacacs_tcp_recv");
 
-	DEBUG2("proto_tacacs_tcp - Received %s seq_no %d length %d %s",
-	       packet_name[buffer[1]], buffer[2],
-	       (int) packet_len, thread->name);
+	if (DEBUG_ENABLED2) {
+		char bogus_type[4];
+		char const *type;
+		uint8_t packet_type = buffer[1];
+
+		if ((packet_type > 0) && (packet_type < NUM_ELEMENTS(packet_name))) {
+			type = packet_name[packet_type];
+		} else {
+			snprintf(bogus_type, sizeof(bogus_type), "%d", packet_type);
+			type = bogus_type;
+		}
+		DEBUG2("proto_tacacs_tcp - Received %s seq_no %d length %zd %s",
+		       type, buffer[2],
+		       packet_len, thread->name);
+	}
 
 	return packet_len;
 }
 
-static ssize_t mod_write(fr_listen_t *li, UNUSED void *packet_ctx, UNUSED fr_time_t request_time,
-			 uint8_t *buffer, size_t buffer_len, size_t written)
+static ssize_t mod_write(fr_listen_instance_t *li, UNUSED void *packet_ctx, UNUSED fr_time_t request_time,
+			 uint8_t *buffer,
+			 size_t buffer_len, size_t written)
 {
 	proto_tacacs_tcp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_tacacs_tcp_thread_t);
 	ssize_t				data_size;
-	fr_tacacs_packet_t		*pkt;
+	ssize_t				total;
 
 	/*
 	 *	We only write TACACS packets.
@@ -209,10 +284,8 @@ static ssize_t mod_write(fr_listen_t *li, UNUSED void *packet_ctx, UNUSED fr_tim
 	 *	put the stats in the listener, so that proto_tacacs
 	 *	can update them, too.. <sigh>
 	 */
-	pkt = (fr_tacacs_packet_t *) buffer;
 	if (written == 0) {
 		thread->stats.total_responses++;
-		if (thread->single_connection) pkt->hdr.flags |= FR_FLAGS_VALUE_SINGLE_CONNECT;
 	}
 
 	/*
@@ -223,22 +296,50 @@ static ssize_t mod_write(fr_listen_t *li, UNUSED void *packet_ctx, UNUSED fr_tim
 	if (data_size <= 0) return data_size;
 
 	/*
-	 *	If the "use single connection" flag is clear, then we
-	 *	are only doing a single session.  In which case,
-	 *	return 0, which tells the caller to close the socket.
+	 *	The total never exceeds buffer_len, which is far below
+	 *	SSIZE_MAX.
 	 */
-	if (((pkt->hdr.flags & FR_FLAGS_VALUE_SINGLE_CONNECT) == 0) &&
-	    (data_size + written) >= buffer_len) {
-		// @todo - check status for pass / fail / error, which
-		// cause the connection to be closed.  Everything else
-		// leaves it open.
-		return 0;
+	if (!fr_cond_assert(fr_add(&total, data_size, written))) return -1;
+
+	/*
+	 *	If we're supposed to close the socket, then go do that.
+	 */
+	if (((data_size + written) == buffer_len) &&
+	    !packet_is_encrypted((fr_tacacs_packet_t const *) buffer)) {
+		fr_tacacs_packet_t const *pkt = (fr_tacacs_packet_t const *) buffer;
+
+		switch (pkt->hdr.type) {
+		case FR_TAC_PLUS_AUTHEN:
+			if (pkt->authen_reply.status == FR_TAC_PLUS_AUTHEN_STATUS_ERROR) goto close_it;
+			break;
+
+		case FR_TAC_PLUS_AUTHOR:
+			if (pkt->author_reply.status == FR_TAC_PLUS_AUTHOR_STATUS_ERROR) {
+			close_it:
+				ERROR("tacacs %s - Closing connection due to unrecoverable server error response",
+					thread->name);
+				errno = ECONNRESET;
+				return -1;
+			}
+			break;
+
+		case FR_TAC_PLUS_ACCT:
+			if (pkt->acct_reply.status == FR_TAC_PLUS_ACCT_STATUS_ERROR) goto close_it;
+			break;
+
+		default:
+			break;
+		}
 	}
 
-	return data_size + written;
+	/*
+	 *	Return the packet we wrote, plus any bytes previously
+	 *	left over from previous packets.
+	 */
+	return total;
 }
 
-static int mod_connection_set(fr_listen_t *li, fr_io_address_t *connection)
+static int mod_connection_set(fr_listen_instance_t *li, fr_io_address_t *connection)
 {
 	proto_tacacs_tcp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_tacacs_tcp_thread_t);
 
@@ -247,7 +348,7 @@ static int mod_connection_set(fr_listen_t *li, fr_io_address_t *connection)
 	return 0;
 }
 
-static void mod_network_get(void *instance, int *ipproto, bool *dynamic_clients, fr_trie_t const **trie)
+static void mod_network_get(int *ipproto, bool *dynamic_clients, fr_trie_t const **trie, void *instance)
 {
 	proto_tacacs_tcp_t *inst = talloc_get_type_abort(instance, proto_tacacs_tcp_t);
 
@@ -259,32 +360,37 @@ static void mod_network_get(void *instance, int *ipproto, bool *dynamic_clients,
 /** Open a TCP listener for TACACS+
  *
  */
-static int mod_open(fr_listen_t *li)
+static int mod_open(fr_listen_instance_t *li)
 {
-	proto_tacacs_tcp_t const       	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_tacacs_tcp_t);
+	proto_tacacs_tcp_t const        *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_tacacs_tcp_t);
 	proto_tacacs_tcp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_tacacs_tcp_thread_t);
 
 	int				sockfd;
+	fr_ipaddr_t			ipaddr = inst->ipaddr;
 	uint16_t			port = inst->port;
 
 	fr_assert(!thread->connection);
 
 	li->fd = sockfd = fr_socket_server_tcp(&inst->ipaddr, &port, inst->port_name, true);
 	if (sockfd < 0) {
-		PERROR("Failed opening TCP socket");
+		cf_log_err(li->listen->cs, "Failed opening TCP socket - %s", fr_strerror());
 	error:
 		return -1;
 	}
 
-	if (fr_socket_bind(sockfd, &inst->ipaddr, &port, inst->interface) < 0) {
+	(void) fr_nonblock(sockfd);
+
+	if (fr_socket_bind(sockfd, inst->interface, &ipaddr, &port) < 0) {
 		close(sockfd);
-		PERROR("Failed binding socket");
+		cf_log_err(li->listen->cs, "Failed binding to socket - %s", fr_strerror());
+		cf_log_err(li->listen->cs, DOC_ROOT_REF(troubleshooting/network/bind));
 		goto error;
 	}
 
-	if (listen(sockfd, 8) < 0) {
+	if (listen(sockfd, SOMAXCONN) < 0) {
 		close(sockfd);
-		PERROR("Failed listening on socket");
+		cf_log_err(li->listen->cs, "Failed listening on socket - %s", fr_syserror(errno));
 		goto error;
 	}
 
@@ -303,9 +409,9 @@ static int mod_open(fr_listen_t *li)
 
 /** Set the file descriptor for this socket.
  */
-static int mod_fd_set(fr_listen_t *li, int fd)
+static int mod_fd_set(fr_listen_instance_t *li, int fd)
 {
-	proto_tacacs_tcp_t const  *inst = talloc_get_type_abort_const(li->app_io_instance, proto_tacacs_tcp_t);
+	proto_tacacs_tcp_t const  *inst = talloc_get_type_abort_const(li->listen->app_io_instance, proto_tacacs_tcp_t);
 	proto_tacacs_tcp_thread_t *thread = talloc_get_type_abort(li->thread_instance, proto_tacacs_tcp_thread_t);
 
 	thread->sockfd = fd;
@@ -318,85 +424,35 @@ static int mod_fd_set(fr_listen_t *li, int fd)
 	return 0;
 }
 
-static void *mod_track_create(UNUSED void const *instance, UNUSED void *thread_instance, UNUSED RADCLIENT *client,
-			      fr_io_track_t *track, uint8_t const *buffer, UNUSED size_t buffer_len)
-{
-	fr_tacacs_packet_t const *pkt = (fr_tacacs_packet_t const *) buffer;
-	proto_tacacs_track_t     *t;
-
-	t = talloc_zero(track, proto_tacacs_track_t);
-	if (!t) return NULL;
-
-	talloc_set_name_const(t, "proto_tacacs_track_t");
-
-	switch (pkt->hdr.type) {
-	case FR_TAC_PLUS_AUTHEN:
-		if (packet_is_authen_start_request(pkt)) {
-			t->type = FR_PACKET_TYPE_VALUE_AUTHENTICATION_START;
-		} else {
-			t->type = FR_PACKET_TYPE_VALUE_AUTHENTICATION_CONTINUE;
-		}
-		break;
-
-	case FR_TAC_PLUS_AUTHOR:
-		t->type = FR_PACKET_TYPE_VALUE_AUTHORIZATION_REQUEST;
-		break;
-
-	case FR_TAC_PLUS_ACCT:
-		t->type = FR_PACKET_TYPE_VALUE_ACCOUNTING_REQUEST;
-		break;
-
-	default:
-		talloc_free(t);
-		fr_assert(0);
-		return NULL;
-	}
-
-	t->session_id = pkt->hdr.session_id;
-
-	return t;
-}
-
-static int mod_track_compare(UNUSED void const *instance, UNUSED void *thread_instance, UNUSED RADCLIENT *client,
-			     void const *one, void const *two)
-{
-	int ret;
-	proto_tacacs_track_t const *a = talloc_get_type_abort_const(one, proto_tacacs_track_t);
-	proto_tacacs_track_t const *b = talloc_get_type_abort_const(two, proto_tacacs_track_t);
-
-	/*
-	 *	Session IDs SHOULD be random 32-bit integers.
-	 */
-	ret = (a->session_id < b->session_id) - (a->session_id > b->session_id);
-	if (ret != 0) return ret;
-
-	/*
-	 *	Then ordered by our synthetic packet type.
-	 */
-	return (a->type < b->type) - (a->type > b->type);
-}
-
-static char const *mod_name(fr_listen_t *li)
+static char const *mod_name(fr_listen_instance_t *li)
 {
 	proto_tacacs_tcp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_tacacs_tcp_thread_t);
 
 	return thread->name;
 }
 
-static int mod_bootstrap(void *instance, CONF_SECTION *cs)
+static void mod_hexdump_set(fr_listen_instance_t *li, void *data)
 {
-	proto_tacacs_tcp_t	*inst = talloc_get_type_abort(instance, proto_tacacs_tcp_t);
+	proto_tacacs_tcp_t	*inst = talloc_get_type_abort(data, proto_tacacs_tcp_t);
+	li->listen->read_hexdump = inst->read_hexdump;
+	li->listen->write_hexdump = inst->write_hexdump;
+}
+
+static int mod_instantiate(module_inst_ctx_t const *mctx)
+{
+	proto_tacacs_tcp_t	*inst = talloc_get_type_abort(mctx->mi->data, proto_tacacs_tcp_t);
+	CONF_SECTION		*conf = mctx->mi->conf;
 	size_t			num;
 	CONF_ITEM		*ci;
 	CONF_SECTION		*server_cs;
 
-	inst->cs = cs;
+	inst->cs = conf;
 
 	/*
 	 *	Complain if no "ipaddr" is set.
 	 */
 	if (inst->ipaddr.af == AF_UNSPEC) {
-		cf_log_err(cs, "No 'ipaddr' was specified in the 'tcp' section");
+		cf_log_err(conf, "No 'ipaddr' was specified in the 'tcp' section");
 		return -1;
 	}
 
@@ -412,17 +468,17 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 		struct servent *s;
 
 		if (!inst->port_name) {
-			cf_log_err(cs, "No 'port' was specified in the 'tcp' section");
+			cf_log_err(conf, "No 'port' was specified in the 'tcp' section");
 			return -1;
 		}
 
 		s = getservbyname(inst->port_name, "tcp");
 		if (!s) {
-			cf_log_err(cs, "Unknown value for 'port_name = %s", inst->port_name);
+			cf_log_err(conf, "Unknown value for 'port_name = %s", inst->port_name);
 			return -1;
 		}
 
-		inst->port = ntohl(s->s_port);
+		inst->port = ntohs(s->s_port);
 	}
 
 	/*
@@ -432,18 +488,18 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	num = talloc_array_length(inst->allow);
 	if (!num) {
 		if (inst->dynamic_clients) {
-			cf_log_err(cs, "The 'allow' subsection MUST contain at least one 'network' entry when 'dynamic_clients = true'.");
+			cf_log_err(conf, "The 'allow' subsection MUST contain at least one 'network' entry when 'dynamic_clients = true'.");
 			return -1;
 		}
 	} else {
 		inst->trie = fr_master_io_network(inst, inst->ipaddr.af, inst->allow, inst->deny);
 		if (!inst->trie) {
-			cf_log_perr(cs, "Failed creating list of networks");
+			cf_log_perr(conf, "Failed creating list of networks");
 			return -1;
 		}
 	}
 
-	ci = cf_parent(inst->cs); /* listen { ... } */
+	ci = cf_section_to_item(mctx->mi->parent->conf); /* listen { ... } */
 	fr_assert(ci != NULL);
 	ci = cf_parent(ci);
 	fr_assert(ci != NULL);
@@ -459,7 +515,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	if (cf_section_find_next(server_cs, NULL, "client", CF_IDENT_ANY)) {
 		inst->clients = client_list_parse_section(server_cs, IPPROTO_TCP, false);
 		if (!inst->clients) {
-			cf_log_err(cs, "Failed creating local clients");
+			cf_log_err(conf, "Failed creating local clients");
 			return -1;
 		}
 	}
@@ -467,30 +523,43 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	return 0;
 }
 
-static RADCLIENT *mod_client_find(UNUSED fr_listen_t *li, fr_ipaddr_t const *ipaddr, int ipproto)
+static fr_client_t *mod_client_find(fr_listen_instance_t *li, fr_ipaddr_t const *ipaddr, int ipproto)
 {
+	proto_tacacs_tcp_t const        *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_tacacs_tcp_t);
+
+	/*
+	 *	Prefer local clients.
+	 */
+	if (inst->clients) {
+		fr_client_t *client;
+
+		client = client_find(inst->clients, ipaddr, ipproto);
+		if (client) return client;
+	}
+
 	return client_find(NULL, ipaddr, ipproto);
 }
 
 fr_app_io_t proto_tacacs_tcp = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "tacacs_tcp",
-	.config			= tcp_listen_config,
-	.inst_size		= sizeof(proto_tacacs_tcp_t),
-	.thread_inst_size	= sizeof(proto_tacacs_tcp_thread_t),
-	.bootstrap		= mod_bootstrap,
-
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "tacacs_tcp",
+		.config			= tcp_listen_config,
+		.inst_size		= sizeof(proto_tacacs_tcp_t),
+		.thread_inst_size	= sizeof(proto_tacacs_tcp_thread_t),
+		.instantiate		= mod_instantiate,
+	},
 	.default_message_size	= 4096,
-	.track_duplicates	= true,
+	.track_duplicates	= false,
 
 	.open			= mod_open,
 	.read			= mod_read,
 	.write			= mod_write,
 	.fd_set			= mod_fd_set,
-	.track_create	       	= mod_track_create,
-	.track_compare		= mod_track_compare,
 	.connection_set		= mod_connection_set,
 	.network_get		= mod_network_get,
 	.client_find		= mod_client_find,
 	.get_name		= mod_name,
+	.hexdump_set		= mod_hexdump_set,
 };

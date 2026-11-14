@@ -1,22 +1,45 @@
-#
-#  PRE: update if
-#
-update {
-	&request.Class := 0x00000101
-}
+uint64 foo
+uint32 zscore
 
-if (<integer>&Class[0] == 257) {
+#
+#  PRE: if
+#
+Class := 0x00000101
+
+if ((integer)Class[0] == 257) {
 	success
 }
 
-if (<integer>&Class[0] < 256) {
-	update reply {
-		&Filter-Id += "wrong"
-	}
+if ((integer)Class[0] < 256) {
+	test_fail
 }
 
-if (<integer>&Class[0] > 257) {
-	update reply {
-		&Filter-Id += "wrong"
-	}
+if ((integer)Class[0] > 257) {
+	test_fail
+}
+
+zscore := 1
+
+foo := (uint64) 0x10000000000001
+
+if (foo != (zscore + %cast('uint64', 0x10000000000000))) {
+	test_fail
+}
+
+if (foo != (zscore + (uint64) 0x10000000000000)) {
+	test_fail
+}
+
+Service-Type := ::Framed-User
+
+if ((uint32) Service-Type != 2) {
+	test_fail
+}
+
+#
+#  Cast Service-Type to it's underlying data type,
+#  which means "don't print the enum name".
+#
+if ("%{(uint32) Service-Type}" != "2") {
+	test_fail
 }

@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -16,8 +16,8 @@
 
 /**
  * $Id$
- * @file lib/ldap/start_tls.c
- * @brief Start TLS asynchronously
+ * @file lib/ldap/state.c
+ * @brief Connection state machine for asynchronous LDAP connections
  *
  * @copyright 2017 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
@@ -44,7 +44,8 @@ do { \
  * This function moves the connection through different states, setting different I/O
  * handlers.
  *
- * If any of the states
+ * If any of the states fail to be entered, the connection is moved to the error
+ * state, which restarts the state machine by signalling a reconnect.
  */
 fr_ldap_state_t fr_ldap_state_next(fr_ldap_connection_t *c)
 {
@@ -104,17 +105,30 @@ again:
 		break;
 
 	/*
-	 *	After binding install the mux (write) and
-	 *	demux (read) I/O functions.
+	 *	After binding, read directory capabilities from the
+	 *	rootDSE, so consumers of c->directory never see
+	 *	undiscovered data once the connection is handling
+	 *	requests.  Connections sharing an already discovered
+	 *	directory skip straight to run.
 	 */
 	case FR_LDAP_STATE_BIND:
-		STATE_TRANSITION(FR_LDAP_STATE_RUN);
-	/*
-		if (fr_ldap_mux_async(c) < 0) {
-			STATE_TRANSITION(FR_LDAP_STATE_ERROR);
-			goto again;
+		if (c->directory && !c->directory->discovered) {
+			if (fr_ldap_directory_discover_async(c) < 0) {
+				STATE_TRANSITION(FR_LDAP_STATE_ERROR);
+				goto again;
+			}
+			STATE_TRANSITION(FR_LDAP_STATE_DISCOVER);
+			break;
 		}
+		FALL_THROUGH;
+
+	/*
+	 *	After directory discovery install the mux (write) and
+	 *	demux (read) I/O functions.
 	 */
+	case FR_LDAP_STATE_DISCOVER:
+		STATE_TRANSITION(FR_LDAP_STATE_RUN);
+		connection_signal_connected(c->conn);
 		break;
 
 	/*
@@ -123,8 +137,11 @@ again:
 	case FR_LDAP_STATE_RUN:		/* There's no next state for run, so this an error */
 	case FR_LDAP_STATE_ERROR:
 		STATE_TRANSITION(FR_LDAP_STATE_INIT);
-		fr_connection_signal_reconnect(c->conn, FR_CONNECTION_FAILED);
-		break;
+		connection_signal_reconnect(c->conn, CONNECTION_FAILED);
+		/*
+		 *	The old connection has been freed, so specifically return the INIT state
+		 */
+		return FR_LDAP_STATE_INIT;
 	}
 
 	return c->state;
@@ -138,4 +155,3 @@ void fr_ldap_state_error(fr_ldap_connection_t *c)
 	STATE_TRANSITION(FR_LDAP_STATE_ERROR);
 	fr_ldap_state_next(c);
 }
-

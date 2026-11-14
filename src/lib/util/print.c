@@ -24,14 +24,8 @@ RCSID("$Id$")
 
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/base16.h>
-#include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/pair.h>
-#include <freeradius-devel/util/print.h>
-#include <freeradius-devel/util/strerror.h>
-#include <freeradius-devel/util/talloc.h>
 
-#include <ctype.h>
-#include <string.h>
 
 /** Checks for utf-8, taken from http://www.w3.org/International/questions/qa-forms-utf-8
  *
@@ -46,11 +40,19 @@ inline size_t fr_utf8_char(uint8_t const *str, ssize_t inlen)
 {
 	if (inlen == 0) return 0;
 
-	if (inlen < 0) inlen = 4;	/* longest char */
+	if (inlen < 0) {
+		if (*str < 0x20) return 0; /* end of string, or control characters. */
 
-	if (*str < 0x20) return 0;
+		/*
+		 *	The trailing zero can occur at any point in
+		 *	the next 4 characters.
+		 */
+		for (inlen = 1; inlen <= 4; inlen++) {
+			if (!str[inlen]) break;
+		}
+	}
 
-	if (*str <= 0x7e) return 1;	/* 1 */
+	if (*str <= 0x7f) return 1;	/* 1 */
 
 	if (*str <= 0xc1) return 0;
 
@@ -145,10 +147,10 @@ inline size_t fr_utf8_char(uint8_t const *str, ssize_t inlen)
  * @param[in] inlen	length of input string.  May be -1 if str
  *			is \0 terminated.
  * @return The number of bytes validated.  If ret == inlen the entire
- *	   string is valid.  Else ret gives the offset at which the
- *	   first invalid byte sequence was found.
+ *	   string is valid.  Else ret gives the negative offset at
+ *	   which the first invalid byte sequence was found.
  */
-ssize_t fr_utf8_str(uint8_t const *str, ssize_t inlen)
+fr_slen_t fr_utf8_str(uint8_t const *str, ssize_t inlen)
 {
 	uint8_t const *p, *end;
 	size_t len;
@@ -162,7 +164,7 @@ ssize_t fr_utf8_str(uint8_t const *str, ssize_t inlen)
 		size_t clen;
 
 		clen = fr_utf8_char(p, end - p);
-		if (clen == 0) return end - p;
+		if (clen == 0) return p - end;
 		p += clen;
 	} while (p < end);
 
@@ -182,7 +184,7 @@ ssize_t fr_utf8_str(uint8_t const *str, ssize_t inlen)
 char const *fr_utf8_strchr(int *out_chr_len, char const *str, ssize_t inlen, char const *chr)
 {
 	char const	*p = str, *end;
-	int		needle_len;
+	size_t		needle_len;
 
 	if (inlen < 0) inlen = strlen(str);
 
@@ -194,14 +196,14 @@ char const *fr_utf8_strchr(int *out_chr_len, char const *str, ssize_t inlen, cha
 	 */
 	needle_len = fr_utf8_char((uint8_t const *)chr, -1);
 	if (needle_len == 0) needle_len = 1;	/* Invalid UTF8 sequence - ignore - needle is one byte */
-	if (out_chr_len) *out_chr_len = needle_len;
+	if (out_chr_len) *out_chr_len = (int)needle_len;
 
 	/*
 	 *	Loop over the input sequence, advancing
 	 *      UTF8 sequence by utf8 seqnce.
 	 */
 	while (p < end) {
-		int schr_len;
+		size_t schr_len;
 
 		schr_len = fr_utf8_char((uint8_t const *)p, end - p);
 		if (schr_len == 0) schr_len = 1;	/* Invalid UTF8 sequence - ignore - advance by 1 */
@@ -473,15 +475,17 @@ DIAG_OFF(format-nonliteral)
  * @param[in] ctx	to allocate buffer in.
  * @param[in] fmt	string.
  * @param[in] ap	variadic argument list.
+ * @param[in] suppress_secrets as described
  * @return
  *	- The result of string interpolation.
  *	- NULL if OOM.
  */
-char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
+static char *fr_vasprintf_internal(TALLOC_CTX *ctx, char const *fmt, va_list ap, bool suppress_secrets)
 {
 	char const	*p = fmt, *end = p + strlen(fmt), *fmt_p = p, *fmt_q = p;
 	char		*out = NULL, *out_tmp;
 	va_list		ap_p, ap_q;
+	char		*subst;
 
 	out = talloc_strdup(ctx, "");
 	va_copy(ap_p, ap);
@@ -490,7 +494,8 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 	do {
 		char const	*q;
 		char		len[2] = { '\0', '\0' };
-		char		*subst = NULL;
+
+		subst = NULL;
 
 		if ((*p != '%') || (*++p == '%')) {
 			fmt_q = p + 1;
@@ -500,7 +505,7 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 		/*
 		 *	Check for parameter field
 		 */
-		for (q = p; isdigit(*q); q++);
+		for (q = p; isdigit((uint8_t) *q); q++);
 		if ((q != p) && (*q == '$')) {
 			p = q + 1;
 		}
@@ -542,7 +547,7 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 			(void) va_arg(ap_q, int);
 			p++;
 		} else {
-			for (q = p; isdigit(*q); q++);
+			for (q = p; isdigit((uint8_t) *q); q++);
 			p = q;
 		}
 
@@ -597,15 +602,15 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 			case 'l':
 				if ((*p == 'i') || (*p == 'd')) {
 					if (len[1] == 'l') {
-						(void) va_arg(ap_q, long);		/* long */
-					} else {
 						(void) va_arg(ap_q, long long);		/* long long */
+					} else {
+						(void) va_arg(ap_q, long);		/* long */
 					}
 				} else {
 					if (len[1] == 'l') {
-						(void) va_arg(ap_q, unsigned long);	/* unsigned long */
+						(void) va_arg(ap_q, unsigned long long); /* unsigned long long */
 					} else {
-						(void) va_arg(ap_q, unsigned long long);/* unsigned long long */
+						(void) va_arg(ap_q, unsigned long);	/* unsigned long */
 					}
 				}
 				break;
@@ -663,32 +668,39 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 			 *	subst types
 			 */
 			switch (*(p + 1)) {
-			case 'V':
 			case 'R':
+				/*
+				 *	If the caller explicitly asks to suppress secrets via '%pR', then we
+				 *	do that.
+				 */
+				suppress_secrets = true;
+				FALL_THROUGH;
+
+			case 'V':
 			{
 				fr_value_box_t const *in = va_arg(ap_q, fr_value_box_t const *);
-				fr_sbuff_escape_rules_t const *e_rules = NULL;
-
-				if (*(p + 1) == 'V') e_rules = &fr_value_escape_double;
 
 				/*
 				 *	Allocations that are not part of the output
 				 *	string need to occur in the NULL ctx so we don't fragment
 				 *	any pool associated with it.
 				 */
-				if (in) {
-					fr_value_box_aprint(NULL, &subst, in, e_rules);
-					if (!subst) {
-						talloc_free(out);
-						va_end(ap_p);
-						va_end(ap_q);
-						return NULL;
-					}
+				if (unlikely(in && fr_value_box_is_secret(in) && suppress_secrets)) {
+					subst = talloc_strdup(NULL, "<<< secret >>>");
+
+				} else if (in) {
+					/*
+					 *	Value boxes get escaped as double-quoted strings.
+					 */
+					fr_value_box_aprint(NULL, &subst, in, &fr_value_escape_double);
+
 				} else {
-					subst = talloc_typed_strdup(NULL, "(null)");
+					subst = talloc_strdup(NULL, "(null)");
 				}
 
 			do_splice:
+				if (!subst) goto oom;
+
 				p++;
 
 				/*
@@ -704,7 +716,7 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 					oom:
 						fr_strerror_const("Out of memory");
 						talloc_free(out);
-						talloc_free(subst);
+						TALLOC_FREE(subst);
 						va_end(ap_p);
 						va_end(ap_q);
 						return NULL;
@@ -712,15 +724,15 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 					out = out_tmp;
 
 					out_tmp = talloc_strdup_append_buffer(out, subst);
-					TALLOC_FREE(subst);
 					if (!out_tmp) goto oom;
+					TALLOC_FREE(subst);
 					out = out_tmp;
 
 					va_end(ap_p);		/* one time use only */
 				} else {
 					out_tmp = talloc_strdup_append_buffer(out, subst);
-					TALLOC_FREE(subst);
 					if (!out_tmp) goto oom;
+					TALLOC_FREE(subst);
 					out = out_tmp;
 				}
 
@@ -736,8 +748,6 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 
 				if (!in) {
 					subst = talloc_strdup(NULL, "(null)");
-					if (!subst) goto oom;
-
 					goto do_splice;
 				}
 
@@ -783,7 +793,11 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 					goto do_splice;
 				}
 
-				subst = fr_value_box_list_aprint(NULL, in, NULL, &fr_value_escape_double);
+				if (suppress_secrets) {
+					subst = fr_value_box_list_aprint_secure(NULL, in, NULL, &fr_value_escape_double);
+				} else {
+					subst = fr_value_box_list_aprint(NULL, in, NULL, &fr_value_escape_double);
+				}
 			}
 				goto do_splice;
 
@@ -796,8 +810,13 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 					goto do_splice;
 				}
 
-				VP_VERIFY(in);
-				fr_pair_aprint(NULL, &subst, NULL, in);
+				PAIR_VERIFY(in);
+
+				if (unlikely(in && suppress_secrets)) {
+					fr_pair_aprint_secure(NULL, &subst, NULL, in);
+				} else {
+					fr_pair_aprint(NULL, &subst, NULL, in);
+				}
 			}
 				goto do_splice;
 
@@ -837,6 +856,18 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 
 	return out;
 }
+
+char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
+{
+	return fr_vasprintf_internal(ctx, fmt, ap, false);
+}
+
+char *fr_vasprintf_secure(TALLOC_CTX *ctx, char const *fmt, va_list ap)
+{
+	return fr_vasprintf_internal(ctx, fmt, ap, true);
+}
+
+
 DIAG_ON(format-nonliteral)
 
 /** Special version of asprintf which implements custom format specifiers

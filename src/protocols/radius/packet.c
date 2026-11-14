@@ -18,7 +18,7 @@
  * $Id$
  *
  * @file protocols/radius/packet.c
- * @brief Functions to deal with fr_radius_packet_t data structures.
+ * @brief Functions to deal with fr_packet_t data structures.
  *
  * @copyright 2000-2017 The FreeRADIUS server project
  */
@@ -26,36 +26,26 @@ RCSID("$Id$")
 
 #include "attrs.h"
 
-#include <freeradius-devel/util/base.h>
 #include <freeradius-devel/util/udp.h>
-#include <freeradius-devel/util/udpfromto.h>
+#include <freeradius-devel/util/syserror.h>
 
 #include <fcntl.h>
-#include <ctype.h>
-
-typedef struct {
-	uint8_t	code;
-	uint8_t	id;
-	uint8_t	length[2];
-	uint8_t	vector[RADIUS_AUTH_VECTOR_LENGTH];
-	uint8_t	data[1];
-} radius_packet_t;
-
 
 /*
  *	Some messages get printed out only in debugging mode.
  */
-#define FR_DEBUG_STRERROR_PRINTF if (fr_debug_lvl) fr_strerror_printf_push
+#define FR_DEBUG_STRERROR_PRINTF if (fr_debug_lvl) fr_strerror_printf
 
 
 /** Encode a packet
  *
  */
-ssize_t fr_radius_packet_encode(fr_radius_packet_t *packet, fr_pair_list_t *list,
-				fr_radius_packet_t const *original, char const *secret)
+ssize_t fr_radius_packet_encode(fr_packet_t *packet, fr_pair_list_t *list,
+				fr_packet_t const *original, char const *secret)
 {
-	uint8_t const *original_data;
 	ssize_t slen;
+	fr_radius_ctx_t common = {};
+	fr_radius_encode_ctx_t packet_ctx;
 
 	/*
 	 *	A 4K packet, aligned on 64-bits.
@@ -63,22 +53,33 @@ ssize_t fr_radius_packet_encode(fr_radius_packet_t *packet, fr_pair_list_t *list
 	uint8_t	data[MAX_PACKET_LEN];
 
 #ifndef NDEBUG
-	if (fr_debug_lvl >= L_DBG_LVL_4) fr_radius_packet_log_hex(&default_log, packet);
+	if (fr_debug_lvl >= L_DBG_LVL_4) fr_packet_log_hex(&default_log, packet);
 #endif
 
-	if (original) {
-		original_data = original->data;
-	} else {
-		original_data = NULL;
-	}
+	common.secret = secret;
+	common.secret_length = talloc_strlen(secret);
 
+	packet_ctx = (fr_radius_encode_ctx_t) {
+		.common = &common,
+		.request_authenticator = original ? original->data + 4 : NULL,
+		.rand_ctx = (fr_fast_rand_t) {
+			.a = fr_rand(),
+			.b = fr_rand(),
+		},
+		.request_code = original ? original->data[0] : 0,
+		.code = packet->code,
+		.id = packet->id,
+	};
+
+#if defined(__clang_analyzer__) || defined(__COVERITY__)
 	/*
-	 *	This has to be initialized for Access-Request packets
+	 *	Neither the clang analyser nor Coverity sees fr_radius_encode()
+	 *	fill the buffer through the dbuff, and both report the
+	 *	memcpy() below as a read of uninitialised memory.
 	 */
-	memcpy(data + 4, packet->vector, sizeof(packet->vector));
-
-	slen = fr_radius_encode(data, sizeof(data), original_data, secret, talloc_array_length(secret) - 1,
-				packet->code, packet->id, list);
+	memset(data, 0, sizeof(data));
+#endif
+	slen = fr_radius_encode(&FR_DBUFF_TMP(data, sizeof(data)), list, &packet_ctx);
 	if (slen < 0) return slen;
 
 	/*
@@ -101,180 +102,30 @@ ssize_t fr_radius_packet_encode(fr_radius_packet_t *packet, fr_pair_list_t *list
 	return 0;
 }
 
-/** Calculate/check digest, and decode radius attributes
- *
- * @param[in] packet			to decode.
- * @param[in] list			to add pairs to.
- * @param[in] original			packet, if this is a reply.
- * @param[in] max_attributes		to decode.
- * @param[in] tunnel_password_zeros	set random elements of the tunnel password
- *					vectors to zero to aid in testing.
- * @param[in] secret			shared secret used for decoding encrypted
- *					password attributes.
- * @return
- *	- 0 on success
- *	- -1 on decoding error.
- */
-int fr_radius_packet_decode(fr_radius_packet_t *packet, fr_pair_list_t *list,
-			    fr_radius_packet_t *original,
-			    uint32_t max_attributes, bool tunnel_password_zeros, char const *secret)
-{
-	int			packet_length;
-	uint32_t		num_attributes;
-	uint8_t			*ptr;
-	radius_packet_t		*hdr;
-	fr_pair_list_t		head;
-	fr_dcursor_t		cursor, out;
-	fr_radius_ctx_t		packet_ctx = {
-					.secret = secret,
-					.tunnel_password_zeros = tunnel_password_zeros
-				};
-
-	fr_pair_list_init(&head);
-#ifndef NDEBUG
-	if (fr_debug_lvl >= L_DBG_LVL_4) fr_radius_packet_log_hex(&default_log, packet);
-#endif
-
-	switch (packet->code) {
-	case FR_RADIUS_CODE_ACCESS_REQUEST:
-	case FR_RADIUS_CODE_STATUS_SERVER:
-		memcpy(packet_ctx.vector, packet->vector, sizeof(packet_ctx.vector));
-		break;
-
-	case FR_RADIUS_CODE_ACCESS_ACCEPT:
-	case FR_RADIUS_CODE_ACCESS_REJECT:
-	case FR_RADIUS_CODE_ACCESS_CHALLENGE:
-	case FR_RADIUS_CODE_ACCOUNTING_RESPONSE:
-	case FR_RADIUS_CODE_COA_ACK:
-	case FR_RADIUS_CODE_COA_NAK:
-	case FR_RADIUS_CODE_DISCONNECT_ACK:
-	case FR_RADIUS_CODE_DISCONNECT_NAK:
-		/*
-		 *	radsniff doesn't always have a response
-		 */
-		if (original) {
-			memcpy(packet_ctx.vector, original->vector, sizeof(packet_ctx.vector));
-		} else {
-			memset(packet->vector, 0, sizeof(packet->vector));
-			memset(packet_ctx.vector, 0, sizeof(packet_ctx.vector));
-		}
-		break;
-
-	case FR_RADIUS_CODE_ACCOUNTING_REQUEST:
-	case FR_RADIUS_CODE_COA_REQUEST:
-	case FR_RADIUS_CODE_DISCONNECT_REQUEST:
-		memset(packet->vector, 0, sizeof(packet->vector));
-		memset(packet_ctx.vector, 0, sizeof(packet_ctx.vector));
-		break;
-
-	default:
-		fr_strerror_printf("Cannot decode unknown packet code %d", packet->code);
-		return -1;
-	}
-
-	packet_ctx.tmp_ctx = talloc(packet, uint8_t);
-
-	/*
-	 *	Extract attribute-value pairs
-	 */
-	hdr = (radius_packet_t *)packet->data;
-	ptr = hdr->data;
-	packet_length = packet->data_len - RADIUS_HEADER_LENGTH;
-	num_attributes = 0;
-
-	fr_dcursor_init(&cursor, &head);
-
-	/*
-	 *	Loop over the attributes, decoding them into VPs.
-	 */
-	while (packet_length > 0) {
-		ssize_t my_len;
-
-		/*
-		 *	This may return many VPs
-		 */
-		fr_assert(ptr != NULL);
-		my_len = fr_radius_decode_pair(packet, &cursor, dict_radius, ptr, packet_length, &packet_ctx);
-		if (my_len < 0) {
-		fail:
-			talloc_free(packet_ctx.tmp_ctx);
-			fr_pair_list_free(&head);
-			return -1;
-		}
-
-		/*
-		 *	This should really be an assertion.
-		 */
-		if (my_len == 0) break;
-
-		/*
-		 *	Count the ones which were just added
-		 */
-		while (fr_dcursor_next(&cursor)) num_attributes++;
-
-		/*
-		 *	VSA's may not have been counted properly in
-		 *	fr_radius_packet_ok() above, as it is hard to count
-		 *	then without using the dictionary.  We
-		 *	therefore enforce the limits here, too.
-		 */
-		if ((max_attributes > 0) && (num_attributes > max_attributes)) {
-			char host_ipaddr[INET6_ADDRSTRLEN];
-
-			fr_strerror_printf("Possible DoS attack from host %s: Too many attributes in request "
-					   "(received %d, max %d are allowed)",
-					   inet_ntop(packet->socket.inet.src_ipaddr.af,
-						     &packet->socket.inet.src_ipaddr.addr,
-						     host_ipaddr, sizeof(host_ipaddr)),
-					   num_attributes, max_attributes);
-			goto fail;
-		}
-
-		ptr += my_len;
-		packet_length -= my_len;
-		talloc_free_children(packet_ctx.tmp_ctx);
-	}
-
-	fr_dcursor_init(&out, list);
-	fr_dcursor_tail(&out);		/* Move insertion point to the end of the list */
-	fr_dcursor_head(&cursor);
-	fr_dcursor_merge(&out, &cursor);
-
-	/*
-	 *	Merge information from the outside world into our
-	 *	random pool.
-	 */
-	fr_rand_seed(packet->data, RADIUS_HEADER_LENGTH);
-	talloc_free(packet_ctx.tmp_ctx);
-	talloc_free(packet_ctx.tags);
-
-	return 0;
-}
-
-
 /** See if the data pointed to by PTR is a valid RADIUS packet.
  *
  * Packet is not 'const * const' because we may update data_len, if there's more data
  * in the UDP packet than in the RADIUS packet.
  *
+ * This function can only be called for UDP packets.
+ *
  * @param[in] packet		to check.
  * @param[in] max_attributes	to decode.
- * @param[in] require_ma	to require Message-Authenticator.
+ * @param[in] require_message_authenticator	to require Message-Authenticator.
  * @param[out] reason		if not NULL, will have the failure reason written to where it points.
  * @return
  *	- True on success.
  *	- False on failure.
  */
-bool fr_radius_packet_ok(fr_radius_packet_t *packet, uint32_t max_attributes, bool require_ma, decode_fail_t *reason)
+bool fr_radius_packet_ok(fr_packet_t *packet, uint32_t max_attributes, bool require_message_authenticator, fr_radius_decode_fail_t *reason)
 {
-	char host_ipaddr[INET6_ADDRSTRLEN];
+	size_t len = packet->data_len;
 
-	if (!fr_radius_ok(packet->data, &packet->data_len, max_attributes, require_ma, reason)) {
-		FR_DEBUG_STRERROR_PRINTF("Bad packet received from host %s",
-					 inet_ntop(packet->socket.inet.src_ipaddr.af, &packet->socket.inet.src_ipaddr.addr,
-						   host_ipaddr, sizeof(host_ipaddr)));
+	if (!fr_radius_ok(packet->data, &len, max_attributes, require_message_authenticator, reason)) {
 		return false;
 	}
+	fr_assert(packet->data_len >= len);
+	packet->data_len = len;	/* UDP packet may be larger than RADIUS header len */
 
 	/*
 	 *	Fill RADIUS header fields
@@ -289,21 +140,14 @@ bool fr_radius_packet_ok(fr_radius_packet_t *packet, uint32_t max_attributes, bo
 /** Verify the Request/Response Authenticator (and Message-Authenticator if present) of a packet
  *
  */
-int fr_radius_packet_verify(fr_radius_packet_t *packet, fr_radius_packet_t *original, char const *secret)
+int fr_radius_packet_verify(fr_packet_t *packet, fr_packet_t *original, char const *secret)
 {
-	uint8_t const	*original_data;
 	char		buffer[INET6_ADDRSTRLEN];
 
 	if (!packet->data) return -1;
 
-	if (original) {
-		original_data = original->data;
-	} else {
-		original_data = NULL;
-	}
-
-	if (fr_radius_verify(packet->data, original_data,
-			     (uint8_t const *) secret, talloc_array_length(secret) - 1) < 0) {
+	if (fr_radius_verify(packet->data, original ? original->data + 4 : NULL,
+			     (uint8_t const *) secret, talloc_strlen(secret), false, false) < 0) {
 		fr_strerror_printf_push("Received invalid packet from %s",
 					inet_ntop(packet->socket.inet.src_ipaddr.af, &packet->socket.inet.src_ipaddr.addr,
 						  buffer, sizeof(buffer)));
@@ -317,30 +161,13 @@ int fr_radius_packet_verify(fr_radius_packet_t *packet, fr_radius_packet_t *orig
 /** Sign a previously encoded packet
  *
  */
-int fr_radius_packet_sign(fr_radius_packet_t *packet, fr_radius_packet_t const *original,
+int fr_radius_packet_sign(fr_packet_t *packet, fr_packet_t const *original,
 			  char const *secret)
 {
 	int ret;
-	uint8_t const *original_data;
 
-	if (original) {
-		original_data = original->data;
-	} else {
-		original_data = NULL;
-	}
-
-	/*
-	 *	Copy the random vector to the packet.  Other packet
-	 *	codes have the Request Authenticator be the packet
-	 *	signature.
-	 */
-	if ((packet->code == FR_RADIUS_CODE_ACCESS_REQUEST) ||
-	    (packet->code == FR_RADIUS_CODE_STATUS_SERVER)) {
-		memcpy(packet->data + 4, packet->vector, sizeof(packet->vector));
-	}
-
-	ret = fr_radius_sign(packet->data, original_data,
-			       (uint8_t const *) secret, talloc_array_length(secret) - 1);
+	ret = fr_radius_sign(packet->data, original ? original->data + 4 : NULL,
+			       (uint8_t const *) secret, talloc_strlen(secret));
 	if (ret < 0) return ret;
 
 	memcpy(packet->vector, packet->data + 4, RADIUS_AUTH_VECTOR_LENGTH);
@@ -351,7 +178,7 @@ int fr_radius_packet_sign(fr_radius_packet_t *packet, fr_radius_packet_t const *
 /** Wrapper for recvfrom, which handles recvfromto, IPv6, and all possible combinations
  *
  */
-static ssize_t rad_recvfrom(int sockfd, fr_radius_packet_t *packet, int flags)
+static ssize_t rad_recvfrom(int sockfd, fr_packet_t *packet, int flags)
 {
 	ssize_t			data_len;
 
@@ -372,18 +199,18 @@ static ssize_t rad_recvfrom(int sockfd, fr_radius_packet_t *packet, int flags)
 }
 
 
-/** Receive UDP client requests, and fill in the basics of a fr_radius_packet_t structure
+/** Receive UDP client requests, and fill in the basics of a fr_packet_t structure
  *
  */
-fr_radius_packet_t *fr_radius_packet_recv(TALLOC_CTX *ctx, int fd, int flags, uint32_t max_attributes, bool require_ma)
+fr_packet_t *fr_packet_recv(TALLOC_CTX *ctx, int fd, int flags, uint32_t max_attributes, bool require_message_authenticator)
 {
 	ssize_t			data_len;
-	fr_radius_packet_t	*packet;
+	fr_packet_t	*packet;
 
 	/*
 	 *	Allocate the new request data structure
 	 */
-	packet = fr_radius_packet_alloc(ctx, false);
+	packet = fr_packet_alloc(ctx, false);
 	if (!packet) {
 		fr_strerror_const("out of memory");
 		return NULL;
@@ -392,7 +219,7 @@ fr_radius_packet_t *fr_radius_packet_recv(TALLOC_CTX *ctx, int fd, int flags, ui
 	data_len = rad_recvfrom(fd, packet, flags);
 	if (data_len < 0) {
 		FR_DEBUG_STRERROR_PRINTF("Error receiving packet: %s", fr_syserror(errno));
-		fr_radius_packet_free(&packet);
+		fr_packet_free(&packet);
 		return NULL;
 	}
 
@@ -405,7 +232,7 @@ fr_radius_packet_t *fr_radius_packet_recv(TALLOC_CTX *ctx, int fd, int flags, ui
 	    (packet->socket.inet.dst_ipaddr.af == AF_UNSPEC) ||
 	    (packet->socket.inet.dst_port == 0)) {
 		FR_DEBUG_STRERROR_PRINTF("Error receiving packet: %s", fr_syserror(errno));
-		fr_radius_packet_free(&packet);
+		fr_packet_free(&packet);
 		return NULL;
 	}
 #endif
@@ -419,7 +246,7 @@ fr_radius_packet_t *fr_radius_packet_recv(TALLOC_CTX *ctx, int fd, int flags, ui
 	 */
 	if (packet->data_len > MAX_PACKET_LEN) {
 		FR_DEBUG_STRERROR_PRINTF("Discarding packet: Larger than RFC limitation of 4096 bytes");
-		fr_radius_packet_free(&packet);
+		fr_packet_free(&packet);
 		return NULL;
 	}
 
@@ -431,15 +258,15 @@ fr_radius_packet_t *fr_radius_packet_recv(TALLOC_CTX *ctx, int fd, int flags, ui
 	 */
 	if ((packet->data_len == 0) || !packet->data) {
 		FR_DEBUG_STRERROR_PRINTF("Empty packet: Socket is not ready");
-		fr_radius_packet_free(&packet);
+		fr_packet_free(&packet);
 		return NULL;
 	}
 
 	/*
 	 *	See if it's a well-formed RADIUS packet.
 	 */
-	if (!fr_radius_packet_ok(packet, max_attributes, require_ma, NULL)) {
-		fr_radius_packet_free(&packet);
+	if (!fr_radius_packet_ok(packet, max_attributes, require_message_authenticator, NULL)) {
+		fr_packet_free(&packet);
 		return NULL;
 	}
 
@@ -460,9 +287,13 @@ fr_radius_packet_t *fr_radius_packet_recv(TALLOC_CTX *ctx, int fd, int flags, ui
 /** Reply to the request
  *
  * Also attach reply attribute value pairs and any user message provided.
+ *
+ * @return
+ *	- >=0 amount of data written.  0 if the packet has no socket.
+ *	- -1 on failure.
  */
-int fr_radius_packet_send(fr_radius_packet_t *packet, fr_pair_list_t *list,
-			  fr_radius_packet_t const *original, char const *secret)
+ssize_t fr_radius_packet_send(fr_packet_t *packet, fr_pair_list_t *list,
+			      fr_packet_t const *original, char const *secret)
 {
 	/*
 	 *	Maybe it's a fake packet.  Don't send it.
@@ -500,7 +331,7 @@ int fr_radius_packet_send(fr_radius_packet_t *packet, fr_pair_list_t *list,
 	 *	If the socket is TCP, call write().  Calling sendto()
 	 *	is allowed on some platforms, but it's not nice.
 	 */
-	if (packet->socket.proto == IPPROTO_TCP) {
+	if (packet->socket.type == SOCK_STREAM) {
 		ssize_t ret;
 
 		ret = write(packet->socket.fd, packet->data, packet->data_len);
@@ -519,7 +350,7 @@ int fr_radius_packet_send(fr_radius_packet_t *packet, fr_pair_list_t *list,
 	return udp_send(&packet->socket, 0, packet->data, packet->data_len);
 }
 
-void _fr_radius_packet_log_hex(fr_log_t const *log, fr_radius_packet_t const *packet, char const *file, int line)
+void _fr_packet_log_hex(fr_log_t const *log, fr_packet_t const *packet, char const *file, int line)
 {
 	uint8_t const *attr, *end;
 	char buffer[1024];
@@ -527,7 +358,7 @@ void _fr_radius_packet_log_hex(fr_log_t const *log, fr_radius_packet_t const *pa
 	if (!packet->data) return;
 
 	fr_log(log, L_DBG, file, line, "  Socket   : %d", packet->socket.fd);
-	fr_log(log, L_DBG, file, line, "  Proto    : %d", packet->socket.proto);
+	fr_log(log, L_DBG, file, line, "  Proto    : %d", (packet->socket.type == SOCK_STREAM) ? IPPROTO_TCP : IPPROTO_UDP);
 
 	if ((packet->socket.inet.src_ipaddr.af == AF_INET) || (packet->socket.inet.src_ipaddr.af == AF_INET6)) {
 		fr_log(log, L_DBG, file, line, "  Src IP   : %pV", fr_box_ipaddr(packet->socket.inet.src_ipaddr));
@@ -537,13 +368,13 @@ void _fr_radius_packet_log_hex(fr_log_t const *log, fr_radius_packet_t const *pa
 	}
 
        if ((packet->data[0] > 0) && (packet->data[0] < FR_RADIUS_CODE_MAX)) {
-               fr_log(log, L_DBG, file, line, "  Code     : %s", fr_packet_codes[packet->data[0]]);
+               fr_log(log, L_DBG, file, line, "  Code     : %s", fr_radius_packet_name[packet->data[0]]);
        } else {
                fr_log(log, L_DBG, file, line, "  Code     : %u", packet->data[0]);
        }
 
        fr_log(log, L_DBG, file, line, "  Id       : %u", packet->data[1]);
-       fr_log(log, L_DBG, file, line, "  Length   : %u", ((packet->data[2] << 8) | (packet->data[3])));
+       fr_log(log, L_DBG, file, line, "  Length   : %u", fr_nbo_to_uint16(packet->data + 2));
        fr_log(log, L_DBG, file, line, "  Vector   : %pH", fr_box_octets(packet->data + 4, RADIUS_AUTH_VECTOR_LENGTH));
 
        if (packet->data_len <= 20) return;
@@ -556,15 +387,16 @@ void _fr_radius_packet_log_hex(fr_log_t const *log, fr_radius_packet_t const *pa
 	       char		*p;
 	       char const	*truncated = "";
 
-#ifndef NDEBUG
-               if (attr[1] < 2) break; /* Coverity */
-#endif
+	       /*
+		*	rad_packet_ok() already checks, but let's do defense in depth.
+		*/
+               if (attr[1] < 2) break;
 
 	       snprintf(buffer, sizeof(buffer), "%02x %02x  ", attr[0], attr[1]);
 	       p = buffer + strlen(buffer);
                if ((attr[0] == FR_VENDOR_SPECIFIC) &&
                    (attr[1] > 6)) {
-                       vendor = (attr[2] << 25) | (attr[3] << 16) | (attr[4] << 8) | attr[5];
+                       vendor = fr_nbo_to_uint32(attr + 2);
 
 		       snprintf(p, buffer + sizeof(buffer) - p, "%02x%02x%02x%02x (%u)  ",
 				attr[2], attr[3], attr[4], attr[5], vendor);
@@ -585,4 +417,103 @@ void _fr_radius_packet_log_hex(fr_log_t const *log, fr_radius_packet_t const *pa
 
 	       fr_log(log, L_DBG, file, line, "      %s%s\n", buffer, truncated);
        }
+}
+
+/*
+ *	Debug the packet if requested.
+ */
+void fr_radius_packet_header_log(fr_log_t const *log, fr_packet_t *packet, bool received)
+{
+	char src_ipaddr[FR_IPADDR_STRLEN];
+	char dst_ipaddr[FR_IPADDR_STRLEN];
+	char const *via_prefix = "";
+	char const *via_ifname = "";
+	char const *via_suffix = "";
+#ifdef WITH_IFINDEX_NAME_RESOLUTION
+	char if_name[IFNAMSIZ];
+#endif
+
+	if (!log) return;
+	if (!packet) return;
+
+#ifdef WITH_IFINDEX_NAME_RESOLUTION
+	if (received) {
+		via_prefix = "via ";
+		via_ifname = fr_ifname_from_ifindex(if_name, packet->socket.inet.ifindex);
+		via_suffix = " ";
+	}
+#endif
+
+	/*
+	 *	Client-specific debugging re-prints the input
+	 *	packet into the client log.
+	 *
+	 *	This really belongs in a utility library
+	 */
+	if (FR_RADIUS_PACKET_CODE_VALID(packet->code)) {
+		fr_log(log, L_DBG, __FILE__, __LINE__,
+		       "%s %s Id %i from %s%s%s:%i to %s%s%s:%i "
+		       "%s%s%slength %zu\n",
+		        received ? "Received" : "Sent",
+		        fr_radius_packet_name[packet->code],
+		        packet->id,
+		        packet->socket.inet.src_ipaddr.af == AF_INET6 ? "[" : "",
+			fr_inet_ntop(src_ipaddr, sizeof(src_ipaddr), &packet->socket.inet.src_ipaddr),
+			packet->socket.inet.src_ipaddr.af == AF_INET6 ? "]" : "",
+		        packet->socket.inet.src_port,
+		        packet->socket.inet.dst_ipaddr.af == AF_INET6 ? "[" : "",
+			fr_inet_ntop(dst_ipaddr, sizeof(dst_ipaddr), &packet->socket.inet.dst_ipaddr),
+		        packet->socket.inet.dst_ipaddr.af == AF_INET6 ? "]" : "",
+		        packet->socket.inet.dst_port,
+			via_prefix, via_ifname, via_suffix,
+			packet->data_len);
+	} else {
+		fr_log(log, L_DBG, __FILE__, __LINE__,
+		       "%s code %u Id %i from %s%s%s:%i to %s%s%s:%i "
+		       "%s%s%slength %zu\n",
+		        received ? "Received" : "Sent",
+		        packet->code,
+		        packet->id,
+		        packet->socket.inet.src_ipaddr.af == AF_INET6 ? "[" : "",
+			fr_inet_ntop(src_ipaddr, sizeof(src_ipaddr), &packet->socket.inet.src_ipaddr),
+		        packet->socket.inet.src_ipaddr.af == AF_INET6 ? "]" : "",
+		        packet->socket.inet.src_port,
+		        packet->socket.inet.dst_ipaddr.af == AF_INET6 ? "[" : "",
+			fr_inet_ntop(dst_ipaddr, sizeof(dst_ipaddr), &packet->socket.inet.dst_ipaddr),
+		        packet->socket.inet.dst_ipaddr.af == AF_INET6 ? "]" : "",
+		        packet->socket.inet.dst_port,
+			via_prefix, via_ifname, via_suffix,
+		        packet->data_len);
+	}
+}
+
+/*
+ *	Debug the packet header and all attributes.  This function is only called by the client code.
+ */
+void fr_radius_packet_log(fr_log_t const *log, fr_packet_t *packet, fr_pair_list_t *list, bool received)
+{
+	fr_radius_packet_header_log(log, packet, received);
+
+	if (!fr_debug_lvl) return;
+
+	/*
+	 *	If we're auto-adding Message Authenticator, then print
+	 *	out that we're auto-adding it.
+	 */
+	if (!received) switch (packet->code) {
+	case FR_RADIUS_CODE_ACCESS_REQUEST:
+	case FR_RADIUS_CODE_STATUS_SERVER:
+		if (!fr_pair_find_by_da(list, NULL, attr_message_authenticator)) {
+			fr_log(log, L_DBG, __FILE__, __LINE__, "\tMessage-Authenticator = 0x\n");
+		}
+		break;
+
+	default:
+		break;
+	}
+
+	fr_pair_list_log(log, 4, list);
+#ifndef NDEBUG
+	if (fr_debug_lvl >= L_DBG_LVL_4) fr_packet_log_hex(log, packet);
+#endif
 }

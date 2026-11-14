@@ -24,15 +24,17 @@
 
 RCSID("$Id$")
 
-#include <freeradius-devel/util/base.h>
 #include <freeradius-devel/util/conf.h>
+#include <freeradius-devel/util/syserror.h>
+#include <freeradius-devel/util/atexit.h>
+#include <freeradius-devel/util/pair_legacy.h>
+#include <freeradius-devel/server/packet.h>
 #include <freeradius-devel/dhcpv4/dhcpv4.h>
-#include <freeradius-devel/util/pcap.h>
 
 /*
  *	Logging macros
  */
- #undef DEBUG
+#undef DEBUG
 #define DEBUG(fmt, ...)		if (fr_debug_lvl > 0) fprintf(stdout, fmt "\n", ## __VA_ARGS__)
 
 #define ERROR(fmt, ...)		fr_perror("dhcpclient: " fmt, ## __VA_ARGS__)
@@ -52,7 +54,7 @@ static fr_time_delta_t	timeout;
 
 static int sockfd;
 #ifdef HAVE_LIBPCAP
-static fr_pcap_t	*pcap;
+static fr_pcap_t	*pcap = NULL;
 #endif
 
 static char *iface = NULL;
@@ -65,7 +67,7 @@ static struct sockaddr_ll ll;	/* Socket address structure */
 static bool raw_mode = false;
 static bool reply_expected = true;
 
-static char const *dhcpclient_version = RADIUSD_VERSION_STRING_BUILD("dhcpclient");
+static char const *dhcpclient_version = RADIUSD_VERSION_BUILD("dhcpclient");
 
 /* structure to keep track of offered IP addresses */
 typedef struct {
@@ -80,15 +82,9 @@ extern fr_dict_autoload_t dhcpclient_dict[];
 fr_dict_autoload_t dhcpclient_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 	{ .out = &dict_dhcpv4, .proto = "dhcpv4" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
-static fr_dict_attr_t const *attr_packet_dst_ip_address;
-static fr_dict_attr_t const *attr_packet_dst_ipv6_address;
-static fr_dict_attr_t const *attr_packet_dst_port;
-static fr_dict_attr_t const *attr_packet_src_ip_address;
-static fr_dict_attr_t const *attr_packet_src_ipv6_address;
-static fr_dict_attr_t const *attr_packet_src_port;
 static fr_dict_attr_t const *attr_packet_type;
 static fr_dict_attr_t const *attr_dhcp_message_type;
 static fr_dict_attr_t const *attr_dhcp_dhcp_server_identifier;
@@ -96,21 +92,15 @@ static fr_dict_attr_t const *attr_dhcp_your_ip_address;
 
 extern fr_dict_attr_autoload_t dhcpclient_dict_attr[];
 fr_dict_attr_autoload_t dhcpclient_dict_attr[] = {
-	{ .out = &attr_packet_dst_ip_address, .name = "Packet-Dst-IP-Address", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_dst_ipv6_address, .name = "Packet-Dst-IPv6-Address", .type = FR_TYPE_IPV6_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_dst_port, .name = "Packet-Dst-Port", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
-	{ .out = &attr_packet_src_ip_address, .name = "Packet-Src-IP-Address", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_src_ipv6_address, .name = "Packet-Src-IPv6-Address", .type = FR_TYPE_IPV6_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_src_port, .name = "Packet-Src-Port", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
 	{ .out = &attr_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_dhcpv4 },
 	{ .out = &attr_dhcp_message_type, .name = "Message-Type", .type = FR_TYPE_UINT8, .dict = &dict_dhcpv4},
 	{ .out = &attr_dhcp_dhcp_server_identifier, .name = "Server-Identifier", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_dhcpv4 },
 	{ .out = &attr_dhcp_your_ip_address, .name = "Your-IP-Address", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_dhcpv4 },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_table_num_sorted_t const request_types[] = {
-	{ L("auto"),     	0	},
+	{ L("auto"),     	0			},
 	{ L("decline"),		FR_DHCP_DECLINE		},
 	{ L("discover"),        FR_DHCP_DISCOVER	},
 	{ L("inform"),		FR_DHCP_INFORM		},
@@ -126,10 +116,11 @@ static NEVER_RETURNS void usage(void)
 	DEBUG("Send a DHCP request with provided RADIUS attrs and output response.");
 
 	DEBUG("  <command>              One of: discover, request, decline, release, inform; or: auto.");
-	DEBUG("  -d <directory>         Set the directory where the dictionaries are stored (defaults to " RADDBDIR ").");
+	DEBUG("  -d <directory>         Set the directory where the dictionaries are stored (defaults to " CONFDIR ").");
 	DEBUG("  -D <dictdir>           Set main dictionary directory (defaults to " DICTDIR ").");
 	DEBUG("  -f <file>              Read packets from file, not stdin.");
 	DEBUG("  -i <interface>         Use this interface to send/receive at packet level on a raw socket.");
+	DEBUG("  -r <retries>           On timeout, retry sending the packet 'retries' times.\n");
 	DEBUG("  -t <timeout>           Wait 'timeout' seconds for a reply (may be a floating point number).");
 	DEBUG("  -v                     Show program version information.");
 	DEBUG("  -x                     Debugging mode.");
@@ -141,12 +132,12 @@ static NEVER_RETURNS void usage(void)
 /*
  *	Initialize the request.
  */
-static int request_init(fr_radius_packet_t **out, fr_pair_list_t *packet_vps, char const *filename)
+static int request_init(fr_packet_t **out, fr_pair_list_t *packet_vps, char const *filename)
 {
 	FILE			*fp;
 	fr_pair_t		*vp;
 	bool			filedone = false;
-	fr_radius_packet_t	*packet;
+	fr_packet_t	*packet;
 
 	/*
 	 *	Determine where to read the VP's from.
@@ -158,18 +149,19 @@ static int request_init(fr_radius_packet_t **out, fr_pair_list_t *packet_vps, ch
 			return -1;
 		}
 	} else {
+		DEBUG("Reading packets from stdin\n");
 		fp = stdin;
 	}
 
-	packet = fr_radius_packet_alloc(NULL, false);
+	packet = fr_packet_alloc(NULL, false);
 
 	/*
 	 *	Read the VP's.
 	 */
-	if (fr_pair_list_afrom_file(packet, dict_dhcpv4, packet_vps, fp, &filedone) < 0) {
+	if (fr_pair_list_afrom_file(packet, dict_dhcpv4, packet_vps, fp, &filedone, true) < 0) {
 		fr_perror("dhcpclient");
-		fr_radius_packet_free(&packet);
-		if (fp && (fp != stdin)) fclose(fp);
+		fr_packet_free(&packet);
+		if (fp != stdin) fclose(fp);
 		return -1;
 	}
 
@@ -179,20 +171,6 @@ static int request_init(fr_radius_packet_t **out, fr_pair_list_t *packet_vps, ch
 	for (vp = fr_pair_list_head(packet_vps);
 	     vp;
 	     vp = fr_pair_list_next(packet_vps, vp)) {
-
-		/*
-		 *	Xlat expansions are not supported. Convert xlat to value box (if possible).
-		 */
-		if (vp->type == VT_XLAT) {
-			if (fr_value_box_from_str(vp, &vp->data, vp->da->type, NULL, vp->xlat, -1, '\0', false) < 0) {
-				fr_perror("dhcpclient");
-				fr_radius_packet_free(&packet);
-				if (fp && (fp != stdin)) fclose(fp);
-				return -1;
-			}
-			vp->type = VT_DATA;
-		}
-
 		/*
 		 *	Allow to set packet type using Message-Type
 		 */
@@ -207,24 +185,17 @@ static int request_init(fr_radius_packet_t **out, fr_pair_list_t *packet_vps, ch
 	     	} else if (vp->da == attr_packet_type) {
 			packet->code = vp->vp_uint32;
 
-		} else if (vp->da == attr_packet_dst_port) {
-			packet->socket.inet.dst_port = vp->vp_uint16;
-
-		} else if ((vp->da == attr_packet_dst_ip_address) ||
-			   (vp->da == attr_packet_dst_ipv6_address)) {
-			memcpy(&packet->socket.inet.dst_ipaddr, &vp->vp_ip, sizeof(packet->socket.inet.src_ipaddr));
-
-		} else if (vp->da == attr_packet_src_port) {
-			packet->socket.inet.src_port = vp->vp_uint16;
-
-		} else if ((vp->da == attr_packet_src_ip_address) ||
-			   (vp->da == attr_packet_src_ipv6_address)) {
-			memcpy(&packet->socket.inet.src_ipaddr, &vp->vp_ip, sizeof(packet->socket.inet.src_ipaddr));
 		} /* switch over the attribute */
 
 	} /* loop over the VP's we read in */
 
-	if (fp && (fp != stdin)) fclose(fp);
+	/*
+	 *	Fill in the packet header from attributes, and then
+	 *	re-realize the attributes.
+	 */
+	fr_packet_net_from_pairs(packet, packet_vps);
+
+	if (fp != stdin) fclose(fp);
 
 	/*
 	 *	And we're done.
@@ -242,11 +213,11 @@ static int request_init(fr_radius_packet_t **out, fr_pair_list_t *packet_vps, ch
  *	We'll just return the first eligible reply, and display the others.
  */
 #if defined(HAVE_LINUX_IF_PACKET_H) || defined (HAVE_LIBPCAP)
-static fr_radius_packet_t *fr_dhcpv4_recv_raw_loop(int lsockfd,
+static fr_packet_t *fr_dhcpv4_recv_raw_loop(int lsockfd,
 #ifdef HAVE_LINUX_IF_PACKET_H
 					    struct sockaddr_ll *p_ll,
 #endif
-					    fr_radius_packet_t *request,
+					    fr_packet_t *request,
 #ifndef HAVE_LINUX_IF_PACKET_H
 					    UNUSED
 #endif
@@ -254,8 +225,8 @@ static fr_radius_packet_t *fr_dhcpv4_recv_raw_loop(int lsockfd,
 					    )
 {
 	fr_time_delta_t	our_timeout;
-	fr_radius_packet_t	*found = NULL;
-	fr_radius_packet_t	*reply = NULL;
+	fr_packet_t	*found = NULL;
+	fr_packet_t	*reply = NULL;
 	fr_pair_list_t		reply_vps;
 	int			nb_reply = 0;
 	int			nb_offer = 0;
@@ -269,12 +240,10 @@ static fr_radius_packet_t *fr_dhcpv4_recv_raw_loop(int lsockfd,
 	our_timeout = timeout;
 
 	/* Loop waiting for DHCP replies until timer expires */
-	while (our_timeout) {
+	while (fr_time_delta_ispos(our_timeout)) {
 		if ((!found) || (reply)) { // only debug at start and each time we get a valid DHCP reply on raw socket
-			DEBUG("Waiting for %s DHCP replies for: %d.%06d",
-			      (nb_reply > 0) ? " additional ":" ",
-			      (int)(our_timeout / NSEC),
-			      (int)(our_timeout % NSEC));
+			DEBUG("Waiting for %s DHCP replies for: %.6f",
+			      (nb_reply > 0) ? " additional ":" ", fr_time_delta_to_sec_double(our_timeout));
 		}
 
 		reply = NULL;
@@ -289,17 +258,24 @@ static fr_radius_packet_t *fr_dhcpv4_recv_raw_loop(int lsockfd,
 		if (retval > 0 && FD_ISSET(lsockfd, &read_fd)) {
 			/* There is something to read on our socket */
 
-#ifdef HAVE_LINUX_IF_PACKET_H
-			reply = fr_dhcv4_raw_packet_recv(lsockfd, p_ll, request, request_list);
-#else
-#  ifdef HAVE_LIBPCAP
-			reply = fr_dhcpv4_pcap_recv(pcap);
+#ifdef HAVE_LIBPCAP
+			if (pcap) {
+				reply = fr_dhcpv4_pcap_recv(pcap);
+#  ifdef HAVE_LINUX_IF_PACKET_H
+			} else
 #  else
-#    error Need <if/packet.h> or <pcap.h>
+			}
 #  endif
 #endif
+#ifdef HAVE_LINUX_IF_PACKET_H
+			{
+				reply = fr_dhcpv4_raw_packet_recv(lsockfd, p_ll, request, request_list);
+			}
+#elif !defined(HAVE_LIBPCAP)
+#    error Need <if/packet.h> or <pcap.h>
+#endif
 		} else {
-			our_timeout = 0;
+			our_timeout = fr_time_delta_wrap(0);
 		}
 
 		if (reply) {
@@ -307,8 +283,8 @@ static fr_radius_packet_t *fr_dhcpv4_recv_raw_loop(int lsockfd,
 
 			if (fr_debug_lvl > 1) fr_dhcpv4_print_hex(stdout, reply->data, reply->data_len);
 
-			fr_dcursor_init(&cursor, &reply_vps);
-			if (fr_dhcpv4_decode(reply, reply->data, reply->data_len, &cursor, &reply->code) < 0) {
+			fr_pair_dcursor_init(&cursor, &reply_vps);
+			if (fr_dhcpv4_decode(reply, &reply_vps, reply->data, reply->data_len, &reply->code) < 0) {
 				ERROR("Failed decoding reply");
 				return NULL;
 			}
@@ -316,8 +292,8 @@ static fr_radius_packet_t *fr_dhcpv4_recv_raw_loop(int lsockfd,
 			if (!found) found = reply;
 
 			if (reply->code == FR_DHCP_OFFER) {
-				fr_pair_t *vp1 = fr_pair_find_by_da(&reply_vps, attr_dhcp_dhcp_server_identifier, 0);
-				fr_pair_t *vp2 = fr_pair_find_by_da(&reply_vps, attr_dhcp_your_ip_address, 0);
+				fr_pair_t *vp1 = fr_pair_find_by_da(&reply_vps, NULL, attr_dhcp_dhcp_server_identifier);
+				fr_pair_t *vp2 = fr_pair_find_by_da(&reply_vps, NULL, attr_dhcp_your_ip_address);
 
 				if (vp1 && vp2) {
 					nb_offer++;
@@ -336,9 +312,10 @@ static fr_radius_packet_t *fr_dhcpv4_recv_raw_loop(int lsockfd,
 
 	/* display offer(s) received */
 	if (nb_offer > 0 ) {
-		DEBUG("Received %d DHCP Offer(s):", nb_offer);
 		int i;
-		for (i = 0; i < nb_reply; i++) {
+
+		DEBUG("Received %d DHCP Offer(s):", nb_offer);
+		for (i = 0; i < nb_offer; i++) {
 			char server_addr_buf[INET6_ADDRSTRLEN];
 			char offered_addr_buf[INET6_ADDRSTRLEN];
 
@@ -355,7 +332,7 @@ static fr_radius_packet_t *fr_dhcpv4_recv_raw_loop(int lsockfd,
 }
 #endif	/* <if/packet.h> or <pcap.h> */
 
-static int send_with_socket(fr_radius_packet_t **reply, fr_radius_packet_t *request,
+static int send_with_socket(fr_packet_t **reply, fr_packet_t *request,
 #ifndef HAVE_LINUX_IF_PACKET_H
 			    UNUSED
 #endif
@@ -379,7 +356,7 @@ static int send_with_socket(fr_radius_packet_t **reply, fr_radius_packet_t *requ
 			return -1;
 		}
 
-		if (fr_socket_bind(sockfd, &request->socket.inet.src_ipaddr, &request->socket.inet.src_port, NULL) < 0) {
+		if (fr_socket_bind(sockfd, NULL, &request->socket.inet.src_ipaddr, &request->socket.inet.src_port) < 0) {
 			ERROR("Error binding socket - %s", fr_strerror());
 			return -1;
 		}
@@ -440,7 +417,7 @@ static int send_with_socket(fr_radius_packet_t **reply, fr_radius_packet_t *requ
 }
 
 #ifdef HAVE_LIBPCAP
-static int send_with_pcap(fr_radius_packet_t **reply, fr_radius_packet_t *request, fr_pair_list_t *request_list)
+static int send_with_pcap(fr_packet_t **reply, fr_packet_t *request, fr_pair_list_t *request_list)
 {
 	char ip[16];
 	char pcap_filter[255];
@@ -458,7 +435,7 @@ static int send_with_pcap(fr_radius_packet_t **reply, fr_radius_packet_t *reques
 	}
 
 	fr_inet_ntoh(&request->socket.inet.src_ipaddr, ip, sizeof(ip));
-	sprintf(pcap_filter, "udp and dst port %d", request->socket.inet.src_port);
+	snprintf(pcap_filter, sizeof(pcap_filter), "udp and dst port %d", request->socket.inet.src_port);
 
 	if (fr_pcap_apply_filter(pcap, pcap_filter) < 0) {
 		ERROR("Failing setting filter");
@@ -491,9 +468,9 @@ static int send_with_pcap(fr_radius_packet_t **reply, fr_radius_packet_t *reques
 }
 #endif	/* HAVE_LIBPCAP */
 
-static void dhcp_packet_debug(fr_radius_packet_t *packet, fr_pair_list_t *list, bool received)
+static void dhcp_packet_debug(fr_packet_t *packet, fr_pair_list_t *list, bool received)
 {
-	char		buffer[2048];
+	char		buffer[2048] = "";
 
 	char		src_ipaddr[INET6_ADDRSTRLEN];
 	char		dst_ipaddr[INET6_ADDRSTRLEN];
@@ -510,14 +487,14 @@ static void dhcp_packet_debug(fr_radius_packet_t *packet, fr_pair_list_t *list, 
 	 *
 	 *	This really belongs in a utility library
 	 */
-	printf("%s %s Id %08x from %s%s%s:%i to %s%s%s:%i "
+	printf("%s %s Id %08" PRIx32 " from %s%s%s:%i to %s%s%s:%i "
 #ifdef WITH_IFINDEX_NAME_RESOLUTION
 	       "%s%s%s"
 #endif
 	       "length %zu\n",
 	       received ? "Received" : "Sending",
-	       dhcp_message_types[packet->code],
-	       packet->id,
+	       FR_DHCP_PACKET_CODE_VALID(packet->code) ? dhcp_message_types[packet->code] : "unknown",
+	       (uint32_t)packet->id,
 	       packet->socket.inet.src_ipaddr.af == AF_INET6 ? "[" : "",
 	       inet_ntop(packet->socket.inet.src_ipaddr.af,
 			 &packet->socket.inet.src_ipaddr.addr,
@@ -540,10 +517,13 @@ static void dhcp_packet_debug(fr_radius_packet_t *packet, fr_pair_list_t *list, 
 	for (vp = fr_pair_list_head(list);
 	     vp;
 	     vp = fr_pair_list_next(list, vp)) {
-		VP_VERIFY(vp);
+		fr_sbuff_t out;
 
-		fr_pair_print(&FR_SBUFF_OUT(buffer, sizeof(buffer)), NULL, vp);
-		printf("\t%s\n", buffer);
+		PAIR_VERIFY(vp);
+
+		out = FR_SBUFF_OUT(buffer, sizeof(buffer));
+		(void) fr_pair_print(&out, NULL, vp);
+		printf("\t%s\n", fr_sbuff_start(&out));
 	}
 }
 
@@ -556,16 +536,14 @@ int main(int argc, char **argv)
 	static fr_ipaddr_t	client_ipaddr;
 
 	int			c;
-	char const		*raddb_dir = RADDBDIR;
+	char const		*confdir = CONFDIR;
 	char const		*dict_dir = DICTDIR;
 	char const		*filename = NULL;
 
-	fr_radius_packet_t	*packet = NULL;
+	fr_packet_t	*packet = NULL;
 	fr_pair_list_t		packet_vps;
-	fr_radius_packet_t	*reply = NULL;
+	fr_packet_t	*reply = NULL;
 	fr_pair_list_t		reply_vps;
-
-	TALLOC_CTX		*autofree;
 
 	int			ret;
 
@@ -577,8 +555,6 @@ int main(int argc, char **argv)
 	 */
 	fr_atexit_global_setup();
 
-	autofree = talloc_autofree_context();
-
 	fr_debug_lvl = 1;
 
 	while ((c = getopt(argc, argv, "d:D:f:hr:t:vxi:")) != -1) switch(c) {
@@ -587,7 +563,7 @@ int main(int argc, char **argv)
 			break;
 
 		case 'd':
-			raddb_dir = optarg;
+			confdir = optarg;
 			break;
 
 		case 'f':
@@ -599,13 +575,13 @@ int main(int argc, char **argv)
 			break;
 
 		case 'r':
-			if (!isdigit((int) *optarg)) usage();
+			if (!isdigit((uint8_t) *optarg)) usage();
 			retries = atoi(optarg);
 			if ((retries == 0) || (retries > 1000)) usage();
 			break;
 
 		case 't':
-			if (fr_time_delta_from_str(&timeout, optarg, FR_TIME_RES_SEC) < 0) usage();
+			if (fr_time_delta_from_str(&timeout, optarg, strlen(optarg), FR_TIME_RES_SEC) < 0) usage();
 			break;
 
 		case 'v':
@@ -625,7 +601,7 @@ int main(int argc, char **argv)
 
 	if (argc < 2) usage();
 
-	if (!fr_dict_global_ctx_init(autofree, dict_dir)) {
+	if (!fr_dict_global_ctx_init(NULL, true, dict_dir)) {
 		fr_perror("dhcpclient");
 		fr_exit(EXIT_FAILURE);
 	}
@@ -640,10 +616,13 @@ int main(int argc, char **argv)
 		fr_exit(EXIT_FAILURE);
 	}
 
-	if (fr_dict_read(fr_dict_unconst(dict_freeradius), raddb_dir, FR_DICTIONARY_FILE) == -1) {
+	if (fr_dict_read(fr_dict_unconst(dict_freeradius), confdir, FR_DICTIONARY_FILE) == -1) {
 		fr_perror("dhcpclient");
 		fr_exit(EXIT_FAILURE);
 	}
+
+	packet_global_init();
+
 	fr_strerror_clear();	/* Clear the error buffer */
 
 	/*
@@ -671,7 +650,7 @@ int main(int argc, char **argv)
 	 *	See what kind of request we want to send.
 	 */
 	if (argc >= 3) {
-		if (!isdigit((int) argv[2][0])) {
+		if (!isdigit((uint8_t) argv[2][0])) {
 			packet_code = fr_table_value_by_str(request_types, argv[2], -2);
 			if (packet_code == -2) {
 				ERROR("Unknown packet type: %s", argv[2]);
@@ -695,7 +674,7 @@ int main(int argc, char **argv)
 		}
 
 		if (server_ipaddr.addr.v4.s_addr == 0xFFFFFFFF) {
-			ERROR("Using interface: %s (index: %d) in raw packet mode", iface, iface_ind);
+			DEBUG("Using interface: %s (index: %d) in raw packet mode", iface, iface_ind);
 			raw_mode = true;
 		}
 	}
@@ -739,16 +718,14 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 *	Decode to produce fr_pair_ts from the default field
+	 *	Decode the request to produce fr_pair_t's from the headers.
 	 */
 	if (fr_debug_lvl) {
-		fr_dcursor_t cursor;
-		fr_dcursor_init(&cursor, &packet_vps);
-
 		if (fr_debug_lvl > 1) fr_dhcpv4_print_hex(stdout, packet->data, packet->data_len);
 
-		fr_dhcpv4_decode(packet, packet->data, packet->data_len, &cursor, &packet->code);
-		dhcp_packet_debug(packet, &packet_vps, false);
+		(void) fr_dhcpv4_decode(packet, &reply_vps, packet->data, packet->data_len, &packet->code);
+		dhcp_packet_debug(packet, &reply_vps, false);
+		fr_pair_list_free(&reply_vps);
 	}
 
 #ifdef HAVE_LIBPCAP
@@ -761,9 +738,7 @@ int main(int argc, char **argv)
 	}
 
 	if (reply) {
-		fr_dcursor_t cursor;
-		fr_dcursor_init(&cursor, &reply_vps);
-		if (fr_dhcpv4_decode(reply, reply->data, reply->data_len, &cursor, &reply->code) < 0) {
+		if (fr_dhcpv4_decode(reply, &reply_vps, reply->data, reply->data_len, &reply->code) < 0) {
 			ERROR("Failed decoding packet");
 			ret = -1;
 		}
@@ -771,7 +746,17 @@ int main(int argc, char **argv)
 	}
 
 	fr_dhcpv4_global_free();
-	fr_dict_autofree(dhcpclient_dict);
 
-	return ret < 0 ? 1 : 0;
+	if (fr_dict_autofree(dhcpclient_dict) < 0) {
+		fr_perror("dhcpclient");
+		ret = -1;
+	}
+
+	/*
+	 *	Ensure our atexit handlers run before any other
+	 *	atexit handlers registered by third party libraries.
+	 */
+	fr_atexit_global_trigger_all();
+
+	return ret < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

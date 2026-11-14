@@ -19,7 +19,7 @@
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  *
  * @copyright 2020 The FreeRADIUS server project
- * @copyright 2020 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2020 Network RADIUS SAS (legal@networkradius.com)
  */
 
 #include <freeradius-devel/io/master.h>
@@ -32,7 +32,7 @@
 typedef struct {
 	fr_io_instance_t	io;				//!< wrapper for IO abstraction
 
-	char			**allowed_types;		//!< names for for 'type = ...'
+	char const		**allowed_types;		//!< names for for 'type = ...'
 	bool			allowed[FR_TACACS_CODE_MAX];	//!< indexed by value
 
 	uint32_t		max_packet_size;		//!< for message ring buffer.

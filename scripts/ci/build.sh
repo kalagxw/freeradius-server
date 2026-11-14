@@ -24,9 +24,6 @@ fi
 #
 #  Configure the server as per the build matrix
 #
-#  We specify -with-rlm-python-bin because Otherwise travis picks up
-#  /opt/python, which doesn't have .so available
-#
 echo "Performing full configuration"
 CFLAGS="${BUILD_CFLAGS}" ./configure -C \
     --enable-werror \
@@ -46,7 +43,7 @@ cat "./src/include/autoconf.h"
 #  Build the server
 #
 echo "Starting compilation"
-make -j8
+make -j$(nproc)
 
 #
 #  If this is not a Coverity build (which would duplicate the parameters of another build)
@@ -54,8 +51,7 @@ make -j8
 #
 if [ "${COVERITY_SCAN_BRANCH}" != 1 -a "${CC}" = 'clang' ]; then
     echo "Starting clang scan"
-    # Restrict to two cores (provided by Travis) for now...
-    make -j2 scan && [ "$(find build/plist/ -name *.html)" = '' ];
+    make -j$(nproc) scan && [ "$(find build/plist/ -name *.html)" = '' ];
 fi
 
 #
@@ -68,8 +64,7 @@ for i in \
     imap-setup.sh \
     exim-setup.sh \
     mysql-setup.sh \
-    ldap-setup.sh \
-    redis-setup.sh; do
+    ldap-setup.sh; do
     script="./scripts/ci/$i"
 
     echo "Calling $i"

@@ -6,8 +6,9 @@ TARGETNAME	:=
 
 ifneq "${TARGETNAME}" ""
   TARGETNAME	:= rlm_json
-  TARGET        := $(TARGETNAME).a
+  TARGET        := $(TARGETNAME)$(L)
 endif
+TGT_CATEGORY	:=
 
 SOURCES		:= $(TARGETNAME).c
 
@@ -15,4 +16,5 @@ SOURCES		:= $(TARGETNAME).c
 #  Append SRC_CFLAGS and leave TGT_LDLIBS alone
 #
 SRC_CFLAGS	+= -I$(top_builddir)/src/lib/json/
-TGT_PREREQS	:= libfreeradius-json.a
+TGT_PREREQS	:= libfreeradius-json$(L)
+LOG_ID_LIB	= 24

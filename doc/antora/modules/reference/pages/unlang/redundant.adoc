@@ -25,8 +25,8 @@ behave identically, otherwise different requests will be processed
 through different modules and will give different results.
 
 In general, we recommend using the
-xref:unlang/redundant-load-balance.adoc[redundant-load-balance] statement
-instead of `redundant`.
+xref:unlang/redundant-load-balance.adoc[redundant-load-balance]
+statement instead of `redundant`.
 
 .Example
 [source,unlang]
@@ -38,5 +38,127 @@ redundant {
 }
 ----
 
-// Copyright (C) 2021 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
-// Development of this documentation was sponsored by Network RADIUS SAS.
+== Redundant Sections as Modules
+
+It can be useful to use the same `redundant` section in multiple
+places.  Instead of copying the same text multiple times, a
+`redundant` section can be defined as a module in the `mods-enabled/`
+directory.
+
+For example, the following text can be placed into the file
+`mods-enabled/sql_all`.  Once it is there, it can be used as a module
+named `sql_all`, and used anywhere a module is allowed to use.
+
+.Example of Redundant SQL module
+[source,unlang]
+----
+redundant sql_all {
+    sql1
+    sql2
+    sql3
+}
+----
+
+In previous versions of the server, this definition would be placed
+into the `instantiate` section of `radiusd.conf.  This configuration
+is no longer used, and the `sql_all` definition can just be placed as
+a module definition into the `mods-enabled/` directory.
+
+== Redundant Expansions
+
+Modules may be used in a `redundant` section, and modules can register
+xref:xlat/index.adoc[dynamic expansions].  It is therefore also useful
+to define redundant dynamic expansions.  The good news is that the
+server does this automatically.
+
+When a `redundant` section is defined, _and_ where all of the modules
+in the `redundant` section reference the same underlying module (e.g.
+`sql`, or `ldap`), the server then automatically registers a new
+_redundant expansion_, with the name of the `redundant` section.  The
+example below shows how this works.
+
+.Example
+[source,unlang]
+----
+redundant sql_all {
+	sql1
+	sql2
+	sql3
+}
+----
+
+Each `sql` module will register it's own xref:xlat/index.adoc[dynamic
+expansions], such as `%sql1(...)`, and `%sql2(...)` and `%sql3(...).
+However, there will _also_ be a new SQL expansion defined:
+
+----
+%sql_all(...)
+----
+
+This is a _redundant_ expansion.  When it is called, it follows
+operation of the `redundant` block which defined it.  That is, it will
+first run `%sql1(...)`, then if that fails, run `%sql2(...)`, etc.
+
+.Example of Redundant SQL module
+[source,unlang]
+----
+Reply-Message := %sql_all("SELECT message FROM table WHERE name='%{User-Name}'")
+----
+
+The one caveat here is that the arguments passed to the underlying
+modules are expanded again _for each call_.  If the expansion
+arguments have side effects, then those side effects can be applied
+multiple times, once for each `redundant` attempt.
+
+=== Additional redundant expansions
+
+Modules can register multiple expansions. If the module's expansion
+shares the module's instance name, the redundant expansion is
+registered with the `redundant` section name. Otherwise, the redundant
+expansion is _qualified_ with the `redundant` section name.
+
+For example, the `sql` module provides two expansions, a self-named
+expansion and a `group` expansion.  Using the example from the
+previous section, `redundant sql_all {...}` would register the
+following:
+
+----
+%sql_all(...)
+%sql_all.group(...)
+----
+
+=== Module expansion grouping
+
+Module expansions which share the same name are grouped into the same
+redundant expansion.  This may result in only a subset of the module
+expansions in a `redundant` section being called by a redundant
+expansion.
+
+.Example
+[source,unlang]
+----
+redundant sql_and_ldap {
+	sql1
+	sql2
+	ldap1
+    ldap2
+}
+----
+
+The `sql_and_ldap` redundant section would register the following
+expansions:
+
+- `%sql_and_ldap(...)` which would call `%sql1(...)`, `%sql2(...)`,
+  `%ldap1(...)`, and `%ldap2(...)`
+- `%sql_and_ldap.group(...)` which would call `%sql1.group(...)`,
+  `%sql2.group(...)`, `%ldap1.group(...)`, `%ldap2.group(...)`
+- `%sql_and_ldap.profile(...)` which would call `%ldap1.profile(...)`,
+  `%ldap2.profile(...)`
+
+If the arguments passed to the redundant expansion are not compatible
+with _all_ the module expansions it would call, the server will log an
+error and either fail to start, or stop processing the expression
+which called the redundant expansion.
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

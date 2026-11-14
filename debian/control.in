@@ -1,46 +1,51 @@
+# autoconf is needed so configure can regenerate src/lib/backtrace's
+# shipped configure to accept --runstatedir from dh_auto_configure.
 Source: freeradius
 Build-Depends: @BUILDDEPS@ debhelper (>= 9),
- quilt,
- dpkg-dev (>= 1.13.19),
- dh-systemd (>= 1.5) | debhelper (>= 13.3.0),
+ autoconf,
  autotools-dev,
- libcurl4-openssl-dev | libcurl4-gnutls-dev,
+ dh-systemd (>= 1.5) | debhelper (>= 13.3.0),
+ dpkg-dev (>= 1.13.19),
+ freetds-dev,
+ libbrotli-dev,
  libcap-dev,
+ libcurl4-openssl-dev | libcurl4-gnutls-dev,
  libgdbm-dev,
- libidn11-dev,
- libjson-perl,
+ libhiredis-dev,
+ libidn11-dev | libidn-dev,
  libjson-c (>= 1.13) | libjson-c4 | libjson-c5,
  libjson-c-dev,
+ libjson-perl,
+ libkqueue-dev (>= 2.6.1),
  libkrb5-dev | heimdal-dev,
- libkqueue-dev,
  libldap2-dev,
+ libmemcached-dev,
+ libmariadb-dev,
  libpam0g-dev,
  libpcap-dev,
- libpcre2-dev | libpcre3-dev,
+ libpcre2-dev,
  libperl-dev,
- libmysqlclient-dev | default-libmysqlclient-dev,
  libpq-dev,
+ librdkafka-dev,
  libreadline-dev,
  libsasl2-dev,
  libsqlite3-dev,
  libssl-dev,
  libtalloc-dev,
+ libunbound-dev,
  libwbclient-dev,
- libyubikey-dev,
  libykclient-dev,
- libmemcached-dev,
- libhiredis-dev,
- python-dev,
+ libyubikey-dev,
+ python3-dev,
+ quilt,
  samba-dev,
- unixodbc-dev,
- asciidoctor,
- pandoc
+ unixodbc-dev
 Section: net
 Priority: optional
 Maintainer: Network RADIUS SARL <info@networkradius.com>
 Uploaders: Stephen Gran <sgran@debian.org>, Mark Hymers <mhy@debian.org>
 Standards-Version: 3.9.6
-Homepage: http://www.freeradius.org/
+Homepage: https://freeradius.org/
 
 Package: freeradius
 Architecture: any
@@ -84,12 +89,9 @@ Description: FreeRADIUS client utilities
  This package contains various client programs and utilities from
  the FreeRADIUS Server project, including:
   - radclient
-  - radlast
   - radsniff
   - radsqlrelay
   - radtest
-  - radwho
-  - radzap
   - smbencrypt
 
 Package: freeradius-perl-util
@@ -99,6 +101,20 @@ Recommends: libtemplate-perl, libdbi-perl, libyaml-libyaml-perl, libdbd-pg-perl,
 Description: FreeRADIUS Perl utilities
  This package contains utilities for managing IP pools in SQL databases
 
+Package: freeradius-utils-json
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}, freeradius-common, libfreeradius4 (= ${binary:Version})
+Description: FreeRADIUS JSON conversion utilities
+ This package contains utilities that bridge between FreeRADIUS configuration
+ and JSON:
+  - radconf2json: render a parsed server configuration as JSON
+  - radjson2conf: render a JSON configuration tree back to .conf form
+  - radmod2json: dump the parser definitions of installed modules as JSON
+ .
+ These utilities are intended for tooling that needs to inspect or transform
+ FreeRADIUS configuration programmatically (config migration, schema
+ documentation, third-party integrations).
+
 Package: freeradius-snmp
 Architecture: any
 Depends: libsnmp-base
@@ -107,11 +123,15 @@ Description: FreeRADIUS SNMP mibs and utilities
 
 Package: libfreeradius4
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}
+Depends: ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}, libkqueue0 (>= 2.6.1)
 Conflicts: libfreeradius3
 Description: FreeRADIUS shared library
  The FreeRADIUS projects' libfreeradius-util, libfreeradius-radius and libfreeradius-eap, used by
  the FreeRADIUS server and some of the utilities.
+
+Package: libfreeradius-curl
+Architecture: any
+Description: curl wrapper library for FreeRADIUS
 
 Package: libfreeradius-dev
 Architecture: any
@@ -123,11 +143,17 @@ Description: FreeRADIUS shared library development files
  .
  This package contains the development headers and static library version.
 
-Package: freeradius-dhcp
+Package: freeradius-brotli
 Architecture: any
 Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}
-Description: DHCP module for FreeRADIUS server
- The FreeRADIUS server can act as a DHCP server, and this module
+Description: Brotli compression and decompression for FreeRADIUS server
+ This module adds brotli compression and decompression support to FreeRADIUS.
+
+Package: freeradius-ftp
+Architecture: any
+Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}, libfreeradius-curl (= ${binary:Version})
+Description: FTP module for FreeRADIUS server
+ The FreeRADIUS server can make calls to remote FTP servers, and this module
  is necessary for that.
 
 Package: freeradius-krb5
@@ -136,6 +162,12 @@ Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, $
 Description: kerberos module for FreeRADIUS server
  The FreeRADIUS server can use Kerberos to authenticate users, and this module
  is necessary for that.
+
+Package: freeradius-kafka
+Architecture: any
+Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}
+Description: Kafka module for FreeRADIUS server
+ This module allows FreeRADIUS to send messages to a Kafka cluster.
 
 Package: freeradius-ldap
 Architecture: any
@@ -146,10 +178,31 @@ Description: LDAP module for FreeRADIUS server
 
 Package: freeradius-rest
 Architecture: any
-Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}
+Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}, libfreeradius-curl (= ${binary:Version})
 Description: REST module for FreeRADIUS server
  The FreeRADIUS server can make calls to remote web APIs, and this module
  is necessary for that.
+
+Package: freeradius-imap
+Architecture: any
+Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}, libfreeradius-curl (= ${binary:Version})
+Description: IMAP module for FreeRADIUS server
+ The FreeRADIUS server can make calls to IMAP servers to authenticate users,
+ and this module is necessary for that.
+
+Package: freeradius-smtp
+Architecture: any
+Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}, libfreeradius-curl (= ${binary:Version})
+Description: SMTP module for FreeRADIUS server
+ The FreeRADIUS server can make calls to SMTP servers to authenticate users
+ or send emails, and this module is necessary for that.
+
+Package: freeradius-ocsp
+Architecture: any
+Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}, libfreeradius-curl (= ${binary:Version})
+Description: OCSP module for FreeRADIUS server
+ The FreeRADIUS server can make calls OCSP responders to validate certificates,
+ and this module is necessary for that.
 
 Package: freeradius-postgresql
 Architecture: any
@@ -179,12 +232,26 @@ Description: Redis module for FreeRADIUS server
  This module is required to enable the FreeRADIUS server to access
  Redis databases.
 
+Package: freeradius-freetds
+Architecture: any
+Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}
+Description: FreeTDS support for FreeRADIUS
+ This module is required to enable the FreeRADIUS server to access
+ Microsoft SQL Server/Sybase databases.
+
 Package: freeradius-memcached
 Architecture: any
 Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}
 Description: Memcached module for FreeRADIUS server
  The FreeRADIUS server can cache data in memcached and this package
  contains the required module.
+
+Package: freeradius-unbound
+Architecture: any
+Depends: freeradius (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}, ${dist:Depends}
+Description: Unbound module for FreeRADIUS server
+ This package is required to add libunbound DNS functionality to the
+ FreeRADIUS server.
 
 Package: freeradius-yubikey
 Architecture: any

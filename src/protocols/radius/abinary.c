@@ -25,18 +25,15 @@ RCSID("$Id$")
 #include <freeradius-devel/util/base16.h>
 #include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/pair.h>
-#include <freeradius-devel/util/talloc.h>
 
 #include "radius.h"
-
-#include <ctype.h>
 
 /*
  * Two types of filters are supported, GENERIC and IP.  The identifiers
  * are:
  */
 
-typedef enum {
+typedef enum : uint8_t {
 	ASCEND_FILTER_GENERIC = 0,
 	ASCEND_FILTER_IP = 1,
 	ASCEND_FILTER_IPX = 2,
@@ -54,12 +51,6 @@ typedef enum {
  */
 
 #define IPX_NODE_ADDR_LEN		6
-
-#if ! defined( false )
-# define false		0
-# define true		(! false)
-#endif
-
 
 /*
  *	ascend_ip_filter_t
@@ -221,7 +212,7 @@ typedef struct {
  *	value:		A value to compare against the masked bits at
  *			offset in a users packet.
  *
- *	compNeq:	Defines type of comarison (Equal or Notequal)
+ *	compNeq:	Defines type of comparison (Equal or Notequal)
  *			default is Equal.
  *
  *	fill:		Round things out to a dword boundary
@@ -309,7 +300,7 @@ static fr_table_num_sorted_t const filterType[] = {
 };
 static size_t filterType_len = NUM_ELEMENTS(filterType);
 
-typedef enum {
+typedef enum : uint8_t {
 	FILTER_IN,
 	FILTER_OUT,
 	FILTER_FORWARD,
@@ -376,7 +367,7 @@ static size_t filterProtoName_len = NUM_ELEMENTS(filterProtoName);
  *
  * An enumerated values for the IP filter port comparisons.
  */
-typedef enum {
+typedef enum : uint8_t {
 	RAD_NO_COMPARE = 0,
 	RAD_COMPARE_LESS,
 	RAD_COMPARE_EQUAL,
@@ -401,6 +392,8 @@ static int ascend_parse_ipx_net(int argc, char **argv,
 				ascend_ipx_net_t *net, uint8_t *comp)
 {
 	int		token;
+	fr_slen_t	slen;
+	unsigned long	socket_num;
 	char const	*p;
 
 	if (argc < 3) {
@@ -437,10 +430,10 @@ static int ascend_parse_ipx_net(int argc, char **argv,
 	/*
 	 *	Node must be 6 octets long.
 	 */
-	token = fr_base16_decode(NULL,
+	slen = fr_base16_decode(NULL,
 			   &FR_DBUFF_TMP(net->node, IPX_NODE_ADDR_LEN),
-			   &FR_SBUFF_IN(p, strlen(p)), false);
-	if (token != IPX_NODE_ADDR_LEN) {
+			   &FR_SBUFF_IN_STR(p), false);
+	if (slen != IPX_NODE_ADDR_LEN) {
 		fr_strerror_printf("IPX network node name '%s' is the wrong size", argv[2]);
 		return -1;
 	}
@@ -492,13 +485,13 @@ static int ascend_parse_ipx_net(int argc, char **argv,
 	/*
 	 *	Parse the value.
 	 */
-	token = strtoul(argv[5], NULL, 16);
-	if (token > 65535) {
+	socket_num = strtoul(argv[5], NULL, 16);
+	if (socket_num > 65535) {
 		fr_strerror_printf("Socket value '%s' is too large for IPX network filter", argv[5]);
 		return -1;
 	}
 
-	net->socket = token;
+	net->socket = socket_num;
 	net->socket = htons(net->socket);
 
 
@@ -628,7 +621,8 @@ static int ascend_parse_ipaddr(uint32_t *ipaddr, char *str)
 {
 	int		count = 0;
 	int		ip[4];
-	int	     masklen;
+	int		masklen;
+	bool		have_netmask = false;
 	uint32_t	netmask = 0;
 
 	/*
@@ -666,6 +660,7 @@ static int ascend_parse_ipaddr(uint32_t *ipaddr, char *str)
 
 			case '/': /* netmask  */
 				str++;
+				have_netmask = true;
 				masklen = atoi(str);
 				if ((masklen < 0) || (masklen > 32)) {
 					fr_strerror_printf("Invalid mask in '%s'", str);
@@ -707,7 +702,7 @@ static int ascend_parse_ipaddr(uint32_t *ipaddr, char *str)
 	/*
 	 *	Set the default netmask.
 	 */
-	if (!netmask) {
+	if (!have_netmask) {
 		if (!*ipaddr) {
 			netmask = 0;
 		} else if ((*ipaddr & 0x80000000) == 0) {
@@ -739,7 +734,7 @@ static int ascend_parse_port(uint16_t *port, char *compare, char *str)
 	 */
 	slen = fr_table_value_by_str(filterCompare, compare, -1);
 	if (slen < 0) {
-		fr_strerror_printf("Unknown comparison operator '%s'", str);
+		fr_strerror_printf("Unknown comparison operator '%s'", compare);
 		return slen;
 	}
 
@@ -903,6 +898,10 @@ static int ascend_parse_ip(int argc, char **argv, ascend_ip_filter_t *filter)
 					return -1;
 				}
 			}
+			if (token > UINT8_MAX) {
+				fr_strerror_printf("IP protocol \"%s\" is too large in IP data filter", argv[0]);
+				return -1;
+			}
 			filter->proto = token;
 			flags |= IP_PROTO_FLAG;
 
@@ -933,7 +932,7 @@ static int ascend_parse_ip(int argc, char **argv, ascend_ip_filter_t *filter)
  */
 static int ascend_parse_ipv6(int argc, char **argv, ascend_ipv6_filter_t *filter)
 {
-	ssize_t slen;
+	int slen;
 	int token;
 	int flags;
 
@@ -1033,6 +1032,10 @@ static int ascend_parse_ipv6(int argc, char **argv, ascend_ipv6_filter_t *filter
 					return -1;
 				}
 			}
+			if (token > UINT8_MAX) {
+				fr_strerror_printf("IPv6 protocol \"%s\" is too large in IP data filter", argv[0]);
+				return -1;
+			}
 			filter->proto = token;
 			flags |= IP_PROTO_FLAG;
 
@@ -1081,7 +1084,9 @@ static int ascend_parse_ipv6(int argc, char **argv, ascend_ipv6_filter_t *filter
 static int ascend_parse_generic(int argc, char **argv,
 				ascend_generic_filter_t *filter)
 {
-	int slen;
+	unsigned long offset;
+	fr_slen_t slen;
+	fr_slen_t value_slen;
 	int token;
 	int flags;
 
@@ -1115,24 +1120,24 @@ static int ascend_parse_generic(int argc, char **argv,
 		return -1;
 	}
 
-	slen = atoi(argv[0]);
-	if (slen > 65535) goto invalid;
+	offset = strtoul(argv[0], NULL, 10);
+	if (offset > UINT16_MAX) goto invalid;
 
-	filter->offset = slen;
+	filter->offset = offset;
 	filter->offset = htons(filter->offset);
 
 	slen = fr_base16_decode(NULL,
 			   &FR_DBUFF_TMP(filter->mask, sizeof(filter->mask)),
-			   &FR_SBUFF_IN(argv[1], strlen(argv[1])), false);
+			   &FR_SBUFF_IN_STR(argv[1]), false);
 	if (slen != sizeof(filter->mask)) {
 		fr_strerror_printf("Invalid filter mask '%s'", argv[1]);
 		return -1;
 	}
 
-	token = fr_base16_decode(NULL,
+	value_slen = fr_base16_decode(NULL,
 			   &FR_DBUFF_TMP(filter->value, sizeof(filter->value)),
-			   &FR_SBUFF_IN(argv[2], strlen(argv[2])), false);
-	if (token != sizeof(filter->value)) {
+			   &FR_SBUFF_IN_STR(argv[2]), false);
+	if (value_slen != sizeof(filter->value)) {
 		fr_strerror_printf("Invalid filter mask '%s'", argv[1]);
 		return -1;
 	}
@@ -1371,7 +1376,10 @@ ssize_t fr_radius_decode_abinary(fr_pair_t *vp, uint8_t const *data, size_t data
 		return -1;
 	}
 
-	if (data_len < size) return -size;
+	/*
+	 *	Account for the 4 octet header, too.
+	 */
+	if (data_len < (4 + size)) return -size;
 
 	FR_SBUFF_IN_SPRINTF_RETURN(&sbuff, "%s %s %s", fr_table_str_by_value(filterType, filter->type, "??"),
 				   direction[filter->direction & 0x01], action[filter->forward & 0x01]);
@@ -1456,20 +1464,28 @@ ssize_t fr_radius_decode_abinary(fr_pair_t *vp, uint8_t const *data, size_t data
 
 	case ASCEND_FILTER_GENERIC:
 	{
-		int count;
+		size_t i, len;
+
+		/*
+		 *	Why is len 16 bits, when the masks are only 6 bytes?
+		 */
+		len = ntohs(filter->generic.len);
+		if (len > sizeof(filter->generic.mask)) {
+			return -size;
+		}
 
 		FR_SBUFF_IN_SPRINTF_RETURN(&sbuff, " %u ", (unsigned int) ntohs(filter->generic.offset));
 
 		/* show the mask */
-		for (count = 0; count < ntohs(filter->generic.len); count++) {
-			FR_SBUFF_IN_SPRINTF_RETURN(&sbuff, "%02x", filter->generic.mask[count]);
+		for (i = 0; i < len; i++) {
+			FR_SBUFF_IN_SPRINTF_RETURN(&sbuff, "%02x", filter->generic.mask[i]);
 		}
 
 		FR_SBUFF_IN_STRCPY_RETURN(&sbuff, " ");
 
 		/* show the value */
-		for (count = 0; count < ntohs(filter->generic.len); count++) {
-			FR_SBUFF_IN_SPRINTF_RETURN(&sbuff, "%02x", filter->generic.value[count]);
+		for (i = 0; i < len; i++) {
+			FR_SBUFF_IN_SPRINTF_RETURN(&sbuff, "%02x", filter->generic.value[i]);
 		}
 
 		FR_SBUFF_IN_SPRINTF_RETURN(&sbuff, " %s", (filter->generic.compNeq) ? "!=" : "==");
@@ -1536,7 +1552,7 @@ ssize_t fr_radius_decode_abinary(fr_pair_t *vp, uint8_t const *data, size_t data
 	/*
 	 *	Copy the finished string to the output VP.
 	 */
-	if (fr_pair_value_strdup(vp, string) < 0) return -1;
+	if (fr_pair_value_strdup(vp, string, true) < 0) return -1;
 
 	return 0;
 }

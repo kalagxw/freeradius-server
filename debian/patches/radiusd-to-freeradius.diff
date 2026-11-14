@@ -1,21 +1,19 @@
 Index: freeradius-server/Make.inc.in
-===================================================================
 --- freeradius-server.orig/Make.inc.in
 +++ freeradius-server/Make.inc.in
-@@ -105,7 +105,7 @@ LDFLAGS		= $(OPENSSL_LDFLAGS) $(TALLOC_L
+@@ -120,7 +120,7 @@ LDFLAGS		= $(OPENSSL_LDFLAGS) $(TALLOC_LDFLAGS) $(KQUEUE_LDFLAGS) @LDFLAGS@
  
  LOGDIR		= ${logdir}
- RADDBDIR	= ${raddbdir}
+ CONFDIR		= ${confdir}
 -RUNDIR		= ${localstatedir}/run/radiusd
 +RUNDIR		= ${localstatedir}/run/freeradius
  SBINDIR		= ${sbindir}
  RADIR		= ${radacctdir}
  
 Index: freeradius-server/raddb/radiusd.conf.in
-===================================================================
 --- freeradius-server.orig/raddb/radiusd.conf.in
 +++ freeradius-server/raddb/radiusd.conf.in
-@@ -67,7 +67,7 @@ radacctdir = @radacctdir@
+@@ -69,7 +69,7 @@ radacctdir = @radacctdir@
  #
  #  See also the `-n` command-line option.
  #
@@ -24,19 +22,25 @@ Index: freeradius-server/raddb/radiusd.conf.in
  
  #
  #  Location of config and logfiles.
-@@ -429,8 +429,8 @@ security {
+@@ -523,7 +523,7 @@ security {
+ 	#  shadow passwords, the `user` and `group` items should be
+ 	#  set to `radius`.
+ 	#
+-#	user = radius
++	user = freerad
+ 
+ 	#
+ 	#  group::
+@@ -549,7 +549,7 @@ security {
  	#  member.  This can allow for some finer-grained access
  	#  controls.
  	#
--#	user = radius
 -#	group = radius
-+	user = freerad
 +	group = freerad
  
  	#
- 	#  allow_core_dumps:: Core dumps are a bad thing.
+ 	#  After the server has changed to the final user/group, it
 Index: freeradius-server/scripts/monit/freeradius.monitrc
-===================================================================
 --- freeradius-server.orig/scripts/monit/freeradius.monitrc
 +++ freeradius-server/scripts/monit/freeradius.monitrc
 @@ -8,9 +8,9 @@
@@ -53,44 +57,40 @@ Index: freeradius-server/scripts/monit/freeradius.monitrc
     if failed host 127.0.0.1 port 1813 type udp protocol radius secret testing123 then alert
     if cpu > 95% for 2 cycles then alert
 Index: freeradius-server/raddb/sites-available/control-socket
-===================================================================
 --- freeradius-server.orig/raddb/sites-available/control-socket
 +++ freeradius-server/raddb/sites-available/control-socket
-@@ -82,12 +82,12 @@ server control {
+@@ -68,7 +68,7 @@ server control-socket-server  {
  			#
- 			#  uid:: Name of user who is allowed to connect to the control socket.
+ 			#  Note that the control socket cannot have uid of 0.
  			#
 -#			uid = radius
 +#			uid = freerad
  
  			#
- 			#  gid:: Name of group that is allowed to connect to the control socket.
+ 			#  gid:: Name of group which owns the control socket.
+@@ -80,7 +80,7 @@ server control-socket-server  {
+ 			#
+ 			#  Note that the control socket cannot have gid of 0.
  			#
 -#			gid = radius
 +#			gid = freerad
  
  			#
- 			#  Access mode.
+ 			#  mode:: Access mode.
 Index: freeradius-server/src/bin/radiusd.c
-===================================================================
 --- freeradius-server.orig/src/bin/radiusd.c
 +++ freeradius-server/src/bin/radiusd.c
-@@ -230,14 +230,11 @@ int main(int argc, char *argv[])
+@@ -311,7 +311,12 @@ int main(int argc, char *argv[])
+ 		EXIT_WITH_FAILURE;
  	}
  
- 	/*
--	 *	Set some default values
+-	main_config_name_set_default(config, program, false);
++	/*
 +	 *
 +	 *	Debian changes the binary name to "freeradius", but
 +	 *	leaves the configuration file as "radiusd.conf".
- 	 */
--	program = strrchr(argv[0], FR_DIR_SEP);
--	if (!program) {
--		program = argv[0];
--	} else {
--		program++;
--	}
-+	program = "radiusd";
- 	main_config_name_set_default(config, program, false);
++	 */
++	main_config_name_set_default(config, "radiusd", false);
  
  	config->daemonize = true;
+ 	config->spawn_workers = true;

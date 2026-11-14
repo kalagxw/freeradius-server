@@ -26,7 +26,6 @@ RCSID("$Id$")
 #ifndef HAVE_FOPENCOOKIE
 #include <freeradius-devel/util/talloc.h>
 #include <stdio.h>
-#include <errno.h>
 #include "fopencookie.h"
 
 #define NEED_READ 0x01
@@ -184,7 +183,6 @@ FILE *fopencookie(void *cookie, const char *mode, cookie_io_functions_t io_funcs
 	if (need & NEED_SEEK) {
 		if (fseek(f, 0L, SEEK_END) < 0) {
 			fclose(f);
-			talloc_free(oc);
 			return NULL;
 		}
 	}

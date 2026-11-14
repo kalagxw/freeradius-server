@@ -1,0 +1,25 @@
+
+path::
+
+The search path for Python modules.  It must include the path to your
+Python module.
+
+
+
+path_include_default::
+
+If "yes", retain the default search path.  Any additional search
+path components will be prepended to the default search path.
+
+
+== Default Configuration
+
+```
+python {
+#	path = ${modconfdir}/${.:name}
+#	path_include_default = "yes"
+}
+```
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

@@ -1,12 +1,14 @@
 = Single Quoted Strings
 
 .Syntax
-`'string'`
+`'string'` `'''string with 'quote' embedded'''`
 
 A single-quoted string is interpreted without any dynamic string
 expansion. The quotes allow the string to contain spaces, among other
-special characters. The single quote character can be placed in such a
-string by escaping it with a backslash.
+special characters.
+
+The quotation character can be placed inside of the string by escaping
+it with a backslash.
 
 .Examples
 
@@ -15,5 +17,5 @@ string by escaping it with a backslash.
 `'foo\\'bar'` +
 `'this is a long string'`
 
-// Copyright (C) 2021 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
-// Development of this documentation was sponsored by Network RADIUS SAS.
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

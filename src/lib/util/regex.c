@@ -26,13 +26,8 @@ RCSID("$Id$")
 #ifdef HAVE_REGEX
 
 #include <freeradius-devel/util/regex.h>
-#include <freeradius-devel/util/strerror.h>
-#include <freeradius-devel/util/talloc.h>
-#include <freeradius-devel/util/atexit.h>
-#include <freeradius-devel/util/table.h>
-#include <freeradius-devel/util/talloc.h>
 
-#if defined(HAVE_REGEX_PCRE) || (defined(HAVE_REGEX_PCRE2) && defined(PCRE2_CONFIG_JIT))
+#if defined(HAVE_REGEX_PCRE2) && defined(PCRE2_CONFIG_JIT)
 #ifndef FR_PCRE_JIT_STACK_MIN
 #  define FR_PCRE_JIT_STACK_MIN	(128 * 1024)
 #endif
@@ -40,6 +35,67 @@ RCSID("$Id$")
 #  define FR_PCRE_JIT_STACK_MAX (512 * 1024)
 #endif
 #endif
+
+/*
+ *	pcre2_set_max_pattern_compiled_length() arrived in PCRE2 10.41.
+ */
+#if defined(HAVE_REGEX_PCRE2) && defined(PCRE2_MAJOR) && \
+	((PCRE2_MAJOR > 10) || ((PCRE2_MAJOR == 10) && (PCRE2_MINOR >= 41)))
+#  define FR_PCRE2_HAVE_MAX_PATTERN_LENGTH 1
+
+/*
+ *	The largest a single pattern may compile to.
+ *
+ *	A bounded repeat is expanded by the engine, and nesting them
+ *	multiplies: "((((a){40}){40}){40}){40}" is 25 characters, and expands
+ *	to around 40^4 nodes.  With no limit, a pattern of a few dozen bytes
+ *	compiles to gigabytes.  That matters because regex_compile() runs at
+ *	runtime as well as at config time, see xlat_func_regex_search().
+ *
+ *	Hand-written patterns compile to a few KB at most, so this bound is
+ *	orders of magnitude above anything legitimate, and only fires on
+ *	patterns built to exhaust memory.
+ */
+#  ifndef FR_PCRE2_MAX_PATTERN_LENGTH
+#    define FR_PCRE2_MAX_PATTERN_LENGTH (1024 * 1024)
+#  endif
+#endif
+
+const fr_sbuff_escape_rules_t regex_escape_rules = {
+	.name = "regex",
+	.chr = '\\',
+	.subs = {
+		['$'] = '$',
+		['*'] = '*',
+		['+'] = '+',
+		['.'] = '.',
+		['/'] = '/',
+		['?'] = '?',
+		['('] = '(',
+		[')'] = ')',
+		['['] = '[',
+		[']'] = ']',
+		['{'] = '{',
+		['}'] = '}',
+		['\\'] = '\\',
+		['^'] = '^',
+		['`'] = '`',
+		['|'] = '|',
+		['\a'] = 'a',
+		['\b'] = 'b',
+		['\n'] = 'n',
+		['\r'] = 'r',
+		['\t'] = 't',
+		['\v'] = 'v'
+	},
+	.esc = {
+		SBUFF_CHAR_UNPRINTABLES_LOW,
+		SBUFF_CHAR_UNPRINTABLES_EXTENDED
+	},
+	.do_utf8 = true,
+	.do_oct = true
+};
+
 
 /*
  *######################################
@@ -111,9 +167,9 @@ static int _pcre2_tls_free(fr_pcre2_tls_t *tls)
 	return 0;
 }
 
-static void _pcre2_tls_free_on_exit(void *arg)
+static int _pcre2_tls_free_on_exit(void *arg)
 {
-	talloc_free(arg);
+	return talloc_free(arg);
 }
 
 /** Thread local init for pcre2
@@ -143,6 +199,14 @@ static int fr_pcre2_tls_init(void)
 		_pcre2_tls_free(tls);
 		return -1;
 	}
+
+#ifdef FR_PCRE2_HAVE_MAX_PATTERN_LENGTH
+	/*
+	 *	Cap memory usage.  Patterns over this limit will fail
+	 *	with an error in pcre2_compile() or regex_compile().
+	 */
+	pcre2_set_max_pattern_length(tls->ccontext, FR_PCRE2_MAX_PATTERN_LENGTH);
+#endif
 
 	tls->mcontext = pcre2_match_context_create(tls->gcontext);
 	if (!tls->mcontext) {
@@ -422,7 +486,7 @@ int regex_exec(regex_t *preg, char const *subject, size_t len, fr_regmatch_t *re
  *	- >= 0 the length of the output string.
  *	- < 0 on error.
  */
-int regex_substitute(TALLOC_CTX *ctx, char **out, size_t max_out, regex_t *preg, fr_regex_flags_t *flags,
+int regex_substitute(TALLOC_CTX *ctx, char **out, size_t max_out, regex_t *preg, fr_regex_flags_t const *flags,
 		     char const *subject, size_t subject_len,
 		     char const *replacement, size_t replacement_len,
 		     fr_regmatch_t *regmatch)
@@ -504,7 +568,7 @@ again:
 	 */
 	ret = pcre2_substitute(preg->compiled,
 			       (PCRE2_SPTR8)subject, (PCRE2_SIZE)subject_len, 0,
-			       options, regmatch ? regmatch->match_data : NULL, fr_pcre2_tls->mcontext,
+			       options, NULL, fr_pcre2_tls->mcontext,
 			       (PCRE2_UCHAR const *)replacement, replacement_len, (PCRE2_UCHAR *)buff, &actual_len);
 
 	if (ret < 0) {
@@ -532,6 +596,10 @@ again:
 			}
 			buff_len = actual_len;	/* The length we get passed back includes the \0 */
 			buff = talloc_array(ctx, char, buff_len);
+			if (!buff) {
+				fr_strerror_const("Out of memory");
+				return -1;
+			}
 			goto again;
 		}
 
@@ -629,330 +697,7 @@ fr_regmatch_t *regex_match_data_alloc(TALLOC_CTX *ctx, uint32_t count)
 
 	return regmatch;
 }
-/*
- *######################################
- *#       FUNCTIONS FOR LIBPCRE        #
- *######################################
- */
-#elif defined(HAVE_REGEX_PCRE)
-/*
- *	Wrapper functions for libpcre. Much more powerful, and guaranteed
- *	to be binary safe but require libpcre.
- */
-#if (PCRE_MAJOR >= 8) && (PCRE_MINOR >= 32) && defined(PCRE_CONFIG_JIT)
-#  define HAVE_PCRE_JIT_EXEC 1
-#endif
 
-#ifdef HAVE_PCRE_JIT_EXEC
-static _Thread_local pcre_jit_stack *fr_pcre_jit_stack;
-#endif
-
-/** Free regex_t structure
- *
- * Calls libpcre specific free functions for the expression and study.
- *
- * @param preg to free.
- */
-static int _regex_free(regex_t *preg)
-{
-	if (preg->compiled) pcre_free(preg->compiled);
-#ifdef PCRE_CONFIG_JIT
-	if (preg->extra) pcre_free_study(preg->extra);
-#else
-	if (preg->extra) pcre_free(preg->extra);
-#endif
-
-	return 0;
-}
-
-/*
- *	Replace the libpcre memory allocation and freeing functions
- *	with talloc wrappers. This allows us to use the subcapture copy
- *	functions and just reparent the memory allocated.
- */
-static void *_pcre_talloc(size_t to_alloc)
-{
-	return talloc_array(NULL, uint8_t, to_alloc);
-}
-
-static void _pcre_talloc_free(void *to_free)
-{
-	talloc_free(to_free);
-}
-
-/** Wrapper around pcre_compile
- *
- * Allows the rest of the code to do compilations using one function signature.
- *
- * @note Compiled expression must be freed with talloc_free.
- *
- * @param[out] out		Where to write out a pointer to the structure containing
- *				the compiled expression.
- * @param[in] pattern		to compile.
- * @param[in] len		of pattern.
- * @param[in] flags		controlling matching.  May be NULL.
- * @param[in] subcaptures	Whether to compile the regular expression to store subcapture
- *				data.
- * @param[in] runtime		If false run the pattern through the PCRE JIT to convert it
- *				to machine code. This trades startup time (longer) for
- *				runtime performance (better).
- * @return
- *	- >= 1 on success.
- *	- <= 0 on error. Negative value is offset of parse error.
- */
-ssize_t regex_compile(TALLOC_CTX *ctx, regex_t **out, char const *pattern, size_t len,
-		      fr_regex_flags_t const *flags, bool subcaptures, bool runtime)
-{
-	char const	*error;
-	int		offset;
-	int		cflags = 0;
-	regex_t		*preg;
-
-	static		bool setup;
-	static		bool study_flags;
-
-	/*
-	 *	Lets us use subcapture copy
-	 */
-	if (!setup) {
-#ifdef PCRE_CONFIG_JIT
-		int *do_jit = 0;
-
-		/*
-		 *	If the headers are from >= 8.20
-		 *	check at runtime to see if this version
-		 *	of the libpcre library was compiled with
-		 *	JIT support.
-		 */
-		pcre_config(PCRE_CONFIG_JIT, &do_jit);
-
-		if (do_jit) study_flags |= PCRE_STUDY_JIT_COMPILE;
-#endif
-		pcre_malloc = _pcre_talloc;		/* pcre_malloc is a global provided by libpcre */
-		pcre_free = _pcre_talloc_free;		/* pcre_free is a global provided by libpcre */
-	}
-
-	/*
-	 *	Check inputs
-	 */
-	*out = NULL;
-
-	if (len == 0) {
-		fr_strerror_const("Empty expression");
-		return 0;
-	}
-
-	/*
-	 *	Options
-	 */
-	if (flags) {
-		if (flags->global) {
-			fr_strerror_const("g - Global matching/substitution not supported with libpcre");
-			return 0;
-		}
-		if (flags->ignore_case) cflags |= PCRE_CASELESS;
-		if (flags->multiline) cflags |= PCRE_MULTILINE;
-		if (flags->dot_all) cflags |= PCRE_DOTALL;
-		if (flags->unicode) cflags |= PCRE_UTF8;
-		if (flags->extended) cflags |= PCRE_EXTENDED;
-	}
-
-	if (!subcaptures) cflags |= PCRE_NO_AUTO_CAPTURE;
-
-	preg = talloc_zero(ctx, regex_t);
-	talloc_set_destructor(preg, _regex_free);
-
-	preg->compiled = pcre_compile(pattern, cflags, &error, &offset, NULL);
-	if (!preg->compiled) {
-		fr_strerror_printf("%s", error);
-		talloc_free(preg);
-
-		return -(ssize_t)offset;
-	}
-
-	if (!runtime) {
-		preg->precompiled = true;
-		preg->extra = pcre_study(preg->compiled, study_flags, &error);
-		if (error) {
-			fr_strerror_printf("Pattern study failed: %s", error);
-			talloc_free(preg);
-
-			return 0;
-		}
-
-#ifdef PCRE_INFO_JIT
-		/*
-		 *	Check to see if the JIT was successful.
-		 *
-		 * 	Not all platforms have JIT support, the pattern
-		 *	may not be jitable, or JIT support may have been
-		 *	disabled.
-		 */
-		if (study_flags & PCRE_STUDY_JIT_COMPILE) {
-			int jitd = 0;
-
-			pcre_fullinfo(preg->compiled, preg->extra, PCRE_INFO_JIT, &jitd);
-			if (jitd) preg->jitd = true;
-		}
-#endif
-	}
-
-	*out = preg;
-
-	return len;
-}
-
-static fr_table_num_ordered_t const regex_pcre_error_str[] = {
-	{ L("PCRE_ERROR_NOMATCH"),		PCRE_ERROR_NOMATCH },
-	{ L("PCRE_ERROR_NULL"),			PCRE_ERROR_NULL },
-	{ L("PCRE_ERROR_BADOPTION"),		PCRE_ERROR_BADOPTION },
-	{ L("PCRE_ERROR_BADMAGIC"),		PCRE_ERROR_BADMAGIC },
-	{ L("PCRE_ERROR_UNKNOWN_OPCODE"),	PCRE_ERROR_UNKNOWN_OPCODE },
-	{ L("PCRE_ERROR_NOMEMORY"),		PCRE_ERROR_NOMEMORY },
-	{ L("PCRE_ERROR_NOSUBSTRING"),		PCRE_ERROR_NOSUBSTRING },
-	{ L("PCRE_ERROR_MATCHLIMIT"),		PCRE_ERROR_MATCHLIMIT },
-	{ L("PCRE_ERROR_CALLOUT"),		PCRE_ERROR_CALLOUT },
-	{ L("PCRE_ERROR_BADUTF8"),		PCRE_ERROR_BADUTF8 },
-	{ L("PCRE_ERROR_BADUTF8_OFFSET"),	PCRE_ERROR_BADUTF8_OFFSET },
-	{ L("PCRE_ERROR_PARTIAL"),		PCRE_ERROR_PARTIAL },
-	{ L("PCRE_ERROR_BADPARTIAL"),		PCRE_ERROR_BADPARTIAL },
-	{ L("PCRE_ERROR_INTERNAL"),		PCRE_ERROR_INTERNAL },
-	{ L("PCRE_ERROR_BADCOUNT"),		PCRE_ERROR_BADCOUNT },
-	{ L("PCRE_ERROR_DFA_UITEM"),		PCRE_ERROR_DFA_UITEM },
-	{ L("PCRE_ERROR_DFA_UCOND"),		PCRE_ERROR_DFA_UCOND },
-	{ L("PCRE_ERROR_DFA_UMLIMIT"),		PCRE_ERROR_DFA_UMLIMIT },
-	{ L("PCRE_ERROR_DFA_WSSIZE"),		PCRE_ERROR_DFA_WSSIZE },
-	{ L("PCRE_ERROR_DFA_RECURSE"),		PCRE_ERROR_DFA_RECURSE },
-	{ L("PCRE_ERROR_RECURSIONLIMIT"),	PCRE_ERROR_RECURSIONLIMIT },
-	{ L("PCRE_ERROR_NULLWSLIMIT"),		PCRE_ERROR_NULLWSLIMIT },
-	{ L("PCRE_ERROR_BADNEWLINE"),		PCRE_ERROR_BADNEWLINE },
-	{ L("PCRE_ERROR_BADOFFSET"),		PCRE_ERROR_BADOFFSET },
-	{ L("PCRE_ERROR_SHORTUTF8"),		PCRE_ERROR_SHORTUTF8 },
-	{ L("PCRE_ERROR_RECURSELOOP"),		PCRE_ERROR_RECURSELOOP },
-	{ L("PCRE_ERROR_JIT_STACKLIMIT"),	PCRE_ERROR_JIT_STACKLIMIT },
-	{ L("PCRE_ERROR_BADMODE"),		PCRE_ERROR_BADMODE },
-	{ L("PCRE_ERROR_BADENDIANNESS"),	PCRE_ERROR_BADENDIANNESS },
-	{ L("PCRE_ERROR_DFA_BADRESTART"),	PCRE_ERROR_DFA_BADRESTART },
-	{ L("PCRE_ERROR_JIT_BADOPTION"),	PCRE_ERROR_JIT_BADOPTION },
-	{ L("PCRE_ERROR_BADLENGTH"),		PCRE_ERROR_BADLENGTH },
-#ifdef PCRE_ERROR_UNSET
-	{ L("PCRE_ERROR_UNSET"),		PCRE_ERROR_UNSET },
-#endif
-};
-static size_t regex_pcre_error_str_len = NUM_ELEMENTS(regex_pcre_error_str);
-
-#ifdef HAVE_PCRE_JIT_EXEC
-/** Free a PCRE JIT stack on exit
- *
- * @param[in] stack to free.
- */
-static void _pcre_jit_stack_free(void *stack)
-{
-	pcre_jit_stack_free(stack);
-}
-#endif
-
-/** Wrapper around pcre_exec
- *
- * @param[in] preg	The compiled expression.
- * @param[in] subject	to match.
- * @param[in] len	Length of subject.
- * @param[in] regmatch	Match result structure.
- * @return
- *	- -1 on failure.
- *	- 0 on no match.
- *	- 1 on match.
- */
-int regex_exec(regex_t *preg, char const *subject, size_t len, fr_regmatch_t *regmatch)
-{
-	int	ret;
-	size_t	matches;
-
-#ifdef HAVE_PCRE_JIT_EXEC
-	/*
-	 *	Allocate thread local JIT stack
-	 */
-	if (!fr_pcre_jit_stack) {
-		/*
-		 *	Starts at 128K, max is 512K per thread.
-		 */
-		fr_atexit_thread_local(fr_pcre_jit_stack, _pcre_jit_stack_free,
-					       pcre_jit_stack_alloc(FR_PCRE_JIT_STACK_MIN, FR_PCRE_JIT_STACK_MAX));
-		if (!fr_pcre_jit_stack) {
-			fr_strerror_const("Allocating JIT stack failed");
-			return -1;
-		}
-	}
-#endif
-
-	/*
-	 *	Disable capturing
-	 */
-	if (!regmatch) {
-		matches = 0;
-	} else {
-		matches = regmatch->allocd;
-
-		/*
-		 *	Reset the match result structure
-		 */
-		memset(regmatch->match_data, 0, sizeof(regmatch->match_data[0]) * matches);
-		regmatch->used = 0;
-	}
-
-#ifdef HAVE_PCRE_JIT_EXEC
-	if (preg->jitd) {
-		ret = pcre_jit_exec(preg->compiled, preg->extra, subject, len, 0, 0,
-				    regmatch ? (int *)regmatch->match_data : NULL, matches * 3, fr_pcre_jit_stack);
-	} else
-#endif
-	{
-		ret = pcre_exec(preg->compiled, preg->extra, subject, len, 0, 0,
-				regmatch ? (int *)regmatch->match_data : NULL, matches * 3);
-	}
-	if (ret < 0) {
-		if (ret == PCRE_ERROR_NOMATCH) return 0;
-
-		fr_strerror_printf("regex evaluation failed with code (%i): %s", ret,
-				   fr_table_str_by_value(regex_pcre_error_str, ret, "<INVALID>"));
-		return -1;
-	}
-
-	/*
-	 *	0 signifies more offsets than we provided space for,
-	 *	so don't touch nmatches.
-	 */
-	if (regmatch && (ret > 0)) {
-		regmatch->used = ret;
-
-		if (regmatch->subject) talloc_const_free(regmatch->subject);
-		regmatch->subject = talloc_bstrndup(regmatch, subject, len);
-		if (!regmatch->subject) {
-			fr_strerror_const("Out of memory");
-			return -1;
-		}
-	}
-
-	return 1;
-}
-
-/** Returns the number of subcapture groups
- *
- * @return
- *	- >0 The number of subcaptures contained within the pattern
- *	- 0 if the number of subcaptures can't be determined.
- */
-uint32_t regex_subcapture_count(regex_t const *preg)
-{
-	int count;
-
-	if (pcre_fullinfo(preg->compiled, preg->extra, PCRE_INFO_CAPTURECOUNT, &count) != 0) {
-		fr_strerror_const("Error determining subcapture group count");
-		return 0;
-	}
-
-	return (uint32_t)count + 1;
-}
 /*
  *######################################
  *#    FUNCTIONS FOR POSIX-REGEX      #
@@ -1051,7 +796,7 @@ ssize_t regex_compile(TALLOC_CTX *ctx, regex_t **out, char const *pattern, size_
 
 		if ((size_t)(p - pattern) != len) {
 			fr_strerror_printf("Found null in pattern at offset %zu.  Pattern unsafe for compilation",
-					   (p - pattern));
+					   (size_t)(p - pattern));
 			return -(p - pattern);
 		}
 
@@ -1127,7 +872,7 @@ int regex_exec(regex_t *preg, char const *subject, size_t len, fr_regmatch_t *re
 
 		if ((size_t)(p - subject) != len) {
 			fr_strerror_printf("Found null in subject at offset %zu.  String unsafe for evaluation",
-					   (p - subject));
+					   (size_t)(p - subject));
 			if (regmatch) regmatch->used = 0;
 			return -1;
 		}
@@ -1177,7 +922,7 @@ uint32_t regex_subcapture_count(UNUSED regex_t const *preg)
 }
 #  endif
 
-#  if defined(HAVE_REGEX_POSIX) || defined(HAVE_REGEX_PCRE)
+#  if defined(HAVE_REGEX_POSIX)
 /** Allocate vectors to fill with match data
  *
  * @param[in] ctx	to allocate match vectors in.
@@ -1235,10 +980,10 @@ fr_regmatch_t *regex_match_data_alloc(TALLOC_CTX *ctx, uint32_t count)
  *      - > 0 on success.  The number of flag bytes parsed.
  *	- <= 0 on failure.  Negative offset of first unrecognised flag.
  */
-ssize_t regex_flags_parse(int *err, fr_regex_flags_t *out, fr_sbuff_t *in,
-			  fr_sbuff_term_t const *terminals, bool err_on_dup)
+fr_slen_t regex_flags_parse(int *err, fr_regex_flags_t *out, fr_sbuff_t *in,
+			    fr_sbuff_term_t const *terminals, bool err_on_dup)
 {
-	fr_sbuff_t	our_in = FR_SBUFF_NO_ADVANCE(in);
+	fr_sbuff_t	our_in = FR_SBUFF(in);
 
 	if (err) *err = 0;
 
@@ -1249,7 +994,7 @@ ssize_t regex_flags_parse(int *err, fr_regex_flags_t *out, fr_sbuff_t *in,
 			if (err_on_dup && out->_f) { \
 				fr_strerror_printf("Duplicate regex flag '%c'", *our_in.p); \
 				if (err) *err = -2; \
-				return -fr_sbuff_used(&our_in); \
+				FR_SBUFF_ERROR_RETURN(&our_in); \
 			} \
 			out->_f = 1; \
 			break
@@ -1263,15 +1008,15 @@ ssize_t regex_flags_parse(int *err, fr_regex_flags_t *out, fr_sbuff_t *in,
 #undef DO_REGEX_FLAG
 
 		default:
-			if (fr_sbuff_is_terminal(&our_in, terminals)) return fr_sbuff_set(in, &our_in);
+			if (fr_sbuff_is_terminal(&our_in, terminals)) FR_SBUFF_SET_RETURN(in, &our_in);
 
 			fr_strerror_printf("Unsupported regex flag '%c'", *our_in.p);
 			if (err) *err = -1;
-			return -(fr_sbuff_used_total(&our_in));
+			FR_SBUFF_ERROR_RETURN(&our_in);
 		}
 		fr_sbuff_advance(&our_in, 1);
 	}
-	return fr_sbuff_set(in, &our_in);
+	FR_SBUFF_SET_RETURN(in, &our_in);
 }
 
 /** Print the flags
@@ -1282,9 +1027,9 @@ ssize_t regex_flags_parse(int *err, fr_regex_flags_t *out, fr_sbuff_t *in,
  *	- The number of bytes written to the out buffer.
  *	- A number >= outlen if truncation has occurred.
  */
-ssize_t regex_flags_print(fr_sbuff_t *sbuff, fr_regex_flags_t const flags[static REGEX_FLAG_BUFF_SIZE])
+ssize_t regex_flags_print(fr_sbuff_t *sbuff, fr_regex_flags_t const *flags)
 {
-	fr_sbuff_t our_sbuff = FR_SBUFF_NO_ADVANCE(sbuff);
+	fr_sbuff_t our_sbuff = FR_SBUFF(sbuff);
 
 #define DO_REGEX_FLAG(_f, _c) \
 	if (flags->_f) FR_SBUFF_IN_CHAR_RETURN(&our_sbuff, _c)
@@ -1297,6 +1042,85 @@ ssize_t regex_flags_print(fr_sbuff_t *sbuff, fr_regex_flags_t const flags[static
 	DO_REGEX_FLAG(extended, 'x');
 #undef DO_REGEX_FLAG
 
-	return fr_sbuff_set(sbuff, &our_sbuff);
+	FR_SBUFF_SET_RETURN(sbuff, &our_sbuff);
 }
 #endif
+
+/** Compare two boxes using an operator
+ *
+ *  @todo - allow /foo/i on the RHS
+ *
+ *  However, this involves allocating intermediate sbuffs for the
+ *  unescaped RHS, and all kinds of extra work.  It's not overly hard,
+ *  but it's something we wish to avoid for now.
+ *
+ * @param[in] op to use in comparison. MUST be T_OP_REG_EQ or T_OP_REG_NE
+ * @param[in] a Value to compare,  MUST be FR_TYPE_STRING
+ * @param[in] b uncompiled regex as FR_TYPE_STRING
+ * @return
+ *	- 1 if true
+ *	- 0 if false
+ *	- -1 on failure.
+ */
+int fr_regex_cmp_op(fr_token_t op, fr_value_box_t const *a, fr_value_box_t const *b)
+{
+	int rcode;
+	TALLOC_CTX *ctx = NULL;
+	size_t lhs_len;
+	char const *lhs;
+	regex_t *regex = NULL;
+
+	if (!((op == T_OP_REG_EQ) || (op == T_OP_REG_NE))) {
+		fr_strerror_const("Invalid operator for regex comparison");
+		return -1;
+	}
+
+	if (b->type != FR_TYPE_STRING) {
+		fr_strerror_const("RHS must be regular expression");
+		return -1;
+	}
+
+	ctx = talloc_init_const("regex_cmp_op");
+	if (!ctx) return -1;
+
+	if ((a->type != FR_TYPE_STRING) && (a->type != FR_TYPE_OCTETS)) {
+		fr_slen_t slen;
+		char *p;
+
+		slen = fr_value_box_aprint(ctx, &p, a, NULL); /* no escaping */
+		if (slen < 0) {
+			talloc_free(ctx);
+			return -1;
+		}
+
+		lhs = p;
+		lhs_len = slen;
+
+	} else {
+		lhs = a->vb_strvalue;
+		lhs_len = a->vb_length;
+	}
+
+	if (regex_compile(ctx, &regex, b->vb_strvalue, b->vb_length, NULL, false, true) < 0) {
+		talloc_free(ctx);
+		return -1;
+	}
+
+#ifdef STATIC_ANALYZER
+	if (!regex) {
+		talloc_free(ctx);
+		return -1;
+	}
+#endif
+
+	rcode = regex_exec(regex, lhs, lhs_len, NULL);
+	talloc_free(ctx);
+	if (rcode < 0) return rcode;
+
+	/*
+	 *	Invert the sense of the rcode for !~
+	 */
+	if (op == T_OP_REG_NE) rcode = (rcode == 0);
+
+	return rcode;
+}

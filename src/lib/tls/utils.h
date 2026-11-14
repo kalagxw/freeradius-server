@@ -25,6 +25,8 @@
  */
 RCSIDH(utils_h, "$Id$")
 
+#include "openssl_user_macros.h"
+
 #include <openssl/ssl.h>
 
 #include <freeradius-devel/util/time.h>
@@ -34,11 +36,36 @@ RCSIDH(utils_h, "$Id$")
 extern "C" {
 #endif
 
+/*
+ *	OpenSSL 4.0 returns const extensions and extension objects, which
+ *	OpenSSL 3.x functions won't accept.
+ */
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+#  define FR_OPENSSL_X509_CONST const
+#else
+#  define FR_OPENSSL_X509_CONST
+#endif
+
+/** Return the length of an ASN1_STRING's data
+ *
+ * The data is not NUL terminated, so always use this length with ASN1_STRING_get0_data().
+ */
+static inline size_t fr_tls_asn1_string_length(ASN1_STRING const *s)
+{
+#if OPENSSL_VERSION_NUMBER >= 0x40100000L
+	return ASN1_STRING_get_length(s);
+#else
+	return (size_t)ASN1_STRING_length(s);
+#endif
+}
+
 char const	*fr_tls_utils_x509_pkey_type(X509 *cert);
 
 int		fr_tls_utils_keyblock_size_get(request_t *request, SSL *ssl);
 
 int		fr_tls_utils_asn1time_to_epoch(time_t *out, ASN1_TIME const *asn1);
+
+int		fr_utils_get_private_key_password(char *buf, int size, UNUSED int rwflag, void *u);
 
 #ifdef __cplusplus
 }

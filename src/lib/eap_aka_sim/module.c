@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -28,8 +28,6 @@ RCSID("$Id$")
 #include <freeradius-devel/server/module.h>
 #include <freeradius-devel/server/pair.h>
 #include <freeradius-devel/server/virtual_servers.h>
-#include <freeradius-devel/unlang/interpret.h>
-#include <freeradius-devel/unlang/module.h>
 #include <freeradius-devel/util/rand.h>
 
 #include "attrs.h"
@@ -39,13 +37,11 @@ RCSID("$Id$")
 /** Encode EAP session data from attributes
  *
  */
-static unlang_action_t mod_encode(rlm_rcode_t *p_result, module_ctx_t const *mctx,
-				  request_t *request, UNUSED void *rctx)
+static unlang_action_t mod_encode(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	eap_aka_sim_module_conf_t	*inst = talloc_get_type_abort(mctx->instance, eap_aka_sim_module_conf_t);
+	eap_aka_sim_module_conf_t	*inst = talloc_get_type_abort(mctx->mi->data, eap_aka_sim_module_conf_t);
 	eap_session_t			*eap_session = eap_session_get(request->parent);
-	eap_aka_sim_mod_session_t	*mod_session = talloc_get_type_abort(eap_session->opaque,
-										eap_aka_sim_mod_session_t);
+	eap_aka_sim_mod_session_t	*mod_session = talloc_get_type_abort(eap_session->opaque, eap_aka_sim_mod_session_t);
 	fr_pair_t			*subtype_vp;
 
 	static eap_code_t		rcode_to_eap_code[RLM_MODULE_NUMCODES] = {
@@ -60,19 +56,18 @@ static unlang_action_t mod_encode(rlm_rcode_t *p_result, module_ctx_t const *mct
 						[RLM_MODULE_UPDATED]	= FR_EAP_CODE_FAILURE
 					};
 	eap_code_t			code;
-	rlm_rcode_t			rcode = unlang_interpret_stack_result(request);
+	rlm_rcode_t			rcode = mod_session->virtual_server_result.rcode;
 	fr_aka_sim_ctx_t		encode_ctx;
 	uint8_t	const			*request_hmac_extra = NULL;
 	size_t				request_hmac_extra_len = 0;
 	fr_pair_t			*vp;
-	int				ret;
 
 	/*
 	 *	If there's no subtype vp, we look at the rcode
 	 *	from the virtual server to determine what kind
 	 *	of EAP response to send.
 	 */
-	subtype_vp = fr_pair_find_by_da(&request->reply_pairs, attr_eap_aka_sim_subtype, 0);
+	subtype_vp = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_eap_aka_sim_subtype);
 	if (!subtype_vp) {
 		eap_session->this_round->request->code = (rcode == RLM_MODULE_OK) ?
 								FR_EAP_CODE_SUCCESS : FR_EAP_CODE_FAILURE;
@@ -91,6 +86,8 @@ static unlang_action_t mod_encode(rlm_rcode_t *p_result, module_ctx_t const *mct
 
 		return UNLANG_ACTION_CALCULATE_RESULT;
 	}
+
+	fr_assert(rcode < RLM_MODULE_NUMCODES);
 
 	/*
 	 *	If there is a subtype vp, verify the return
@@ -129,18 +126,18 @@ static unlang_action_t mod_encode(rlm_rcode_t *p_result, module_ctx_t const *mct
 	 *	Perform different actions depending on the type
 	 *	of request we're sending.
 	 */
-	switch (subtype_vp->vp_uint16) {
+	switch (subtype_vp->vp_uint8) {
 	case FR_SUBTYPE_VALUE_AKA_IDENTITY:
 	case FR_SUBTYPE_VALUE_SIM_START:
-		if (RDEBUG_ENABLED2) break;
+		if (!RDEBUG_ENABLED2) break;
 
 		/*
 		 *	Figure out if the state machine is
 		 *	requesting an ID.
 		 */
-		if ((vp = fr_pair_find_by_da(&request->reply_pairs, attr_eap_aka_sim_any_id_req, 0)) ||
-		    (vp = fr_pair_find_by_da(&request->reply_pairs, attr_eap_aka_sim_fullauth_id_req, 0)) ||
-		    (vp = fr_pair_find_by_da(&request->reply_pairs, attr_eap_aka_sim_permanent_id_req, 0))) {
+		if ((vp = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_eap_aka_sim_any_id_req)) ||
+		    (vp = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_eap_aka_sim_fullauth_id_req)) ||
+		    (vp = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_eap_aka_sim_permanent_id_req))) {
 			RDEBUG2("Sending EAP-Request/%pV (%s)", &subtype_vp->data, vp->da->name);
 		} else {
 			RDEBUG2("Sending EAP-Request/%pV", &subtype_vp->data);
@@ -158,7 +155,7 @@ static unlang_action_t mod_encode(rlm_rcode_t *p_result, module_ctx_t const *mct
 	 *	it should have used that.
 	 */
 	case FR_SUBTYPE_VALUE_AKA_CHALLENGE:
-		vp = fr_pair_find_by_da(&request->reply_pairs, attr_eap_aka_sim_bidding, 0);
+		vp = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_eap_aka_sim_bidding);
 
 		/*
 		 *	Explicit NO
@@ -188,14 +185,15 @@ static unlang_action_t mod_encode(rlm_rcode_t *p_result, module_ctx_t const *mct
 			if (fr_aka_sim_crypto_finalise_checkcode(vp, &checkcode, mod_session->checkcode_state) < 0) {
 				RPWDEBUG("Failed calculating checkcode");
 				pair_delete_reply(vp);
+			} else {
+				fr_pair_value_memdup_buffer_shallow(vp, checkcode, false);	/* Buffer already in the correct ctx */
 			}
-			fr_pair_value_memdup_buffer_shallow(vp, checkcode, false);	/* Buffer already in the correct ctx */
 		}
 
 		/*
 		 *	Extra data to append to the packet when signing.
 		 */
-		vp = fr_pair_find_by_da(&request->control_pairs, attr_eap_aka_sim_hmac_extra_request, 0);
+		vp = fr_pair_find_by_da(&request->control_pairs, NULL, attr_eap_aka_sim_hmac_extra_request);
 		if (vp) {
 			request_hmac_extra = vp->vp_octets;
 			request_hmac_extra_len = vp->vp_length;
@@ -205,9 +203,22 @@ static unlang_action_t mod_encode(rlm_rcode_t *p_result, module_ctx_t const *mct
 		 *	Extra data to append to the response packet when
 		 *	validating the signature.
 		 */
-		vp = fr_pair_find_by_da(&request->control_pairs, attr_eap_aka_sim_hmac_extra_response, 0);
+		vp = fr_pair_find_by_da(&request->control_pairs, NULL, attr_eap_aka_sim_hmac_extra_response);
 		if (vp) {
-			fr_assert(!mod_session->response_hmac_extra);
+			/*
+			 *	We may attempt to challenge the supplicant
+			 *	twice when performing a resynchronisation.
+			 *
+			 *	We previously asserted that the following were NULL:
+			 *
+			 *	mod_session->response_hmac_extra
+			 *	mod_session->ctx.k_encr
+			 *	mod_session->ctx.k_aut
+			 *
+			 *	but that is incorrect, as these fields need to be
+			 *	updated if new vectors are available.
+			 */
+			talloc_free(mod_session->response_hmac_extra);
 			MEM(mod_session->response_hmac_extra = talloc_memdup(mod_session,
 										vp->vp_octets, vp->vp_length));
 			mod_session->response_hmac_extra_len = vp->vp_length;
@@ -215,18 +226,18 @@ static unlang_action_t mod_encode(rlm_rcode_t *p_result, module_ctx_t const *mct
 		/*
 		 *	Key we use for encrypting and decrypting attributes.
 		 */
-		vp = fr_pair_find_by_da(&request->control_pairs, attr_eap_aka_sim_k_encr, 0);
+		vp = fr_pair_find_by_da(&request->control_pairs, NULL, attr_eap_aka_sim_k_encr);
 		if (vp) {
-			fr_assert(!mod_session->ctx.k_encr);
+			talloc_const_free(mod_session->ctx.k_encr);
 			MEM(mod_session->ctx.k_encr = talloc_memdup(mod_session, vp->vp_octets, vp->vp_length));
 		}
 
 		/*
 		 *	Key we use for signing and validating mac values.
 		 */
-		vp = fr_pair_find_by_da(&request->control_pairs, attr_eap_aka_sim_k_aut, 0);
+		vp = fr_pair_find_by_da(&request->control_pairs, NULL, attr_eap_aka_sim_k_aut);
 		if (vp) {
-			fr_assert(!mod_session->ctx.k_aut);
+			talloc_const_free(mod_session->ctx.k_aut);
 			MEM(mod_session->ctx.k_aut = talloc_memdup(mod_session, vp->vp_octets, vp->vp_length));
 			mod_session->ctx.k_aut_len = vp->vp_length;
 		}
@@ -246,10 +257,9 @@ static unlang_action_t mod_encode(rlm_rcode_t *p_result, module_ctx_t const *mct
 
 	RDEBUG2("Encoding attributes");
 	log_request_pair_list(L_DBG_LVL_2, request, NULL, &request->reply_pairs, NULL);
-	ret = fr_aka_sim_encode(request, &request->reply_pairs, &encode_ctx);
-	if (ret <= 0) RETURN_MODULE_FAIL;
+	if (fr_aka_sim_encode(request, &request->reply_pairs, &encode_ctx) <= 0) RETURN_UNLANG_FAIL;
 
-	switch (subtype_vp->vp_uint16) {
+	switch (subtype_vp->vp_uint8) {
 	case FR_SUBTYPE_VALUE_AKA_IDENTITY:
 		/*
 		 *	Ingest the identity message into the checkcode
@@ -280,21 +290,22 @@ static unlang_action_t mod_encode(rlm_rcode_t *p_result, module_ctx_t const *mct
 /** Decode EAP session data into attribute
  *
  */
-unlang_action_t eap_aka_sim_process(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+unlang_action_t eap_aka_sim_process(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	eap_aka_sim_module_conf_t	*inst = talloc_get_type_abort(mctx->instance, eap_aka_sim_module_conf_t);
+	eap_aka_sim_module_conf_t	*inst = talloc_get_type_abort(mctx->mi->data, eap_aka_sim_module_conf_t);
 	eap_session_t			*eap_session = eap_session_get(request->parent);
 	eap_aka_sim_mod_session_t	*mod_session = talloc_get_type_abort(eap_session->opaque,
 									     eap_aka_sim_mod_session_t);
 	fr_pair_t			*subtype_vp;
 	fr_dcursor_t			cursor;
-	int				ret;
+	ssize_t				ret;
 	fr_aka_sim_ctx_t		decode_ctx;
+	bool				free_hmac_extra = false;
 
 	switch (eap_session->this_round->response->type.num) {
 	default:
 		REDEBUG2("Unsupported EAP type (%u)", eap_session->this_round->response->type.num);
-		RETURN_MODULE_REJECT;
+		RETURN_UNLANG_REJECT;
 
 	case FR_EAP_METHOD_IDENTITY:
 	case FR_EAP_METHOD_NAK:	/* Peer NAK'd our original suggestion */
@@ -306,25 +317,25 @@ unlang_action_t eap_aka_sim_process(rlm_rcode_t *p_result, module_ctx_t const *m
 	case FR_EAP_METHOD_SIM:
 	case FR_EAP_METHOD_AKA:
 	case FR_EAP_METHOD_AKA_PRIME:
-		fr_dcursor_init(&cursor, &request->request_pairs);
+		fr_pair_dcursor_init(&cursor, &request->request_pairs);
 
 		decode_ctx = mod_session->ctx;
 		decode_ctx.hmac_extra = mod_session->response_hmac_extra;
 		decode_ctx.hmac_extra_len = mod_session->response_hmac_extra_len;
 		decode_ctx.eap_packet = eap_session->this_round->response;
 
-		ret = fr_aka_sim_decode(request,
-					&cursor,
+		ret = fr_aka_sim_decode(request->request_ctx,
+					&request->request_pairs,
 					dict_eap_aka_sim,
 					eap_session->this_round->response->type.data,
 					eap_session->this_round->response->type.length,
 					&decode_ctx);
 
 		/*
-		 *	Only good for one response packet
+		 *	The extra data is only good for one response packet.  It is freed at "done",
+		 *	and not here, as the AT_MAC calculation below needs the extra data too.
 		 */
-		TALLOC_FREE(mod_session->response_hmac_extra);
-		mod_session->response_hmac_extra_len = 0;
+		free_hmac_extra = true;
 
 		/*
 		 *	RFC 4187 says we *MUST* notify, not just send
@@ -345,7 +356,7 @@ unlang_action_t eap_aka_sim_process(rlm_rcode_t *p_result, module_ctx_t const *m
 			log_request_pair_list(L_DBG_LVL_2, request, NULL, &request->request_pairs, NULL);
 		}
 
-		subtype_vp = fr_pair_find_by_da(&request->request_pairs, attr_eap_aka_sim_subtype, 0);
+		subtype_vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_eap_aka_sim_subtype);
 		if (!subtype_vp) {
 			REDEBUG2("Missing Sub-Type");	/* Let the state machine enter the right state */
 			break;
@@ -353,7 +364,7 @@ unlang_action_t eap_aka_sim_process(rlm_rcode_t *p_result, module_ctx_t const *m
 
 		RDEBUG2("Received EAP-Response/%pV", &(subtype_vp)->data);
 
-		switch (subtype_vp->vp_uint16) {
+		switch (subtype_vp->vp_uint8) {
 		/*
 		 *	Ingest the identity message into the checkcode
 		 */
@@ -385,9 +396,9 @@ unlang_action_t eap_aka_sim_process(rlm_rcode_t *p_result, module_ctx_t const *m
 				if (fr_aka_sim_crypto_finalise_checkcode(vp, &checkcode, mod_session->checkcode_state) < 0) {
 					RPWDEBUG("Failed calculating checkcode");
 					pair_delete_control(vp);
+				} else {
+					fr_pair_value_memdup_buffer_shallow(vp, checkcode, false);	/* Buffer already in the correct ctx */
 				}
-				fr_pair_value_memdup_buffer_shallow(vp, checkcode, false);	/* Buffer already in the correct ctx */
-
 			}
 			FALL_THROUGH;
 
@@ -398,7 +409,7 @@ unlang_action_t eap_aka_sim_process(rlm_rcode_t *p_result, module_ctx_t const *m
 			uint8_t		*buff;
 
 			MEM(pair_append_control(&vp, attr_eap_aka_sim_mac) >= 0);
-			fr_pair_value_mem_alloc(vp, &buff, AKA_SIM_MAC_DIGEST_SIZE, false);
+			MEM(fr_pair_value_mem_alloc(vp, &buff, AKA_SIM_MAC_DIGEST_SIZE, false) == 0);
 
 			slen = fr_aka_sim_crypto_sign_packet(buff, eap_session->this_round->response, true,
 							     mod_session->ctx.hmac_md,
@@ -409,7 +420,7 @@ unlang_action_t eap_aka_sim_process(rlm_rcode_t *p_result, module_ctx_t const *m
 			if (slen <= 0) {
 				RPEDEBUG("AT_MAC calculation failed");
 				pair_delete_control(vp);
-				RETURN_MODULE_FAIL;
+				RETURN_UNLANG_FAIL;
 			}
 		}
 			break;
@@ -421,16 +432,21 @@ unlang_action_t eap_aka_sim_process(rlm_rcode_t *p_result, module_ctx_t const *m
 	}
 
 done:
+	if (free_hmac_extra) {
+		TALLOC_FREE(mod_session->response_hmac_extra);
+		mod_session->response_hmac_extra_len = 0;
+	}
+
 	/*
 	 *	Setup our encode function as the resumption
 	 *	frame when the state machine finishes with
 	 *	this round.
 	 */
-	(void)unlang_module_yield(request, mod_encode, NULL, NULL);
+	(void)unlang_module_yield(request, mod_encode, NULL, FR_SIGNAL_NONE, NULL);
 
-	if (virtual_server_push(request, inst->virtual_server, UNLANG_SUB_FRAME) < 0) {
+	if (virtual_server_push(&mod_session->virtual_server_result, request, inst->virtual_server, UNLANG_SUB_FRAME) < 0) {
 		unlang_interpet_frame_discard(request);
-		RETURN_MODULE_FAIL;
+		RETURN_UNLANG_FAIL;
 	}
 
 	return UNLANG_ACTION_PUSHED_CHILD;

@@ -25,7 +25,6 @@
  */
 RCSIDH(fr_assert_h, "$Id$")
 
-#include <stdbool.h>
 #include <freeradius-devel/util/debug.h>
 
 #ifdef __cplusplus
@@ -34,7 +33,7 @@ extern "C" {
 
 #ifdef NDEBUG
 #  define fr_assert(_expr)
-#elif !defined(__clang_analyzer__)
+#elif !defined(STATIC_ANALYZER)
 #  define fr_assert(_expr) ((void) ((_expr) ? (void) 0 : (void) fr_assert_exit(__FILE__, __LINE__, #_expr)))
 #else
 #  include <assert.h>

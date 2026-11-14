@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -25,18 +25,18 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/dhcpv4/dhcpv4.h>
 #include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/skip.h>
 
-#include <freeradius-devel/server/map_proc.h>
 
 static fr_dict_t const *dict_dhcpv4;
 
 extern fr_dict_autoload_t rlm_isc_dhcp_dict[];
 fr_dict_autoload_t rlm_isc_dhcp_dict[] = {
 	{ .out = &dict_dhcpv4, .proto = "dhcpv4" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_client_hardware_address;
@@ -57,7 +57,7 @@ fr_dict_attr_autoload_t rlm_isc_dhcp_dict_attr[] = {
 	{ .out = &attr_server_ip_address, .name = "Server-IP-Address", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_dhcpv4},
 	{ .out = &attr_server_identifier, .name = "Server-Identifier", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_dhcpv4},
 
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 typedef struct rlm_isc_dhcp_info_s rlm_isc_dhcp_info_t;
@@ -74,7 +74,7 @@ typedef struct rlm_isc_dhcp_info_s rlm_isc_dhcp_info_t;
  *	be used as the instance handle.
  */
 typedef struct {
-	char const		*name;
+	CONF_SECTION		*cs;
 	char const		*filename;
 	bool			debug;
 	bool			pedantic;
@@ -95,10 +95,10 @@ typedef struct {
 /*
  *	A mapping of configuration file names to internal variables.
  */
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_INPUT | FR_TYPE_REQUIRED | FR_TYPE_NOT_EMPTY, rlm_isc_dhcp_t, filename) },
-	{ FR_CONF_OFFSET("debug", FR_TYPE_BOOL, rlm_isc_dhcp_t, debug) },
-	{ FR_CONF_OFFSET("pedantic", FR_TYPE_BOOL, rlm_isc_dhcp_t, pedantic) },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("filename", CONF_FLAG_FILE_READABLE | CONF_FLAG_REQUIRED | CONF_FLAG_NOT_EMPTY, rlm_isc_dhcp_t, filename) },
+	{ FR_CONF_OFFSET("debug", rlm_isc_dhcp_t, debug) },
+	{ FR_CONF_OFFSET("pedantic", rlm_isc_dhcp_t, pedantic) },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -140,7 +140,7 @@ typedef struct {
 	char		*ptr;		//!< pointer into read buffer
 
 	char		*token;		//!< current token that we parsed
-	int		token_len;	//!< length of the token
+	size_t		token_len;	//!< length of the token
 
 	char		string[256];	//!< double quoted strings go here, so we don't mangle the input buffer
 } rlm_isc_dhcp_tokenizer_t;
@@ -149,7 +149,7 @@ typedef struct {
 typedef int (*rlm_isc_dhcp_parse_t)(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info);
 typedef int (*rlm_isc_dhcp_apply_t)(rlm_isc_dhcp_t const *inst, request_t *request, rlm_isc_dhcp_info_t *info);
 
-typedef enum rlm_isc_dhcp_type_t {
+typedef enum rlm_isc_dhcp_type_t : uint8_t {
 	ISC_INVALID = 0,		//!< we recognize it, but don't implement it
 	ISC_NOOP,			//!< we don't do anything with it
 	ISC_IGNORE,			//!< we deliberately ignore it
@@ -205,6 +205,9 @@ static int parse_section(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *i
 
 static char const *spaces = "                                                                                ";
 
+#define state_error(_fmt, ...) cf_log_err(state->inst->cs, "Failed parsing %s[%d] - " _fmt, \
+					  state->filename, state->lineno, ## __VA_ARGS__)
+
 /** Refills the read buffer with one line from the file.
  *
  *	This function also takes care of suppressing blank lines, and
@@ -226,12 +229,13 @@ redo:
 	state->lineno++;
 	state->line = state->ptr;
 
-	if (!fgets(state->ptr, state->bufsize - (state->ptr - state->buffer), state->fp)) {
+	if (!fgets(state->ptr, (int)(state->bufsize - (state->ptr - state->buffer)), state->fp)) {
 		if (feof(state->fp)) {
 			state->eof = true;
 			return 0;
 		}
 
+		state_error("%s", fr_syserror(errno));
 		return -1;
 	}
 
@@ -257,8 +261,9 @@ redo:
 
 static int skip_spaces(rlm_isc_dhcp_tokenizer_t *state, char *p)
 {
-	state->ptr = p;
 	char *start = p;
+
+	state->ptr = p;
 
 	fr_skip_whitespace(state->ptr);
 
@@ -287,8 +292,6 @@ static int skip_spaces(rlm_isc_dhcp_tokenizer_t *state, char *p)
 	return 0;
 }
 
-
-
 /*
  *	ISC's double quoted strings allow all kinds of extra magic, so
  *	we re-implement string parsing yet again.
@@ -300,20 +303,20 @@ static int read_string(rlm_isc_dhcp_tokenizer_t *state)
 
 	while (true) {
 		if (!*p) {
-			fr_strerror_const("unterminated string");
+			state_error("unterminated string");
 			return -1;
 		}
 
 		if (*p == '"') {
 			p++;
-			if (isspace((int) *p)) {
+			if (isspace((uint8_t) *p)) {
 				if (skip_spaces(state, p) < 0) return -1;
 				break;
 			}
 		}
 
-		if ((size_t) (q - state->string) >= sizeof(state->string)) {
-			fr_strerror_const("string is too long");
+		if ((size_t) (q - state->string) >= sizeof(state->string) - 1) {
+			state_error("string is too long");
 			return -1;
 		}
 
@@ -355,7 +358,7 @@ redo:
 
 		if (ret == 0) {
 			if (!state->allow_eof) {
-				fr_strerror_const("Unexpected EOF");
+				state_error("Unexpected EOF");
 				return -1;
 			}
 
@@ -368,7 +371,7 @@ redo:
 	 *	or semi-colon.  We skip those characters
 	 *	before looking for the next token.
 	 */
-	while (isspace((int) *state->ptr) || (*state->ptr == ';') || (*state->ptr == ',')) state->ptr++;
+	while (isspace((uint8_t) *state->ptr) || (*state->ptr == ';') || (*state->ptr == ',')) state->ptr++;
 
 	if (!*state->ptr) goto redo;
 
@@ -384,7 +387,7 @@ redo:
 	 */
 	if (state->token[0] == '"') {
 		if (hint != T_DOUBLE_QUOTED_STRING) {
-			fr_strerror_printf("Unexpected '\"'");
+			state_error("Unexpected '\"'");
 			return -1;
 		}
 
@@ -398,7 +401,7 @@ redo:
 		 */
 		if (*p == ';') {
 			if (semicolon == NO_SEMICOLON) {
-				fr_strerror_const("unexpected ';'");
+				state_error("unexpected ';'");
 				return -1;
 			}
 
@@ -446,7 +449,7 @@ redo:
 		/*
 		 *	Whitespace, we're done.
 		 */
-		if (isspace((int) *p)) {
+		if (isspace((uint8_t) *p)) {
 			if (skip_spaces(state, p) < 0) return -1;
 			break;
 		}
@@ -458,12 +461,12 @@ redo:
 	state->token_len = p - state->token;
 
 	if (state->token_len == 0) {
-		fr_strerror_const("FUCK");
+		state_error("Failed to find token");
 		return -1;
 	}
 
 	if (state->token_len >= 256) {
-		fr_strerror_const("token too large");
+		state_error("token too large");
 		return -1;
 	}
 
@@ -473,12 +476,12 @@ redo:
 	 */
 	if (hint == T_LCBRACE) {
 		if (*state->token != '{') {
-			fr_strerror_const("missing '{'");
+			state_error("missing '{'");
 			return -1;
 		}
 
 		if ((size_t) state->braces >= (sizeof(spaces) - 1)) {
-			fr_strerror_const("sections are nested too deep");
+			state_error("sections are nested too deep");
 			return -1;
 		}
 
@@ -488,7 +491,7 @@ redo:
 
 	if (hint == T_RCBRACE) {
 		if (*state->token != '}') {
-			fr_strerror_const("missing '}'");
+			state_error("missing '}'");
 			return -1;
 		}
 
@@ -503,7 +506,7 @@ redo:
 	 */
 	if (*state->token == '}') {
 		if (!allow_rcbrace) {
-			fr_strerror_const("unexpected '}'");
+			state_error("unexpected '}'");
 			return -1;
 		}
 
@@ -517,7 +520,7 @@ redo:
 	 */
 	if ((hint == T_BARE_WORD) || (hint == T_DOUBLE_QUOTED_STRING)) {
 		if (*state->token == '{') {
-			fr_strerror_const("unexpected '{'");
+			state_error("unexpected '{'");
 			return -1;
 		}
 	}
@@ -548,13 +551,13 @@ static int match_subword(rlm_isc_dhcp_tokenizer_t *state, char const *cmd, rlm_i
 	 *	Remember the next command.
 	 */
 	next = q = cmd;
-	while (*next && !isspace((int) *next) && (*next != ',')) next++;
+	while (*next && !isspace((uint8_t) *next) && (*next != ',')) next++;
 	if (!*next) semicolon = YES_SEMICOLON;
 
 	/*
 	 *	Matching an in-line word.
 	 */
-	if (islower((int) *q)) {
+	if (islower((uint8_t) *q)) {
 		ret = read_token(state, T_BARE_WORD, semicolon, false);
 		if (ret <= 0) return -1;
 
@@ -564,9 +567,9 @@ static int match_subword(rlm_isc_dhcp_tokenizer_t *state, char const *cmd, rlm_i
 		for (p = state->token; p < (state->token + state->token_len); p++, q++) {
 			if (*p != *q) {
 			fail:
-				fr_strerror_printf("Expected '%.*s', got unknown text '%.*s'",
-						   state->token_len, state->token,
-						   (int) (next - cmd), cmd);
+				state_error("Expected '%.*s', got unknown text '%.*s'",
+					    (int)state->token_len, state->token,
+					    (int) (next - cmd), cmd);
 				return -1;
 			}
 		}
@@ -583,7 +586,7 @@ static int match_subword(rlm_isc_dhcp_tokenizer_t *state, char const *cmd, rlm_i
 		 *	Matched all of this word in 'q', but there are
 		 *	more words after this one..  Recurse.
 		 */
-		if (isspace((int) *q)) {
+		if (isspace((uint8_t) *q)) {
 			return match_subword(state, next, info);
 		}
 
@@ -621,9 +624,9 @@ static int match_subword(rlm_isc_dhcp_tokenizer_t *state, char const *cmd, rlm_i
 	 *	multiple fields.
 	 */
 	p = type_name;
-	while (*q && !isspace((int) *q) && (*q != ',')) {
+	while (*q && !isspace((uint8_t) *q) && (*q != ',')) {
 		if ((p - type_name) >= (int) sizeof(type_name)) return -1; /* internal error */
-		*(p++) = tolower((int) *(q++));
+		*(p++) = tolower((uint8_t) *(q++));
 	}
 	*p = '\0';
 
@@ -653,10 +656,9 @@ static int match_subword(rlm_isc_dhcp_tokenizer_t *state, char const *cmd, rlm_i
 		semicolon = MAYBE_SEMICOLON;
 	}
 
-	type = fr_table_value_by_str(fr_value_box_type_table, type_name, FR_TYPE_NULL);
+	type = fr_type_from_str(type_name);
 	if (type == FR_TYPE_NULL) {
-		fr_strerror_printf("unknown data type '%.*s'",
-				   (int) (next - cmd), cmd);
+		state_error("unknown data type '%.*s'", (int) (next - cmd), cmd);
 		return -1;	/* internal error */
 	}
 
@@ -693,9 +695,8 @@ redo_multi:
 	 */
 	info->argv[info->argc] = talloc_zero(info, fr_value_box_t);
 
-	ret = fr_value_box_from_str(info, info->argv[info->argc], type, NULL,
-				      state->token, state->token_len, 0, false);
-	if (ret < 0) return ret;
+	if (fr_value_box_from_str(info, info->argv[info->argc], type, NULL,
+				  state->token, state->token_len, NULL) < 0) return -1;
 
 	info->argc++;
 
@@ -703,8 +704,8 @@ redo_multi:
 		if (state->saw_semicolon) return 1;
 
 		if (info->argc >= info->cmd->max_argc) {
-			fr_strerror_printf("Too many arguments (%d > %d) for command '%s'",
-					   info->argc, info->cmd->max_argc, info->cmd->name);
+			state_error("Too many arguments (%d > %d) for command '%s'",
+				    info->argc, info->cmd->max_argc, info->cmd->name);
 			return -1;
 		}
 
@@ -728,15 +729,18 @@ redo_multi:
 static int parse_include(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info)
 {
 	int ret;
-	char *p, pathname[8192];
+	char pathname[8192];
+	char const *sep;
 	char const *name = info->argv[0]->vb_strvalue;
 
 	IDEBUG("%.*s include %s ;", state->braces, spaces, name);
 
-	p = strrchr(state->filename, '/');
-	if (p) {
+	sep = strrchr(state->filename, '/');
+	if (sep) {
+		char *p;
+
 		strlcpy(pathname, state->filename, sizeof(pathname));
-		p = pathname + (p - state->filename) + 1;
+		p = pathname + (sep - state->filename) + 1;
 		strlcpy(p, name, sizeof(pathname) - (p - pathname));
 
 		name = pathname;
@@ -770,7 +774,7 @@ static uint32_t host_ether_hash(void const *data)
 	return fr_hash(self->ether, sizeof(self->ether));
 }
 
-static int8_t host_ether_cmp(void const *one, void const *two)
+static fr_cmp_ret_t host_ether_cmp(void const *one, void const *two)
 {
 	isc_host_ether_t const *a = one;
 	isc_host_ether_t const *b = two;
@@ -792,25 +796,25 @@ static uint32_t host_uid_hash(void const *data)
 	return fr_hash(self->client->vb_octets, self->client->vb_length);
 }
 
-static int8_t host_uid_cmp(void const *one, void const *two)
+static fr_cmp_ret_t host_uid_cmp(void const *one, void const *two)
 {
 	isc_host_uid_t const *a = one;
 	isc_host_uid_t const *b = two;
 
 	MEMCMP_RETURN(a, b, client->vb_octets, client->vb_length);
-	return 0;
+	return CMP_EQ;
 }
 
 
 /**	option space name [ [ code width number ] [ length width number ] [ hash size number ] ] ;
  *
  */
-static int parse_option_space(UNUSED rlm_isc_dhcp_info_t *parent, UNUSED rlm_isc_dhcp_tokenizer_t *state,
+static int parse_option_space(UNUSED rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *state,
 			      UNUSED char *name)
 {
 	// @todo - register the named option space with inst->option_space
 	//	   and create inst->option_space
-	fr_strerror_const("please implement 'option space name [ [ code width number ] [ length width number ] [ hash size number ] ]'");
+	state_error("please implement 'option space name [ [ code width number ] [ length width number ] [ hash size number ] ]'");
 	return -1;
 }
 
@@ -839,7 +843,7 @@ static fr_type_t isc2fr_type(rlm_isc_dhcp_tokenizer_t *state)
 	TYPE_CHECK("text", FR_TYPE_STRING);
 	TYPE_CHECK("string", FR_TYPE_OCTETS);
 
-	fr_strerror_printf("unknown type '%.*s'", state->token_len, state->token);
+	state_error("unknown type '%.*s'", (int)state->token_len, state->token);
 	return FR_TYPE_NULL;
 }
 
@@ -861,14 +865,14 @@ static int parse_option_definition(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tok
 
 	p = strchr(name, '.');
 	if (p) {
-		fr_strerror_const("cannot (yet) define options in spaces");
+		state_error("cannot (yet) define options in spaces");
 	error:
 		talloc_free(name);
 		return -1;
 	}
 
 	if (parent != state->inst->head) {
-		fr_strerror_const("option definitions cannot be scoped");
+		state_error("option definitions cannot be scoped");
 		goto error;
 	}
 
@@ -883,9 +887,8 @@ static int parse_option_definition(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tok
 	}
 
 	type = FR_TYPE_UINT32;
-	ret = fr_value_box_from_str(NULL, &box, type, NULL,
-				      state->token, state->token_len, 0, false);
-	if (ret < 0) goto error;
+	if (fr_value_box_from_str(NULL, &box, type, NULL,
+				  state->token, state->token_len, NULL) < 0) goto error;
 
 	/*
 	 *	Look for '='
@@ -894,7 +897,7 @@ static int parse_option_definition(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tok
 	if (ret <= 0) goto error_ret;
 
 	if ((state->token_len != 1) || (state->token[0] != '=')) {
-		fr_strerror_printf("expected '=' after code definition got '%.*s'", state->token_len, state->token);
+		state_error("expected '=' after code definition got '%.*s'", (int)state->token_len, state->token);
 		goto error;
 	}
 
@@ -922,8 +925,8 @@ static int parse_option_definition(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tok
 		if (ret <= 0) goto error_ret;
 
 		if (! ((state->token_len == 2) && (memcmp(state->token, "of", 2) == 0))) {
-			fr_strerror_printf("expected 'array of', not 'array %.*s'",
-					   state->token_len, state->token);
+			state_error("expected 'array of', not 'array %.*s'",
+				    (int)state->token_len, state->token);
 			goto error;
 		}
 
@@ -935,7 +938,7 @@ static int parse_option_definition(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tok
 	}
 
 	if ((state->token_len == 1) && (state->token[0] == '{')) {
-		fr_strerror_const("records are not supported in option definition");
+		state_error("records are not supported in option definition");
 		goto error;
 	}
 
@@ -946,7 +949,7 @@ static int parse_option_definition(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tok
 	 *	not a *semicolon* error.
 	 */
 	if (!state->saw_semicolon) {
-		fr_strerror_const("expected ';'");
+		state_error("expected ';'");
 		goto error;
 	}
 
@@ -960,7 +963,7 @@ static int parse_option_definition(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tok
 	da = fr_dict_attr_by_name(NULL, fr_dict_root(dict_dhcpv4), name);
 	if (da &&
 	    ((da->attr != box.vb_uint32) || (da->type != type))) {
-		fr_strerror_printf("cannot add different code / type for a pre-existing name '%s'", name);
+		state_error("cannot add different code / type for a pre-existing name '%s'", name);
 		goto error;
 	}
 
@@ -973,7 +976,7 @@ static int parse_option_definition(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tok
 	root = fr_dict_root(dict_dhcpv4);
 	da = fr_dict_attr_child_by_num(root, box.vb_uint32);
 	if (da && (da->type != type)) {
-		fr_strerror_printf("cannot add different type for a pre-existing code %d", box.vb_uint32);
+		state_error("cannot add different type for a pre-existing code %u", box.vb_uint32);
 		goto error;
 	}
 
@@ -1005,7 +1008,7 @@ static int parse_option(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *s
 	 *	semicolon after it.
 	 */
 	if (!da->flags.array && !state->saw_semicolon) {
-		fr_strerror_printf("expected ';' %s", state->ptr);
+		state_error("expected ';' %s", state->ptr);
 		return -1;
 	}
 
@@ -1014,13 +1017,11 @@ static int parse_option(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *s
 	/*
 	 *	Add in the first value.
 	 */
-	ret = fr_pair_value_from_str(vp, value, talloc_array_length(value) - 1, '\0', false);
+	ret = fr_pair_value_from_str(vp, value, talloc_strlen(value), NULL, false);
 	if (ret < 0) {
 		talloc_free(value);
 		return ret;
 	}
-
-	vp->op = T_OP_EQ;
 
 	fr_pair_append(&parent->options, vp);
 
@@ -1043,15 +1044,13 @@ static int parse_option(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *s
 
 		MEM(vp = fr_pair_afrom_da(parent, da));
 
-		ret = fr_pair_value_from_str(vp, state->token, state->token_len, '\0', false);
+		ret = fr_pair_value_from_str(vp, state->token, state->token_len, NULL, false);
 		if (ret < 0) return ret;
-
-		vp->op = T_OP_EQ;
 
 		fr_pair_append(&parent->options, vp);
 
 		// @todo - print out ISC names...
-		IDEBUG("%.*s option %s %.*ss ", state->braces, spaces, da->name, state->token_len, state->token);
+		IDEBUG("%.*s option %s %.*ss ", state->braces, spaces, da->name, (int)state->token_len, state->token);
 	}
 
 	/*
@@ -1094,7 +1093,7 @@ static int parse_options(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *
 	 *	Must have at least two arguments.
 	 */
 	if (argc < 2) {
-		fr_strerror_const("unexpected ';'");
+		state_error("unexpected ';'");
 		return -1;
 	}
 
@@ -1140,7 +1139,7 @@ static int parse_options(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *
 	 *	It must be "option NAME code NUMBER = DEFINITION"
 	 */
 	if (strcmp(argv[1], "code") != 0) {
-		fr_strerror_printf("unknown option '%s'", argv[0]);
+		state_error("unknown option '%s'", argv[0]);
 		talloc_free(argv[0]);
 		talloc_free(argv[1]);
 		return -1;
@@ -1204,7 +1203,7 @@ static int match_keyword(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *
 			/*
 			 *	The token exactly matches the command.
 			 */
-			if (!c || isspace((int) c)) {
+			if (!c || isspace((uint8_t) c)) {
 				q = &(tokens[half].name[state->token_len]);
 				break;
 			}
@@ -1234,7 +1233,7 @@ static int match_keyword(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *
 	 */
 	if (!q) {
 	unknown:
-		fr_strerror_printf("unknown command '%.*s'", state->token_len, state->token);
+		state_error("unknown command '%.*s'", (int)state->token_len, state->token);
 		return -1;
 	}
 
@@ -1254,7 +1253,7 @@ static int match_keyword(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *
 	if (state->inst->pedantic && !tokens[half].parse) {
 		if (tokens[half].type == ISC_INVALID) {
 			ERROR("Command '%.*s' is not supported.",
-			      state->token_len, state->token);
+			      (int)state->token_len, state->token);
 			return -1;
 		}
 
@@ -1266,19 +1265,19 @@ static int match_keyword(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *
 		if (DEBUG_ENABLED) {
 			if (tokens[half].type == ISC_NOOP) {
 				WARN("Command '%.*s' is not yet implemented.",
-				     state->token_len, state->token);
+				     (int)state->token_len, state->token);
 			}
 
 			if (tokens[half].type == ISC_IGNORE) {
 				WARN("Ignoring command '%.*s'.  It is not relevant.",
-				     state->token_len, state->token);
+				     (int)state->token_len, state->token);
 			}
 		}
 	}
 
 	semicolon = YES_SEMICOLON; /* default to always requiring this */
 
-	DDEBUG("... TOKEN %.*s ", state->token_len, state->token);
+	DDEBUG("... TOKEN %.*s ", (int)state->token_len, state->token);
 
 	info = talloc_zero(parent, rlm_isc_dhcp_info_t);
 	fr_pair_list_init(&info->options);
@@ -1297,7 +1296,7 @@ static int match_keyword(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *
 	 *	There's more to this command,
 	 *	go parse that, too.
 	 */
-	if (isspace((int) *q)) {
+	if (isspace((uint8_t) *q)) {
 		if (state->saw_semicolon) goto unexpected;
 
 		ret = match_subword(state, q, info);
@@ -1314,13 +1313,13 @@ static int match_keyword(rlm_isc_dhcp_info_t *parent, rlm_isc_dhcp_tokenizer_t *
 	 */
 	if ((semicolon == NO_SEMICOLON) && state->saw_semicolon) {
 	unexpected:
-		fr_strerror_const("unexpected ';'");
+		state_error("unexpected ';'");
 		talloc_free(info);
 		return -1;
 	}
 
 	if ((semicolon == YES_SEMICOLON) && !state->saw_semicolon) {
-		fr_strerror_const("missing ';'");
+		state_error("missing ';'");
 		talloc_free(info);
 		return -1;
 	}
@@ -1392,7 +1391,7 @@ static int parse_host(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info
 	for (child = info->child; child != NULL; child = child->next) {
 		if (child->cmd->type == ISC_HARDWARE_ETHERNET) {
 			if (ether) {
-				fr_strerror_const("cannot have two 'hardware ethernet' entries in a 'host'");
+				state_error("cannot have two 'hardware ethernet' entries in a 'host'");
 				return -1;
 			}
 
@@ -1401,8 +1400,8 @@ static int parse_host(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info
 	}
 
 	if (!ether) {
-		fr_strerror_printf("host %s does not contain a 'hardware ethernet' entry",
-				   info->argv[0]->vb_strvalue);
+		state_error("host %s does not contain a 'hardware ethernet' entry",
+			    info->argv[0]->vb_strvalue);
 		return -1;
 	}
 
@@ -1416,10 +1415,20 @@ static int parse_host(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info
 	/*
 	 *	We can't have duplicate ethernet addresses for hosts.
 	 */
-	old_ether = fr_hash_table_find(state->inst->hosts_by_ether, my_ether);
+	fr_hash_table_find((void **)&old_ether, state->inst->hosts_by_ether, my_ether);
 	if (old_ether) {
-		fr_strerror_printf("'host %s' and 'host %s' contain duplicate 'hardware ethernet' fields",
-				   info->argv[0]->vb_strvalue, old_ether->host->argv[0]->vb_strvalue);
+		state_error("'host %s' and 'host %s' contain duplicate 'hardware ethernet' fields",
+			    info->argv[0]->vb_strvalue, old_ether->host->argv[0]->vb_strvalue);
+		talloc_free(my_ether);
+		return -1;
+	}
+
+	/*
+	 *	Insert into the ether hashes.
+	 */
+	if (fr_hash_table_insert(state->inst->hosts_by_ether, my_ether) != 0) {
+		state_error("Failed inserting 'host %s' into hash table",
+			    info->argv[0]->vb_strvalue);
 		talloc_free(my_ether);
 		return -1;
 	}
@@ -1427,39 +1436,26 @@ static int parse_host(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info
 	/*
 	 *	The 'host' entry might not have a client identifier option.
 	 */
-	vp = fr_pair_find_by_da(&info->options, attr_client_identifier, 0);
+	vp = fr_pair_find_by_da(&info->options, NULL, attr_client_identifier);
 	if (vp) {
 		my_uid = talloc_zero(info, isc_host_uid_t);
 		my_uid->client = &vp->data;
 		my_uid->host = info;
 
-		old_uid = fr_hash_table_find(state->inst->hosts_by_uid, my_uid);
+		fr_hash_table_find((void **)&old_uid, state->inst->hosts_by_uid, my_uid);
 		if (old_uid) {
-			fr_strerror_printf("'host %s' and 'host %s' contain duplicate 'option client-identifier' fields",
-					   info->argv[0]->vb_strvalue, old_uid->host->argv[0]->vb_strvalue);
-			talloc_free(my_ether);
+			state_error("'host %s' and 'host %s' contain duplicate 'option client-identifier' fields",
+				    info->argv[0]->vb_strvalue, old_uid->host->argv[0]->vb_strvalue);
+		fail:
+			(void) fr_hash_table_delete(state->inst->hosts_by_ether, my_ether);
 			talloc_free(my_uid);
 			return -1;
 		}
-	}
 
-	/*
-	 *	Insert into the ether hashes.
-	 */
-	if (!fr_hash_table_insert(state->inst->hosts_by_ether, my_ether)) {
-		fr_strerror_printf("Failed inserting 'host %s' into hash table",
-				   info->argv[0]->vb_strvalue);
-		talloc_free(my_ether);
-		if (my_uid) talloc_free(my_uid);
-		return -1;
-	}
-
-	if (my_uid) {
-		if (!fr_hash_table_insert(state->inst->hosts_by_uid, my_uid)) {
-			fr_strerror_printf("Failed inserting 'host %s' into hash table",
-					   info->argv[0]->vb_strvalue);
-			talloc_free(my_uid);
-			return -1;
+		if (fr_hash_table_insert(state->inst->hosts_by_uid, my_uid) != 0) {
+			state_error("Failed inserting 'host %s' into hash table",
+				    info->argv[0]->vb_strvalue);
+			goto fail;
 		}
 	}
 
@@ -1485,9 +1481,9 @@ static int parse_host(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info
 		}
 	}
 
-	if (!fr_hash_table_insert(parent->hosts_by_ether, my_ether)) {
-		fr_strerror_printf("Failed inserting 'host %s' into hash table",
-				   info->argv[0]->vb_strvalue);
+	if (fr_hash_table_insert(parent->hosts_by_ether, my_ether) != 0) {
+		state_error("Failed inserting 'host %s' into hash table",
+			    info->argv[0]->vb_strvalue);
 		return -1;
 	}
 
@@ -1502,10 +1498,10 @@ static int parse_host(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info
 			}
 		}
 
-
-		if (!fr_hash_table_insert(parent->hosts_by_uid, my_uid)) {
-			fr_strerror_printf("Failed inserting 'host %s' into hash table",
-					   info->argv[0]->vb_strvalue);
+		if (fr_hash_table_insert(parent->hosts_by_uid, my_uid) != 0) {
+			(void) fr_hash_table_remove(NULL, parent->hosts_by_ether, my_ether); /* remove and don't free */
+			state_error("Failed inserting 'host %s' into hash table",
+				    info->argv[0]->vb_strvalue);
 			return -1;
 		}
 	}
@@ -1519,11 +1515,6 @@ static int parse_host(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info
 	return 2;
 }
 
-/*
- *	Utter laziness
- */
-#define vb_ipv4addr vb_ip.addr.v4.s_addr
-
 /** subnet IPADDR netmask MASK { ... }
  *
  */
@@ -1536,8 +1527,8 @@ static int parse_subnet(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *in
 	/*
 	 *	Check if argv[1] is a valid netmask
 	 */
-	if (!(netmask & (~netmask >> 1))) {
-		fr_strerror_printf("invalid netmask '%pV'", info->argv[1]);
+	if (netmask & (~netmask >> 1)) {
+		state_error("invalid netmask '%pV'", info->argv[1]);
 		return -1;
 	}
 
@@ -1545,7 +1536,7 @@ static int parse_subnet(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *in
 	 *	192.168.2.1/16 is wrong.
 	 */
 	if ((info->argv[0]->vb_ipv4addr & netmask) != info->argv[0]->vb_ipv4addr) {
-		fr_strerror_printf("subnet '%pV' does not match netmask '%pV'", info->argv[0], info->argv[1]);
+		state_error("subnet '%pV' does not match netmask '%pV'", info->argv[0], info->argv[1]);
 		return -1;
 	}
 
@@ -1564,11 +1555,11 @@ static int parse_subnet(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *in
 		rlm_isc_dhcp_info_t *old;
 
 		/*
-		 *	Duplicate or overlapping "subnet" entries aren't allowd.
+		 *	Duplicate or overlapping "subnet" entries aren't allowed.
 		 */
 		old = fr_trie_lookup_by_key(parent->subnets, &(info->argv[0]->vb_ipv4addr), bits);
 		if (old) {
-			fr_strerror_printf("subnet %pV netmask %pV' overlaps with existing subnet", info->argv[0], info->argv[1]);
+			state_error("subnet %pV netmask %pV' overlaps with existing subnet", info->argv[0], info->argv[1]);
 			return -1;
 
 		}
@@ -1586,8 +1577,8 @@ static int parse_subnet(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *in
 
 	ret = fr_trie_insert_by_key(parent->subnets, &(info->argv[0]->vb_ipv4addr), bits, info);
 	if (ret < 0) {
-		fr_strerror_printf("Failed inserting 'subnet %pV netmask %pV' into trie",
-				   info->argv[0], info->argv[1]);
+		state_error("Failed inserting 'subnet %pV netmask %pV' into trie",
+			    info->argv[0], info->argv[1]);
 		return -1;
 	}
 
@@ -1618,26 +1609,27 @@ static rlm_isc_dhcp_info_t *get_host(request_t *request, fr_hash_table_t *hosts_
 	 *	If that doesn't match, use client hardware
 	 *	address.
 	 */
-	vp = fr_pair_find_by_da(&request->request_pairs, attr_client_identifier, 0);
-	if (vp) {
-		isc_host_uid_t *client, my_client;
+	if (hosts_by_uid) {
+		vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_client_identifier);
+		if (vp) {
+			isc_host_uid_t *client, my_client;
 
-		my_client.client = &(vp->data);
+			my_client.client = &(vp->data);
 
-		client = fr_hash_table_find(hosts_by_uid, &my_client);
-		if (client) {
-			host = client->host;
-			goto done;
+			fr_hash_table_find((void **)&client, hosts_by_uid, &my_client);
+			if (client) {
+				host = client->host;
+				goto done;
+			}
 		}
 	}
 
-
-	vp = fr_pair_find_by_da(&request->request_pairs, attr_client_hardware_address, 0);
+	vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_client_hardware_address);
 	if (!vp) return NULL;
 
 	memcpy(&my_ether.ether, vp->vp_ether, sizeof(my_ether.ether));
 
-	ether = fr_hash_table_find(hosts_by_ether, &my_ether);
+	fr_hash_table_find((void **)&ether, hosts_by_ether, &my_ether);
 	if (!ether) return NULL;
 
 	host = ether->host;
@@ -1657,15 +1649,17 @@ done:
 
 static int add_option_by_da(rlm_isc_dhcp_info_t *info, fr_dict_attr_t const *da)
 {
-	int ret;
 	fr_pair_t *vp;
 
 	if (!info->parent) return -1; /* internal error */
 
 	MEM(vp = fr_pair_afrom_da(info->parent, da));
 
-	ret = fr_value_box_copy(vp, &(vp->data), info->argv[0]);
-	if (ret < 0) return ret;
+	/* TLS error buffer is checked */
+	if (unlikely(fr_value_box_copy(vp, &(vp->data), info->argv[0]) < 0)) {
+		talloc_free(vp);
+		return -1;
+	}
 
 	fr_pair_append(&info->parent->options, vp);
 
@@ -1678,10 +1672,10 @@ static int add_option_by_da(rlm_isc_dhcp_info_t *info, fr_dict_attr_t const *da)
 /** filename STRING
  *
  */
-static int parse_filename(UNUSED rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info)
+static int parse_filename(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info)
 {
 	if (info->argv[0]->vb_length > member_size(dhcp_packet_t, file)) {
-		fr_strerror_const("filename is too long");
+		state_error("filename is too long");
 		return -1;
 	}
 
@@ -1691,10 +1685,10 @@ static int parse_filename(UNUSED rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_i
 /** server-name STRING
  *
  */
-static int parse_server_name(UNUSED rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info)
+static int parse_server_name(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *info)
 {
 	if (info->argv[0]->vb_length > member_size(dhcp_packet_t, sname)) {
-		fr_strerror_const("filename is too long");
+		state_error("server name is too long");
 		return -1;
 	}
 
@@ -1745,7 +1739,6 @@ static int parse_next_server(UNUSED rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhc
  */
 static int apply_fixed_ip(rlm_isc_dhcp_t const *inst, request_t *request)
 {
-	int ret;
 	rlm_isc_dhcp_info_t *host, *info;
 	fr_pair_t *vp;
 	fr_pair_t *yiaddr;
@@ -1753,7 +1746,7 @@ static int apply_fixed_ip(rlm_isc_dhcp_t const *inst, request_t *request)
 	/*
 	 *	If there's already a fixed IP, don't do anything
 	 */
-	yiaddr = fr_pair_find_by_da(&request->reply_pairs, attr_your_ip_address, 0);
+	yiaddr = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_your_ip_address);
 	if (yiaddr) return 0;
 
 	host = get_host(request, inst->hosts_by_ether, inst->hosts_by_uid);
@@ -1774,9 +1767,10 @@ static int apply_fixed_ip(rlm_isc_dhcp_t const *inst, request_t *request)
 
 		MEM(vp = fr_pair_afrom_da(request->reply_ctx, attr_your_ip_address));
 
-		ret = fr_value_box_copy(vp, &(vp->data), info->argv[0]);
-		if (ret < 0) return ret;
-
+		if (unlikely(fr_value_box_copy(vp, &(vp->data), info->argv[0]) < 0)) {
+			RPEDEBUG("Failed assigning Your-IP-Address");
+			return -1;
+		}
 		fr_pair_append(&request->reply_pairs, vp);
 
 		/*
@@ -1800,7 +1794,7 @@ static int apply(rlm_isc_dhcp_t const *inst, request_t *request, rlm_isc_dhcp_in
 	fr_pair_t *yiaddr;
 
 	ret = 0;
-	yiaddr = fr_pair_find_by_da(&request->reply_pairs, attr_your_ip_address, 0);
+	yiaddr = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_your_ip_address);
 
 	/*
 	 *	First, apply any "host" options
@@ -1877,7 +1871,7 @@ recurse:
 		     vp = fr_pair_list_next(&head->options, vp)) {
 			fr_pair_t *reply;
 
-			reply = fr_pair_find_by_da(&request->reply_pairs, vp->da, 0);
+			reply = fr_pair_find_by_da(&request->reply_pairs, NULL, vp->da);
 			if (reply) continue;
 
 			/*
@@ -2068,8 +2062,8 @@ static int parse_section(rlm_isc_dhcp_tokenizer_t *state, rlm_isc_dhcp_info_t *i
 			q = parent->cmd->name;
 			fr_skip_not_whitespace(q);
 
-			fr_strerror_printf("cannot nest '%.*s' statements",
-					   (int) (q - parent->cmd->name), parent->cmd->name);
+			state_error("cannot nest '%.*s' statements",
+				    (int) (q - parent->cmd->name), parent->cmd->name);
 			return -1;
 		}
 	}
@@ -2120,7 +2114,7 @@ static int read_file(rlm_isc_dhcp_t *inst, rlm_isc_dhcp_info_t *parent, char con
 	 */
 	fp = fopen(filename, "r");
 	if (!fp) {
-		fr_strerror_printf("Error opening filename %s: %s", filename, fr_syserror(errno));
+		cf_log_err(inst->cs, "Error opening filename %s: %s", filename, fr_syserror(errno));
 		return -1;
 	}
 
@@ -2148,9 +2142,6 @@ static int read_file(rlm_isc_dhcp_t *inst, rlm_isc_dhcp_info_t *parent, char con
 		ret = read_token(&state, T_BARE_WORD, YES_SEMICOLON, false);
 		if (ret < 0) {
 		fail:
-			fr_strerror_printf("Failed reading %s:[%d] - %s",
-					   filename, state.lineno,
-					   fr_strerror());
 			fclose(fp);
 			return ret;
 		}
@@ -2176,16 +2167,15 @@ static int read_file(rlm_isc_dhcp_t *inst, rlm_isc_dhcp_info_t *parent, char con
 	return 1;
 }
 
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	int ret;
-	rlm_isc_dhcp_t *inst = instance;
-	rlm_isc_dhcp_info_t *info;
+	rlm_isc_dhcp_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_isc_dhcp_t);
+	CONF_SECTION		*conf = mctx->mi->conf;
+	rlm_isc_dhcp_info_t	*info;
+	int			ret;
 
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) inst->name = cf_section_name1(conf);
-
-	inst->head = info = talloc_zero(inst, rlm_isc_dhcp_info_t);
+	inst->cs = conf;
+	MEM(inst->head = info = talloc_zero(inst, rlm_isc_dhcp_info_t));
 	fr_pair_list_init(&info->options);
 	info->last = &(info->child);
 
@@ -2196,10 +2186,7 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 	if (!inst->hosts_by_uid) return -1;
 
 	ret = read_file(inst, info, inst->filename);
-	if (ret < 0) {
-		cf_log_err(conf, "%s", fr_strerror());
-		return -1;
-	}
+	if (ret < 0) return -1;
 
 	if (ret == 0) {
 		cf_log_warn(conf, "No configuration read from %s", inst->filename);
@@ -2209,45 +2196,48 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 	return 0;
 }
 
-static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_authorize(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_isc_dhcp_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_isc_dhcp_t);
+	rlm_isc_dhcp_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_isc_dhcp_t);
 	int			ret;
 
 	ret = apply_fixed_ip(inst, request);
-	if (ret < 0) RETURN_MODULE_FAIL;
-	if (ret == 0) RETURN_MODULE_NOOP;
+	if (ret < 0) RETURN_UNLANG_FAIL;
+	if (ret == 0) RETURN_UNLANG_NOOP;
 
-	if (ret == 2) RETURN_MODULE_UPDATED;
+	if (ret == 2) RETURN_UNLANG_UPDATED;
 
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
-static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_post_auth(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_isc_dhcp_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_isc_dhcp_t);
+	rlm_isc_dhcp_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_isc_dhcp_t);
 	int			ret;
 
 	ret = apply(inst, request, inst->head);
-	if (ret < 0) RETURN_MODULE_FAIL;
-	if (ret == 0) RETURN_MODULE_NOOP;
+	if (ret < 0) RETURN_UNLANG_FAIL;
+	if (ret == 0) RETURN_UNLANG_NOOP;
 
 	// @todo - check for subnet mask option.  If none exists, use one from the enclosing network?
 
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
-extern module_t rlm_isc_dhcp;
-module_t rlm_isc_dhcp = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "isc_dhcp",
-	.type		= 0,
-	.inst_size	= sizeof(rlm_isc_dhcp_t),
-	.config		= module_config,
-	.instantiate	= mod_instantiate,
-
-	.methods = {
-		[MOD_AUTHORIZE]	= mod_authorize,
-		[MOD_POST_AUTH]	= mod_post_auth,
+extern module_rlm_t rlm_isc_dhcp;
+module_rlm_t rlm_isc_dhcp = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "isc_dhcp",
+		.inst_size	= sizeof(rlm_isc_dhcp_t),
+		.config		= module_config,
+		.instantiate	= mod_instantiate
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("recv", CF_IDENT_ANY), .method = mod_authorize },
+			{ .section = SECTION_NAME("send", CF_IDENT_ANY), .method = mod_post_auth },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

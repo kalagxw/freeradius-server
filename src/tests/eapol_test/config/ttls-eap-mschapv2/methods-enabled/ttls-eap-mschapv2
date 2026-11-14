@@ -1,0 +1,13 @@
+type = ttls
+type = mschapv2
+ttls {
+	tls {
+		$template tls-common
+	}
+	default_eap_type = md5
+	virtual_server = "inner-tunnel"
+	include_length = no
+}
+
+mschapv2 {
+}

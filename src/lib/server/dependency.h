@@ -36,12 +36,9 @@ extern char const	*radiusd_version_short;
 
 #include <stddef.h>
 
+#define RADIUSD_VERSION_STRING STRINGIFY(RADIUSD_VERSION_MAJOR) "." STRINGIFY(RADIUSD_VERSION_MINOR) "." STRINGIFY(RADIUSD_VERSION_INCRM)
+
 int		rad_check_lib_magic(uint64_t magic);
-int 		ssl_check_consistency(void);
-char const	*ssl_version_by_num(uint32_t version);
-char const	*ssl_version_num(void);
-char const	*ssl_version_range(uint32_t low, uint32_t high);
-char const	*ssl_version(void);
 int		dependency_feature_add(CONF_SECTION *cs, char const *name, bool enabled);
 int		dependency_version_number_add(CONF_SECTION *cs, char const *name, char const *version);
 void		dependency_features_init(CONF_SECTION *cs) CC_HINT(nonnull);

@@ -21,11 +21,11 @@
 #          bugs, add features, etc).
 
 # Note: Parameterized "functions" in this makefile that are marked with
-#       "USE WITH EVAL" are only useful in conjuction with eval. This is
+#       "USE WITH EVAL" are only useful in conjunction with eval. This is
 #       because those functions result in a block of Makefile syntax that must
 #       be evaluated after expansion. Since they must be used with eval, most
 #       instances of "$" within them need to be escaped with a second "$" to
-#       accomodate the double expansion that occurs when eval is invoked.
+#       accommodate the double expansion that occurs when eval is invoked.
 
 #
 #  You can watch what it's doing by:
@@ -36,6 +36,13 @@ ifeq "${VERBOSE}" ""
     Q=@
 else
     Q=
+endif
+
+ifeq "${BUILD_CC}" ""
+   BUILD_CC := $(shell which cc)
+   ifeq "${BUILD_CC}" ""
+     BUILD_CC := ${CC}
+   endif
 endif
 
 #
@@ -84,10 +91,10 @@ endef
 #   USE WITH EVAL
 #
 define ADD_CLEAN_RULE
-    clean: clean.$(notdir ${1})
     .PHONY: clean.$(notdir ${1})
     clean.$(notdir ${1}):
 	$(Q)$(strip rm -f ${${1}_BUILD}/${1} $${${1}_OBJS} $${${1}_DEPS} $${${1}_OBJS:%.${OBJ_EXT}=%.[do]}) $(if ${TARGET_DIR},$${TARGET_DIR}/$(notdir ${1}))
+	$(Q)$(strip rm -rf ${${1}_BUILD}/.libs/$(basename ${1})* ${${1}_BUILD}/local/${1} ${${1}_BUILD}/local/.libs/$(basename ${1})*)
 	${Q}$${${1}_POSTCLEAN}
 
 endef
@@ -152,7 +159,6 @@ define FILTER_DEPENDS
 	  -e 's/$$$$/ :/' \
 	  < $${BUILD_DIR}/objs/$$*.d | sed -e '$$$$!N; /^\(.*\)\n\1$$$$/!P; D' \
 	 >> $${BUILD_DIR}/make/src/$$*.mk
-	 @rm -f $${BUILD_DIR}/objs/$$*.d
 endef
 
 # ADD_OBJECT_RULE - Parameterized "function" that adds a pattern rule, using
@@ -244,7 +250,8 @@ define ADD_TARGET_RULE.exe
 	    $(Q)$(ECHO) LINK $${${1}_BUILD}/${1}
 	    $(Q)$${${1}_LINKER} -o $${${1}_BUILD}/${1} $${RPATH_FLAGS} $${LDFLAGS} \
                 $${${1}_LDFLAGS} $${${1}_OBJS} $${${1}_PRLIBS} \
-                $${LDLIBS} $${${1}_LDLIBS}
+                $${LDLIBS} $${${1}_LDLIBS} ${OSX_LDFLAGS}
+	    ${Q}$(DSYMUTIL) $${${1}_BUILD}/${1}
 	    $(Q)$${${1}_POSTMAKE}
 
     ifneq "${ANALYZE.c}" ""
@@ -310,7 +317,19 @@ endef
 #   top-level directory, the canonical form is the absolute path (i.e. from
 #   the root of the filesystem) also without "./" or "../" sequences.
 define CANONICAL_PATH
-$(patsubst ${CURDIR}/%,%,$(abspath ${1}))
+$(patsubst ${top_srcdir}/%,%,$(patsubst ${CURDIR}/%,%,$(abspath ${1})))
+endef
+
+# CATEGORY_TARGETS - Expand to every target declared so far whose
+# TGT_CATEGORY matches one of the given categories.  Category names
+# are project-defined labels; a makefile fragment opts in by setting
+# TGT_CATEGORY next to TARGET.  Note "so far": in a := assignment the
+# result depends on makefile parse order, just like filtering ALL_TGTS
+# directly.
+#
+#   USE WITH: $(call CATEGORY_TARGETS,lib-protocol lib-util)
+define CATEGORY_TARGETS
+$(strip $(foreach x,${ALL_TGTS},$(if $(filter ${1},$($(x)_CATEGORY)),$(x))))
 endef
 
 # COMPILE_C_CMDS - Commands for compiling C source code.
@@ -318,7 +337,8 @@ ifeq "$(CPPCHECK)" ""
 define COMPILE_C_CMDS
 	$(Q)mkdir -p $(dir $@)
 	$(Q)$(ECHO) CC $<
-	$(Q)$(strip ${COMPILE.c} -o $@ -c -MD ${CPPFLAGS} ${CFLAGS} ${SRC_CFLAGS} ${INCDIRS} \
+	$(Q)$(strip ${SRC_CC} -o $@ -c -MD ${CPPFLAGS} ${CFLAGS} ${SRC_CFLAGS} ${INCDIRS} \
+	    $(if $(findstring clang,${SRC_CC}),-MJ $(basename $@).cc.json) \
 	    $(addprefix -I, ${SRC_INCDIRS}) ${SRC_DEFS} ${DEFS} $<)
 endef
 else
@@ -342,8 +362,8 @@ endif
 define ANALYZE_C_CMDS
 	$(Q)mkdir -p $(dir $@)
 	$(Q)$(ECHO) SCAN $<
-	$(Q)$(strip ${ANALYZE.c} --analyze -Xanalyzer -analyzer-output=html -c $< -o $@ ${CPPFLAGS} \
-	    ${CFLAGS} ${SRC_CFLAGS} ${INCDIRS} $(addprefix -I,${SRC_INCDIRS}) ${SRC_DEFS} ${DEFS}) || (rm -f $@ && false)
+	$(Q)$(strip ${ANALYZE.c} --analyze -Xanalyzer -analyzer-output=html ${CPPFLAGS} \
+	    ${CFLAGS} ${SRC_CFLAGS} ${INCDIRS} $(addprefix -I,${SRC_INCDIRS}) ${SRC_DEFS} ${DEFS} -o $@ $<)  || (rm -f $@ && false)
 	$(Q)if $(ANALYZE_C_DUMP) && test -d "$@"; then \
 	    echo "Decode with:"; \
 	    echo -n "echo \""; \
@@ -380,10 +400,12 @@ define INCLUDE_SUBMAKEFILE
     TGT_INSTALLDIR := ..
     TGT_CHECK_HEADERS :=
     TGT_CHECK_LIBS :=
+    TGT_CATEGORY :=
     TEST :=
 
     SOURCES :=
     HEADERS :=
+    SRC_CC := $(COMPILE.c)
     SRC_CFLAGS :=
     SRC_CXXFLAGS :=
     SRC_DEFS :=
@@ -402,6 +424,7 @@ define INCLUDE_SUBMAKEFILE
     DIR_STACK := $$(call PUSH,$${DIR_STACK},$${DIR})
 
     include ${1}
+    ALL_MAKEFILES += ${1}
 
     # Initialize internal local variables.
     OBJS :=
@@ -422,13 +445,14 @@ define INCLUDE_SUBMAKEFILE
         $$(eval $$(call ADD_LIBTOOL_SUFFIX))
 
         ALL_TGTS += $${TGT}
+        $${TGT}_CATEGORY := $$(strip $${TGT_CATEGORY})
         $${TGT}_LDFLAGS := $${TGT_LDFLAGS}
         $${TGT}_LDLIBS := $${TGT_LDLIBS}
         $${TGT}_LINKER := $${TGT_LINKER}
         $${TGT}_POSTMAKE := $${TGT_POSTMAKE}
         $${TGT}_POSTCLEAN := $${TGT_POSTCLEAN}
         $${TGT}_POSTINSTALL := $${TGT_POSTINSTALL}
-        $${TGT}_PRBIN := $$(addprefix $${BUILD_DIR}/bin/,$$(filter-out %.a %.so %.la,$${TGT_PREREQS}))
+        $${TGT}_PRBIN := $$(addprefix $${BUILD_DIR}/bin/,$$(filter-out %.a %.la %.${TARGET_LIB_EXT},$${TGT_PREREQS}))
         $${TGT}_DEPS :=
         $${TGT}_OBJS :=
         $${TGT}_SOURCES :=
@@ -438,28 +462,24 @@ define INCLUDE_SUBMAKEFILE
         #  If we link to FOO, and FOO itself links to things, then we also link to the things
         #  which FOO needs.  That way we don't have to manually specify the recursive library
         #  references.
-	$${TGT}_PREREQS := $$(strip $$(call uniq,$$(foreach x,$${TGT_PREREQS},$$(or $${$${x}_PREREQS},) $${x})))
-        $${TGT}_PRLIBS := $$(addprefix $${BUILD_DIR}/lib/,$$(filter %.a %.so %.la,$${$${TGT}_PREREQS}))
+        $${TGT}_PREREQS := $$(strip $$(call uniq,$$(foreach x,$${TGT_PREREQS},$$(or $${$${x}_PREREQS},) $${x})))
+        $${TGT}_PRLIBS := $$(addprefix $${BUILD_DIR}/lib/,$$(filter %.a %.la %.${TARGET_LIB_EXT},$${$${TGT}_PREREQS}))
 
         # If it's an EXE, ensure that transitive library linking works.
         # i.e. we build libfoo.a which in turn requires -lbar.  So, the executable
         # has to be linked to both libfoo.a and -lbar.
-	ifeq "$${$${TGT}_SUFFIX}" ".exe"
-		$${TGT}_LDLIBS += $$(filter-out %.a %.so %.la,$${$${TGT_PREREQS}_LDLIBS})
-
-		#
-		#  OSX does lazy linking by default.  We want to over-ride that for binaries.
-		#  That way we catch errors at compile time, and not at run time.
-		#
-		ifneq "$(findstring apple-darwin,$(TARGET_SYSTEM))" ""
-			$${TGT}_LDFLAGS += -Wl,-undefined -Wl,error
-		endif
-	endif
+        ifeq "$${$${TGT}_SUFFIX}" ".${TARGET_EXE_EXT}"
+            # This breaks compilation by listing the same libraries multiple times, jlibtool either
+            # needs to be made smarter to filter out the duplicates, or we need to find a way of
+            # doing it here.
+#           $${TGT}_LDLIBS += $$(filter-out %.a %.la %.${TARGET_LIB_EXT},$${$${TGT_PREREQS}_LDLIBS})
+        endif
 
         $${TGT}_BUILD := $$(if $$(suffix $${TGT}),$${BUILD_DIR}/lib,$${BUILD_DIR}/bin)
         $${TGT}_MAKEFILES += ${1}
         $${TGT}_CHECK_HEADERS := $${TGT_CHECK_HEADERS}
         $${TGT}_CHECK_LIBS := $${TGT_CHECK_LIBS}
+
     else
         # The values defined by this makefile apply to the the "current" target
         # as determined by which target is at the top of the stack.
@@ -516,6 +536,7 @@ define INCLUDE_SUBMAKEFILE
         # A "hook" to define variables needed by the "legacy" makefiles.
         $$(eval $$(call ADD_LEGACY_VARIABLES,$$(dir ${1}),$${TGT}))
 
+        $${OBJS}: SRC_CC := $${SRC_CC}
         $${OBJS}: SRC_CFLAGS := $${SRC_CFLAGS}
         $${OBJS}: SRC_CXXFLAGS := $${SRC_CXXFLAGS}
         $${OBJS}: SRC_DEFS := $$(addprefix -D,$${SRC_DEFS})
@@ -559,11 +580,11 @@ define INCLUDE_SUBMAKEFILE
         # Choose the correct linker.
         ifeq "$$(strip $$(filter $${CXX_SRC_EXTS},$${$${TGT}_SOURCES}))" ""
             ifeq "$${$${TGT}_LINKER}" ""
-                $${TGT}_LINKER := ${LL}$${LINK.c}
+                $${TGT}_LINKER := $${LINK.c}
             endif
         else
             ifeq "$${$${TGT}_LINKER}" ""
-                $${TGT}_LINKER := ${LL}$${LINK.cxx}
+                $${TGT}_LINKER := $${LINK.cxx}
             endif
         endif
 
@@ -621,12 +642,9 @@ define PUSH
 ${2:%=${1}:%}
 endef
 
-# QUALIFY_PATH - Given a "root" directory and one or more paths, qualifies the
-#   paths using the "root" directory (i.e. appends the root directory name to
-#   the paths) except for paths that are absolute.
-define QUALIFY_PATH
-$(addprefix ${1}/,$(filter-out /%,${2})) $(filter /%,${2})
-endef
+# SHELL_QUOTE and QUALIFY_PATH are shared with the package test, which runs
+# without this framework, so they live in their own file.  See scripts/utils.mk.
+include scripts/utils.mk
 
 ###############################################################################
 #
@@ -661,6 +679,7 @@ DEFS :=
 DIR_STACK :=
 INCDIRS :=
 TGT_STACK :=
+ALL_MAKEFILES :=
 
 ifeq "${top_builddir}" ""
     top_builddir := .
@@ -690,6 +709,38 @@ CPP = cc -E
 LINK.c = ${CC}
 LINK.cxx = ${CXX}
 
+#
+#  dsymutil emits a separate .dSYM bundle alongside Mach-O binaries on
+#  macOS so debuggers and crash reporters can find DWARF after a strip.
+#  It does not understand ELF, so we only invoke it on apple-darwin
+#  targets; everything else gets the `echo` no-op so the recipe step
+#  is harmless. Older boiler.mk versions picked the binary up off PATH
+#  whenever libbacktrace was present, which broke the build inside
+#  images that happen to ship LLVM (e.g. the profiling image's
+#  kcachegrind / inferno toolchain).
+#
+ifneq "$(findstring apple-darwin,$(TARGET_SYSTEM))" ""
+  ifneq "$(AC_HAVE_BACKTRACE)" ""
+    DSYMUTIL = $(shell which dsymutil)
+  endif
+endif
+
+ifeq "$(DSYMUTIL)" ""
+  DSYMUTIL := echo
+endif
+
+#
+#  OSX does lazy linking by default.  We want to over-ride that for all binaries.
+#  That way we catch errors at compile time, and not at run time.
+#
+#  We also add "-w" to suppress warnings.  Because -undefined,error is supported,
+#  but deprecated.
+#
+ifneq "$(findstring apple-darwin,$(TARGET_SYSTEM))" ""
+  OSX_LDFLAGS += -w -Wl,-undefined -Wl,error
+endif
+
+
 # Set ECHO to "true" for *very* quiet builds
 ECHO = echo
 
@@ -699,8 +750,20 @@ ECHO = echo
 all:
 
 # Add "clean" rules to remove all build-generated files.
+#
+# Note that the "clean.foo" rule above in ADD_CLEAN_RULE does not add
+# that target to the dependency for "clean".  Having those
+# dependencies means that on a global "clean", "make" will then
+# laboriously walk through all of the libraries, binaries, etc. which
+# is very slow.
+#
+#  Instead, we just delete the entire build directory.  We also
+#  hard-code it, to prevent errors if the BUILD_DIR macro is
+#  accidentally empty.
+#
 .PHONY: clean
 clean:
+	@${Q}rm -rf ./build
 
 top_makedir := $(dir $(lastword ${MAKEFILE_LIST}))
 

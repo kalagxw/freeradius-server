@@ -1,37 +1,37 @@
+string test_string
+
 #
 #  Sync calls return the response
 #
-update request {
-	&Tmp-String-0 := "%(exec_sync:/bin/sh -c 'echo hello')"
-}
-if (&Tmp-String-0 != 'hello') {
+test_string := %exec_sync('/bin/sh', '-c', "echo 'hello'")
+if (test_string != 'hello') {
 	test_fail
 }
 
 #
 #  Call something which will take longer than the timeout
 #
-update request {
-	&Tmp-String-0 := "%(exec_sync:/bin/sleep 10)"
-}
+request -= Module-Failure-Message
 
-if (&Module-Failure-Message[*] != "Timeout running program - killing it and failing the request") {
+test_string := %exec_sync('/bin/sleep', '10')
+
+if (Module-Failure-Message != "Execution of external program failed: Timeout running program") {
 	test_fail
 }
 
-if (&Tmp-String-0 != "") {
+if test_string  {
 	test_fail
 }
 
-update request {
-	&Tmp-String-0 := "%(exec_sync:/bin/sh $ENV{MODULE_TEST_DIR}/fail.sh)"
-}
+request -= Module-Failure-Message
 
-if (&Tmp-String-0 != "") {
+test_string := %exec_sync('/bin/sh', "$ENV{MODULE_TEST_DIR}/fail.sh")
+
+if test_string {
 	test_fail
 }
 
-if (&request.Module-Failure-Message != "Execution of external program returned 7") {
+if (Module-Failure-Message != "Execution of external program returned 7") {
 	test_fail
 }
 
@@ -40,7 +40,7 @@ if (&request.Module-Failure-Message != "Execution of external program returned 7
 #
 exec_sync_mod
 
-if ((!&control.Tmp-String-0) || (&control.Tmp-String-0 != 'welcome')) {
+if ((!control.Called-Station-Id) || (control.Called-Station-Id != 'welcome')) {
 	test_fail
 }
 
@@ -51,11 +51,15 @@ if ((!&control.Tmp-String-0) || (&control.Tmp-String-0 != 'welcome')) {
 #
 exec_sync_attrs
 
-if ((!&control.Tmp-String-1) || (&control.Tmp-String-1 != 'tony')) {
+if ((!control.Filter-Id) || (control.Filter-Id != 'tony')) {
 	test_fail
 }
 
-if ((!&control.Tmp-String-2) || (&control.Tmp-String-2 != 'aabbccddeeff')) {
+if ((!control.Callback-Id) || (control.Callback-Id != 'aabbccddeeff')) {
+	test_fail
+}
+
+if ((!reply.Filter-Id) || (reply.Filter-Id != 'tony')) {
 	test_fail
 }
 
@@ -71,8 +75,19 @@ if (notfound) {
 	test_fail
 }
 
-if (&control.Tmp-String-3 == "Failure") {
+if (control.NAS-Identifier == "Failure") {
 	test_fail
 }
 
+control -= Filter-Id[*]
+#
+#  Call a module which uses an xlat function in its arguments
+#
+exec_sync_xlat_args
+
+if !(control.Filter-Id == 'TONY') {
+	test_fail
+}
+
+reply -= Filter-Id[*]
 test_pass

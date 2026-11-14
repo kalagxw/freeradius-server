@@ -29,15 +29,32 @@ RCSID("$Id$")
 #include <sys/stat.h>
 
 #include <freeradius-devel/util/file.h>
-#include <freeradius-devel/util/strerror.h>
 #include <freeradius-devel/util/syserror.h>
-#include <freeradius-devel/util/talloc.h>
 #include <freeradius-devel/util/value.h>
 
-static ssize_t _fr_mkdir(int *fd_out, char const *path, mode_t mode, fr_mkdir_func_t func, void *uctx)
+/** Callback for the common case of chown() of the directory.
+ *
+ */
+int fr_mkdir_chown(int fd, char const *path, void *uctx)
 {
-	int	ret, fd;
-	char	*p;
+	fr_mkdir_chown_t const *ctx = uctx;
+
+	if ((ctx->uid == (uid_t) -1) && (ctx->gid == (gid_t) -1)) return 0;
+
+	if (fchown(fd, ctx->uid, ctx->gid) < 0) {
+		fr_strerror_printf("Failed changing ownership on directory \"%s\": %s",
+				   path, fr_syserror(errno));
+		return -1;
+	}
+
+	return 0;
+}
+
+
+static ssize_t _fr_mkdir(int *fd_out, char *start, char *path, mode_t mode, fr_mkdir_func_t func, void *uctx)
+{
+	int		ret, fd;
+	char		*p;
 
 	/*
 	 *	Try to make the path.  If it exists, chmod it.
@@ -58,9 +75,9 @@ static ssize_t _fr_mkdir(int *fd_out, char const *path, mode_t mode, fr_mkdir_fu
 					   fr_syserror(errno));
 		mkdir_error:
 			p = strrchr(path, FR_DIR_SEP);
-			if (!p) return 0;
+			if (!p) return start - path;
 
-			return -(p - path);
+			return start - p;
 		}
 
 		if (fchmod(fd, mode) < 0) {
@@ -70,7 +87,7 @@ static ssize_t _fr_mkdir(int *fd_out, char const *path, mode_t mode, fr_mkdir_fu
 			goto mkdir_error;
 		}
 		*fd_out = fd;
-		return PATH_MAX;
+		return strlen(start);
 	}
 
 	/*
@@ -83,49 +100,86 @@ static ssize_t _fr_mkdir(int *fd_out, char const *path, mode_t mode, fr_mkdir_fu
 	 *	process created this directory in between our check
 	 *	and our creation.
 	 */
-	if ((errno != ENOENT) && (errno != EEXIST)) {
-		fr_strerror_printf("Unexpected error creating directory: %s",
-				   fr_syserror(errno));
+	if (errno == EEXIST) {
+		fd = open(path, O_DIRECTORY);
+		if (fd < 0) {
+			fr_strerror_printf("Failed opening existing directory: %s", fr_syserror(errno));
+			goto mkdir_error;
+		}
+		*fd_out = fd;
+		return strlen(start);
+	}
+
+	/*
+	 *	ENOENT means we're trying to create too much path
+	 *	at once.  Recurse to discover the deepest path
+	 *	component that already exists.
+	 */
+	if (errno != ENOENT) {
+		fr_strerror_printf("Failed creating directory path: %s", fr_syserror(errno));
 		goto mkdir_error;
 	}
 
 	/*
-	 *	A component in the path path doesn't
+	 *	A component in the path doesn't
 	 *	exist.  Look for the LAST path name.  Try
 	 *	to create that.  If there's an error, we leave
 	 *	the path path as the one at which the
-	 *	error occured.
+	 *	error occurred.
 	 */
 	p = strrchr(path, FR_DIR_SEP);
-	if (!p || (p == path)) return -(p - path);
+	if (!p || (p == path)) return start - path;	/* last path component and we've previously failed */
 
 	*p = '\0';
-	if (_fr_mkdir(fd_out, path, mode, func, uctx) < 0) return -(p - path);
+	if (_fr_mkdir(fd_out, start, path, mode, func, uctx) <= 0) return start - p;
+
+	if (!fr_cond_assert_msg((*fd_out) >= 0, "Logic error - Bad FD %i", *fd_out)) return start - p;
 
 	/*
 	 *	At this point *fd_out, should be an FD
 	 *	for the containing directory.
+	 *
+	 *	Dir may already exist if we're racing
+	 *	other processes as we do in CI.
 	 */
 	if (mkdirat(*fd_out, p + 1, 0700) < 0) {
-		fr_strerror_printf("Failed creating directory: %s", fr_syserror(errno));
+		/*
+		 *	This is usually because of a race with
+		 *	other processes trying to create the
+		 *	same directory.
+		 */
+		if (errno == EEXIST) {
+			fd = openat(*fd_out, p + 1, O_DIRECTORY);
+			if (fd < 0) {
+				fr_strerror_printf_push("Failed opening existing directory path component: %s",
+							fr_syserror(errno));
+				goto mkdirat_error;
+			}
+			*p = FR_DIR_SEP;
+			goto done;
+		}
+
+		fr_strerror_printf_push("Failed creating directory path component: %s", fr_syserror(errno));
+
 	mkdirat_error:
 		close(*fd_out);
 		*fd_out = -1;
-		return -(p - path);
+		return start - p;
 	}
 
 	fd = openat(*fd_out, p + 1, O_DIRECTORY);
 	if (fd < 0) {
-		fr_strerror_printf("Failed opening directory we "
-				   "created: %s", fr_syserror(errno));
+		fr_strerror_printf_push("Failed opening directory we "
+					"created: %s", fr_syserror(errno));
 		goto mkdirat_error;
 	}
 
 	if (fchmod(fd, mode) < 0) {
-		fr_strerror_printf("Failed setting permissions on "
-				   "directory we created: %s", fr_syserror(errno));
+		fr_strerror_printf_push("Failed setting permissions on "
+					"directory we created: %s", fr_syserror(errno));
 		goto mkdirat_error;
 	}
+
 	*p = FR_DIR_SEP;
 
 	/*
@@ -140,10 +194,11 @@ static ssize_t _fr_mkdir(int *fd_out, char const *path, mode_t mode, fr_mkdir_fu
 	 *	Swap active *fd_out to point to the dir
 	 *      we just created.
 	 */
+done:
 	close(*fd_out);
 	*fd_out = fd;
 
-	return PATH_MAX;
+	return strlen(start);
 }
 
 /** Create directories that are missing in the specified path
@@ -188,12 +243,14 @@ ssize_t fr_mkdir(int *fd_out, char const *path, ssize_t len, mode_t mode, fr_mkd
 		return -1;
 	}
 
+	fr_strerror_clear();	/* We make liberal use of push */
+
 	/*
 	 *	Call the recursive function to
 	 *	create any missing dirs in the
 	 *	specified path.
 	 */
-	slen = _fr_mkdir(&fd, our_path, mode, func, uctx);
+	slen = _fr_mkdir(&fd, our_path, our_path, mode, func, uctx);
 	talloc_free(our_path);
 	if (slen <= 0) return slen;
 
@@ -237,6 +294,8 @@ char *fr_realpath(TALLOC_CTX *ctx, char const *path, ssize_t len)
 		return NULL;
 	}
 
+	talloc_free(tmp_path);
+
 	talloc_abs_path = talloc_strdup(ctx, abs_path);
 	free(abs_path);
 	if (!talloc_abs_path) {
@@ -266,13 +325,13 @@ ssize_t fr_touch(int *fd_out, char const *filename, mode_t mode, bool mkdir, mod
 	fd = open(filename, O_WRONLY | O_CREAT, mode);
 	if (fd < 0) {
 		ssize_t slen = 0;
-		char	*q;
+		char const *q;
 
 		if (mkdir && (errno == ENOENT) && (q = strrchr(filename, FR_DIR_SEP))) {
-			int dir_fd;
+			int dir_fd = -1;
 
 			slen = fr_mkdir(&dir_fd, filename, q - filename, dir_mode, NULL, NULL);
-			if (slen <= 0) return slen;
+			if((slen <= 0) || (dir_fd < 0)) return slen;
 
 			fd = openat(dir_fd, q + 1, O_WRONLY | O_CREAT, mode);
 			if (fd >= 0) {
@@ -323,8 +382,8 @@ int fr_unlink(char const *filename) {
  */
 char const *fr_cwd_strip(char const *filename)
 {
-	static char our_wd[MAXPATHLEN];
-	char *found;
+	char our_wd[MAXPATHLEN];
+	char const *found;
 
 	if (!getcwd(our_wd, sizeof(our_wd))) return filename;
 
@@ -336,4 +395,838 @@ char const *fr_cwd_strip(char const *filename)
 	}
 
 	return filename;
+}
+
+/** From a pathname, return fd and filename needed for *at() functions
+ *
+ * @param[in] dirfd	points to place to store the dirfd
+ * @param[in] filename	points to placd to store a pointer into pathname
+ *			that points to the filename
+ * @param[in] pathname	the full pathname of the file
+ *
+ * @return
+ *	- -1 on error
+ *	-  0 on success
+ */
+int fr_dirfd(int *dirfd, char const **filename, char const *pathname)
+{
+	char const *last_slash = strrchr(pathname, '/');
+
+	if (last_slash == NULL) {
+		*filename = pathname;
+		*dirfd = AT_FDCWD;
+		return 0;
+	}
+	{
+		char	dirpath[PATH_MAX];
+		size_t	dirlen = (size_t)(last_slash - pathname);
+
+		if (unlikely(dirlen >= sizeof(dirpath))) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+
+		memcpy(dirpath, pathname, dirlen);
+		dirpath[dirlen] = '\0';
+		*filename = last_slash + 1;
+		*dirfd = open(dirpath, O_DIRECTORY);
+		return (*dirfd < 0) ? -1 : 0;
+	}
+}
+
+static bool fr_globdir_file_ok(char const *try, fr_globdir_iter_t *iter)
+{
+	size_t len, room;
+	char const *p;
+	char *filename;
+	struct stat stat_buf;
+
+	/*
+	 *	Filter the filenames.
+	 */
+	if (try[0] == '.') return false;
+
+	/*
+	 *	Check for valid characters
+	 */
+	p = try;
+	while (*p) {
+		/*
+		 *	Control characters are invalid UTF-8, too.
+		 */
+		len = fr_utf8_char((uint8_t const *) p, -1);
+		if (!len) return false;
+
+		/*
+		 *	The string is valid UTF-8, but is NOT an ASCII
+		 *	character.  We allow it.
+		 */
+		if (len > 1) {
+			p += len;
+			continue;
+		}
+
+		/*
+		 *	Limit the ASCII characters we allow.
+		 */
+		if (isalpha((uint8_t)*p) ||
+		    isdigit((uint8_t)*p) ||
+		    (*p == '-') ||
+		    (*p == '_') ||
+		    (*p == '.')) {
+			p++;
+			continue;
+		}
+
+		/*
+		 *	Invalid character in filename, it's not a match.
+		 */
+		return false;
+	}
+
+	len = p - try;
+	if (!len) return false;
+
+	/*
+	 *	Ignore files generated by deb / rpm packaging updates.
+	 */
+	if ((len > 10) && (strncmp(&try[len - 10], ".dpkg-dist", 10) == 0)) return false;
+	if ((len > 9) && (strncmp(&try[len - 9], ".dpkg-old", 9) == 0)) return false;
+	if ((len > 7) && (strncmp(&try[len - 7], ".rpmnew", 7) == 0)) return false;
+	if ((len > 8) && (strncmp(&try[len - 8], ".rpmsave", 8) == 0)) return false;
+
+	/*
+	 *	When reading all files in a directory, iter->filename points to the directory
+	 *	name which is being read.  The file being tested needs to be added after that.
+	 */
+	filename = iter->filename + (iter->type == FR_GLOBDIR_DIR ? strlen(iter->filename) : 0);
+
+	/*
+	 *	strlcpy() returns the length of the input, which can be larger than the available space.
+	 */
+	room = (iter->path + PATH_MAX) - filename;
+
+	if (strlcpy(filename, try, room) >= room) return false;
+
+	/*
+	 *	We only read normal files which are NOT executable, and symlinks.
+	 */
+	if (stat(iter->path, &stat_buf) != 0) {
+		return false;
+	}
+
+	if (S_ISREG(stat_buf.st_mode)) {
+		if ((stat_buf.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0) {
+			return false;
+		}
+	} else if (!S_ISLNK(stat_buf.st_mode)) { /* soft links are executable */
+		return false;
+	}
+
+	return true;
+}
+
+#ifdef HAVE_DIRENT_H
+/*
+ *	Filter filenames when reading a directory.
+ */
+static int fr_globdir_dir_next(char const **filename, fr_globdir_iter_t *iter)
+{
+	struct dirent *dp;
+
+	fr_assert(iter->dir != NULL);
+
+	/*
+	 *	Reading all of the directory entries will result in
+	 *	reading ones we don't want, so we filter them.
+	 */
+	while (true) {
+		errno = 0;
+		dp = readdir(iter->dir);
+		if (!dp) {
+			if (errno != 0) return -1;
+
+			*filename = NULL;
+			return 0;
+		}
+
+		if (!fr_globdir_file_ok(dp->d_name, iter)) continue;
+
+		/*
+		 *	It's mostly ASCII, and not a leftover file name, stop.
+		 */
+		break;
+	}
+
+	*filename = iter->filename;
+	return 0;
+}
+#endif
+
+/** Create a full path from dir + pattern.
+ *
+ */
+static int fr_globdir_get_path(char const *dir, char const *pattern, fr_globdir_iter_t *iter)
+{
+	char const *p;
+	char *q;
+	bool slash;
+
+	/*
+	 *	Bootstrap the full path.
+	 */
+	iter->path = malloc(PATH_MAX);
+	if (!iter->path) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	/*
+	 *	Sanity check the directory name.
+	 *
+	 *	We assume that the directory name is otherwise safe.
+	 */
+	p = dir;
+	q = iter->path;
+	while (*p) {
+		/*
+		 *	Suppress duplicate '/', and trailing '/'.
+		 */
+		if (*p == '/') {
+			*(q++) = *(p++);
+
+			while (*p == '/') p++;
+
+			if (!*p) break;
+			continue;
+		}
+
+		if ((size_t) (q - iter->path) >= PATH_MAX) {
+			free(iter->path);
+			errno = ENOMEM;
+			return -1;
+		}
+
+		*(q++) = *(p++);
+	}
+
+	/*
+	 *	Add in a trailing '/' to the directory.
+	 */
+	*(q++) = '/';
+	slash = true;
+	iter->filename = q;
+
+	/*
+	 *	Copy over the pattern name, but sanity check it.
+	 */
+	p = pattern;
+	while (*p) {
+		if ((size_t) (q - iter->path) >= PATH_MAX) {
+			free(iter->path);
+			errno = ENOMEM;
+			return -1;
+		}
+
+		/*
+		 *	@todo - if it's a pattern, then handle [./] as a special case.
+		 */
+
+		/*
+		 *	Handle the case of bad things after the directory name, too.
+		 *
+		 *	But otherwise copy over any '/' which we see in the pattern.
+		 */
+		if (!slash) {
+			slash = (*p == '/');
+			*(q++) = *(p++);
+
+			if (!slash) continue;
+		}
+
+	more_slash:
+		/*
+		 *	///// --> /
+		 */
+		while (*p == '/') p++;
+
+		/*
+		 *	foo/. may be special
+		 */
+		if (*p != '.') {
+			slash = false;
+			continue;
+		}
+
+		/*
+		 *	foo/./ --> foo/
+		 */
+		if (p[1] == '/') {
+			p += 2;
+			goto more_slash;
+		}
+
+		/*
+		 *	foo/../ --> error
+		 */
+		if ((p[1] == '.') && (p[2] == '/')) {
+			free(iter->path);
+			errno = ENOENT;
+			return -1;
+		}
+
+		/*
+		 *	foo/.bar is OK
+		 */
+		slash = false;
+	}
+	*q = '\0';
+
+	return 0;
+}
+
+/** Initialize an iterator over filenames.
+ *
+ * @param[out] filename	the _relative_ filename which should be opened
+ * @param[in] dir	the directory to read
+ * @param[in] pattern	the filename or pattern to read.  Cannot be an absolute path.
+ * @param[in,out] iter	the iteration structure.
+ * @return
+ *	- <0 on error
+ *	- 0 on success, but no filename
+ *	- 1 for "have file".
+ */
+int fr_globdir_iter_init(char const **filename, char const *dir, char const *pattern, fr_globdir_iter_t *iter)
+{
+	char const *p;
+	char const *to_open;
+
+	/*
+	 *	Default to files, which is the most common case.
+	 */
+	*iter = (fr_globdir_iter_t) {
+		.type= FR_GLOBDIR_FILE,
+	};
+
+	/*
+	 *	Figure out what kind of thing we're opening.
+	 */
+	for (p = pattern; *p != '\0'; p++) {
+		/*
+		 *	foo/ - read the entire directory.
+		 */
+		if (*p == '/') {
+			if (p[1]) continue;
+
+#ifdef HAVE_DIRENT_H
+			iter->type = FR_GLOBDIR_DIR;
+			break;
+#else
+			errno = ENOENT;
+			return -1;
+#endif
+		}
+
+		/*
+		 *	foo*.txt
+		 *	foo?.txt
+		 *	foo.[ch]
+		 *
+		 *	- file globbing.
+		 *
+		 *	File globbing is either full path, or a path relative to CWD.  It is most notably NOT
+		 *	relative to the input "dir".  So if there are globs, we need a full path.
+		 */
+		if ((*p == '*') || (*p == '?') || (*p == '[')) {
+#ifdef HAVE_GLOB_H
+			/*
+			 *	@todo - call realpath() to get the canonical filename?
+			 */
+			if ((pattern[0] != '/') && (dir[0] != '/')) {
+				errno = ENOENT;
+				return -1;
+			}
+
+			iter->type = FR_GLOBDIR_GLOB;
+			break;
+#else
+			errno = ENOENT;
+			return -1;
+#endif
+		}
+	}
+
+	/*
+	 *	The pattern is an absolute path, we just use that as-is.
+	 */
+	if (pattern[0] == '/') {
+		to_open = pattern;
+
+	} else if (iter->type == FR_GLOBDIR_FILE) {
+		/*
+		 *	Short-circuit the common case for files.  We're just opening a file, and the file is
+		 *	relative to the directory which was passed in.
+		 */
+		*filename = pattern;
+		return 1;
+
+	} else {
+		/*
+		 *	Either dir is absolute and pattern is relative, or they're both relative.  Merge dir +
+		 *	pattern into a path.
+		 *
+		 *	Note that globs are relative to CWD, so relative globs must be passed in correctly
+		 *	(that's an @todo), otherwise they won't work.
+		 */
+		if (fr_globdir_get_path(dir, pattern, iter) < 0) {
+			return -1;
+		}
+
+		to_open = iter->path;
+	}
+
+	/*
+	 *	Now that we know what type of thing it is, go do the
+	 *	right thing.
+	 */
+	switch (iter->type) {
+	case FR_GLOBDIR_INVALID:
+		(void) fr_globdir_iter_free(iter);
+		errno = ENOENT;
+		return -1;
+
+	case FR_GLOBDIR_FILE:
+		*filename = iter->path;
+		break;
+
+#ifdef HAVE_DIRENT_H
+	case FR_GLOBDIR_DIR:
+		/*
+		 *	No directory means no file.  The caller then decides if the file is required.
+		 */
+		iter->dir = opendir(to_open);
+		if (!iter->dir) {
+			(void) fr_globdir_iter_free(iter);
+			return 0;
+		}
+
+		if (fr_globdir_dir_next(filename, iter) < 0) {
+			(void) fr_globdir_iter_free(iter);
+			return -1;
+		}
+		break;
+#endif
+
+#ifdef HAVE_GLOB_H
+	case FR_GLOBDIR_GLOB:
+		if (glob(to_open, GLOB_NOESCAPE | GLOB_ERR, NULL, &iter->glob) < 0) {
+			(void) fr_globdir_iter_free(iter);
+			return -1;
+		}
+
+		if (iter->glob.gl_pathc == 0) {
+			*filename = NULL;
+		} else {
+			iter->gl_current = 0;
+
+			/*
+			 *	@todo - check the filenames using fr_globdir_file_ok()
+			 */
+			*filename = iter->glob.gl_pathv[iter->gl_current];
+		}
+		break;
+#endif
+	}
+
+	return 0 + (*filename != NULL);
+}
+
+/** Get the next filename.
+ *
+ *  fr_globdir_iter_init()
+ *  do {
+ *	... use filename
+ *  } while (fr_globdir_iter_next() == 1);
+ *  fr_globdir_iter_free()
+ *
+ * @return
+ *	- <0 for error
+ *	- 0 for done
+ *	- 1 for "have filename"
+ */
+int fr_globdir_iter_next(char const **filename, fr_globdir_iter_t *iter)
+{
+	switch (iter->type) {
+	case FR_GLOBDIR_INVALID:
+		break;
+
+	case FR_GLOBDIR_FILE:
+		*filename = NULL;
+		return 0;
+
+#ifdef HAVE_DIRENT_H
+	case FR_GLOBDIR_DIR:
+		if (fr_globdir_dir_next(filename, iter) < 0) return -1;
+
+		return 0 + (*filename != NULL);
+#endif
+
+#ifdef HAVE_GLOB_H
+	case FR_GLOBDIR_GLOB:
+		iter->gl_current++;
+		if (iter->gl_current >= iter->glob.gl_pathc) {
+			return 0;
+		}
+
+		*filename = iter->glob.gl_pathv[iter->gl_current];
+		fr_assert(*filename != NULL);
+
+		return 1;
+#endif
+	}
+
+	return -1;
+}
+
+int fr_globdir_iter_free(fr_globdir_iter_t *iter)
+{
+	if (iter->path) {
+		free(iter->path);
+		iter->path = NULL;
+	}
+
+	switch (iter->type) {
+	case FR_GLOBDIR_INVALID:
+		return -1;
+
+	case FR_GLOBDIR_FILE:
+		break;
+
+#ifdef HAVE_DIRENT_H
+	case FR_GLOBDIR_DIR:
+		if (!iter->dir) return 0;
+
+		return closedir(iter->dir);
+#endif
+
+#ifdef HAVE_GLOB_H
+	case FR_GLOBDIR_GLOB:
+		globfree(&iter->glob);
+		break;
+#endif
+	}
+
+	return 0;
+}
+
+/*
+ *	This is fine.  Don't complain.
+ */
+DIAG_OFF_OPTIONAL(gnu-designator)
+
+const fr_sbuff_escape_rules_t fr_filename_escape = {
+	.name = "filename",
+	.chr = '_',
+	.do_utf8 = true,
+	.do_hex = true,
+
+	.esc = {
+		[ 0x00 ... 0x2d ] = true,		// special characters, but not '.'
+		[ 0x2f ] = true,			// /
+		[ 0x3A ... 0x3f ] = true,		// :;<=>?, but not "@"
+		[ 0x5b ... 0x5e ] = true,		// [\]^
+		[ 0x60 ] = true,			// back-tick
+		[ 0x7b ... 0xff ] = true,		// {|}, and all chars which have high bit set, but aren't UTF-8
+	},
+};
+
+const fr_sbuff_escape_rules_t fr_filename_escape_dots = {
+	.name = "filename",
+	.chr = '_',
+	.do_utf8 = true,
+	.do_hex = true,
+
+	.esc = {
+		[ 0x00 ... 0x2f ] = true,		// special characters, '.', '/', etc.
+		[ 0x3A ... 0x3f ] = true,		// :;<=>?, but not "@"
+		[ 0x5b ... 0x5e ] = true,		// [\]^
+		[ 0x60 ] = true,			// back-tick
+		[ 0x7b ... 0xff ] = true,		// {|}, and all chars which have high bit set, but aren't UTF-8
+	},
+};
+
+/** Escape a string-typed value box so its contents are safe to use in a filename.
+ *
+ *  The box's safe_for marker is set to this function, so a second
+ *  call is a no-op.  Boxes with zero length are also a no-op.
+ *
+ *  @param[in]      ctx    talloc_ctx
+ *  @param[in,out]  vb     value box to escape in place.
+ *  @return
+ *      - 0 on no-op (empty box).
+ *      - 1 on success (box was either already safe or has been
+ *        rewritten).
+ *      - -1 on allocation/escape failure.
+ */
+int fr_filename_box_make_safe(TALLOC_CTX *ctx, fr_value_box_t *vb)
+{
+	fr_sbuff_t		sbuff;
+	fr_sbuff_uctx_talloc_t	tctx;
+	ssize_t			slen;
+
+	fr_assert(vb->type == FR_TYPE_STRING);
+
+	if (vb->vb_length == 0) return 0;
+
+	if (fr_value_box_is_safe_for(vb, fr_filename_box_make_safe)) return 1;
+
+	/*
+	 *	In many cases, the filename is already clean, so we can avoid all kinds of work.
+	 */
+	if (!fr_sbuff_in_needs_escaping(vb->vb_strvalue, vb->vb_length, &fr_filename_escape)) {
+		goto done;
+	}
+
+	/*
+	 *	Escaped output can be up to ~4x the input (each byte
+	 *	may turn into "_XX").  Let the sbuff grow as needed.
+	 *	rather than guessing.
+	 */
+	if (!fr_sbuff_init_talloc(ctx, &sbuff, &tctx, vb->vb_length + 1, SIZE_MAX)) {
+		return -1;
+	}
+
+	slen = fr_sbuff_in_escape(&sbuff, vb->vb_strvalue, vb->vb_length, &fr_filename_escape);
+	if (slen < 0) {
+	error:
+		talloc_free(sbuff.buff);
+		return -1;
+	}
+
+	/*
+	 *	Trim it to the correct size.
+	 */
+	if (fr_sbuff_trim_talloc(&sbuff, SIZE_MAX) < 0) goto error;
+
+	fr_value_box_strdup_shallow_replace(vb, sbuff.buff, (size_t) slen);
+
+done:
+	fr_value_box_mark_safe_for(vb, fr_filename_box_make_safe);
+
+	return 1;
+}
+
+/** See if a filename is OK.
+ *
+ * @param[in] filename	to check
+ * @param[in] end	of the filename to check
+ * @param[in] allow_dir allow trailing '/' on filenames, but not './' or '../'
+ * @return
+ *	- false - filename is invalid or insecure
+ *	- true - filename is sane and OK
+ */
+bool fr_filename_ok(char const *filename, char const *end, bool allow_dir)
+{
+	char const *p = filename;
+	bool isdir;
+
+	if (end == filename) {
+		fr_strerror_const("invalid zero-length (empty) filename");
+		return false;
+	}
+
+	isdir = true;
+
+	/*
+	 *	See if the filename is doing anything funky.  If so, disallow it.
+	 *
+	 *	.     - current directory, not allowed
+	 *	./    - ditto
+	 *	.foo  - allowed
+	 *	foo   - allowed
+	 *	foo/  - disallowed
+	 */
+	while (p < end) {
+		if (!isdir) goto next;
+
+		/*
+		 *	"foo/bar" is OK.
+		 *
+		 *	@todo - do we care about repeated "/", such as foo//// ?
+		 *	Likely not, but perhaps we want to normalize it.
+		 */
+		if (*p != '.') goto next;
+
+		/*
+		 *	"foo/." might be a problem.
+		 */
+		p++;
+		if (p == end) {
+			fr_strerror_const("invalid attempt to access current directory via '/.'");
+			return false;
+		}
+
+		/*
+		 *	"./foo" is allowed.  But "foo/./" is not allowed.
+		 */
+		if (*p == '/') {
+			p++;
+
+			if (p == end) {
+				fr_strerror_const("invalid attempt to access current directory via './'");
+				return false;
+			}
+
+			/*
+			 *	@todo - do we care about "foo/./././" ?
+			 */
+			isdir = true;
+			continue;
+		}
+
+		/*
+		 *	"foo/.foo" is allowed.
+		 */
+		if (*p != '.') goto next;
+
+		/*
+		 *	"foo/../ is disallowed.
+		 */
+		p++;
+		if ((p == end) || (*p == '/')) {
+			fr_strerror_const("invald attempt to go to parent directory via '/../'");
+			return false;
+		}
+
+	next:
+		if (*(uint8_t const *) p < ' ') {
+			fr_strerror_const("invalid filename contains control character");
+			return false;
+		}
+
+		isdir = (*p == '/');
+		p++;
+	}
+
+	/*
+	 *	The last character was a '/', we may (or may not) allow it.
+	 */
+	if (isdir && !allow_dir) {
+		fr_strerror_const("invalid attempt to access current directory by '/'");
+		return false;
+	}
+
+	return true;
+}
+
+/** See if a filename is allowed by a list.
+ *
+ * @param[in] filename	to check
+ * @param[in] end	of the filename to check
+ * @param[in] array	list to check
+ * @return
+ *	- false - filename is not allowed by the list
+ *	- true - filename is allowed by the list
+ */
+bool fr_filename_allowed_by_list(char const *filename, char const *end, char const * const *array)
+{
+	size_t i, num_files;
+	size_t len = end - filename;
+
+	num_files = talloc_array_length(array);
+	if (!num_files) return false;
+
+	for (i = 0; i < num_files; i++) {
+		/*
+		 *	Get length of config entry, not including terminating NUL
+		 */
+		size_t alen = talloc_array_length(array[i]) - 1;
+
+		if (!alen) continue;
+
+		/*
+		 *	Disallow '/' for security reasons.
+		 */
+		if ((alen == 1) && (array[i][0] == '/')) {
+			continue;
+		}
+
+		/*
+		 *	The allowed directory is longer than the filename, it's not allowed.
+		 */
+		if (alen > len) continue;
+
+		/*
+		 *	No leading match, it's not allowed.
+		 */
+		if (memcmp(filename, array[i], alen) != 0) continue;
+
+		/*
+		 *	Exact match, it is allowed.
+		 */
+		if (alen == len) return true;
+
+		/*
+		 *	"allow = foo/bar/" (trailing slash) is already
+		 *	at a directory boundary.
+		 */
+		if (array[i][alen - 1] == '/') return true;
+
+		/*
+		 *	Setting "allow = foo/bar" does NOT mean that
+		 *	we allow "foo/bard".  It MUST be "foo/bar/bad"
+		 */
+		if (filename[alen] != '/') continue;
+
+		return true;
+	}
+
+	return false;
+}
+
+/** Get the filename from a path
+ *
+ * @param path to get filename from.
+ * @return
+ *	- pointer to the filename in the path.
+ *	- pointer to the path if no '/' is found.
+ */
+char const *fr_filename(char const *path)
+{
+	char const *p = strrchr(path, '/');
+
+	if (p) return p + 1;
+
+	return path;
+}
+
+/** Trim a common prefix from a filename
+ *
+ * @param path to get filename from.
+ * @param common prefix to trim from the path.
+ * @return
+ *	- pointer to the position on the path where the common prefix match ended.
+ */
+char const *fr_filename_common_trim(char const *path, char const *common)
+{
+	char const *p_p, *p_c, *p_pn, *p_cn;
+
+	if (!path) return NULL;
+	if (!common) return NULL;
+
+	p_p = path;
+	p_c = common;
+
+	while ((p_pn = strchr(p_p, '/')) != NULL) {
+		p_cn = strchr(p_c, '/');
+		if (!p_cn) p_cn = p_c + strlen(p_c);
+
+		if ((p_pn - p_p) != (p_cn - p_c)) break;	/* path component not the same len */
+		if (strncmp(p_p, p_c, p_pn - p_p) != 0) break;  /* path component not the same */
+
+		p_p = p_pn + 1;
+		p_c = p_cn + 1;
+	}
+
+	return p_p;
 }

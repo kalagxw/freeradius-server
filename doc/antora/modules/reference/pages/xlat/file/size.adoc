@@ -1,0 +1,26 @@
+= Size
+
+The `file.size` function returns the size (in bytes) of the given
+file.
+
+[#syntax]
+== Syntax
+
+`%file.size(_string_)`
+
+.Return: _uint64_
+
+.Checking the size of a file
+====
+[source,unlang]
+----
+if (%file.size("/var/log/radius.log") > (((uint64)1) << 20)) {
+	%log.info("The log file is getting large!")
+}
+----
+====
+
+include::partial$file_limit.adoc[]
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

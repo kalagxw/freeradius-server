@@ -1,28 +1,15 @@
+string result_string
+uint32 result_integer
 
-update request {
-        &Tmp-Integer-0           := "%{rand:-1}"
-        &Tmp-Integer-1           := "%{rand:hello world}"
-        &Tmp-Integer-2           := "%{rand:123}"
-}
-
-#
-#  Negative limit should have failed
-#
-if (&Tmp-Integer-0 != 0) {
+result_integer := %rand('123')
+if (!result_integer) {
 	test_fail
 }
 
 #
-#  Invalid limit should have failed
+#  Make sure random number is within limit
 #
-if (&Tmp-Integer-1 != 0) {
-	test_fail
-}
-
-#
-#  Make sure random number is whithin limit
-#
-if (&Tmp-Integer-2 < 0 || &Tmp-Integer-2 > 123) {
+if (result_integer < 0 || result_integer > 123) {
 	test_fail
 }
 

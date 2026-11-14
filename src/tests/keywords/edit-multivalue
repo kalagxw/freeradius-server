@@ -1,0 +1,78 @@
+string foo
+string bar
+string baz
+
+baz = "a,b,c,d,e"
+
+#
+#  Append, don't create multiple versions
+#
+bar += %str.split(baz, ',')
+
+if !(bar == "abcde") {
+	test_fail
+}
+
+#
+#  This is a warning.  We only create one copy of "foo".
+#
+#  We cannot have multiple copies of local variables.  There's no real
+#  reason why, but for now it's safer to be limited.
+#
+foo := %str.split(baz, ',')
+if !(foo[#] == 1) {
+	test_fail
+}
+
+#
+#  Append
+#
+Reply-Message = "foo"
+
+Reply-Message += { "a", "b", "c" }
+
+#
+#  This seems wrong and inconsistent with Filter-Id below???
+#
+if !(Reply-Message == "fooabc") {
+	test_fail
+}
+
+Filter-Id := { "a", "b", "c" }
+if !(Filter-Id[#] == 3) {
+	test_fail
+}
+
+#
+#  List by reference
+#
+foo := ""
+foo += Filter-Id[*]
+if !(foo == "abc") {
+	test_fail
+}
+
+request -= Reply-Message
+
+#
+#  Attribute references in in-place lists work.
+#
+Reply-Message := { Filter-ID[2], Filter-ID[1], Filter-ID[0] }
+if !(Reply-Message[#] == 3) {
+	test_fail
+}
+
+if (Reply-Message[0] != 'c') {
+	test_fail
+}
+
+#
+#  This would make sense, but it doesn't work.  Instead it says:
+#
+#   Missing attribute value
+#   Failed creating map from 'Reply-Message = (null)'
+#
+#Tmp-Group-0 := { Reply-Message, Filter-Id }
+
+
+success

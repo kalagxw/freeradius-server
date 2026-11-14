@@ -1,35 +1,57 @@
 # The FreeRADIUS server
 
-[![CI build status][BuildStatus]][BuildStatusLink] [![Coverity Status][CoverityStatus]][CoverityStatusLink] [![LGTM Status][LGTMStatus]][LGTMStatusLink]
+[![CI build status](https://github.com/FreeRADIUS/freeradius-server/actions/workflows/ci.yml/badge.svg)][BuildStatusLink] [![Coverity status][CoverityStatus]][CoverityStatusLink] [![OSS-Fuzz status][OssFuzz]][OssFuzzLink]
 
 ## Introduction
 
 The FreeRADIUS Server Project is a high performance and highly
 configurable multi-protocol policy server, supporting RADIUS, DHCPv4
-DHCPv6, TACACS+ and VMPS. It is available under the terms of the GNU GPLv2.
+DHCPv6, DNS, TACACS+ and VMPS. It is available under the terms of the GNU GPLv2.
 Using RADIUS allows authentication and authorization for a network
 to be centralized, and minimizes the number of changes that have to
 be done when adding or deleting new users to a network.
 
 FreeRADIUS can authenticate users on systems such as 802.1x (WiFi),
 dialup, PPPoE, VPN's, VoIP, and many others.  It supports back-end
-databases such as MySQL, PostgreSQL, Oracle, Microsoft Active
+databases such as MySQL, MariaDB, PostgreSQL, Oracle, Microsoft Active
 Directory, Apache Cassandra, Redis, OpenLDAP, and many more.  It is
 used daily to authenticate the Internet access for hundreds of millions
 of people, in sites ranging from 10 to 10 million+ users.
+
+## WARNING
+
+VERSION 4 IS IN DEVELOPMENT AND HAS NOT BEEN OFFICIALLY RELEASED. USE AT YOUR OWN RISK.
+
+Please wait for an official release before using version 4 (v4).
 
 ## Documentation
 
 Please see the [documentation](doc/) directory, which has full
 documentation for version 4.
 
-Please also see <https://freeradius.org> and <https://wiki.freeradius.org>
+Please also see <https://freeradius.org> and <https://www.freeradius.org/documentation/freeradius-server/4.0.0/>
 for additional documentation.
+
+### Use of AI
+
+We do _not_ recommend using AI tools to generate FreeRADIUS
+configurations.  Experience has shown that these configurations are
+largely wrong.
+
+We _do_ recommend using AI tools to analyze your configuration, and
+suggest optimizations or improvements.  However, these suuggestions
+should be viewed with great suspicion.
+
+The benefit of AI is not in creating new content.  The benefit of AI
+is in analyzing large amounts of existing content.  Computers remember
+things better than people, and are better at cross-checking
+configurations for consistency, errors, or things which were missed.
+As such, AI can sometimes be helpful.
 
 ## Installation
 
 To install the server, please see the [installation
-instructions](doc/antora/modules/installation/pages/index.adoc) document.
+instructions](doc/antora/modules/howto/pages/installation/index.adoc) document.
 
 ## Configuring the server
 
@@ -70,12 +92,8 @@ which includes WARNINGs about common issues, and suggestions for how
 they may be fixed.
 
 The debug output is explained in detail in the
-[radiusd-X](http://wiki.freeradius.org/radiusd-X) page on the
-[wiki](http://wiki.freeradius.org).
-
-Many questions are answered on the Wiki:
-
-<https://wiki.freeradius.org>
+[radiusd-X](https://www.freeradius.org/documentation/freeradius-server/4.0.0/debugging/radiusd_X.html)
+page.
 
 Read the configuration files.  Many parts of the server are
 documented only with extensive comments in the configuration files.
@@ -84,12 +102,21 @@ Search the mailing lists. For example, using Google, searching
 "site:lists.freeradius.org <search term>" will return results from
 the FreeRADIUS mailing lists.
 
-<https://freeradius.org/support/>
+[Additional
+help](https://www.freeradius.org/documentation/freeradius-server/4.0.0/gethelp.html)
+is available via the mailing lists, including commercial support.
 
-Instructions for what to post on the mailing list are [on the
-wiki](http://wiki.freeradius.org/list-help).  Please note that we DO
-recommend posting the output of `radiusd -X`.  We do NOT recommend
-posting the configuration files.
+When posting to the mailing list, we recommend posting the output of
+`radiusd -X`.  That information shows what the server is doing when it
+receives packets, and how it processes those packets.
+
+Do NOT post the configuration files to the mailing list.  They're not
+useful.  Instead, post the output of `radiusd -X`.  We really cannot
+emphasize that enough.
+
+DO post a clear description of what the problem is.  Empty questions
+will not make you friends.  e.g. "I changed things and now it doesn't
+work.  What do I do to fix it?"
 
 ## Feedback, Defects, and Community Support
 
@@ -109,19 +136,19 @@ mailing lists first to determine whether it really is a defect or
 missing feature.
 
 Instructions for gathering data for defect reports can be found in
-[here](doc/antora/modules/developers/pages/bugs.adoc) or on the
-[wiki](https://wiki.freeradius.org/project/bug-reports).
+[here](doc/antora/modules/developers/pages/bugs/bugs.adoc) and online at
+<https://www.freeradius.org/documentation/freeradius-server/4.0.0/developers/bugs.html>
 
 Under no circumstances should the issue tracker be used for support
 requests, those questions belong on the user's mailing list.  If you
 post questions related to the server in the issue tracker, the issue
-will be closed and locked.  If you persist in positing questions to
+will be closed and locked.  If you persist in posting questions to
 the issue tracker you will be banned from all FreeRADIUS project
 repositories on GitHub.
 
-Please do NOT complain that the developers aren't answering your
+Please do _not_ complain that the developers aren't answering your
 questions quickly enough, or aren't fixing the problems quickly
-enough.  Please do NOT complain if you're told to go read
+enough.  Please do _not_ complain if you're told to go read
 documentation.  We recognize that the documentation isn't perfect, but
 it *does* exist, and reading it can solve most common questions.
 
@@ -135,11 +162,13 @@ code, or documentation).
 
 Technical support, managed systems support, custom deployments,
 sponsored feature development and many other commercial services
-are available from [Network RADIUS](https://networkradius.com).
+are available from [InkBridge Networks](https://www.inkbridgenetworks.com).
 
-[CoverityStatus]: https://scan.coverity.com/projects/58/badge.svg?flat=1 "Coverity Status"
-[CoverityStatusLink]: https://scan.coverity.com/projects/58
 [BuildStatus]: https://github.com/FreeRADIUS/freeradius-server/workflows/CI/badge.svg?branch=master "CI status"
 [BuildStatusLink]: https://github.com/FreeRADIUS/freeradius-server/actions?query=workflow%3ACI
+[OssFuzz]: https://oss-fuzz-build-logs.storage.googleapis.com/badges/freeradius.svg "OSS-Fuzz status"
+[OssFuzzLink]: https://bugs.chromium.org/p/oss-fuzz/issues/list?sort=-opened&can=1&q=proj:freeradius
+[CoverityStatus]: https://scan.coverity.com/projects/58/badge.svg?flat=1 "Coverity Status"
+[CoverityStatusLink]: https://scan.coverity.com/projects/58
 [LGTMStatus]: https://img.shields.io/lgtm/alerts/g/FreeRADIUS/freeradius-server.svg?logo=lgtm&logoWidth=18
 [LGTMStatusLink]: https://lgtm.com/projects/g/FreeRADIUS/freeradius-server/alerts/

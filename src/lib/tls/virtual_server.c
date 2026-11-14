@@ -21,47 +21,72 @@
  * @brief Calls a section in the TLS policy virtual server.
  *
  * @copyright 2021 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2026 Network RADIUS SAS (legal@networkradius.com)
  */
-#ifdef WITH_TLS
-#define LOG_PREFIX "tls - "
 
+#ifdef WITH_TLS
+#define LOG_PREFIX "tls"
+
+#include <freeradius-devel/unlang/action.h>
 #include <freeradius-devel/unlang/interpret.h>
 #include <freeradius-devel/unlang/call.h>
 #include <freeradius-devel/server/virtual_servers.h>
 
 #include "attrs.h"
 #include "base.h"
-#include "cache.h"
+#include "ticket.h"
 
 /** Push a request to perform a policy action using a virtual server
  *
  * This function will setup a TLS subrequest to run a virtual server section.
  *
+ * @note FIXME - The result of these callback sections are ignored... We may
+ *       want to change this in the future.
+ *
  * @param[out] child		to run as a subrequest of the parent.
  * @param[in] resume		Function to call after the virtual server
  *      			finishes processing the request. uctx will
  *				be a pointer to the provided tls_session.
+ *				May be NULL, when nothing needs the result.
  * @param[in] conf		the tls configuration.
  * @param[in] tls_session	The current tls_session.
+ * @param[in] cache_required	Does this action require the tls cache
  * @return
- *      - 0 on success.
- *	- -1 on failure.
+ *      - UNLANG_ACTION_PUSHED_CHILD on success.
+ *	- UNLANG_ACTION_FAIL on failure.
  */
-unlang_action_t fr_tls_call_push(request_t *child, unlang_function_t resume,
-				 fr_tls_conf_t *conf, fr_tls_session_t *tls_session)
+unlang_action_t fr_tls_call_push(request_t *child, unlang_function_no_result_t resume,
+				 fr_tls_conf_t *conf, fr_tls_session_t *tls_session,
+#ifdef NDEBUG
+				 UNUSED
+#endif
+				 bool cache_required)
 {
-	fr_assert(tls_session->cache);
+	fr_assert(tls_session->cache || !cache_required);
+
+	/*
+	 *	The caller MUST have checked if a virtual server is
+	 *	available.  If not, then the 'child' request has been
+	 *	built and allocated for no purpose.
+	 *
+	 *	unlang_call_push() below is nonnull, so a NULL
+	 *	virtual_server must not reach it.  Every caller frees the
+	 *	child when this function fails, so returning here leaks
+	 *	nothing.
+	 */
+	if (!fr_cond_assert_msg(conf->virtual_server != NULL,
+				"TLS configuration has no virtual_server, so no policy section can run")) {
+		return UNLANG_ACTION_FAIL;
+	}
 
 	/*
 	 *	Sets up a dispatch frame in the parent
 	 *	and a result processing frame in the child.
 	 */
 	if (unlang_subrequest_child_push(NULL, child,
-					 &(unlang_subrequest_session_t){
-						.enable = true,
-						.unique_ptr = tls_session
-					 },
+					 tls_session,
 					 true, UNLANG_SUB_FRAME) < 0) {
+		fr_assert(!request_is_detachable(child));
 		return UNLANG_ACTION_FAIL;
 	}
 
@@ -69,8 +94,23 @@ unlang_action_t fr_tls_call_push(request_t *child, unlang_function_t resume,
 	 *	Setup a function to execute after the
 	 *	subrequest completes.
 	 */
-	if (unlang_function_push(child, NULL, resume,
-				 NULL, UNLANG_SUB_FRAME, tls_session) < 0) return UNLANG_ACTION_FAIL;
+	if (resume && !fr_cond_assert(unlang_function_push(child,
+							   NULL,
+							   resume,
+							   NULL,
+							   FR_SIGNAL_NONE, UNLANG_SUB_FRAME,
+							   tls_session) == UNLANG_ACTION_PUSHED_CHILD)) {
+		/*
+		 *	We just pushed the child frame onto the stack.
+		 *	We don't want the subrequest to execute, if we then
+		 *	failed to push the function that executes after it
+		 *	returns.
+		 */
+	error:
+		unlang_interpet_frame_discard(child->parent);
+		fr_assert(!request_is_detachable(child));
+		return UNLANG_ACTION_FAIL;
+	}
 
 	/*
 	 *	Now the child and parent stacks are both
@@ -78,10 +118,7 @@ unlang_action_t fr_tls_call_push(request_t *child, unlang_function_t resume,
 	 *	call into the subrequest to run the section
 	 *	specified by Packet-Type.
 	 */
-	if (unlang_call_push(child, conf->virtual_server, UNLANG_SUB_FRAME) < 0) {
-		request_detach(child);
-		return UNLANG_ACTION_FAIL;
-	}
+	if (unlang_call_push(NULL, child, conf->virtual_server, UNLANG_SUB_FRAME) < 0) goto error;
 
 	return UNLANG_ACTION_PUSHED_CHILD;
 }

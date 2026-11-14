@@ -1,0 +1,48 @@
+#
+#  PRE: subrequest
+#
+Filter-Id := 'testing'
+
+# Cancel in subrequest
+subrequest ::Access-Request {
+	detach
+
+	# Smoke test, check for crashes
+	if (parent.Filter-Id == 'testing') {
+		test_fail
+	}
+
+	# Ensure yield and resume behave as expected
+	# Detached requests do not use normal time tracking
+	%delay_10s(0s)
+
+	parent.Reply-Message = 'testing'
+
+	# As we're detached this failure doesn't do anything
+	test_fail
+}
+
+# Should not have been set from detached child
+if (Reply-Message && (Reply-Message == 'testing')) {
+	test_fail
+}
+
+# Regression test - Previous behaviour of detached subrequest
+# sections was to leave the previous rcode set, but evaluate
+# it with the priorities of the subrequest section, which was
+# wrong.
+#
+# New behaviour should be to avoid calculating a new rcode.
+fail {
+	fail = 1
+}
+
+# Check that detached requests can be cancelled
+subrequest ::Access-Request {
+	detach
+
+	# Smoke test for cancelling detached requests
+	%cancel()
+}
+
+success

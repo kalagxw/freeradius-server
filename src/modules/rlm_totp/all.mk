@@ -1,2 +1,2 @@
-TARGET		:= rlm_totp.a
-SOURCES		:= rlm_totp.c
+SUBMAKEFILES := rlm_totp.mk libfreeradius-totp.mk
+

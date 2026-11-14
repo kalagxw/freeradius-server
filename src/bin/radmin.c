@@ -25,12 +25,11 @@
  */
 RCSID("$Id$")
 
-#include <freeradius-devel/io/schedule.h>
+#include <freeradius-devel/io/thread.h>
 #include <freeradius-devel/server/base.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/server/radmin.h>
 
-#include <freeradius-devel/util/dict.h>
 #include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/socket.h>
 
@@ -40,7 +39,6 @@ RCSID("$Id$")
  *	Readline headers aren't compliant
  */
 DIAG_OFF(strict-prototypes)
-# include <stdio.h>
 #if defined(HAVE_READLINE_READLINE_H)
 #  include <readline/readline.h>
 #  define USE_READLINE (1)
@@ -71,6 +69,9 @@ static bool stop = false;
 static int context = 0;
 static fr_cmd_info_t radmin_info;
 static TALLOC_CTX *radmin_ctx = NULL;
+static FILE *my_stdin = NULL;
+static FILE *my_stdout = NULL;
+static FILE *my_stderr = NULL;
 
 #ifndef USE_READLINE
 /*
@@ -83,14 +84,14 @@ static char *readline(char const *prompt)
 	char *line, *p;
 
 	if (prompt && *prompt) puts(prompt);
-	fflush(stdout);
+	fflush(my_stdout);
 
 	line = fgets(readline_buffer, sizeof(readline_buffer), stdin);
 	if (!line) return NULL;
 
 	p = strchr(line, '\n');
 	if (!p) {
-		fprintf(stderr, "Input line too long\n");
+		fprintf(my_stderr, "Input line too long\n");
 		return NULL;
 	}
 
@@ -214,12 +215,12 @@ radmin_completion(const char *text, int start, UNUSED int end)
 static int radmin_help(UNUSED int count, UNUSED int key)
 {
 	size_t offset;
-	printf("\n");
+	fprintf(my_stdout, "\n");
 
 	offset = (radmin_partial_line - radmin_buffer);
 	strlcpy(radmin_partial_line, rl_line_buffer, 8192 - offset);
 
-	(void) fr_command_print_help(stdout, radmin_cmd, radmin_buffer);
+	(void) fr_command_print_help(my_stdout, radmin_cmd, radmin_buffer);
 	rl_on_new_line();
 	return 0;
 }
@@ -230,7 +231,8 @@ static int radmin_help(UNUSED int count, UNUSED int key)
 static void *fr_radmin(UNUSED void *input_ctx)
 {
 	int argc = 0;
-	int *context_exit, *context_offset;
+	int *context_exit;
+	size_t *context_offset;
 	char const *prompt;
 	size_t size;
 	TALLOC_CTX *ctx;
@@ -247,10 +249,10 @@ static void *fr_radmin(UNUSED void *input_ctx)
 	fr_command_info_init(ctx, info);
 
 	context_exit = talloc_zero_array(ctx, int, CMD_MAX_ARGV + 1);
-	context_offset = talloc_zero_array(ctx, int, CMD_MAX_ARGV + 1);
+	context_offset = talloc_zero_array(ctx, size_t, CMD_MAX_ARGV + 1);
 	context_offset[0] = 0;
 
-	fflush(stdout);
+	fflush(my_stdout);
 
 #ifdef USE_READLINE
 	rl_attempted_completion_function = radmin_completion;
@@ -262,13 +264,22 @@ static void *fr_radmin(UNUSED void *input_ctx)
 		char *line;
 
 		fr_assert(context >= 0);
-		fr_assert(context_offset[context] >= 0);
 		radmin_partial_line = radmin_buffer + context_offset[context];
 		line = readline(prompt);
 		if (stop) break;
 
-		if (!line) continue;
+		/*
+		 *	NULL means "read hit EOF"
+		 */
+		if (!line) {
+			INFO("radmin input was closed - exiting");
+			main_loop_signal_raise(RADIUS_SIGNAL_SELF_EXIT);
+			break;
+		}
 
+		/*
+		 *	non-NULL, but empty line means "no input"
+		 */
 		if (!*line) {
 			radmin_free(line);
 			continue;
@@ -283,7 +294,7 @@ static void *fr_radmin(UNUSED void *input_ctx)
 			 *	It closes the CLI immediately.
 			 */
 			if (strcmp(line, "quit") == 0) {
-				cmd_exit(stdout, stderr, NULL, info);
+				cmd_exit(my_stdout, my_stderr, NULL, info);
 				goto next;
 			}
 
@@ -332,7 +343,10 @@ static void *fr_radmin(UNUSED void *input_ctx)
 		/*
 		 *	Skip blank lines.
 		 */
-		if (argc == context) continue;
+		if (argc == context) {
+			radmin_free(line);
+			continue;
+		}
 
 		/*
 		 *	It's a partial command.  Add it to the context
@@ -351,7 +365,7 @@ static void *fr_radmin(UNUSED void *input_ctx)
 			 *	Not enough room for more commands, refuse to do it.
 			 */
 			if ((context_offset[context] + len + 80) >= size) {
-				fprintf(stderr, "Too many commands!\n");
+				fprintf(my_stderr, "Too many commands!\n");
 				goto next;
 			}
 
@@ -389,8 +403,8 @@ static void *fr_radmin(UNUSED void *input_ctx)
 		 */
 		add_history(line);
 
-		if (fr_command_run(stdout, stderr, info, false) < 0) {
-			fprintf(stderr, "Failed running command.\n");
+		if (fr_command_run(my_stdout, my_stderr, info, false) < 0) {
+			fprintf(my_stderr, "Failed running command.\n");
 		}
 
 	next:
@@ -407,6 +421,10 @@ static void *fr_radmin(UNUSED void *input_ctx)
 		if (stop) break;
 	}
 
+	fclose(my_stdin);
+	fclose(my_stdout);
+	fclose(my_stderr);
+
 	talloc_free(ctx);
 	radmin_buffer = NULL;
 	radmin_partial_line = NULL;
@@ -418,7 +436,7 @@ static void *fr_radmin(UNUSED void *input_ctx)
 /** radmin functions, tables, and callbacks
  *
  */
-static fr_time_delta_t start_time;
+static fr_time_t start_time;
 
 static int cmd_exit(UNUSED FILE *fp, UNUSED FILE *fp_err, UNUSED void *ctx, UNUSED fr_cmd_info_t const *info)
 {
@@ -458,7 +476,7 @@ static int cmd_uptime(FILE *fp, UNUSED FILE *fp_err, UNUSED void *ctx, UNUSED fr
 {
 	fr_time_delta_t uptime;
 
-	uptime = fr_time() - start_time;
+	uptime = fr_time_sub(fr_time(), start_time);
 
 	fr_fprintf(fp, "Uptime: %pVs seconds\n", fr_box_time_delta(uptime));
 
@@ -473,12 +491,12 @@ static int cmd_stats_memory(FILE *fp, FILE *fp_err, UNUSED void *ctx, fr_cmd_inf
 	}
 
 	if (strcmp(info->argv[0], "total") == 0) {
-		fprintf(fp, "%zd\n", talloc_total_size(NULL));
+		fprintf(fp, "%zu\n", talloc_total_size(NULL));
 		return 0;
 	}
 
 	if (strcmp(info->argv[0], "blocks") == 0) {
-		fprintf(fp, "%zd\n", talloc_total_blocks(NULL));
+		fprintf(fp, "%zu\n", talloc_total_blocks(NULL));
 		return 0;
 	}
 
@@ -521,7 +539,9 @@ static int cmd_set_profile_status(UNUSED FILE *fp, FILE *fp_err, UNUSED void *ct
 	fr_value_box_t box;
 	struct ProfilerState state;
 
-	if (fr_value_box_from_str(NULL, &box, FR_TYPE_BOOL, NULL, info->argv[0], strlen(info->argv[0]), '\0', false) < 0) {
+	if (fr_value_box_from_str(NULL, &box, FR_TYPE_BOOL, NULL,
+				  info->argv[0], strlen(info->argv[0]),
+				  NULL) <= 0) {
 		fprintf(fp_err, "Failed setting profile status '%s' - %s\n", info->argv[0], fr_strerror());
 		return -1;
 	}
@@ -546,7 +566,7 @@ static int cmd_set_profile_status(UNUSED FILE *fp, FILE *fp_err, UNUSED void *ct
 			ProfilerStart(filename);
 		} else {
 			pid_t pid = getpid();
-			MEM(filename = talloc_asprintf(NULL, "/tmp/freeradius-profile.%u.prof", pid));
+			MEM(filename = talloc_asprintf(NULL, "/tmp/freeradius-profile.%ld.prof", (long)pid));
 			ProfilerStart(filename);
 			talloc_free(filename);
 		}
@@ -686,7 +706,7 @@ static int tab_expand_config_thing(TALLOC_CTX *talloc_ctx, UNUSED void *ctx, fr_
 		if (!fr_command_strncmp(text, check)) continue;
 
 	add:
-		expansions[count] = str = malloc(reflen + strlen(check) + offset + 1);
+		MEM(expansions[count] = str = malloc(reflen + strlen(check) + offset + 1));
 		memcpy(str, ref, reflen);
 		str[reflen] = '.';
 		strcpy(str + reflen + offset, check);
@@ -779,7 +799,7 @@ static int cmd_show_config_item(FILE *fp, FILE *fp_err, UNUSED void *ctx, fr_cmd
 
 static int cmd_show_client(FILE *fp, FILE *fp_err, UNUSED void *ctx, fr_cmd_info_t const *info)
 {
-	RADCLIENT *client;
+	fr_client_t *client;
 
 	if (info->argc >= 2) {
 		int proto;
@@ -788,7 +808,7 @@ static int cmd_show_client(FILE *fp, FILE *fp_err, UNUSED void *ctx, fr_cmd_info
 			proto = IPPROTO_TCP;
 
 		} else if (strcmp(info->argv[1], "udp") == 0) {
-			proto = IPPROTO_TCP;
+			proto = IPPROTO_UDP;
 
 		} else {
 			fprintf(fp_err, "Unknown proto '%s'.\n", info->argv[1]);
@@ -1059,7 +1079,7 @@ static fr_cmd_table_t cmd_table[] = {
 	CMD_TABLE_END
 };
 
-int fr_radmin_start(main_config_t *config, bool cli)
+int fr_radmin_start(main_config_t *config, bool cli, int std_fd[static 3])
 {
 	radmin_ctx = talloc_init_const("radmin");
 	if (!radmin_ctx) return -1;
@@ -1080,6 +1100,36 @@ int fr_radmin_start(main_config_t *config, bool cli)
 
 	if (!cli) return 0;
 
+	my_stdin = fdopen(std_fd[STDIN_FILENO], "r");
+	if (!my_stdin) {
+		ERROR("Failed initializing radmin stdin %s", fr_syserror(errno));
+		return -1;
+	}
+#ifdef USE_READLINE
+	rl_instream = my_stdin;
+#endif
+
+	my_stdout = fdopen(std_fd[STDOUT_FILENO], "w");
+	if (!my_stdout) {
+		fclose(my_stdin);
+		my_stdin = NULL;
+		ERROR("Failed initializing radmin stdout - %s", fr_syserror(errno));
+		return -1;
+	}
+#ifdef USE_READLINE
+	rl_outstream = my_stdout;
+#endif
+
+	my_stderr = fdopen(std_fd[2], "w");
+	if (!my_stderr) {
+		fclose(my_stdin);
+		fclose(my_stdout);
+		my_stdin = NULL;
+		my_stdout = NULL;
+		PERROR("Failed initializing radmin stderr");
+		return -1;
+	}
+
 	/*
 	 *	Note that the commands are registered by the main
 	 *	thread.  That registration is done in a (mostly)
@@ -1087,11 +1137,12 @@ int fr_radmin_start(main_config_t *config, bool cli)
 	 *	won't go into la-la-land.  They might find unfinished
 	 *	commands, but they don't crash.
 	 */
-	if (fr_schedule_pthread_create(&cli_pthread_id, fr_radmin, NULL) < 0) {
+	if (fr_thread_create(&cli_pthread_id, fr_radmin, NULL) < 0) {
 		PERROR("Failed creating radmin thread");
 		return -1;
 	}
 	cli_started = true;
+	INFO("radmin interface started");
 
 	return 0;
 }

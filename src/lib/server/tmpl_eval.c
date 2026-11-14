@@ -28,50 +28,66 @@ RCSID("$Id$")
 
 #define _TMPL_PRIVATE 1
 
-#include <freeradius-devel/server/tmpl.h>
 #include <freeradius-devel/server/exec.h>
 #include <freeradius-devel/server/exec_legacy.h>
-#include <freeradius-devel/util/proto.h>
-#include <freeradius-devel/util/dlist.h>
+#include <freeradius-devel/server/tmpl.h>
+#include <freeradius-devel/server/tmpl_dcursor.h>
+#include <freeradius-devel/server/client.h>
+#include <freeradius-devel/unlang/call.h>
 
-/** Resolve attribute #pair_list_t value to an attribute list.
+#include <freeradius-devel/util/atexit.h>
+#include <freeradius-devel/util/edit.h>
+
+
+static fr_dict_t const *dict_freeradius;
+static fr_dict_t const *dict_radius;
+
+extern fr_dict_autoload_t tmpl_dict[];
+fr_dict_autoload_t tmpl_dict[] = {
+	{ .out = &dict_freeradius, .proto = "freeradius" },
+	{ .out = &dict_radius, .proto = "radius" }, /* @todo - remove RADIUS from the server core... */
+	DICT_AUTOLOAD_TERMINATOR
+};
+
+/** Placeholder attribute for uses of unspecified attribute references
+ */
+extern fr_dict_attr_t const *tmpl_attr_unspec;
+fr_dict_attr_t const *tmpl_attr_unspec;
+
+
+/** Resolve attribute #fr_pair_list_t value to an attribute list.
  *
  * The value returned is a pointer to the pointer of the HEAD of a #fr_pair_t list in the
  * #request_t. If the head of the list changes, the pointer will still be valid.
  *
  * @param[in] request containing the target lists.
- * @param[in] list #pair_list_t value to resolve to #fr_pair_t list. Will be NULL if list
+ * @param[in] list #fr_pair_list_t value to resolve to #fr_pair_t list. Will be NULL if list
  *	name couldn't be resolved.
  * @return a pointer to the HEAD of a list in the #request_t.
  *
- * @see tmpl_pair_cursor_init
+ * @see tmpl_dcursor_init
  */
-fr_pair_list_t *tmpl_list_head(request_t *request, tmpl_pair_list_t list)
+fr_pair_list_t *tmpl_list_head(request_t *request, fr_dict_attr_t const *list)
 {
 	if (!request) return NULL;
 
-	switch (list) {
-	/* Don't add default */
-	case PAIR_LIST_UNKNOWN:
-		break;
-
-	case PAIR_LIST_REQUEST:
+	if (list == request_attr_request) {
 		if (!request->packet) return NULL;
 		return &request->request_pairs;
-
-	case PAIR_LIST_REPLY:
-		if (!request->reply) return NULL;
-		return &request->reply_pairs;
-
-	case PAIR_LIST_CONTROL:
-		return &request->control_pairs;
-
-	case PAIR_LIST_STATE:
-		return &request->session_state_pairs;
 	}
 
-	RWDEBUG2("List \"%s\" is not available",
-		fr_table_str_by_value(pair_list_table, list, "<INVALID>"));
+	if (list == request_attr_reply) {
+		if (!request->reply) return NULL;
+		return &request->reply_pairs;
+	}
+
+	if (list == request_attr_control) return &request->control_pairs;
+
+	if (list == request_attr_state) return &request->session_state_pairs;
+
+	if (list == request_attr_local) return &request->local_pairs;
+
+	RWDEBUG2("List \"%s\" is not available", tmpl_list_name(list, "<INVALID>"));
 
 	return NULL;
 }
@@ -79,71 +95,53 @@ fr_pair_list_t *tmpl_list_head(request_t *request, tmpl_pair_list_t list)
 /** Return the correct TALLOC_CTX to alloc #fr_pair_t in, for a list
  *
  * Allocating new #fr_pair_t in the context of a #request_t is usually wrong.
- * #fr_pair_t should be allocated in the context of a #fr_radius_packet_t, so that if the
- * #fr_radius_packet_t is freed before the #request_t, the associated #fr_pair_t lists are
+ * #fr_pair_t should be allocated in the context of a #fr_packet_t, so that if the
+ * #fr_packet_t is freed before the #request_t, the associated #fr_pair_t lists are
  * freed too.
  *
  * @param[in] request containing the target lists.
- * @param[in] list #pair_list_t value to resolve to TALLOC_CTX.
+ * @param[in] list #fr_pair_list_t value to resolve to TALLOC_CTX.
  * @return
  *	- TALLOC_CTX on success.
  *	- NULL on failure.
  *
  * @see tmpl_pair_list
  */
-TALLOC_CTX *tmpl_list_ctx(request_t *request, tmpl_pair_list_t list)
+TALLOC_CTX *tmpl_list_ctx(request_t *request, fr_dict_attr_t const *list)
 {
 	if (!request) return NULL;
 
-	switch (list) {
-	case PAIR_LIST_REQUEST:
-		return request->request_ctx;
+	if (list == request_attr_request) return request->request_ctx;
 
-	case PAIR_LIST_REPLY:
-		return request->reply_ctx;
+	if (list == request_attr_reply) return request->reply_ctx;
 
-	case PAIR_LIST_CONTROL:
-		return request->control_ctx;
+	if (list == request_attr_control) return request->control_ctx;
 
-	case PAIR_LIST_STATE:
-		return request->session_state_ctx;
+	if (list == request_attr_state) return request->session_state_ctx;
 
-	/* Don't add default */
-	case PAIR_LIST_UNKNOWN:
-		break;
-	}
+	if (list == request_attr_local) return request->local_ctx;
 
 	return NULL;
 }
 
-/** Resolve a list to the #fr_radius_packet_t holding the HEAD pointer for a #fr_pair_t list
+/** Resolve a list to the #fr_packet_t holding the HEAD pointer for a #fr_pair_t list
  *
- * Returns a pointer to the #fr_radius_packet_t that holds the HEAD pointer of a given list,
+ * Returns a pointer to the #fr_packet_t that holds the HEAD pointer of a given list,
  * for the current #request_t.
  *
  * @param[in] request To resolve list in.
- * @param[in] list #pair_list_t value to resolve to #fr_radius_packet_t.
+ * @param[in] list #fr_pair_list_t value to resolve to #fr_packet_t.
  * @return
- *	- #fr_radius_packet_t on success.
+ *	- #fr_packet_t on success.
  *	- NULL on failure.
  *
  * @see tmpl_pair_list
  */
-fr_radius_packet_t *tmpl_packet_ptr(request_t *request, tmpl_pair_list_t list)
+fr_packet_t *tmpl_packet_ptr(request_t *request, fr_dict_attr_t const *list)
 {
-	switch (list) {
-	/* Don't add default */
-	case PAIR_LIST_STATE:
-	case PAIR_LIST_CONTROL:
-	case PAIR_LIST_UNKNOWN:
-		return NULL;
+	if (list == request_attr_request) return request->packet;
 
-	case PAIR_LIST_REQUEST:
-		return request->packet;
-
-	case PAIR_LIST_REPLY:
-		return request->reply;
-	}
+	if (list == request_attr_reply) return request->reply;
 
 	return NULL;
 }
@@ -155,37 +153,41 @@ fr_radius_packet_t *tmpl_packet_ptr(request_t *request, tmpl_pair_list_t list)
  * to a #request_t higher in the chain than the current #request_t.
  *
  * @see tmpl_pair_list
- * @param[in,out] context #request_t to start resolving from, and where to write
- *	a pointer to the resolved #request_t back to.
- * @param[in] name (request) to resolve.
+ * @param[in,out] context	#request_t to start resolving from, and where to write
+ *				a pointer to the resolved #request_t back to.
+ * @param[in] rql		list of request qualifiers to follow.
  * @return
  *	- 0 if request is valid in this context.
  *	- -1 if request is not valid in this context.
  */
-int tmpl_request_ptr(request_t **context, tmpl_request_ref_t name)
+int tmpl_request_ptr(request_t **context, FR_DLIST_HEAD(tmpl_request_list) const *rql)
 {
+	tmpl_request_t *rr = NULL;
 	request_t *request = *context;
 
-	switch (name) {
-	case REQUEST_CURRENT:
-		return 0;
+	while ((rr = tmpl_request_list_next(rql, rr))) {
+		switch (rr->request) {
+		case REQUEST_CURRENT:
+			continue;	/* noop */
 
-	case REQUEST_PARENT:	/* Navigate up one level */
-		if (!request->parent) return -1;
-		*context = request->parent;
-		break;
+		case REQUEST_PARENT:	/* Navigate up one level */
+			if (!request->parent) return -1;
+			request = request->parent;
+			break;
 
-	case REQUEST_OUTER:	/* Navigate to the outermost request */
-		if (!request->parent) return -1;
-		while (request->parent) request = request->parent;
-		*context = request;
-		break;
+		case REQUEST_OUTER:	/* Navigate to the outermost request */
+			if (!request->parent) return -1;
+			while (request->parent) request = request->parent;
+			break;
 
-	case REQUEST_UNKNOWN:
-	default:
-		fr_assert(0);
-		return -1;
+		case REQUEST_UNKNOWN:
+		default:
+			fr_assert(0);
+			return -1;
+		}
 	}
+
+	*context = request;
 
 	return 0;
 }
@@ -208,7 +210,7 @@ fr_type_t tmpl_expanded_type(tmpl_t const *vpt)
 	/*
 	 *	Casts take precedence over everything.
 	 */
-	if (vpt->cast != FR_TYPE_NULL) return vpt->cast;
+	if (tmpl_rules_cast(vpt) != FR_TYPE_NULL) return tmpl_rules_cast(vpt);
 
 	/*
 	 *	Anything that's not a bare word will
@@ -219,7 +221,7 @@ fr_type_t tmpl_expanded_type(tmpl_t const *vpt)
 
 	switch (vpt->type) {
 	case TMPL_TYPE_ATTR:
-		return tmpl_da(vpt)->type;
+		return tmpl_attr_tail_da(vpt)->type;
 
 	case TMPL_TYPE_DATA:
 		return tmpl_value_type(vpt);
@@ -244,7 +246,7 @@ fr_type_t tmpl_expanded_type(tmpl_t const *vpt)
  *
  * Depending what arguments are passed, either copies the value to buff, or writes a pointer
  * to a string buffer to out. This allows the most efficient access to the value resolved by
- * the #tmpl_t, avoiding unecessary string copies.
+ * the #tmpl_t, avoiding unnecessary string copies.
  *
  * @note This function is used where raw string values are needed, which may mean the string
  *	returned may be binary data or contain unprintable chars. #fr_snprint or #fr_asprint
@@ -258,16 +260,14 @@ fr_type_t tmpl_expanded_type(tmpl_t const *vpt)
  * @param[out] buff		Expansion buffer, may be NULL except for the following types:
  *				- #TMPL_TYPE_EXEC
  *				- #TMPL_TYPE_XLAT
+ *				- input type non-string, output type string
  * @param[in] bufflen		Length of expansion buffer. Must be >= 2.
  * @param[in] request		Current request.
  * @param[in] vpt		to expand. Must be one of the following types:
- *				- #TMPL_TYPE_UNRESOLVED
  *				- #TMPL_TYPE_EXEC
  *				- #TMPL_TYPE_XLAT
  *				- #TMPL_TYPE_ATTR
  *				- #TMPL_TYPE_DATA
- * @param[in] escape		xlat escape function (only used for xlat types).
- * @param[in] escape_ctx	xlat escape function data.
  * @param dst_type		FR_TYPE_* matching out pointer.  @see tmpl_expand.
  * @return
  *	- -1 on failure.
@@ -277,102 +277,77 @@ ssize_t _tmpl_to_type(void *out,
 		      uint8_t *buff, size_t bufflen,
 		      request_t *request,
 		      tmpl_t const *vpt,
-		      xlat_escape_legacy_t escape, void const *escape_ctx,
 		      fr_type_t dst_type)
 {
-	fr_value_box_t		value_to_cast;
-	fr_value_box_t		value_from_cast = { .type = FR_TYPE_NULL };
-	fr_value_box_t const	*to_cast = &value_to_cast;
-	fr_value_box_t const	*from_cast = &value_from_cast;
+	fr_value_box_t		value_to_cast = FR_VALUE_BOX_INITIALISER_NULL(value_to_cast);
+	fr_value_box_t		value_from_cast = FR_VALUE_BOX_INITIALISER_NULL(value_from_cast);
+	fr_value_box_t const	*to_cast = NULL;
+	fr_value_box_t const	*from_cast = NULL;
 
 	fr_pair_t		*vp = NULL;
-
-	fr_type_t		src_type = FR_TYPE_NULL;
 
 	ssize_t			slen = -1;	/* quiet compiler */
 
 	TMPL_VERIFY(vpt);
 
-	fr_assert(!tmpl_is_list(vpt));
+	fr_assert(!tmpl_needs_resolving(vpt));
+	fr_assert(!fr_type_is_structural(dst_type));
+
 	fr_assert(!buff || (bufflen >= 2));
 
 	switch (vpt->type) {
-	case TMPL_TYPE_UNRESOLVED:
-		RDEBUG4("EXPAND TMPL UNRESOLVED");
-		fr_value_box_bstrndup_shallow(&value_to_cast, NULL, vpt->name, vpt->len, false);
-		src_type = FR_TYPE_STRING;
-		break;
-
 	case TMPL_TYPE_EXEC:
-	{
 		RDEBUG4("EXPAND TMPL EXEC");
 		if (!buff) {
-			fr_strerror_const("Missing expansion buffer for EXEC");
+			REDEBUG("Missing expansion buffer for exec");
 			return -1;
 		}
 
-		if (radius_exec_program_legacy(request, (char *)buff, bufflen, NULL, request, vpt->name, NULL,
+		if (radius_exec_program_legacy((char *) buff, bufflen, request, vpt->name, NULL,
 					true, false, fr_time_delta_from_sec(EXEC_TIMEOUT)) != 0) return -1;
-		fr_value_box_strdup_shallow(&value_to_cast, NULL, (char *)buff, true);
-		src_type = FR_TYPE_STRING;
-	}
+
+		fr_value_box_strdup_shallow(&value_to_cast, NULL, (char *) buff, true);
+		to_cast = &value_to_cast;
 		break;
 
 	case TMPL_TYPE_XLAT:
-	{
-		size_t len;
-
 		RDEBUG4("EXPAND TMPL XLAT PARSED");
-		RDEBUG2("EXPAND %s", vpt->name); /* xlat_struct doesn't do this */
+
+		/* No EXPAND <xlat> here as the xlat code does it */
+
 		if (!buff) {
-			fr_strerror_const("Missing expansion buffer for XLAT_STRUCT");
+			REDEBUG("Missing expansion buffer for dynamic expansion");
 			return -1;
 		}
+
 		/* Error in expansion, this is distinct from zero length expansion */
-		slen = xlat_eval_compiled((char *)buff, bufflen, request, tmpl_xlat(vpt), escape, escape_ctx);
+		slen = xlat_eval_compiled((char *) buff, bufflen, request, tmpl_xlat(vpt), NULL, NULL);
 		if (slen < 0) return slen;
 
-		RDEBUG2("   --> %s", (char *)buff);	/* Print pre-unescaping (so it's escaped) */
-
-		/*
-		 *	Undo any of the escaping that was done by the
-		 *	xlat expansion function.
-		 *
-		 *	@fixme We need a way of signalling xlat not to escape things.
-		 */
-		len = fr_value_str_unescape(&FR_SBUFF_IN((char *)buff, slen),
-					    &FR_SBUFF_IN((char *)buff, slen), SIZE_MAX, '"');
-		fr_assert(buff);
-		fr_value_box_bstrndup_shallow(&value_to_cast, NULL, (char *)buff, len, true);
-		src_type = FR_TYPE_STRING;
-	}
+		fr_value_box_bstrndup_shallow(&value_to_cast, NULL, (char *) buff, slen, true);
+		to_cast = &value_to_cast;
 		break;
 
 	case TMPL_TYPE_ATTR:
-	{
-		int ret;
-
 		RDEBUG4("EXPAND TMPL ATTR");
-		ret = tmpl_find_vp(&vp, request, vpt);
-		if (ret < 0) return -2;
+		if (tmpl_find_vp(&vp, request, vpt) < 0) {
+			REDEBUG("Failed to find attribute %s", vpt->name);
+			return -2;
+		}
 
 		to_cast = &vp->data;
-		src_type = vp->da->type;
-	}
 		break;
 
 	case TMPL_TYPE_DATA:
 		RDEBUG4("EXPAND TMPL DATA");
 		to_cast = tmpl_value(vpt);
-		src_type = tmpl_value_type(vpt);
 		break;
 
 	/*
 	 *	We should never be expanding these.
 	 */
 	case TMPL_TYPE_UNINITIALISED:
-	case TMPL_TYPE_NULL:
-	case TMPL_TYPE_LIST:
+	case TMPL_TYPE_DATA_UNRESOLVED:
 	case TMPL_TYPE_EXEC_UNRESOLVED:
 	case TMPL_TYPE_ATTR_UNRESOLVED:
 	case TMPL_TYPE_XLAT_UNRESOLVED:
@@ -386,134 +361,67 @@ ssize_t _tmpl_to_type(void *out,
 	}
 
 	/*
-	 *	Deal with casts.
+	 *	Same type, just copy the value.
+	 *
+	 *	If the input is exec/xlat, then we can just copy the output ptr to the caller, as it's already
+	 *	pointing to "buff".
 	 */
-	switch (src_type) {
-	case FR_TYPE_STRING:
-		switch (dst_type) {
-		case FR_TYPE_STRING:
-		case FR_TYPE_OCTETS:
-			from_cast = to_cast;
-			break;
-
-		default:
-			break;
-		}
-		break;
-
-	case FR_TYPE_OCTETS:
-		switch (dst_type) {
-		/*
-		 *	Need to use the expansion buffer for this conversion as
-		 *	we need to add a \0 terminator.
-		 */
-		case FR_TYPE_STRING:
-			if (!buff) {
-				fr_strerror_const("Missing expansion buffer for octet->string cast");
-				return -1;
-			}
-			if (bufflen <= to_cast->vb_length) {
-				fr_strerror_printf("Expansion buffer too small.  "
-						   "Have %zu bytes, need %zu bytes", bufflen,
-						   to_cast->vb_length + 1);
-				return -1;
-			}
-			memcpy(buff, to_cast->vb_octets, to_cast->vb_length);
-			buff[to_cast->vb_length] = '\0';
-
-			fr_value_box_bstrndup_shallow(&value_from_cast, NULL,
-						      (char *)buff, to_cast->vb_length, true);
-			break;
-
-		/*
-		 *	Just copy the pointer.  Length does not include \0.
-		 */
-		case FR_TYPE_OCTETS:
-			from_cast = to_cast;
-			break;
-
-		default:
-			break;
-		}
-		break;
-
-	default:
-	{
-		int		ret;
-		TALLOC_CTX	*ctx;
-
-		/*
-		 *	Same type, just set from_cast to to_cast and copy the value.
-		 */
-		if (src_type == dst_type) {
-			from_cast = to_cast;
-			break;
-		}
-
-		MEM(ctx = talloc_new(request));
-
-		from_cast = &value_from_cast;
-
-		/*
-		 *	Data type conversion...
-		 */
-		ret = fr_value_box_cast(ctx, &value_from_cast, dst_type, NULL, to_cast);
-		if (ret < 0) goto error;
-
-
-		/*
-		 *	For the dynamic types we need to copy the output
-		 *	to the buffer.  Really we need a version of fr_value_box_cast
-		 *	that works with buffers, but it's not a high priority...
-		 */
-		switch (dst_type) {
-		case FR_TYPE_STRING:
-			if (!buff) {
-				fr_strerror_const("Missing expansion buffer to store cast output");
-			error:
-				talloc_free(ctx);
-				return -1;
-			}
-			if (from_cast->vb_length >= bufflen) {
-				fr_strerror_printf("Expansion buffer too small.  "
-						   "Have %zu bytes, need %zu bytes", bufflen,
-						   from_cast->vb_length + 1);
-				goto error;
-			}
-			memcpy(buff, from_cast->vb_strvalue, from_cast->vb_length);
-			buff[from_cast->vb_length] = '\0';
-
-			fr_value_box_bstrndup_shallow(&value_from_cast, NULL,
-						      (char *)buff, from_cast->vb_length, from_cast->tainted);
-			break;
-
-		case FR_TYPE_OCTETS:
-			if (!buff) {
-				fr_strerror_const("Missing expansion buffer to store cast output");
-				goto error;
-			}
-			if (from_cast->vb_length > bufflen) {
-				fr_strerror_printf("Expansion buffer too small.  "
-						   "Have %zu bytes, need %zu bytes", bufflen, from_cast->vb_length);
-				goto error;
-			}
-			memcpy(buff, from_cast->vb_octets, from_cast->vb_length);
-			fr_value_box_memdup_shallow(&value_from_cast, NULL,
-						    buff, from_cast->vb_length, from_cast->tainted);
-			break;
-
-		default:
-			break;
-		}
-
-		talloc_free(ctx);	/* Free any dynamically allocated memory from the cast */
-	}
+	if (to_cast->type == dst_type) {
+		from_cast = to_cast;
+		goto do_copy;
 	}
 
+	/*
+	 *	We need a buffer to hold ouput data which can be returned to the caller.
+	 */
+	if (fr_type_is_variable_size(dst_type) && !buff) {
+		REDEBUG("Missing expansion buffer for %s -> %s cast", fr_type_to_str(to_cast->type), fr_type_to_str(dst_type));
+		return -1;
+	}
+
+	/*
+	 *	Convert to the correct data type.
+	 */
+	if (fr_value_box_cast(request, &value_from_cast, dst_type, NULL, to_cast)) {
+		RPEDEBUG("Failed casting input %pV to data type %s", to_cast, fr_type_to_str(dst_type));
+		return -1;
+	}
+
+	from_cast = &value_from_cast;
+
+	/*
+	 *	If the output is a talloc'd buffer, then we have to copy it to "buff", so that we can return
+	 *	the pointer to the caller.
+	 */
+	if (fr_type_is_variable_size(dst_type)) {
+		size_t len = from_cast->vb_length + (dst_type == FR_TYPE_STRING);
+
+		if (bufflen < len) {
+			REDEBUG("Expansion buffer is too small.  Buffer is %zu bytes, and we need %zu bytes",
+				bufflen, len);
+			return -1;
+		}
+
+		/*
+		 *	Copy the data to the buffer, and clear the alloc'd pointer.
+		 */
+		memcpy(buff, from_cast->vb_octets, len);
+		len = from_cast->vb_length;
+		fr_value_box_clear(&value_from_cast);
+
+		/*
+		 *	"out" is a pointer to a char* or uint8_t*
+		 */
+		*(uint8_t **) out = buff;
+
+		return len;	/* the amount of data we copied above */
+	}
+
+do_copy:
 	RDEBUG4("Copying %zu bytes to %p from offset %zu",
-		fr_value_box_field_sizes[dst_type], *((void **)out), fr_value_box_offsets[dst_type]);
+		fr_value_box_field_sizes[dst_type], out, fr_value_box_offsets[dst_type]);
 
-	memcpy(out, ((uint8_t const *) from_cast) + fr_value_box_offsets[dst_type], fr_value_box_field_sizes[dst_type]);
+	fr_value_box_memcpy_out(out, from_cast);
 
 	return from_cast->vb_length;
 }
@@ -540,7 +448,7 @@ ssize_t _tmpl_to_type(void *out,
  * @param out		Where to write pointer to the new buffer.
  * @param request	Current request.
  * @param vpt		to expand. Must be one of the following types:
- *			- #TMPL_TYPE_UNRESOLVED
+ *			- #TMPL_TYPE_DATA_UNRESOLVED
  *			- #TMPL_TYPE_EXEC
  *			- #TMPL_TYPE_XLAT
  *			- #TMPL_TYPE_ATTR
@@ -558,106 +466,63 @@ ssize_t _tmpl_to_atype(TALLOC_CTX *ctx, void *out,
 		       xlat_escape_legacy_t escape, void const *escape_ctx,
 		       fr_type_t dst_type)
 {
-	fr_value_box_t		*to_cast = NULL;
-	fr_value_box_t		from_cast;
+	fr_value_box_t		*vb_out, *vb_in = NULL;
+	fr_value_box_t		value = FR_VALUE_BOX_INITIALISER_NULL(value);
 
 	fr_pair_t		*vp = NULL;
-	fr_value_box_t		value;
 	bool			needs_dup = false;
 
 	ssize_t			slen = -1;
 	int			ret;
 
-	TALLOC_CTX		*tmp_ctx = talloc_new(ctx);
+	TALLOC_CTX		*tmp_ctx = NULL;
+	char			*str = NULL;
 
 	TMPL_VERIFY(vpt);
 
-	memset(&value, 0, sizeof(value));
+	fr_assert(!tmpl_needs_resolving(vpt));
+	fr_assert(!fr_type_is_structural(dst_type));
 
 	switch (vpt->type) {
-	case TMPL_TYPE_UNRESOLVED:
-		RDEBUG4("EXPAND TMPL UNRESOLVED");
-
-		fr_value_box_bstrndup_shallow(&value, NULL, vpt->name, vpt->len, false);
-		to_cast = &value;
-		needs_dup = true;
-		break;
-
 	case TMPL_TYPE_EXEC:
-	{
-		char *buff;
-
 		RDEBUG4("EXPAND TMPL EXEC");
 
-		fr_value_box_bstr_alloc(tmp_ctx, &buff, &value, NULL, 1024, true);
-		if (radius_exec_program_legacy(request, buff, 1024, NULL, request, vpt->name, NULL,
-					true, false, fr_time_delta_from_sec(EXEC_TIMEOUT)) != 0) {
+		MEM(tmp_ctx = talloc_new(ctx));
+
+		MEM(fr_value_box_bstr_alloc(tmp_ctx, &str, &value, NULL, 1024, true));
+		if (radius_exec_program_legacy(str, 1024, request, vpt->name, NULL,
+					       true, false, fr_time_delta_from_sec(EXEC_TIMEOUT)) != 0) {
 		error:
 			talloc_free(tmp_ctx);
-			return slen;
+			return -1;
 		}
+
 		fr_value_box_strtrim(tmp_ctx, &value);
-		to_cast = &value;
-	}
-		break;
-
-	case TMPL_TYPE_XLAT_UNRESOLVED:
-	{
-		fr_value_box_t	tmp;
-		fr_type_t	src_type = FR_TYPE_STRING;
-
-		RDEBUG4("EXPAND TMPL XLAT");
-
-		/* Error in expansion, this is distinct from zero length expansion */
-		slen = xlat_aeval(tmp_ctx, (char **)&value.datum.ptr, request, vpt->name, escape, escape_ctx);
-		if (slen < 0) goto error;
-		value.vb_length = slen;
-
-		/*
-		 *	Undo any of the escaping that was done by the
-		 *	xlat expansion function.
-		 *
-		 *	@fixme We need a way of signalling xlat not to escape things.
-		 */
-		ret = fr_value_box_from_str(tmp_ctx, &tmp, src_type, NULL,
-					    value.vb_strvalue, value.vb_length, '"', false);
-		if (ret < 0) goto error;
-
-		fr_value_box_bstrndup_shallow(&value, NULL, tmp.vb_strvalue, tmp.vb_length, tmp.tainted);
-		to_cast = &value;
-	}
+		vb_in = &value;
 		break;
 
 	case TMPL_TYPE_XLAT:
 	case TMPL_TYPE_REGEX_XLAT:
-	{
-		fr_value_box_t	tmp;
-		fr_type_t		src_type = FR_TYPE_STRING;
-
 		RDEBUG4("EXPAND TMPL XLAT STRUCT");
-		RDEBUG2("EXPAND %s", vpt->name); /* xlat_struct doesn't do this */
 
-		/* Error in expansion, this is distinct from zero length expansion */
-		slen = xlat_aeval_compiled(tmp_ctx, (char **)&value.datum.ptr, request, tmpl_xlat(vpt), escape, escape_ctx);
-		if (slen < 0) goto error;
-
-		value.vb_length = slen;
+		MEM(tmp_ctx = talloc_new(ctx));
 
 		/*
-		 *	Undo any of the escaping that was done by the
-		 *	xlat expansion function.
-		 *
-		 *	@fixme We need a way of signalling xlat not to escape things.
+		 *	An error in expansion is distinct from zero
+		 *	length expansion.  Zero-length strings are
+		 *	permitted.
 		 */
-		ret = fr_value_box_from_str(tmp_ctx, &tmp, src_type, NULL,
-					    value.vb_strvalue, value.vb_length, '"', false);
-		if (ret < 0) goto error;
+		slen = xlat_aeval_compiled(tmp_ctx, &str, request, tmpl_xlat(vpt), escape, escape_ctx);
+		if (slen < 0) {
+			RPEDEBUG("Failed expanding %s", vpt->name);
+			goto error;
+		}
 
-		fr_value_box_bstrndup_shallow(&value, NULL, tmp.vb_strvalue, tmp.vb_length, tmp.tainted);
-		to_cast = &value;
-
-		RDEBUG2("   --> %s", value.vb_strvalue);	/* Print post-unescaping */
-	}
+		/*
+		 *	The output is a string which might get cast to something later.
+		 */
+		fr_value_box_bstrndup_shallow(&value, NULL, str, (size_t) slen, false);
+		vb_in = &value;
 		break;
 
 	case TMPL_TYPE_ATTR:
@@ -665,107 +530,135 @@ ssize_t _tmpl_to_atype(TALLOC_CTX *ctx, void *out,
 
 		ret = tmpl_find_vp(&vp, request, vpt);
 		if (ret < 0) {
+			RDEBUG("Failed finding attribute %s", vpt->name);
 			talloc_free(tmp_ctx);
 			return -2;
 		}
 
 		fr_assert(vp);
 
-		to_cast = &vp->data;
-		switch (to_cast->type) {
-		case FR_TYPE_STRING:
-		case FR_TYPE_OCTETS:
-			fr_assert(to_cast->datum.ptr);
-			needs_dup = true;
-			break;
-
-		default:
-			break;
-		}
+		needs_dup = true;
+		vb_in = &vp->data;
 		break;
 
 	case TMPL_TYPE_DATA:
-	{
 		RDEBUG4("EXPAND TMPL DATA");
 
-		to_cast = UNCONST(fr_value_box_t *, tmpl_value(vpt));
-		switch (to_cast->type) {
-		case FR_TYPE_STRING:
-		case FR_TYPE_OCTETS:
-			fr_assert(to_cast->datum.ptr);
-			needs_dup = true;
-			break;
-
-		default:
-			break;
-		}
-	}
+		needs_dup = true;
+		vb_in = UNCONST(fr_value_box_t *, tmpl_value(vpt));
 		break;
 
 	/*
 	 *	We should never be expanding these.
 	 */
 	case TMPL_TYPE_UNINITIALISED:
-	case TMPL_TYPE_NULL:
-	case TMPL_TYPE_LIST:
 	case TMPL_TYPE_EXEC_UNRESOLVED:
 	case TMPL_TYPE_REGEX:
 	case TMPL_TYPE_REGEX_UNCOMPILED:
 	case TMPL_TYPE_REGEX_XLAT_UNRESOLVED:
 	case TMPL_TYPE_ATTR_UNRESOLVED:
+	case TMPL_TYPE_DATA_UNRESOLVED:
+	case TMPL_TYPE_XLAT_UNRESOLVED:
 	case TMPL_TYPE_MAX:
 		fr_assert(0);
 		goto error;
 	}
 
+	fr_assert(vb_in != NULL);
+	VALUE_BOX_VERIFY(vb_in);
+
 	/*
-	 *	Special case where we just copy the boxed value
-	 *	directly instead of casting it.
+	 *	If the output is a value-box, we might cast it using the tmpl cast.  When done, we just copy
+	 *	the value-box.
 	 */
 	if (dst_type == FR_TYPE_VALUE_BOX) {
-		fr_value_box_t	**vb_out = (fr_value_box_t **)out;
+		fr_type_t cast_type;
 
-		MEM(*vb_out = fr_value_box_alloc_null(ctx));
+		MEM(vb_out = fr_value_box_alloc_null(ctx));
+		cast_type = tmpl_rules_cast(vpt);
 
-		ret = needs_dup ? fr_value_box_copy(ctx, *vb_out, to_cast) : fr_value_box_steal(ctx, *vb_out, to_cast);
-		talloc_free(tmp_ctx);
-		if (ret < 0) {
-			RPEDEBUG("Failed copying data to output box");
-			TALLOC_FREE(*vb_out);
-			return -1;
+		if (cast_type == FR_TYPE_NULL) {
+			if (needs_dup) {
+				if (unlikely(fr_value_box_copy(vb_out, vb_out, vb_in) < 0)) {
+					talloc_free(vb_out);
+					goto failed_cast;
+				}
+			} else {
+				fr_value_box_steal(vb_out, vb_out, vb_in);
+			}
+
+		} else {
+			ret = fr_value_box_cast(vb_out, vb_out, cast_type, NULL, vb_in);
+
+			if (ret < 0) {
+				talloc_free(vb_out);
+				dst_type = cast_type;
+
+			failed_cast:
+				RPEDEBUG("Failed casting input %pV to data type %s", vb_in, fr_type_to_str(dst_type));
+				goto error;
+			}
 		}
+
+		talloc_free(tmp_ctx);
+		VALUE_BOX_VERIFY(vb_out);
+		*(fr_value_box_t **) out = vb_out;
 		return 0;
 	}
 
 	/*
-	 *	Don't dup the buffers unless we need to.
+	 *	Cast the data to the correct type.  Which also allocates any variable sized buffers from the
+	 *	output ctx.
 	 */
-	if ((to_cast->type != dst_type) || needs_dup) {
-		ret = fr_value_box_cast(ctx, &from_cast, dst_type, NULL, to_cast);
-		if (ret < 0) goto error;
-	} else {
-		switch (to_cast->type) {
-		case FR_TYPE_OCTETS:
-		case FR_TYPE_STRING:
-			/*
-			 *	Ensure we don't free the output buffer when the
-			 *	tmp_ctx is freed.
-			 */
-			if (value.datum.ptr && (talloc_parent(value.datum.ptr) == tmp_ctx)) {
-				value.datum.ptr = talloc_reparent(tmp_ctx, ctx, value.datum.ptr);
-			}
-			break;
+	if (dst_type != vb_in->type) {
+		if (vb_in == &value) {
+			size_t datalen;
+			fr_slen_t parse_len;
 
-		default:
-			break;
+			fr_assert(tmp_ctx != NULL);
+			if (!fr_cond_assert(str != NULL)) goto error;
+			fr_assert(dst_type != FR_TYPE_STRING); /* exec / xlat returned string in 'str' */
+
+			datalen = talloc_strlen(str);
+			parse_len = fr_value_box_from_str(ctx, &value, dst_type, NULL, str, datalen, NULL);
+			if (parse_len < 0) {
+				fr_value_box_bstrndup_shallow(&value, NULL, str, datalen, false);
+				goto failed_cast;
+			}
+
+		} else {
+			ret = fr_value_box_cast(ctx, &value, dst_type, NULL, vb_in);
+			if (ret < 0) goto failed_cast;
 		}
-		memcpy(&from_cast, to_cast, sizeof(from_cast));
-	}
+
+		/*
+		 *	The input data has been converted, and placed into value.
+		 */
+		vb_in = &value;
+
+	} else if (fr_type_is_variable_size(dst_type)) {
+		/*
+		 *	The output type is the same, but variable sized types need to be either duplicated, or
+		 *	reparented.
+		 */
+		if (needs_dup) {
+			fr_assert(vb_in != &value);
+
+			if (unlikely(fr_value_box_copy(ctx, &value, vb_in) < 0)) goto failed_cast;
+			vb_in = &value;
+		} else {
+			fr_assert(dst_type == FR_TYPE_STRING);
+			fr_assert(str != NULL);
+
+			(void) talloc_steal(ctx, str); /* ensure it's parented from the right context */
+			fr_assert(vb_in == &value);
+		}
+	} /* else the output type is a leaf, and is the same data type as the input */
 
 	RDEBUG4("Copying %zu bytes to %p from offset %zu",
-		fr_value_box_field_sizes[dst_type], *((void **)out), fr_value_box_offsets[dst_type]);
+		fr_value_box_field_sizes[dst_type], out, fr_value_box_offsets[dst_type]);
 
-	memcpy(out, ((uint8_t *)&from_cast) + fr_value_box_offsets[dst_type], fr_value_box_field_sizes[dst_type]);
+	fr_value_box_memcpy_out(out, vb_in);
 
 	/*
 	 *	Frees any memory allocated for temporary buffers
@@ -773,414 +666,7 @@ ssize_t _tmpl_to_atype(TALLOC_CTX *ctx, void *out,
 	 */
 	talloc_free(tmp_ctx);
 
-	return from_cast.vb_length;
-}
-
-static inline CC_HINT(always_inline)
-void _tmpl_cursor_pool_init(tmpl_pair_cursor_ctx_t *cc)
-{
-	if (!cc->pool) MEM(cc->pool = talloc_pool(cc->ctx, sizeof(tmpl_cursor_nested_t) * 5));
-}
-
-/** Traverse a group attribute
- *
- * Here we just look for a particular group attribute in the context of its parent
- *
- * @param[in] list_head The head of the pair_list being evaluated.
- * @param[in] current	The pair to evaluate.
- * @param[in] ns	Tracks tree position between cursor calls.
- * @return
- *	- the next matching attribute
- *	- NULL if none found
- */
-static fr_pair_t *_tmpl_cursor_child_eval(UNUSED fr_dlist_head_t *list_head, UNUSED fr_pair_t *current, tmpl_cursor_nested_t *ns)
-{
-	fr_pair_t *vp;
-
-	for (vp = fr_dcursor_current(&ns->group.cursor);
-	     vp;
-	     vp = fr_dcursor_next(&ns->group.cursor)) {
-		if (fr_dict_attr_cmp(ns->ar->ar_da, vp->da) == 0) {
-			fr_dcursor_next(&ns->group.cursor);	/* Advance to correct position for next call */
-			return vp;
-		}
-	}
-
-	return NULL;
-}
-
-/** Initialise the evaluation context for traversing a group attribute
- *
- */
-static inline CC_HINT(always_inline)
-void _tmpl_cursor_child_init(TALLOC_CTX *list_ctx, fr_pair_list_t *list, tmpl_attr_t const *ar, tmpl_pair_cursor_ctx_t *cc)
-{
-	tmpl_cursor_nested_t *ns;
-
-	_tmpl_cursor_pool_init(cc);
-	MEM(ns = talloc(cc->pool, tmpl_cursor_nested_t));
-	*ns = (tmpl_cursor_nested_t){
-		.ar = ar,
-		.func = _tmpl_cursor_child_eval,
-		.list_ctx = list_ctx
-	};
-	fr_dcursor_init(&ns->group.cursor, list);
-	fr_dlist_insert_tail(&cc->nested, ns);
-}
-
-/** Find a leaf attribute
- *
- * @param[in] list_head The head of the pair_list being evaluated.
- * @param[in] curr	The current attribute to start searching from.
- * @param[in] ns	Tracks tree position between cursor calls.
- * @return
- *	- the next matching attribute
- *	- NULL if none found
- */
-static fr_pair_t *_tmpl_cursor_leaf_eval(fr_dlist_head_t *list_head, fr_pair_t *curr, tmpl_cursor_nested_t *ns)
-{
-	fr_pair_t *vp = curr;
-
-	while (vp) {
-		if (fr_dict_attr_cmp(ns->ar->ar_da, vp->da) == 0) return vp;
-		vp = fr_dlist_next(list_head, vp);
-	}
-
-	return NULL;
-}
-
-/** Initialise the evaluation context for finding a leaf attribute
- *
- */
-static inline CC_HINT(always_inline)
-void _tmpl_cursor_leaf_init(TALLOC_CTX *list_ctx, fr_pair_list_t *list, tmpl_attr_t const *ar, tmpl_pair_cursor_ctx_t *cc)
-{
-	tmpl_cursor_nested_t	*ns = &cc->leaf;
-
-	*ns = (tmpl_cursor_nested_t){
-		.ar = ar,
-		.func = _tmpl_cursor_leaf_eval,
-		.list_ctx = list_ctx
-	};
-	ns->leaf.list_head = list;
-	fr_dlist_insert_tail(&cc->nested, ns);
-}
-
-/** Stub list eval function until we can remove lists
- *
- */
-static fr_pair_t *_tmpl_cursor_list_eval(UNUSED fr_dlist_head_t *list_head, fr_pair_t *curr, UNUSED tmpl_cursor_nested_t *ns)
-{
-	return curr;
-}
-
-static inline CC_HINT(always_inline)
-void _tmpl_cursor_list_init(TALLOC_CTX *list_ctx, fr_pair_list_t *list, tmpl_attr_t const *ar, tmpl_pair_cursor_ctx_t *cc)
-{
-	tmpl_cursor_nested_t *ns;
-
-	ns = &cc->leaf;
-	*ns = (tmpl_cursor_nested_t){
-		.ar = ar,
-		.func = _tmpl_cursor_list_eval,
-		.list_ctx = list_ctx
-	};
-	ns->leaf.list_head = list;
-	fr_dlist_insert_tail(&cc->nested, ns);
-}
-
-static inline CC_HINT(always_inline) void _tmpl_cursor_eval_pop(tmpl_pair_cursor_ctx_t *cc)
-{
-	tmpl_cursor_nested_t *ns = fr_dlist_pop_tail(&cc->nested);
-
-	if (ns != &cc->leaf) talloc_free(ns);
-}
-
-/** Evaluates, then, sometimes, pops evaluation contexts from the tmpl stack
- *
- * To pop or not to pop is determined by whether evaluating the context again
- * would/should/could produce another fr_pair_t.
- *
- * @param[in] list_head The head of the pair_list being evaluated.
- * @param[in] curr	The pair to evaluate.
- * @param[in] cc	Tracks state between cursor calls.
- * @return the vp evaluated.
- */
-static inline CC_HINT(always_inline)
-fr_pair_t *_tmpl_cursor_eval(fr_dlist_head_t *list_head, fr_pair_t *curr, tmpl_pair_cursor_ctx_t *cc)
-{
-	tmpl_attr_t const	*ar;
-	tmpl_cursor_nested_t	*ns;
-	fr_pair_t		*iter = curr, *vp;
-
-	ns = fr_dlist_tail(&cc->nested);
-	ar = ns->ar;
-
-	if (ar) switch (ar->ar_num) {
-	/*
-	 *	Get the first instance
-	 */
-	case NUM_ANY:
-		vp = ns->func(list_head, curr, ns);
-		_tmpl_cursor_eval_pop(cc);
-		break;
-
-	/*
-	 *	Get all instances
-	 */
-	case NUM_ALL:
-	case NUM_COUNT:
-	all_inst:
-		vp = ns->func(list_head, curr, ns);
-		if (!vp) _tmpl_cursor_eval_pop(cc);	/* pop only when we're done */
-		break;
-
-	/*
-	 *	Get the last instance
-	 */
-	case NUM_LAST:
-		vp = NULL;
-		while ((iter = ns->func(list_head, iter, ns))) {
-			vp = iter;
-
-			if (!fr_dlist_next(list_head, vp)) break;
-
-			iter = fr_dlist_next(list_head,vp);
-		}
-		_tmpl_cursor_eval_pop(cc);
-		break;
-
-	/*
-	 *	Get the n'th instance
-	 */
-	default:
-	{
-		int16_t		i = 0;
-
-		for (;;) {
-			vp = ns->func(list_head, iter, ns);
-			if (!vp) break;	/* Prev and next at the correct points */
-
-			if (++i > ar->num) break;
-
-			iter = fr_dlist_next(list_head, vp);
-		};
-		_tmpl_cursor_eval_pop(cc);
-	}
-		break;
-	} else goto all_inst;	/* Used for TMPL_TYPE_LIST */
-
-	return vp;
-}
-
-static inline CC_HINT(always_inline)
-void _tmpl_pair_cursor_init(TALLOC_CTX *list_ctx, fr_pair_list_t *list, tmpl_attr_t const *ar, tmpl_pair_cursor_ctx_t *cc)
-{
-	if (fr_dlist_next(&cc->vpt->data.attribute.ar, ar)) switch (ar->ar_da->type) {
-	case FR_TYPE_STRUCTURAL:
-		_tmpl_cursor_child_init(list_ctx, list, ar, cc);
-		break;
-
-	default:
-	leaf:
-		_tmpl_cursor_leaf_init(list_ctx, list, ar, cc);
-		break;
-	} else goto leaf;
-}
-
-static void *_tmpl_cursor_next(fr_dlist_head_t *list, void *curr, void *uctx)
-{
-	tmpl_pair_cursor_ctx_t	*cc = uctx;
-	tmpl_t const		*vpt = cc->vpt;
-
-	fr_pair_t		*vp;
-	fr_pair_list_t		*list_head;
-
-	switch (vpt->type) {
-	case TMPL_TYPE_ATTR:
-	{
-		tmpl_attr_t const	*ar = NULL;
-		tmpl_cursor_nested_t	*ns = NULL;
-
-		/*
-		 *	- Continue until there are no evaluation contexts
-		 *	- Push a evaluation context if evaluating the head of the
-		 *	  stack yields a VP and we're not at the deepest attribute
-		 *	  reference.
-		 *	- Return if we have a VP and there are no more attribute
-		 *	  references to push, i.e. we're at the deepest attribute
-		 *	  reference.
-		 */
-		while ((ns = fr_dlist_tail(&cc->nested))) {
-			ar = ns->ar;
-			vp = _tmpl_cursor_eval(list, curr, cc);
-			if (!vp) continue;
-
-			ar = fr_dlist_next(&vpt->data.attribute.ar, ar);
-			if (ar) {
-				list_head = &vp->vp_group;
-				_tmpl_pair_cursor_init(vp, list_head, ar, cc);
-				curr = fr_pair_list_head(list_head);
-				list = &list_head->head;
-				continue;
-			}
-
-			return vp;
-		}
-
-	null_result:
-		return NULL;
-	}
-
-	/*
-	 *	Hacks for evaluating lists
-	 *	Hopefully this tmpl type goes away soon...
-	 */
-	case TMPL_TYPE_LIST:
-		if (!fr_dlist_tail(&cc->nested)) goto null_result;	/* end of list */
-
-		vp = _tmpl_cursor_eval(list, curr, cc);
-		if (!vp) goto null_result;
-
-		return vp;
-
-	default:
-		fr_assert(0);
-	}
-
-	return NULL;
-}
-
-/** Initialise a #fr_dcursor_t to the #fr_pair_t specified by a #tmpl_t
- *
- * This makes iterating over the one or more #fr_pair_t specified by a #tmpl_t
- * significantly easier.
- *
- * @param[out] err		May be NULL if no error code is required.
- *				Will be set to:
- *				- 0 on success.
- *				- -1 if no matching #fr_pair_t could be found.
- *				- -2 if list could not be found (doesn't exist in current #request_t).
- *				- -3 if context could not be found (no parent #request_t available).
- * @param[in] ctx		to make temporary allocations under.
- * @param[in] cc		to initialise.  Tracks evaluation state.
- *				Must be explicitly cleared with tmpl_cursor_state_clear
- *				otherwise we will leak memory.
- * @param[in] cursor		to store iterator position.
- * @param[in] request		The current #request_t.
- * @param[in] vpt		specifying the #fr_pair_t type or list to iterate over.
- * @return
- *	- First #fr_pair_t specified by the #tmpl_t.
- *	- NULL if no matching #fr_pair_t found, and NULL on error.
- *
- * @see tmpl_cursor_next
- */
-fr_pair_t *tmpl_pair_cursor_init(int *err, TALLOC_CTX *ctx, tmpl_pair_cursor_ctx_t *cc,
-				 fr_dcursor_t *cursor, request_t *request, tmpl_t const *vpt)
-{
-	fr_pair_t		*vp = NULL;
-	fr_pair_list_t		*list_head;
-	tmpl_request_t		*rr = NULL;
-	TALLOC_CTX		*list_ctx;
-
-	TMPL_VERIFY(vpt);
-
-	fr_assert(tmpl_is_attr(vpt) || tmpl_is_list(vpt));
-
-	if (err) *err = 0;
-
-	/*
-	 *	Navigate to the correct request context
-	 */
-	while ((rr = fr_dlist_next(&vpt->data.attribute.rr, rr))) {
-		if (tmpl_request_ptr(&request, rr->request) < 0) {
-			if (err) {
-				*err = -3;
-				fr_strerror_printf("Request context \"%s\" not available",
-						   fr_table_str_by_value(tmpl_request_ref_table, rr->request, "<INVALID>"));
-			}
-		error:
-			memset(cc, 0, sizeof(*cc));	/* so tmpl_pair_cursor_clear doesn't explode */
-			return NULL;
-		}
-	}
-
-	/*
-	 *	Get the right list in the specified context
-	 */
-	list_head = tmpl_list_head(request, tmpl_list(vpt));
-	if (!list_head) {
-		if (err) {
-			*err = -2;
-			fr_strerror_printf("List \"%s\" not available in this context",
-					   fr_table_str_by_value(pair_list_table, tmpl_list(vpt), "<INVALID>"));
-		}
-		goto error;
-	}
-	list_ctx = tmpl_list_ctx(request, tmpl_list(vpt));
-
-	/*
-	 *	Initialise the temporary cursor context
-	 */
-	*cc = (tmpl_pair_cursor_ctx_t){
-		.vpt = vpt,
-		.ctx = ctx,
-		.request = request,
-		.list = list_head
-	};
-	fr_dlist_init(&cc->nested, tmpl_cursor_nested_t, entry);
-
-	/*
-	 *	Prime the stack!
-	 */
-	switch (vpt->type) {
-	case TMPL_TYPE_ATTR:
-		_tmpl_pair_cursor_init(list_ctx, cc->list, fr_dlist_head(&vpt->data.attribute.ar), cc);
-		break;
-
-	case TMPL_TYPE_LIST:
-		_tmpl_cursor_list_init(list_ctx, cc->list, fr_dlist_head(&vpt->data.attribute.ar), cc);
-		break;
-
-	default:
-		fr_assert(0);
-		break;
-	}
-
-	/*
-	 *	Get the first entry from the tmpl
-	 */
-	vp = fr_dcursor_talloc_iter_init(cursor, list_head, _tmpl_cursor_next, cc, fr_pair_t);
-	if (!vp) {
-		if (err) {
-			*err = -1;
-			if (tmpl_is_list(vpt)) {
-				fr_strerror_printf("List \"%s\" is empty", vpt->name);
-			} else {
-				fr_strerror_printf("No matching \"%s\" pairs found", tmpl_da(vpt)->name);
-			}
-		}
-		return NULL;
-	}
-
-	return vp;
-}
-
-/** Clear any temporary state allocations
- *
- */
-void tmpl_pair_cursor_clear(tmpl_pair_cursor_ctx_t *cc)
-{
-	if (!fr_dlist_num_elements(&cc->nested)) return;/* Help simplify dealing with unused cursor ctxs */
-
-	fr_dlist_remove(&cc->nested, &cc->leaf);	/* Noop if leaf isn't inserted */
-	fr_dlist_talloc_free(&cc->nested);
-
-	/*
-	 *	Always free the pool because it's allocated when
-	 *	any nested ctxs are used.
-	 */
-	TALLOC_FREE(cc->pool);
+	return vb_in->vb_length;
 }
 
 /** Copy pairs matching a #tmpl_t in the current #request_t
@@ -1190,7 +676,6 @@ void tmpl_pair_cursor_clear(tmpl_pair_cursor_ctx_t *cc)
  * @param request The current #request_t.
  * @param vpt specifying the #fr_pair_t type or list to copy.
  *	Must be one of the following types:
- *	- #TMPL_TYPE_LIST
  *	- #TMPL_TYPE_ATTR
  * @return
  *	- -1 if no matching #fr_pair_t could be found.
@@ -1202,15 +687,14 @@ int tmpl_copy_pairs(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *request, tm
 {
 	fr_pair_t		*vp;
 	fr_dcursor_t		from;
-	tmpl_pair_cursor_ctx_t	cc;
+	tmpl_dcursor_ctx_t	cc;
+	int err;
 
 	TMPL_VERIFY(vpt);
 
-	int err;
+	fr_assert(tmpl_is_attr(vpt));
 
-	fr_assert(tmpl_is_attr(vpt) || tmpl_is_list(vpt));
-
-	for (vp = tmpl_pair_cursor_init(&err, NULL, &cc, &from, request, vpt);
+	for (vp = tmpl_dcursor_init(&err, NULL, &cc, &from, request, vpt);
 	     vp;
 	     vp = fr_dcursor_next(&from)) {
 		vp = fr_pair_copy(ctx, vp);
@@ -1222,7 +706,7 @@ int tmpl_copy_pairs(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *request, tm
 		}
 		fr_pair_append(out, vp);
 	}
-	tmpl_pair_cursor_clear(&cc);
+	tmpl_dcursor_clear(&cc);
 
 	return err;
 }
@@ -1235,7 +719,6 @@ int tmpl_copy_pairs(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *request, tm
  * @param request The current #request_t.
  * @param vpt specifying the #fr_pair_t type or list to copy.
  *	Must be one of the following types:
- *	- #TMPL_TYPE_LIST
  *	- #TMPL_TYPE_ATTR
  * @return
  *	- -1 if no matching #fr_pair_t could be found.
@@ -1247,20 +730,19 @@ int tmpl_copy_pair_children(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *req
 {
 	fr_pair_t		*vp;
 	fr_dcursor_t		from;
-	tmpl_pair_cursor_ctx_t	cc;
+	tmpl_dcursor_ctx_t	cc;
+	int err;
 
 	TMPL_VERIFY(vpt);
 
-	int err;
-
-	fr_assert(tmpl_is_attr(vpt) || tmpl_is_list(vpt));
+	fr_assert(tmpl_is_attr(vpt));
 
 	fr_pair_list_free(out);
 
-	for (vp = tmpl_pair_cursor_init(&err, NULL, &cc, &from, request, vpt);
+	for (vp = tmpl_dcursor_init(&err, NULL, &cc, &from, request, vpt);
 	     vp;
 	     vp = fr_dcursor_next(&from)) {
-	     	switch (vp->da->type) {
+		switch (vp->vp_type) {
 	     	case FR_TYPE_STRUCTURAL:
 	     		if (fr_pair_list_copy(ctx, out, &vp->vp_group) < 0) {
 	     			err = -4;
@@ -1273,7 +755,7 @@ int tmpl_copy_pair_children(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *req
 	     	}
 	}
 done:
-	tmpl_pair_cursor_clear(&cc);
+	tmpl_dcursor_clear(&cc);
 
 	return err;
 }
@@ -1285,7 +767,6 @@ done:
  * @param[in] request The current #request_t.
  * @param[in] vpt specifying the #fr_pair_t type to find.
  *	Must be one of the following types:
- *	- #TMPL_TYPE_LIST
  *	- #TMPL_TYPE_ATTR
  * @return
  *	- 0 on success (found matching #fr_pair_t).
@@ -1296,14 +777,14 @@ done:
 int tmpl_find_vp(fr_pair_t **out, request_t *request, tmpl_t const *vpt)
 {
 	fr_dcursor_t		cursor;
-	tmpl_pair_cursor_ctx_t	cc;
+	tmpl_dcursor_ctx_t	cc;
 	fr_pair_t		*vp;
 	int			err;
 
 	TMPL_VERIFY(vpt);
 
-	vp = tmpl_pair_cursor_init(&err, request, &cc, &cursor, request, vpt);
-	tmpl_pair_cursor_clear(&cc);
+	vp = tmpl_dcursor_init(&err, request, &cc, &cursor, request, vpt);
+	tmpl_dcursor_clear(&cc);
 
 	if (out) *out = vp;
 
@@ -1325,7 +806,7 @@ int tmpl_find_vp(fr_pair_t **out, request_t *request, tmpl_t const *vpt)
 int tmpl_find_or_add_vp(fr_pair_t **out, request_t *request, tmpl_t const *vpt)
 {
 	fr_dcursor_t		cursor;
-	tmpl_pair_cursor_ctx_t	cc;
+	tmpl_dcursor_ctx_t	cc;
 	fr_pair_t		*vp;
 	int			err;
 
@@ -1334,8 +815,8 @@ int tmpl_find_or_add_vp(fr_pair_t **out, request_t *request, tmpl_t const *vpt)
 
 	*out = NULL;
 
-	vp = tmpl_pair_cursor_init(&err, NULL, &cc, &cursor, request, vpt);
-	tmpl_pair_cursor_clear(&cc);
+	vp = tmpl_dcursor_init(&err, NULL, &cc, &cursor, request, vpt);
+	tmpl_dcursor_clear(&cc);
 
 	switch (err) {
 	case 0:
@@ -1348,11 +829,11 @@ int tmpl_find_or_add_vp(fr_pair_t **out, request_t *request, tmpl_t const *vpt)
 		fr_pair_list_t	*head;
 
 		tmpl_pair_list_and_ctx(ctx, head, request, tmpl_request(vpt), tmpl_list(vpt));
+		if (!head) return -1;
 
-		MEM(vp = fr_pair_afrom_da(ctx, tmpl_da(vpt)));
+		if (pair_append_by_tmpl_parent(ctx, &vp, head, vpt, true) < 0) return -1;
 
-		fr_pair_append(head, vp);
-
+		PAIR_ALLOCED(vp);
 		*out = vp;
 	}
 		return 1;
@@ -1362,286 +843,549 @@ int tmpl_find_or_add_vp(fr_pair_t **out, request_t *request, tmpl_t const *vpt)
 	}
 }
 
-/** Determines points where the reference list extends beyond the current pair tree
+/** Allocate and insert a leaf vp from a tmpl_t, building the parent vps if needed.
  *
- * If a particular branch in the VP hierarchy is incomplete, i.e. the chain of attribute
- * refers to nodes deeper than the nodes currently in the tree, then we return the
- * deepest point node in the tree which matched, and the ar that we failed to evaluate.
+ * This is the simple case - just add a vp at the first place where
+ * the parents exist, or create the parents, with no attempt to handle filters.
  *
- * If the reference list resolves to one or more structural pairs, return those as well.
+ * It is functionally equivalent to fr_pair_append_by_da_parent() but
+ * uses a tmpl_t to build the nested structure rather than a fr_dict_attr_t.
  *
- * This function can be used for a number of different operations, but it's most useful
- * for determining insertion points for new attributes, or determining which attributes
- * need to be updated.
- *
- * @param[in] ctx		to allocate.  It's recommended to pass a pool with space
- *				for at least five extent structures.
- * @param[out] leaf		List of extents we discovered by evaluating all
- *				attribute references. May be NULL.
- * @param[out] interior 	List of extents that need building out, i.e. references
- *				extend beyond pairs. May be NULL.
- * @param[in] request		The current #request_t.
- * @param[in] vpt		specifying the #fr_pair_t type to retrieve or create.
- *				Must be #TMPL_TYPE_ATTR.
+ * @param[in] ctx	to allocate new pair(s) in
+ * @param[out] out	Leaf pair we allocated.
+ * @param[in] list	to insert into.
+ * @param[in] vpt	tmpl representing the attribute to add.
+ * @param[in] skip_list	skip list attr ref at the head of the tmpl.
  * @return
- *	- 1 on success a pair was created.
- *	- 0 on success a pair was found.
- *	- -1 if a new #fr_pair_t couldn't be found or created.
- *	- -2 if list could not be found (doesn't exist in current #request_t).
- *	- -3 if context could not be found (no parent #request_t available).
+ *	- 0 on success.
+ *	- -1 on failure.
  */
-int tmpl_extents_find(TALLOC_CTX *ctx,
-		      fr_dlist_head_t *leaf, fr_dlist_head_t *interior,
-		      request_t *request, tmpl_t const *vpt)
+int pair_append_by_tmpl_parent(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *list, tmpl_t const *vpt, bool skip_list)
 {
-	fr_pair_t		*curr = NULL;
-	fr_pair_list_t		*list_head;
+	fr_pair_t			*vp = NULL;
+	TALLOC_CTX			*pair_ctx = ctx;
+	tmpl_attr_t			*ar, *leaf;
+	tmpl_attr_list_head_t const	*ar_list = &vpt->data.attribute.ar;
 
-	TALLOC_CTX		*list_ctx = NULL;
+	if (!tmpl_is_attr(vpt)) {
+	error:
+		*out = NULL;
+		return -1;
+	}
 
-	tmpl_pair_cursor_ctx_t	cc;
-	tmpl_cursor_nested_t	*ns = NULL;
-
-	tmpl_request_t		*rr = NULL;
-	tmpl_attr_t const	*ar = NULL;
-
-	TMPL_VERIFY(vpt);
-
-	fr_assert(tmpl_is_attr(vpt) || tmpl_is_list(vpt));
-
-#define EXTENT_ADD(_out, _ar, _list_ctx, _list) \
-	do { \
-		tmpl_attr_extent_t	*_extent; \
-		MEM(_extent = talloc(ctx, tmpl_attr_extent_t)); \
-		*_extent = (tmpl_attr_extent_t){ \
-			.ar = _ar,	\
-			.list_ctx = _list_ctx, \
-			.list = _list	\
-		}; \
-		fr_dlist_insert_tail(_out, _extent); \
-	} while (0)
+	leaf = tmpl_attr_list_tail(ar_list);
+	ar = tmpl_attr_list_head(ar_list);
+	if (!ar) goto error;
+	if (skip_list && tmpl_attr_is_list_attr(ar)) ar = tmpl_attr_list_next(ar_list, ar);
 
 	/*
-	 *	Navigate to the correct request context
+	 *	Walk down the tmpl ar stack looking for candidate parent
+	 *	attributes and then allocating the leaf.
 	 */
-	while ((rr = fr_dlist_next(&vpt->data.attribute.rr, rr))) {
-		if (tmpl_request_ptr(&request, rr->request) < 0) {
-			fr_strerror_printf("Request context \"%s\" not available",
-					   fr_table_str_by_value(tmpl_request_ref_table, rr->request, "<INVALID>"));
-			return -3;
+	while (true) {
+		if (unlikely(!ar)) goto error;
+		/*
+		 *	We're not at the leaf, look for a potential parent
+		 */
+		if (ar != leaf) {
+			vp = fr_pair_find_by_da(list, NULL, ar->da);
 		}
-	}
 
-	/*
-	 *	Get the right list in the specified context
-	 */
-	list_head = tmpl_list_head(request, tmpl_list(vpt));
-	if (!list_head) {
-		fr_strerror_printf("List \"%s\" not available in this context",
-				   fr_table_str_by_value(pair_list_table, tmpl_list(vpt), "<INVALID>"));
-		return -2;
-	}
-	list_ctx = tmpl_list_ctx(request, tmpl_list(vpt));
+		/*
+		 *	Nothing found, create the pair
+		 */
+		if (!vp) {
+			if (fr_pair_append_by_da(pair_ctx, &vp, list, ar->da) < 0) goto error;
+			PAIR_ALLOCED(vp);
+		}
 
-	/*
-	 *	If it's a list, just return the list head
-	 */
-	if (vpt->type == TMPL_TYPE_LIST) {
-	do_list:
-		if (leaf) EXTENT_ADD(leaf, NULL, list_ctx, list_head);
+		/*
+		 *	We're at the leaf, return
+		 */
+		if (ar == leaf) {
+			*out = vp;
+			return 0;
+		}
+
+		/*
+		 *	Prepare for next level
+		 */
+		list = &vp->vp_group;
+		pair_ctx = vp;
+		vp = NULL;
+		ar = tmpl_attr_list_next(ar_list, ar);
+	}
+}
+
+/** Insert a value-box to a list, with casting.
+ *
+ * @param list	to append to
+ * @param box	box to cast / append
+ * @param vpt	tmpl with cast.
+ * @return
+ *	- <0 for "cast failed"
+ *	- 0 for success
+ */
+int tmpl_value_list_insert_tail(fr_value_box_list_t *list, fr_value_box_t *box, tmpl_t const *vpt)
+{
+	if (fr_type_is_null(tmpl_rules_cast(vpt)) ||
+	    (box->type == tmpl_rules_cast(vpt))) {
+		fr_value_box_list_insert_tail(list, box);
 		return 0;
 	}
 
+	if (fr_value_box_cast_in_place(box, box, tmpl_rules_cast(vpt), tmpl_rules_enumv(vpt)) < 0) return -1;
+
+	fr_value_box_list_insert_tail(list, box);
+	VALUE_BOX_LIST_VERIFY(list);
+	return 0;
+}
+
+/** Gets the value of a real or virtual attribute
+ *
+ * @param[in] ctx	to allocate boxed value, and buffers in.
+ * @param[out] out	Where to write the boxed value.
+ * @param[in] request	The current request.
+ * @param[in] vpt	Representing the attribute.
+ * @return
+ *	- <0		we failed getting a value for the attribute.
+ *	- 0		we successfully evaluated the tmpl
+ */
+int tmpl_eval_pair(TALLOC_CTX *ctx, fr_value_box_list_t *out, request_t *request, tmpl_t const *vpt)
+{
+	fr_pair_t		*vp = NULL;
+	fr_value_box_t		*value;
+
+	fr_dcursor_t		cursor;
+	tmpl_dcursor_ctx_t	cc;
+
+	int			ret = 0;
+	fr_value_box_list_t	list;
+
+	fr_assert(tmpl_is_attr(vpt));
+
+	fr_value_box_list_init(&list);
+
 	/*
-	 *	If it's a leaf skip all the expensive
-	 *      initialisation and just return the list
-	 *	it's part of.
+	 *	See if we're dealing with an attribute in the request
 	 *
-	 *	This is only needed because lists are
-	 *	treated specially.  Once lists are groups
-	 *	this can be removed.
+	 *	This allows users to manipulate virtual attributes as if
+	 *	they were real ones.
 	 */
-	ar = fr_dlist_head(&vpt->data.attribute.ar);
-	switch (ar->ar_da->type) {
-	case FR_TYPE_STRUCTURAL:
+	vp = tmpl_dcursor_init(NULL, NULL, &cc, &cursor, request, vpt);
+
+	/*
+	 *	We didn't find the VP in a list, check to see if it's
+	 *	virtual.  This allows the caller to "realize" the
+	 *	attribute, and we then prefer the realized version to
+	 *	the virtual one.
+	 */
+	if (!vp) {
+		/*
+		 *	Zero count.
+		 */
+		if (tmpl_attr_tail_num(vpt) == NUM_COUNT) {
+			value = fr_value_box_alloc(ctx, FR_TYPE_UINT32, NULL);
+			if (!value) {
+			oom:
+				fr_strerror_const("Out of memory");
+				ret = -1;
+				goto fail;
+			}
+			value->datum.uint32 = 0;
+			fr_value_box_list_insert_tail(&list, value);
+		} /* Fall through to being done */
+
+		goto done;
+	}
+
+	switch (tmpl_attr_tail_num(vpt)) {
+	/*
+	 *	Return a count of the VPs.
+	 */
+	case NUM_COUNT:
+	{
+		uint32_t		count = 0;
+
+		while (vp != NULL) {
+			count++;
+			vp = fr_dcursor_next(&cursor);
+		}
+
+		value = fr_value_box_alloc(ctx, FR_TYPE_UINT32, NULL);
+		if (!value) goto oom;
+		value->datum.uint32 = count;
+		fr_value_box_list_insert_tail(&list, value);
+		break;
+	}
+
+	/*
+	 *	Output multiple #value_box_t, one per attribute.
+	 */
+	case NUM_ALL:
+		/*
+		 *	Loop over all matching #fr_value_pair
+		 *	shallow copying buffers.
+		 */
+		while (vp != NULL) {
+			if (fr_type_is_structural(vp->vp_type)) {
+				value = fr_value_box_alloc(ctx, FR_TYPE_GROUP, NULL);
+				if (!value) goto oom;
+
+				if (fr_pair_list_copy_to_box(value, &vp->vp_group) < 0) {
+					talloc_free(value);
+					goto oom;
+				}
+
+			} else {
+				value = fr_value_box_alloc(ctx, vp->data.type, vp->da);
+				if (!value) goto oom;
+				if(unlikely(fr_value_box_copy(value, value, &vp->data) < 0)) {
+					talloc_free(value);
+					goto fail;
+				}
+			}
+
+			fr_value_box_list_insert_tail(&list, value);
+			vp = fr_dcursor_next(&cursor);
+		}
 		break;
 
 	default:
-		goto do_list;
+		if (!fr_type_is_leaf(vp->vp_type)) {
+			fr_strerror_const("Invalid data type for evaluation");
+			goto fail;
+		}
+
+		value = fr_value_box_alloc(ctx, vp->data.type, vp->da);
+		if (!value) goto oom;
+
+		if (unlikely(fr_value_box_copy(value, value, &vp->data) < 0)) {
+			talloc_free(value);
+			goto fail;
+		}
+		fr_value_box_list_insert_tail(&list, value);
+		break;
 	}
 
+done:
 	/*
-	 *	Initialise the temporary cursor context
+	 *	Evaluate casts if necessary.
 	 */
-	cc = (tmpl_pair_cursor_ctx_t){
-		.vpt = vpt,
-		.ctx = ctx,
-		.request = request,
-		.list = list_head
-	};
-	fr_dlist_init(&cc.nested, tmpl_cursor_nested_t, entry);
-
-	/*
-	 *	Prime the stack!
-	 */
-	_tmpl_pair_cursor_init(list_ctx, cc.list, fr_dlist_head(&vpt->data.attribute.ar), &cc);
-
-	/*
-	 *	- Continue until there are no evaluation contexts
-	 *	- Push a evaluation context if evaluating the head of the
-	 *	  stack yields a VP and we're not at the deepest attribute
-	 *	  reference.
-	 *	- Return if we have a VP and there are no more attribute
-	 *	  references to push, i.e. we're at the deepest attribute
-	 *	  reference.
-	 */
-	curr = fr_pair_list_head(list_head);
-	while ((ns = fr_dlist_tail(&cc.nested))) {
-		tmpl_attr_t const *n_ar;
-
-		list_ctx = ns->list_ctx;
-		ar = ns->ar;
-		curr = _tmpl_cursor_eval(&list_head->head, curr, &cc);
-		if (!curr) {
-			/*
-			 *	References extend beyond current
-			 *	pair tree.
-			 */
-			if (!ar->resolve_only && interior) EXTENT_ADD(interior, ar, list_ctx, list_head);
-			continue;	/* Rely on _tmpl_cursor_eval popping the stack */
+	if (ret == 0) {
+		if (tmpl_eval_cast_in_place(&list, request, vpt) < 0) {
+			fr_value_box_list_talloc_free(&list);
+			ret = -1;
+			goto fail;
 		}
 
-		/*
-		 *	Evaluate the next reference
-		 */
-		n_ar = fr_dlist_next(&vpt->data.attribute.ar, ar);
-		if (n_ar) {
-			ar = n_ar;
-			list_head = &curr->vp_group;
-			list_ctx = curr;	/* Allocations are under the group */
-			_tmpl_pair_cursor_init(list_ctx, list_head, ar, &cc);
-			curr = fr_pair_list_head(list_head);
-			continue;
-		}
-
-		/*
-		 *	VP tree may extend beyond
-		 *      the reference. If the reference
-		 *	was structural, record this as
-		 *	an extent.
-		 */
-		switch (ar->da->type) {
-		case FR_TYPE_STRUCTURAL:
-			if (leaf) EXTENT_ADD(leaf, NULL, curr, list_head);
-			continue;
-
-		default:
-			break;
-		}
+		fr_value_box_list_move(out, &list);
 	}
+
+fail:
+	tmpl_dcursor_clear(&cc);
+	VALUE_BOX_LIST_VERIFY(out);
+	return ret;
+}
+
+
+/** Gets the value of a tmpl
+ *
+ *  The result is returned "raw".  The caller must do any escaping it desires.
+ *
+ * @param[in] ctx	to allocate boxed value, and buffers in.
+ * @param[out] out	Where to write the boxed value.
+ * @param[in] request	The current request.
+ * @param[in] vpt	Representing the tmpl
+ * @return
+ *	- <0		we failed getting a value for the tmpl
+ *	- 0		we successfully evaluated the tmpl
+ */
+int tmpl_eval(TALLOC_CTX *ctx, fr_value_box_list_t *out, request_t *request, tmpl_t const *vpt)
+{
+	char *p;
+	fr_value_box_t		*value;
+	fr_value_box_list_t	list;
+
+	if (tmpl_needs_resolving(vpt)) {
+		fr_strerror_const("Cannot evaluate unresolved tmpl");
+		return -1;
+	}
+
+	if (tmpl_async_required(vpt)) {
+		fr_strerror_const("Cannot statically evaluate asynchronous expansions");
+		return -1;
+	}
+
+	if (tmpl_contains_regex(vpt)) {
+		fr_strerror_const("Cannot statically evaluate regular expression");
+		return -1;
+	}
+
+	if (tmpl_is_attr(vpt)) {
+		return tmpl_eval_pair(ctx, out, request, vpt);
+	}
+
+	if (tmpl_is_data(vpt)) {
+		MEM(value = fr_value_box_alloc(ctx, tmpl_value_type(vpt), NULL));
+
+		if (unlikely(fr_value_box_copy(value, value, tmpl_value(vpt)) < 0)) {
+			talloc_free(value);
+			return -1;	/* Also dups taint */
+		}
+		goto done;
+	}
+
+	fr_assert(tmpl_is_xlat(vpt));
+
+	/*
+	 *	@todo - respect escaping functions.  But the sync
+	 *	escaping uses a different method than the async ones.
+	 *	And we then also need to escape the output of
+	 *	tmpl_eval_pair(), too.
+	 */
+	MEM(value = fr_value_box_alloc_null(ctx));
+	if (tmpl_aexpand(value, &p, request, vpt, NULL, NULL) < 0) {
+		talloc_free(value);
+		return -1;
+	}
+	fr_value_box_bstrndup_shallow(value, NULL, p, talloc_strlen(p), true);
+
+	/*
+	 *	Cast the results if necessary.
+	 */
+done:
+	fr_value_box_list_init(&list);
+	fr_value_box_list_insert_tail(&list, value);
+
+	if (tmpl_eval_cast_in_place(&list, request, vpt) < 0) {
+		fr_value_box_list_talloc_free(&list);
+		return -1;
+	}
+
+	fr_value_box_list_move(out, &list);
+	VALUE_BOX_LIST_VERIFY(out);
 
 	return 0;
 }
 
-/** Allocate interior pairs
+/** Allocate a uctx for an escaping function
  *
- * Builds out the pair tree to the point where leaf attributes can be added
+ * @param[in] request	The current request.
+ * @param[in] escape	Describing how to escape tmpl data.
  *
- * @param[out] leaf	List to add built out attributes to.
- * @param[in] interior	List to remove attributes from.
- * @param[in] vpt	We are evaluating.
- * @return
- *	- 0 on success.
- *      - -1 on failure.
+ * @return the uctx to pass to the escape function.
  */
-int tmpl_extents_build_to_leaf(fr_dlist_head_t *leaf, fr_dlist_head_t *interior, tmpl_t const *vpt)
+static inline void *tmpl_eval_escape_uctx_alloc(request_t *request, tmpl_escape_t const *escape)
 {
-	tmpl_attr_extent_t	*extent = NULL;
+	switch (escape->uctx.type) {
+	case TMPL_ESCAPE_UCTX_STATIC:
+		return UNCONST(void *, escape->uctx.ptr);
 
-	while ((extent = fr_dlist_head(interior))) {
-		fr_pair_t		*vp;
-		fr_pair_list_t		*list;
-		tmpl_attr_t const	*ar;
-		TALLOC_CTX		*list_ctx = extent->list_ctx;
+	case TMPL_ESCAPE_UCTX_ALLOC:
+	{
+		void *uctx;
 
-		fr_assert(extent->ar);	/* Interior extents MUST contain an ar */
+		fr_assert_msg(escape->uctx.size > 0, "TMPL_ESCAPE_UCTX_ALLOC must specify uctx.size > 0");
+		MEM(uctx = talloc_zero_array(NULL, uint8_t, escape->uctx.size));
+		if (escape->uctx.talloc_type) talloc_set_type(uctx, escape->uctx.talloc_type);
+		return uctx;
+	}
 
-		/*
-		 *	Try and allocate VPs for the
-		 *	rest of the attribute references.
-		 */
-		for (ar = extent->ar, list = extent->list;
-		     ar;
-		     ar = fr_dlist_next(&vpt->data.attribute.ar, ar)) {
-			switch (ar->type) {
-			case TMPL_ATTR_TYPE_NORMAL:
-			case TMPL_ATTR_TYPE_UNKNOWN:
-				/*
-				 *	Don't build leaf attributes
-				 */
-				switch (ar->ar_da->type) {
-				case FR_TYPE_STRUCTURAL:
-					break;
+	case TMPL_ESCAPE_UCTX_ALLOC_FUNC:
+		fr_assert_msg(escape->uctx.func.alloc, "TMPL_ESCAPE_UCTX_ALLOC_FUNC must specify a non-null alloc.func");
+		return escape->uctx.func.alloc(request, escape->uctx.func.uctx);
 
-				default:
-					continue;
-				}
+	default:
+		fr_assert_msg(0, "Unknown escape uctx type %u", escape->uctx.type);
+		return NULL;
+	}
+}
 
-				MEM(vp = fr_pair_afrom_da(list_ctx, ar->ar_da));	/* Copies unknowns */
-				fr_pair_append(list, vp);
-				list = &vp->vp_group;
-				list_ctx = vp;		/* New allocations occur under the VP */
-				break;
+/** Free a uctx for an escaping function
+ *
+ * @param[in] escape	Describing how to escape tmpl data.
+ * @param[in] uctx	The uctx to free.
+ */
+static inline void tmpl_eval_escape_uctx_free(tmpl_escape_t const *escape, void *uctx)
+{
+	switch (escape->uctx.type) {
+	case TMPL_ESCAPE_UCTX_STATIC:
+		return;
 
-			default:
-				fr_assert_fail("references of this type should have been resolved");
+	case TMPL_ESCAPE_UCTX_ALLOC:
+		talloc_free(uctx);
+		return;
+
+	case TMPL_ESCAPE_UCTX_ALLOC_FUNC:
+		if (escape->uctx.func.free) escape->uctx.func.free(uctx);
+		return;
+	}
+}
+
+/** Casts a value or list of values according to the tmpl
+ *
+ * @param[in,out] list	Where to write the boxed value.
+ * @param[in] request	The current request.
+ * @param[in] vpt	Representing the attribute.
+ * @return
+ *	- <0		the cast failed
+ *	- 0		we successfully evaluated the tmpl
+ */
+int tmpl_eval_cast_in_place(fr_value_box_list_t *list, request_t *request, tmpl_t const *vpt)
+{
+	fr_type_t cast = tmpl_rules_cast(vpt);
+	bool did_concat = false;
+	void *uctx = NULL;
+
+	if (fr_type_is_structural(cast)) {
+		fr_strerror_printf("Cannot cast to structural type '%s'", fr_type_to_str(cast));
+		return -1;
+	}
+
+	/*
+	 *	Quoting around the tmpl means everything
+	 *	needs to be concatenated, either as a string
+	 *	or octets string.
+	 */
+	switch (vpt->quote) {
+	case T_DOUBLE_QUOTED_STRING:
+	case T_SINGLE_QUOTED_STRING:
+	case T_SOLIDUS_QUOTED_STRING:
+	case T_BACK_QUOTED_STRING:
+	{
+		ssize_t		slen;
+		fr_value_box_t	*vb;
+
+		vb = fr_value_box_list_head(list);
+		if (!vb) return 0;
+
+		if (tmpl_escape_pre_concat(vpt)) {
+			uctx = tmpl_eval_escape_uctx_alloc(request, &vpt->rules.escape);
+
+			/*
+			 *	Sets escaped values, so boxes don't get re-escaped
+			 */
+			if (unlikely(fr_value_box_list_escape_in_place(list, &vpt->rules.escape.box_escape, uctx) < 0)) {
+			error:
+				tmpl_eval_escape_uctx_free(&vpt->rules.escape, uctx);
 				return -1;
 			}
 		}
 
-		fr_dlist_remove(interior, extent);	/* Do this *before* zeroing the dlist headers */
-		*extent = (tmpl_attr_extent_t){
-			.list = list,
-			.list_ctx = list_ctx
-		};
-		fr_dlist_insert_tail(leaf, extent);	/* move between in and out */
+		slen = fr_value_box_list_concat_in_place(vb, vb, list, FR_TYPE_STRING,
+							 FR_VALUE_BOX_LIST_FREE_BOX, true, SIZE_MAX);
+		if (slen < 0) goto error;
+		VALUE_BOX_LIST_VERIFY(list);
+
+		/*
+		 *	If there's no cast, or it's a cast to
+		 *	a string, we're done!
+		 *
+		 *	Otherwise we now need to re-cast the
+		 *	result.
+		 */
+		if (fr_type_is_null(cast) || fr_type_is_string(cast)) {
+		success:
+			tmpl_eval_escape_uctx_free(&vpt->rules.escape, uctx);
+			return 0;
+		}
+
+		did_concat = true;
 	}
+		break;
+
+	default:
+		break;
+	}
+
+	if (fr_type_is_null(cast)) goto success;
+
+	/*
+	 *	Quoting above handled all concatenation,
+	 *	we now need to handle potentially
+	 *	multivalued lists.
+	 */
+	fr_value_box_list_foreach(list, vb) {
+		if (fr_value_box_cast_in_place(vb, vb, cast, NULL) < 0) goto error;
+	}
+
+	/*
+	 *	...and finally, apply the escape function
+	 *	if necessary.  This is done last so that
+	 *	the escape function gets boxes of the type
+	 *	it expects.
+	 */
+	if ((!did_concat && tmpl_escape_pre_concat(vpt)) || tmpl_escape_post_concat(vpt)) {
+		if (!uctx) uctx = tmpl_eval_escape_uctx_alloc(request, &vpt->rules.escape);
+		if (unlikely(fr_value_box_list_escape_in_place(list, &vpt->rules.escape.box_escape, uctx) < 0)) goto error;
+	}
+
+	/*
+	 *	If there's no escape function, but there is
+	 *	a safe_for value, mark all the boxes up with
+	 *	this value.
+	 *
+	 *	This is mostly useful for call_env usage in
+	 *	modules where certain values are implicitly safe
+	 *	for consumption, like SQL statements in the SQL
+	 *	module.
+	 */
+	if (!vpt->rules.escape.box_escape.func && vpt->rules.escape.box_escape.safe_for) {
+		fr_value_box_list_mark_safe_for(list, vpt->rules.escape.box_escape.safe_for);
+	}
+
+	VALUE_BOX_LIST_VERIFY(list);
+
+	goto success;
+}
+
+fr_type_t tmpl_data_type(tmpl_t const *vpt)
+{
+	if (tmpl_rules_cast(vpt) != FR_TYPE_NULL) return tmpl_rules_cast(vpt);
+
+	if (vpt->quote != T_BARE_WORD) return FR_TYPE_STRING;
+
+	if (tmpl_is_data(vpt)) return tmpl_value_type(vpt);
+
+	if (tmpl_is_attr(vpt)) return tmpl_attr_tail_da(vpt)->type;
+
+	if (tmpl_is_xlat(vpt)) return xlat_data_type(tmpl_xlat(vpt));
+
+	return FR_TYPE_NULL;	/* can't determine it */
+}
+
+
+static int _tmpl_global_free(UNUSED void *uctx)
+{
+	fr_dict_autofree(tmpl_dict);
 
 	return 0;
 }
 
-void tmpl_extents_debug(fr_dlist_head_t *head)
+static int _tmpl_global_init(UNUSED void *uctx)
 {
-	tmpl_attr_extent_t const *extent = NULL;
-	fr_pair_t *vp = NULL;
+	fr_dict_attr_t *da;
 
-	for (extent = fr_dlist_head(head);
-	     extent;
-	     extent = fr_dlist_next(head, extent)) {
-	     	tmpl_attr_t const *ar = extent->ar;
-	     	char const *ctx_name;
-
-	     	if (ar) {
-			FR_FAULT_LOG("extent-interior-attr");
-			tmpl_attr_ref_debug(extent->ar, 0);
-		} else {
-			FR_FAULT_LOG("extent-leaf");
-		}
-
-		ctx_name = talloc_get_name(extent->list_ctx);
-		if (strcmp(ctx_name, "fr_pair_t") == 0) {
-			FR_FAULT_LOG("list_ctx     : %p (%s, %s)", extent->list_ctx, ctx_name,
-				     ((fr_pair_t *)extent->list_ctx)->da->name);
-		} else {
-			FR_FAULT_LOG("list_ctx     : %p (%s)", extent->list_ctx, ctx_name);
-		}
-		FR_FAULT_LOG("list         : %p", extent->list);
-		if (fr_pair_list_empty(extent->list)) {
-			FR_FAULT_LOG("list (first) : none (%p)", extent->list);
-		} else {
-			vp = fr_pair_list_head(extent->list);
-			FR_FAULT_LOG("list (first) : %s (%p)", vp->da->name, extent->list);
-		}
+	if (fr_dict_autoload(tmpl_dict) < 0) {
+		PERROR("%s", __FUNCTION__);
+		return -1;
 	}
 
+	da = fr_dict_attr_unknown_raw_afrom_num(UNCONST(TALLOC_CTX *, dict_freeradius), fr_dict_root(dict_freeradius), 0);
+	fr_assert(da != NULL);
+
+	da->type = FR_TYPE_NULL;
+	tmpl_attr_unspec = da;
+
+	return 0;
+}
+
+int tmpl_global_init(void)
+{
+	int ret;
+
+	fr_atexit_global_once_ret(&ret, _tmpl_global_init, _tmpl_global_free, NULL);
+
+	return ret;
 }

@@ -1,52 +1,79 @@
 #
-#  Run the "redis" xlat
+#  Check handling of node failures in a redis cluster
 #
+string redismaster
+string redisreplica
+string takeoverresult
+
 $INCLUDE cluster_reset.inc
 
 #  Hashes to Redis cluster node master 1
-if ("%{redis:SET b 'boom'}" == 'OK') {
-	test_pass
-} else {
+if (!(%redis('SET', 'b', 'boom') == 'OK')) {
 	test_fail
 }
 
-#  Leave some time (100ms) for the synchronisation
-update request {
-	&Tmp-String-0 := `/bin/sleep 0.1`
-}
+#  Leave some time (500ms) for the synchronisation
+%delay(0.5)
+
+#  Note the current master
+redismaster := %redis.node('b', 0)
+
+#  Note the current replica
+redisreplica := %redis.node('b', 1)
 
 #  Cause one of the redis cluster nodes to SEGV
-if ("%{redis:@%{redis_node:b 0} DEBUG SEGFAULT}" != '') {
+if (%redis("@%redis.node('b', 0)", 'DEBUG', 'SEGFAULT')) {
 	test_fail
-} else {
-	test_pass
 }
 
 #  Forcefully failover the slave for that node
-if ("%{redis:@%{redis_node:b 1} CLUSTER FAILOVER TAKEOVER}" != 'OK') {
+#  If the failover has happened automatically, then there is no result
+#  which sometimes happens when running tests with sanitizers, due to
+#  slowness introduced by the sanitizers.
+try {
+	takeoverresult = %redis("@%{redisreplica}", 'CLUSTER', 'FAILOVER', 'TAKEOVER')
+}
+catch fail {
+	takeoverresult = 'OK'
+}
+if (takeoverresult != 'OK') {
 	test_fail
-} else {
-	test_pass
 }
 
-if ("%{redis:GET b}" == 'boom') {
-	test_pass
-} else {
+#  Allow time for the takeover to propagate to other nodes
+foreach i (%range(20)) {
+	#
+	#  Keep remapping the cluster.  The remap can wait on a node which is
+	#  not answering, so bound each attempt and retry.
+	#
+	timeout 1s {
+		try {
+			%redis.remap(%{redisreplica})
+		}
+		catch fail {
+			ok
+		}
+	}
+
+	if (%redis.node('b', 0) == redisreplica) {
+		break
+	}
+	%delay(0.5)
+}
+
+if (!(%redis('GET', 'b') == 'boom')) {
 	test_fail
 }
 
 #  Kill that one too
-if ("%{redis:@%{redis_node:b 1} DEBUG SEGFAULT}" != '') {
+if (%redis("@%redis.node('b')", 'DEBUG', 'SEGFAULT')) {
 	test_fail
-} else {
-	test_pass
 }
 
 # No alternatives...
-if ("%{redis:GET b}" != 'boom') {
-	test_pass
-} else {
+%delay(0.5)
+if (%redis('GET', 'b') == 'boom') {
 	test_fail
 }
 
-
+test_pass

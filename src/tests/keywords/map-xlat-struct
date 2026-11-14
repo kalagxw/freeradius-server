@@ -1,22 +1,22 @@
 #
-# PRE: update
+# PRE: map
 # PROTOCOL: dhcpv6
 #
 #  Test the map xlat
 #
-update {
-	&Tmp-String-0 := "IA-PD.IAID = 11"
-}
+string test_string
 
-if ("%{map:%{Tmp-String-0}}" != 1) {
+test_string := "IA-PD.IAID = 11"
+
+if !%map(test_string) {
 	test_fail
 }
 
-if (!&IA-PD.IAID) {
+if (!IA-PD.IAID) {
 	test_fail
 }
 
-if (&IA-PD.IAID != 11) {
+if (!(IA-PD.IAID == 11)) {
 	test_fail
 }
 

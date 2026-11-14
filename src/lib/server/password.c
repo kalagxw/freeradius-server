@@ -25,6 +25,7 @@ RCSID("$Id$")
 
 #include <freeradius-devel/server/password.h>
 
+#include <freeradius-devel/util/atexit.h>
 #include <freeradius-devel/util/base64.h>
 #include <freeradius-devel/util/base16.h>
 #include <freeradius-devel/util/md4.h>
@@ -36,13 +37,14 @@ RCSID("$Id$")
 #include <freeradius-devel/protocol/freeradius/freeradius.internal.password.h>
 
 #ifdef HAVE_OPENSSL_EVP_H
+#  include <freeradius-devel/tls/openssl_user_macros.h>
 #  include <openssl/evp.h>
 #  include <openssl/sha.h>
 #endif
 
-typedef enum {
+typedef enum : uint8_t {
 	PASSWORD_CLEARTEXT = 0,			//!< Variable length.
-	PASSWORD_HASH,				//!< Fixed lenth.
+	PASSWORD_HASH,				//!< Fixed length.
 	PASSWORD_HASH_SALTED,			//!< Fixed length hash, variable length salt.
 	PASSWORD_HASH_VARIABLE			//!< Variable length everything.
 } password_type_t;
@@ -50,6 +52,8 @@ typedef enum {
 /** Apply preprocessing logic to a password value
  *
  * @param[in] ctx	to allocate returned value in.
+ * @param[in] request	currently being processed.
+ * @param[in] in	Pair containing the password to process.
  * @
  */
 typedef fr_pair_t *(*password_preprocess_t)(TALLOC_CTX *ctx, request_t *request, fr_pair_t *in);
@@ -108,9 +112,15 @@ static fr_dict_attr_t const *attr_ssha3_384;
 static fr_dict_attr_t const *attr_ssha3_512;
 
 static fr_dict_attr_t const *attr_pbkdf2;
+static fr_dict_attr_t const *attr_pbkdf2_sha1;
+static fr_dict_attr_t const *attr_pbkdf2_sha256;
+static fr_dict_attr_t const *attr_pbkdf2_sha512;
+static fr_dict_attr_t const *attr_pbkdf2_sha256_legacy;
 static fr_dict_attr_t const *attr_lm;
 static fr_dict_attr_t const *attr_nt;
 static fr_dict_attr_t const *attr_ns_mta_md5;
+
+static fr_dict_attr_t const *attr_psk;
 
 static fr_dict_attr_t const *attr_user;
 
@@ -118,7 +128,7 @@ extern fr_dict_autoload_t password_dict[];
 fr_dict_autoload_t password_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 extern fr_dict_attr_autoload_t password_dict_attr[];
@@ -156,16 +166,22 @@ fr_dict_attr_autoload_t password_dict_attr[] = {
 	{ .out = &attr_ssha3_512, .name = "Password.SSHA3-512", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
 
 	{ .out = &attr_pbkdf2, .name = "Password.PBKDF2", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
+	{ .out = &attr_pbkdf2_sha1, .name = "Password.PBKDF2-SHA1", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
+	{ .out = &attr_pbkdf2_sha256, .name = "Password.PBKDF2-SHA256", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
+	{ .out = &attr_pbkdf2_sha512, .name = "Password.PBKDF2-SHA512", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
+	{ .out = &attr_pbkdf2_sha256_legacy, .name = "Password.PBKDF2-SHA256-LEGACY", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
 	{ .out = &attr_lm, .name = "Password.LM", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
 	{ .out = &attr_nt, .name = "Password.NT", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
 	{ .out = &attr_ns_mta_md5, .name = "Password.NS-MTA-MD5", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 
+	{ .out = &attr_psk, .name = "Password.PSK", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
+
 	{ .out = &attr_user, .name = "User-Password", .type = FR_TYPE_STRING, .dict = &dict_radius },
 
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
-typedef enum {
+typedef enum : uint8_t {
 	NORMALISED_NOTHING = 0,
 	NORMALISED_B64,
 	NORMALISED_HEX
@@ -202,6 +218,11 @@ static fr_table_num_sorted_t const password_header_table[] = {
 	{ L("{nt}"),				FR_NT		},
 	{ L("{nthash}"),			FR_NT		},
 
+	{ L("{pbkdf2-sha1}"),			FR_PBKDF2_SHA1	},
+	{ L("{pbkdf2-sha256}"),			FR_PBKDF2_SHA256 },
+	{ L("{pbkdf2-sha512}"),			FR_PBKDF2_SHA512 },
+	{ L("{pbkdf2_sha256}"),			FR_PBKDF2_SHA256_LEGACY },
+
 #ifdef HAVE_OPENSSL_EVP_H
 	{ L("{sha224}"),			FR_SHA2	},
 	{ L("{sha256}"),			FR_SHA2	},
@@ -214,12 +235,10 @@ static fr_table_num_sorted_t const password_header_table[] = {
 #ifdef HAVE_OPENSSL_EVP_H
 	{ L("{ssha224}"),			FR_SSHA2_224	},
 	{ L("{ssha256}"),			FR_SSHA2_256	},
-#  if OPENSSL_VERSION_NUMBER >= 0x10101000L
 	{ L("{ssha3-224}"),			FR_SSHA3_224	},
 	{ L("{ssha3-256}"),			FR_SSHA3_256	},
 	{ L("{ssha3-384}"),			FR_SSHA3_384	},
 	{ L("{ssha3-512}"),			FR_SSHA3_512	},
-#  endif
 	{ L("{ssha384}"),			FR_SSHA2_384	},
 	{ L("{ssha512}"),			FR_SSHA2_512	},
 #endif
@@ -233,13 +252,11 @@ static size_t password_header_table_len = NUM_ELEMENTS(password_header_table);
 
 #ifdef HAVE_OPENSSL_EVP_H
 static fr_pair_t *password_process_sha2(TALLOC_CTX *ctx, request_t *request, fr_pair_t *known_good);
-#  if OPENSSL_VERSION_NUMBER >= 0x10101000L
 static fr_pair_t *password_process_sha3(TALLOC_CTX *ctx, request_t *request, fr_pair_t *known_good);
-#  endif
 #endif
 static fr_pair_t *password_process_header(TALLOC_CTX *ctx, request_t *request, fr_pair_t *known_good);
 
-/** Metdata for various password attributes
+/** Metadata for various password attributes
  *
  */
 static password_info_t password_info[] = {
@@ -281,6 +298,22 @@ static password_info_t password_info[] = {
 						.type = PASSWORD_HASH_VARIABLE,
 						.da = &attr_pbkdf2
 					},
+	[FR_PBKDF2_SHA1]		= {
+						.type = PASSWORD_HASH_VARIABLE,
+						.da = &attr_pbkdf2_sha1
+					},
+	[FR_PBKDF2_SHA256]		= {
+						.type = PASSWORD_HASH_VARIABLE,
+						.da = &attr_pbkdf2_sha256
+					},
+	[FR_PBKDF2_SHA512]		= {
+						.type = PASSWORD_HASH_VARIABLE,
+						.da = &attr_pbkdf2_sha512
+					},
+	[FR_PBKDF2_SHA256_LEGACY]	= {
+						.type = PASSWORD_HASH_VARIABLE,
+						.da = &attr_pbkdf2_sha256_legacy
+					},
 	[FR_SHA1]			= {
 						.type = PASSWORD_HASH,
 						.da = &attr_sha1,
@@ -314,7 +347,6 @@ static password_info_t password_info[] = {
 						.da = &attr_sha2_512,
 						.min_hash_len = SHA512_DIGEST_LENGTH,
 					},
-#  if OPENSSL_VERSION_NUMBER >= 0x10101000L
 	[FR_SHA3]			= {
 						.type = PASSWORD_HASH_VARIABLE,
 						.da = &attr_sha3,
@@ -341,7 +373,6 @@ static password_info_t password_info[] = {
 						.da = &attr_sha3_512,
 						.min_hash_len = SHA512_DIGEST_LENGTH
 					},
-#  endif
 #endif
 	[FR_SMD5]			= {
 						.type = PASSWORD_HASH,
@@ -374,7 +405,6 @@ static password_info_t password_info[] = {
 						.da = &attr_ssha2_512,
 						.min_hash_len = SHA512_DIGEST_LENGTH
 					},
-#  if OPENSSL_VERSION_NUMBER >= 0x10101000L
 	[FR_SSHA3_224]			= {
 						.type = PASSWORD_HASH_SALTED,
 						.da = &attr_ssha3_224,
@@ -394,12 +424,17 @@ static password_info_t password_info[] = {
 						.type = PASSWORD_HASH_SALTED,
 						.da = &attr_ssha3_512,
 						.min_hash_len = SHA512_DIGEST_LENGTH
-					}
-#  endif
+					},
 #endif
+
+	[FR_PSK]			= {
+						.type = PASSWORD_HASH,
+						.da = &attr_psk,
+						.min_hash_len = 16
+					},
 };
 
-#define MIN_LEN(_info) (info->type == PASSWORD_HASH_SALTED ? (info->min_hash_len + 1) : info->min_hash_len)
+#define MIN_LEN(_info) ((_info)->type == PASSWORD_HASH_SALTED ? ((_info)->min_hash_len + 1) : (_info)->min_hash_len)
 
 static ssize_t normify(normalise_t *action, uint8_t *buffer, size_t bufflen,
 		       char const *known_good, size_t len, size_t min_len)
@@ -479,7 +514,7 @@ static fr_pair_t *password_normify(TALLOC_CTX *ctx, request_t *request, fr_pair_
 	min_len = MIN_LEN(info);
 	if (min_len >= sizeof(buffer)) return NULL; /* paranoia */
 
-	switch (known_good->da->type) {
+	switch (known_good->vp_type) {
 	case FR_TYPE_OCTETS:
 		decoded = normify(&normalised, buffer, sizeof(buffer),
 				  (char const *)known_good->vp_octets, known_good->vp_length, min_len);
@@ -497,7 +532,7 @@ static fr_pair_t *password_normify(TALLOC_CTX *ctx, request_t *request, fr_pair_
 	if (normalised != NORMALISED_NOTHING) {
 		RDEBUG2("Normalizing %s %s encoding, %zu bytes -> %zu bytes",
 			known_good->da->name, fr_table_str_by_value(normalise_table, normalised, 0),
-			known_good->vp_length, decoded);
+			known_good->vp_length, (size_t)decoded);
 		MEM(out = fr_pair_afrom_da(ctx, known_good->da));
 		fr_pair_value_memdup(out, buffer, decoded, known_good->vp_tainted);
 		return out;
@@ -555,7 +590,6 @@ static fr_pair_t *password_process_sha2(TALLOC_CTX *ctx, request_t *request, fr_
 	}
 }
 
-#  if OPENSSL_VERSION_NUMBER >= 0x10101000L
 /** Split SHA3 hashes into separate attributes based on their length
  *
  * @param[in] ctx		to allocate attributes in.
@@ -581,7 +615,7 @@ static fr_pair_t *password_process_sha3(TALLOC_CTX *ctx, request_t *request, fr_
 		return out;
 
 	case SHA384_DIGEST_LENGTH:
-		out = fr_pair_afrom_da(ctx, attr_sha3_384);
+		MEM(out = fr_pair_afrom_da(ctx, attr_sha3_384));
 		fr_pair_value_copy(out, known_good);
 		return out;
 
@@ -591,7 +625,7 @@ static fr_pair_t *password_process_sha3(TALLOC_CTX *ctx, request_t *request, fr_
 		return out;
 
 	default:
-		MEM(out = password_normify(ctx, request, known_good));
+		out = password_normify(ctx, request, known_good);
 		if (!out) return NULL;
 
 		normalised = password_process_sha3(ctx, request, out);
@@ -600,7 +634,6 @@ static fr_pair_t *password_process_sha3(TALLOC_CTX *ctx, request_t *request, fr_
 		return normalised;
 	}
 }
-#  endif
 #endif
 
 /** Convert a Password.With-Header attribute to the correct type
@@ -631,13 +664,13 @@ static fr_pair_t *password_process_header(TALLOC_CTX *ctx, request_t *request, f
 	fr_pair_t			*new;
 	fr_dict_attr_t const		*def = attr_cleartext;
 
-	VP_VERIFY(known_good);
+	PAIR_VERIFY(known_good);
 
 	/*
 	 *	Ensure this is only ever called with a
 	 *	string type attribute.
 	 */
-	fr_assert(known_good->da->type == FR_TYPE_STRING);
+	fr_assert(known_good->vp_type == FR_TYPE_STRING);
 
 	p = known_good->vp_strvalue;
 	end = p + known_good->vp_length;
@@ -679,7 +712,7 @@ do_header:
 
 		p = q + 1;
 
-		if (!fr_cond_assert(known_good->da->attr < NUM_ELEMENTS(password_info))) return NULL;
+		if (!fr_cond_assert((size_t) attr < NUM_ELEMENTS(password_info))) return NULL;
 		info = &password_info[attr];
 
 		MEM(new = fr_pair_afrom_da(ctx, *(info->da)));
@@ -693,15 +726,16 @@ do_header:
 			break;
 
 		default:
+			talloc_free(new);
 			fr_assert_fail(NULL);
 			return NULL;
 		}
 		return new;
 	}
 
-#ifdef __clang_analyzer__
+#ifdef STATIC_ANALYZER
 	/*
-	 *	clang isn't smart enough to notice that "normify" clears out n1.
+	 *	static analyzer isn't smart enough to notice that "normify" clears out n1.
 	 */
 	memset(n1, 0, sizeof(n1));
 #endif
@@ -721,7 +755,7 @@ do_header:
 		if ((n1[0] == '{') && (memchr(n1, '}', decoded) != NULL)) {
 			RDEBUG2("Normalizing %s %s encoding, %zu bytes -> %zu bytes",
 				known_good->da->name, fr_table_str_by_value(normalise_table, normalised, 0),
-				known_good->vp_length, decoded);
+				known_good->vp_length, (size_t)decoded);
 
 			/*
 			 *	Password.With-Header is a string attribute.
@@ -743,9 +777,9 @@ do_header:
 	 *	header to indicate hash type.
 	 */
 	if (RDEBUG_ENABLED3) {
-		RDEBUG3("No {...} in &control.%pP, re-writing to %s", known_good, def->name);
+		RDEBUG3("No {...} in control.%pP, re-writing to %s", known_good, def->name);
 	} else {
-		RDEBUG2("No {...} in &control.%s, re-writing to %s", known_good->da->name, def->name);
+		RDEBUG2("No {...} in control.%s, re-writing to %s", known_good->da->name, def->name);
 	}
 
 bad_header:
@@ -762,6 +796,8 @@ static fr_pair_t *password_process(TALLOC_CTX *ctx, request_t *request, fr_pair_
 {
 	password_info_t		*info;
 	fr_pair_t		*out;
+
+	if (!fr_cond_assert(known_good->da->attr < NUM_ELEMENTS(password_info))) return NULL;
 
 	info = &password_info[known_good->da->attr];
 	if (info->func) {
@@ -812,10 +848,10 @@ static fr_pair_t *password_process(TALLOC_CTX *ctx, request_t *request, fr_pair_
 	 */
 	if (info->min_hash_len && (out->vp_length < MIN_LEN(info))) {
 		if (RDEBUG_ENABLED3) {
-			RWDEBUG3("&control.%pP too short, expected %zu bytes, got %zu bytes",
+			RWDEBUG3("control.%pP too short, expected %zu bytes, got %zu bytes",
 				 out, MIN_LEN(info), out->vp_length);
 		} else {
-			RWDEBUG2("&control.%s too short, expected %zu bytes, got %zu bytes",
+			RWDEBUG2("control.%s too short, expected %zu bytes, got %zu bytes",
 				 out->da->name, MIN_LEN(info), out->vp_length);
 		}
 	invalid:
@@ -828,10 +864,10 @@ static fr_pair_t *password_process(TALLOC_CTX *ctx, request_t *request, fr_pair_
 	 */
 	if (info->max_hash_len && (out->vp_length > info->max_hash_len)) {
 		if (RDEBUG_ENABLED3) {
-			RWDEBUG3("&control.%pP too long, expected %zu bytes, got %zu bytes",
+			RWDEBUG3("control.%pP too long, expected %zu bytes, got %zu bytes",
 				 out, info->max_hash_len, out->vp_length);
 		} else {
-			RWDEBUG2("&control.%s too long, expected %zu bytes, got %zu bytes",
+			RWDEBUG2("control.%s too long, expected %zu bytes, got %zu bytes",
 				 out->da->name, info->max_hash_len, out->vp_length);
 		}
 		goto invalid;
@@ -843,10 +879,10 @@ static fr_pair_t *password_process(TALLOC_CTX *ctx, request_t *request, fr_pair_
 	if ((info->type == PASSWORD_HASH) && (out->vp_length != info->min_hash_len)) {
 
 		if (RDEBUG_ENABLED3) {
-			RWDEBUG3("&control.%pP incorrect length, expected %zu bytes, got %zu bytes",
+			RWDEBUG3("control.%pP incorrect length, expected %zu bytes, got %zu bytes",
 				 out, info->min_hash_len, out->vp_length);
 		} else {
-			RWDEBUG2("&control.%s incorrect length, expected %zu bytes, got %zu bytes",
+			RWDEBUG2("control.%s incorrect length, expected %zu bytes, got %zu bytes",
 				 out->da->name, info->min_hash_len, out->vp_length);
 		}
 		goto invalid;
@@ -867,7 +903,7 @@ int password_normalise_and_replace(request_t *request, bool normify)
 	int		replaced = 0;
 	fr_pair_t	*known_good, *new;
 
-	for (known_good = fr_dcursor_iter_by_ancestor_init(&cursor, &request->control_pairs, attr_root);
+	for (known_good = fr_pair_dcursor_by_ancestor_init(&cursor, &request->control_pairs, attr_root);
 	     known_good;
 	     known_good = fr_dcursor_next(&cursor)) {
 		if (!fr_cond_assert(known_good->da->attr < NUM_ELEMENTS(password_info))) return -1;
@@ -876,14 +912,22 @@ int password_normalise_and_replace(request_t *request, bool normify)
 		 *	Apply preprocessing steps and normalisation.
 		 */
 		new = password_process(request, request, known_good, normify);
-		if (!new) break;		/* Process next input attribute */
+		if (!new) continue;		/* Process next input attribute */
+
+		/*
+		 *	If we didn't do anything to it, we do nothing.
+		 */
+		if (new == known_good) {
+			replaced++;
+			continue;
+		}
 
 		if (RDEBUG_ENABLED3) {
-			RDEBUG3("Replacing &control.%pP with &control.%pP",
+			RDEBUG3("Replacing control.%pP with control.%pP",
 				known_good, new);
 
 		} else {
-			RDEBUG2("Replacing &control.%s with &control.%s",
+			RDEBUG2("Replacing control.%s with control.%s",
 				known_good->da->name, new->da->name);
 		}
 		fr_dcursor_free_item(&cursor);
@@ -933,7 +977,7 @@ static fr_pair_t *password_normalise_and_recheck(TALLOC_CTX *ctx, request_t *req
 /** Find a "known good" password in the control list of a request
  *
  * Searches for a "known good" password attribute, and applies any processing
- * and normification operations to it, returning a new mormalised fr_pair_t.
+ * and normification operations to it, returning a new normalised fr_pair_t.
  *
  * The ctx passed in should be freed when the caller is done with the returned
  * fr_pair_t, or alternatively, a persistent ctx may be used and the value
@@ -963,22 +1007,21 @@ fr_pair_t *password_find(bool *ephemeral, TALLOC_CTX *ctx, request_t *request,
 	fr_dcursor_t	cursor;
 	fr_pair_t	*known_good;
 
-	for (known_good = fr_dcursor_iter_by_ancestor_init(&cursor, &request->control_pairs, attr_root);
+	if (fr_pair_find_by_da(&request->control_pairs, NULL, attr_user) != NULL) {
+		RWDEBUG("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+		RWDEBUG("!!! Ignoring control.User-Password.  Update your        !!!");
+		RWDEBUG("!!! configuration so that the \"known good\" clear text   !!!");
+		RWDEBUG("!!! password is in Password.Cleartext and NOT in        !!!");
+		RWDEBUG("!!! User-Password.                                      !!!");
+		RWDEBUG("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+	}
+
+	for (known_good = fr_pair_dcursor_by_ancestor_init(&cursor, &request->control_pairs, attr_root);
 	     known_good;
 	     known_good = fr_dcursor_next(&cursor)) {
 		password_info_t		*info;
 		fr_pair_t		*out;
 		size_t			i;
-
-		if (known_good->da == attr_user) {
-			RWDEBUG("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-			RWDEBUG("!!! Ignoring control.User-Password.  Update your        !!!");
-			RWDEBUG("!!! configuration so that the \"known good\" clear text !!!");
-			RWDEBUG("!!! password is in Password.Cleartext and NOT in        !!!");
-			RWDEBUG("!!! User-Password.                                      !!!");
-			RWDEBUG("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-			continue;
-		}
 
 		if (known_good->da->attr >= NUM_ELEMENTS(password_info)) continue;
 
@@ -1023,10 +1066,7 @@ fr_pair_t *password_find(bool *ephemeral, TALLOC_CTX *ctx, request_t *request,
 	return NULL;
 }
 
-/** Load our dictionaries
- *
- */
-int password_init(void)
+static int _password_init(UNUSED void *uctx)
 {
 	if (fr_dict_autoload(password_dict) < 0) {
 		PERROR("%s", __FUNCTION__);
@@ -1041,7 +1081,21 @@ int password_init(void)
 	return 0;
 }
 
-void password_free(void)
+static int _password_free(UNUSED void *uctx)
 {
 	fr_dict_autofree(password_dict);
+
+	return 0;
+}
+
+/** Load our dictionaries
+ *
+ */
+int password_init(void)
+{
+	int ret;
+
+	fr_atexit_global_once_ret(&ret, _password_init, _password_free, NULL);
+
+	return ret;
 }

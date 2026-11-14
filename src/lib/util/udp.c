@@ -24,7 +24,6 @@ RCSID("$Id$")
 
 #include <freeradius-devel/util/log.h>
 #include <freeradius-devel/util/socket.h>
-#include <freeradius-devel/util/strerror.h>
 #include <freeradius-devel/util/syserror.h>
 #include <freeradius-devel/util/udp.h>
 
@@ -32,36 +31,33 @@ RCSID("$Id$")
 
 /** Send a packet via a UDP socket.
  *
- * @param[in] socket		we're reading from.
+ * @param[in] sock		we're reading from.
  * @param[in] flags		to pass to send(), or sendto()
  * @param[in] data		to data to send
  * @param[in] data_len		length of data to send
  * @return
- *	- 0 on success.
+ *	- >=0 amount of data written.
  *	- -1 on failure.
  */
-int udp_send(fr_socket_t const *socket, int flags, void *data, size_t data_len)
+ssize_t udp_send(fr_socket_t const *sock, int flags, void *data, size_t data_len)
 {
-	int ret;
+	ssize_t ret;
 
-	if (unlikely(socket->proto != IPPROTO_UDP)) {
-		fr_strerror_printf("Invalid proto type %u", socket->proto);
-		return -1;
-	}
+	fr_assert(sock->type == SOCK_DGRAM);
 
 	if (flags & UDP_FLAGS_CONNECTED) {
-		ret = (send(socket->fd, data, data_len, 0) == (ssize_t)data_len) ? 0 : -1;
+		ret = send(sock->fd, data, data_len, 0);
 	} else {
 		struct sockaddr_storage	dst, src;
 		socklen_t		sizeof_dst, sizeof_src;
 
 		if (fr_ipaddr_to_sockaddr(&dst, &sizeof_dst,
-					  &socket->inet.dst_ipaddr, socket->inet.dst_port) < 0) return -1;
+					  &sock->inet.dst_ipaddr, sock->inet.dst_port) < 0) return -1;
 		if (fr_ipaddr_to_sockaddr(&src, &sizeof_src,
-					  &socket->inet.src_ipaddr, socket->inet.src_port) < 0) return -1;
+					  &sock->inet.src_ipaddr, sock->inet.src_port) < 0) return -1;
 
-		ret = sendfromto(socket->fd, data, data_len, 0,
-				 socket->inet.ifindex,
+		ret = sendfromto(sock->fd, data, data_len, 0,
+				 sock->inet.ifindex,
 				 (struct sockaddr *)&src, sizeof_src,
 				 (struct sockaddr *)&dst, sizeof_dst);
 	}
@@ -76,7 +72,7 @@ int udp_send(fr_socket_t const *socket, int flags, void *data, size_t data_len)
  *
  * @param[in] sockfd we're reading from.
  */
-int udp_recv_discard(int sockfd)
+ssize_t udp_recv_discard(int sockfd)
 {
 	uint8_t			data[4];
 	struct sockaddr_storage	src;
@@ -157,14 +153,15 @@ ssize_t udp_recv(int sockfd, int flags,
 
 	if ((flags & UDP_FLAGS_PEEK) != 0) sock_flags |= MSG_PEEK;
 
-	if (when) *when = 0;
+	if (when) *when = fr_time_wrap(0);
 
 	/*
 	 *	Always initialise the output socket structure
 	 */
 	*socket_out = (fr_socket_t){
 		.fd = sockfd,
-		.proto = IPPROTO_UDP
+		.type = SOCK_DGRAM,
+		.af = AF_UNSPEC,
 	};
 
 	/*
@@ -172,8 +169,6 @@ ssize_t udp_recv(int sockfd, int flags,
 	 */
 	if ((flags & UDP_FLAGS_CONNECTED) != 0) {
 		slen = recv(sockfd, data, data_len, sock_flags);
-		if (slen <= 0) goto done;
-
 		goto done;
 	}
 
@@ -209,7 +204,8 @@ done:
 	 *	We didn't get it from the kernel
 	 *	so use our own time source.
 	 */
-	if (when && !*when) *when = fr_time();
+	if (when && fr_time_eq(*when, fr_time_wrap(0))) *when = fr_time();
 
+	socket_out->af = socket_out->inet.dst_ipaddr.af;
 	return slen;
 }

@@ -1,0 +1,5 @@
+#
+#  The RHS isn't a number or an enum
+#
+uint32 a
+a := '$[3][2]'	# ERROR

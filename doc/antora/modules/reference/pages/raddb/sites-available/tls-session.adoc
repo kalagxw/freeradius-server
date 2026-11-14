@@ -1,0 +1,311 @@
+
+This virtual server controls TLS sessions.
+
+When a TLS session is used, the server will automatically create
+attributes in the session-state list with details extracted from the
+client certificate chain.
+
+The number of certificates decoded depends on the setting of setting
+of `attriubte_mode` in the `verify` section of the appropriate TLS
+configuration.
+
+Certificates are decoded into nested attributes e.g.
+
+----
+#	TLS-Certificate = {
+#		Subject = '...',
+#		Common-Name = '...',
+#		Issuer = '...'
+#	}
+----
+
+When more than one certificate is decoded, the first ( i.e.
+session-state.TLS-Certificate[0] ) will be the client certificate,
+with the next being its issuer.
+
+----
+server tls-session {
+	namespace = tls
+
+----
+
+This section can be run to verify a client certificate if additional
+checks need to be performed beyond standard checks verification
+against a trust chain, CRLs and OCSP.
+
+Attributes extracted from the certificates forming the client
+certificate chain will be in the session state list.
+
+Returning 'ok', 'updated' or 'noop' will cause the verification to
+succeed. Other return codes will cause the verification to fail.
+
+----
+	verify certificate {
+----
+
+Check the client certificate matches a string, and reject otherwise
+
+----
+##		if ("%{session-state.TLS-Certificate.Common-Name}" != 'client.example.com') {
+##			reject
+##		}
+
+----
+
+Check the client certificate common name against the supplied identity
+
+----
+##		if (EAP-Identity != "host/%{session-state.TLS-Certificate.Common-Name}") {
+##			reject
+##		}
+
+----
+
+The `ocsp` module can be used to check for certificate revocation. See
+xref:reference:raddb/mods-available/ocsp.adoc[mods-available/ocsp] for
+details.
+
+To reduce the number of calls to OCSP endpoints an instance of
+rlm_cache can be used to store responses. A example instance -
+cache_ocsp - is provided in
+xref:reference:raddb/mods-available/cache_tls.adoc[mods-available/cache_tls].
+
+----
+##		cache_ocsp.load
+##		ocsp
+##		if (ok && TLS-OCSP-Next-Update) {
+##			control.Cache-TTL := TLS-OCSP-Next-Update
+##			cache_ocsp.store
+##		}
+
+----
+
+The `crl` module can be used to perform CRL checks. See
+xref:reference:raddb/mods-available/crl.adoc[mods-available/crl] for
+details.
+
+----
+##		crl
+
+----
+
+This is a convenient place to call LDAP, for example, when using
+EAP-TLS, as it will only be called once, after all certificates as
+part of the EAP-TLS challenge process have been verified.
+
+An example could be to use LDAP to check that the connecting host, as
+well as presenting a valid certificate, is also in a group based on
+the EAP-Identity (assuming this contains the service principal name).
+Settings such as the following could be used in the ldap module
+configuration:
+
+basedn = "dc=example, dc=com" filter =
+"(servicePrincipalName=%{EAP-Identity})" base_filter =
+"(objectClass=computer)" groupname_attribute = cn
+groupmembership_filter =
+"(&(objectClass=group)(member=%{control.Ldap-UserDn}))"
+
+----
+#		ldap
+
+----
+
+Now let's test membership of an LDAP group (the ldap bind user will
+need permission to read this group membership):
+
+----
+##		if (!%ldap.group("Permitted-Laptops")) {
+##			reject
+##		}
+
+----
+or, to be more specific, you could use the group's full DN: if
+(!%ldap.group("CN=Permitted-Laptops,OU=Groups,DC=example,DC=org")) {
+
+This may be a better place to call the files modules when using
+EAP-TLS, as it will only be called once, after the challenge-response
+iteration has completed.
+
+----
+#		files
+
+		ok
+	}
+
+----
+
+This section is run prior to creating a new TLS session and can be
+used to modify session parameters such as max and min TLS versions.
+
+----
+##	new session {
+##		control.Max-Version := 1.3
+##		control.Min-Version := 1.2
+##	}
+
+----
+
+This section is run whenever the server needs to read an entry from
+the TLS session cache.
+
+It should read the attribute session-state.TLS-Session-Data from the
+cache, along with any other attributes which were in the cache
+
+On success it should return 'ok' or 'updated'.
+
+The return code has no real effect on session processing and will just
+cause the server to emit a warning.
+
+----
+	load session {
+		control.Cache-Allow-Insert := no
+
+		cache_tls_session
+	}
+
+----
+
+This section is run whenever the server needs to write an entry to the
+TLS session cache.
+
+It should write the attribute session-state.Session-Data to the cache,
+along with any other attributes which need to be cached.
+
+On success it should return 'ok' or 'updated'.
+
+The return code has no real effect on session processing and will just
+cause the server to emit a warning.
+
+The session's TTL is stored in `request.Session-TTL`.  It is initially
+derived from the `lifetime` setting of the `cache` section, of the
+`tls` configuration.
+
+Setting the `cache` module expiration to be the same as `Session-TTL`
+means that the two agree.  There is no reason for the cache entry to
+live longer than the session's TTL.
+
+----
+	store session {
+		control.Cache-TTL := Session-TTL
+
+		cache_tls_session
+	}
+
+----
+
+This section is run whenever the server needs to delete an entry from
+the TLS session cache.
+
+On success it should return 'ok', 'updated', 'noop' or 'notfound'
+
+The return code has no real effect on session processing and will just
+cause the server to emit a warning.
+
+----
+	clear session {
+		control.Cache-TTL := 0
+		control.Cache-Allow-Insert := no
+
+		cache_tls_session
+	}
+
+----
+
+This section is run after the TLS session is established, and all TLS
+negotiation has finished.
+
+It is intended for logging session details such as TLS version or
+cipher suite.
+
+----
+##	establish session {
+##	}
+
+----
+
+This section is run when a TLS session has failed. i.e. it is run
+instead of "establish session".
+
+It is intended for logging session failure details.
+
+If session caching is enabled, this section is run before "clear
+session".
+
+Otherwise if session caching is disabled, then this section is run on
+any TLS connection failure, and "clear session" is not run.
+
+----
+##	fail session {
+##	}
+
+----
+
+This section is run for stateless session resumption, before the
+session ticket is handed to the peer.
+
+A stateless session ticket encodes all of the attributes in the
+`session-state` list.  The contents are encrypted by OpenSSL before
+they are sent to the client.
+
+If you want to store data across session resumptions, then add it to
+the `session-state` list here.
+
+NOTE: The session tickets should be small, at most 512 bytes.
+Anything larger is not likely to work.
+
+This section is run _instead of_ `store session`.
+
+The section is optional. If it is not used, then the session ticket
+contains default information.
+
+----
+##	encode session {
+##	}
+
+----
+
+This section is run for stateless session resumption, after the peer
+has handed us the session ticket.
+
+The session ticket contents are decrypted and placed into the
+`session-state` list before this section is run.
+
+If you want to look at data which was saved across session
+resumptions, then it will be in the `session-state` list here.
+
+This section is run _instead of_ `load session`.
+
+The section is optional. If it is not used, then the `session-state`
+list contains default information.
+
+----
+##	decode session {
+##	}
+
+----
+
+This section is run when a client authenticates with a pre-shared key
+(TLS-PSK), to find the key for the identity that the client sent.
+
+The identity is in `request.TLS-PSK-Identity`.  Provide the key, as
+binary data, in `reply.TLS-PSK-Key`.  If the key is stored as hex,
+convert the key with `%bin()`.
+
+Returning `notfound` means that the identity is unknown.  Returning
+`fail`, `reject`, `invalid`, `disallow`, or `timeout` means that the
+lookup failed.  Any other return code means that the key was found,
+and the section must then have set `reply.TLS-PSK-Key`.  An unknown
+identity, a failed lookup, and a missing key all fail the handshake.
+
+When this section exists, a `tls` configuration that uses this virtual
+server must not set a fixed key in a `psk` section.
+
+----
+##	load psk {
+##		reply.TLS-PSK-Key := %bin(%sql("SELECT hex(key) FROM psk_keys WHERE keyid = '%{TLS-PSK-Identity}'"))
+##	}
+}
+----
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

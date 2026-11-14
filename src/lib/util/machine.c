@@ -216,6 +216,13 @@ fr_machine_t *fr_machine_alloc(TALLOC_CTX *ctx, fr_machine_def_t const *def, voi
 	 */
 	m->current = &m->state[def->init];
 
+#ifdef STATIC_ANALYZER
+	if (!m->current || !m->current->def || !m->current->def->process) {
+		talloc_free(m);
+		return NULL;
+	}
+#endif
+
 	/*
 	 *	We don't transition into the "init" state, as there is
 	 *	no previous state.  We just run the "process"
@@ -233,13 +240,6 @@ fr_machine_t *fr_machine_alloc(TALLOC_CTX *ctx, fr_machine_def_t const *def, voi
 	fr_assert(!m->current->def->enter);
 	fr_assert(!m->current->def->exit);
 	fr_assert(m->current->def->process);
-
-#if defined(__clang_analyzer__)
-	if (!m->current || !m->current->def || !m->current->def->process) {
-		talloc_free(m);
-		return NULL;
-	}
-#endif
 
 	next = m->current->def->process(m, uctx);
 	fr_assert(next >= 0);
@@ -290,7 +290,7 @@ static int state_post(fr_machine_t *m, int state)
  *
  * @param m	The state machine
  * @return
- *	- 0 for "no transition has occured"
+ *	- 0 for "no transition has occurred"
  *	- >0 for "we are in a new state".
  *	-<0 for "error, you should tear down the state machine".
  *
@@ -484,14 +484,14 @@ char const *fr_machine_state_name(fr_machine_t *m, int state)
 {
 	fr_assert(!m->dead);
 
-	if ((state < 0) || (state > m->def->max_state)) return "???";
+	if ((state < 0) || (state > m->def->max_state)) return "<INVALID>";
 
 	if (!state) {
 		if (m->current) {
 			state = m->current->def->number;
 
 		} else {
-			return "???";
+			return "<INVALID>";
 		}
 	}
 
@@ -609,7 +609,7 @@ void fr_machine_resume(fr_machine_t *m)
  * @param m	The state machine
  * @param signal the signal to send to the state machne
  * @return
- *	- 0 for "no transition has occured"
+ *	- 0 for "no transition has occurred"
  *	- >0 for "we are in a new state".
  *	-<0 for "error, you should tear down the state machine".
  *

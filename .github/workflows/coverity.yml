@@ -6,45 +6,71 @@ on:
       - coverity_scan
   schedule:
     - cron: '0 20 * * *'
+  workflow_dispatch:
 
 jobs:
+  #
+  #  `common_vars` determines which registry holds the continuous
+  #  integration (CI) images.  See `.github/workflows/common_vars.yml`.
+  #
+  common_vars:
+    name: Common vars
+    uses: ./.github/workflows/common_vars.yml
+
   coverity:
-    runs-on: ubuntu-20.04
+    needs: common_vars
     if: github.repository_owner == 'FreeRADIUS'
+    runs-on: self-hosted
+    container:
+      image: ${{ needs.common_vars.outputs.image_prefix }}self-hosted:latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
 
-      - name: Package manager performance improvements
-        run: |
-          sudo sh -c 'echo force-unsafe-io > /etc/dpkg/dpkg.cfg.d/02speedup'
-          echo 'man-db man-db/auto-update boolean false' | sudo debconf-set-selections
-          sudo dpkg-reconfigure man-db
-          sudo sed -i 's/^update_initramfs=.*/update_initramfs=no/' /etc/initramfs-tools/update-initramfs.conf
-          sudo apt-get update
+      #
+      #  The CI image has clang only under a versioned name, `clang-N`,
+      #  and nothing in the image makes plain `clang` resolve to the
+      #  versioned binary.  The build step below sets `CC=clang`.  Without
+      #  runner-prep, configure looks for a compiler named `clang`, finds
+      #  none, and stops with "C compiler cannot create executables".
+      #
+      - name: Prepare the runner
+        uses: ./.github/actions/runner-prep
+        with:
+          packaging_changed: ${{ needs.common_vars.outputs.images_changed }}
+          use_docker: true
+          cc: clang
+          llvm_ver: ${{ needs.common_vars.outputs.llvm_version }}
+          gcc_ver: ${{ needs.common_vars.outputs.gcc_version }}
 
-      - name: Install build dependencies
+      - name: Download coverity tool MD5
         run: |
-          sudo apt-get install -y --no-install-recommends build-essential devscripts equivs quilt
-          debian/rules debian/control
-          sudo mk-build-deps -irt"apt-get -y --no-install-recommends" debian/control
-          sudo mk-build-deps -irt"apt-get -y --no-install-recommends" scripts/ci/extra-packages.debian.control
+          wget https://scan.coverity.com/download/linux64 \
+            --post-data "token=${TOKEN}&project=${OWNER}%2Ffreeradius-server&md5=1" \
+            -O coverity_tool.tar.gz.md5
+        env:
+          TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
 
       - name: Cache coverity tool
-        uses: actions/cache@v2
+        uses: actions/cache@v5
         id: cache-coverity
         with:
-          key: coverity-tool-cache-${{ runner.os }}
           path: coverity_tool.tar.gz
+          key: coverity-tool-cache-${{ hashFiles('coverity_tool.tar.gz.md5') }}
 
       - name: Download coverity tool
         if: steps.cache-coverity.outputs.cache-hit != 'true'
         run: |
           wget https://scan.coverity.com/download/linux64 \
-            --post-data "token=${TOKEN}&project=FreeRADIUS%2Ffreeradius-server" \
+            --post-data "token=${TOKEN}&project=${OWNER}%2Ffreeradius-server" \
             -O coverity_tool.tar.gz
         env:
           TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
 
       - name: Extract coverity tool
         run: |
@@ -53,23 +79,37 @@ jobs:
 
       - name: Build with Coverity
         run: |
+          export CC=clang
           export PATH=`pwd`/coverity_tool/bin:$PATH
-          ./configure -with-rlm-python-bin=/usr/bin/python2.7
+          ./configure
+          cov-configure --template --compiler clang --comptype clangcc
           cov-build --dir cov-int make
 
       - name: Display build result
         run: |
-          cat /home/runner/work/freeradius-server/freeradius-server/cov-int/build-log.txt
+          cat cov-int/build-log.txt
 
+      #
+      #  Coverity Scan reports a rejected build, for example one over the
+      #  submission quota, only in the text of the reply, and curl still
+      #  exits 0.  An accepted build gets "Build successfully submitted.",
+      #  and any other reply fails the step.
+      #
       - name: Submit result
         run: |
           tar czf cov-int.tar.gz cov-int
-          curl \
+          response=$(curl --silent --show-error \
             --form token="$TOKEN" \
             --form email="freeradius-devel@lists.freeradius.org" \
             --form file=@cov-int.tar.gz \
             --form version="`cat VERSION`" \
             --form description="FreeRADIUS" \
-            https://scan.coverity.com/builds?project=freeradius%2Ffreeradius-server
+            https://scan.coverity.com/builds?project=${OWNER}%2Ffreeradius-server)
+          echo "$response"
+          if [[ "$response" != *"Build successfully submitted."* ]]; then
+            echo "::error::Coverity Scan rejected the build: $response"
+            exit 1
+          fi
         env:
           TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+          OWNER: ${{ github.repository_owner }}

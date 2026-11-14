@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -23,10 +23,10 @@
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_passwd - "
+#define LOG_PREFIX "passwd"
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/util/debug.h>
 
 struct mypasswd {
@@ -53,7 +53,7 @@ static fr_dict_t const *dict_freeradius;
 extern fr_dict_autoload_t rlm_passwd_dict[];
 fr_dict_autoload_t rlm_passwd_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 #ifdef TEST
@@ -70,20 +70,20 @@ void printpw(struct mypasswd *pw, int num_fields){
 #endif
 
 
-static struct mypasswd *mypasswd_alloc(char const* buffer, int num_fields, size_t* len)
+static struct mypasswd *mypasswd_alloc(TALLOC_CTX *ctx, char const* buffer, int num_fields, size_t* len)
 {
 	struct mypasswd *t;
 	/* reserve memory for (struct mypasswd) + listflag (num_fields * sizeof (char*)) +
 	** fields (num_fields * sizeof (char)) + strlen (inst->format) + 1 */
 
 	*len = sizeof(struct mypasswd) + num_fields * sizeof (char*) + num_fields * sizeof (char ) + strlen(buffer) + 1;
-	MEM(t = (struct mypasswd *)talloc_zero_array(NULL, uint8_t, *len));
+	MEM(t = (struct mypasswd *)talloc_zero_array(ctx, uint8_t, *len));
 
 	return t;
 }
 
-static int string_to_entry(char const* string, int num_fields, char delimiter,
-			   struct mypasswd *passwd, size_t bufferlen)
+static size_t string_to_entry(char const* string, int num_fields, char delimiter,
+			      struct mypasswd *passwd, size_t bufferlen)
 {
 	char *str;
 	size_t len, i;
@@ -131,11 +131,9 @@ static void destroy_password (struct mypasswd * pass)
 
 static unsigned int hash(char const * username, unsigned int tablesize)
 {
-	uint64_t h = 1;
+	uint32_t h = fr_hash_string(username);
 
-	while (*username) h = fr_multiply_mod(h, (7907 + *username++), tablesize);
-
-	return (unsigned int)h;
+	return h % tablesize;
 }
 
 static void release_hash_table(struct hashtable * ht){
@@ -171,7 +169,7 @@ static struct hashtable * build_hash_table (char const * file, int num_fields,
 	char buffer[1024];
 
 	MEM(ht = talloc_zero(NULL, struct hashtable));
-	MEM(ht->filename = talloc_typed_strdup(ht, file));
+	MEM(ht->filename = talloc_strdup(ht, file));
 
 	ht->tablesize = tablesize;
 	ht->num_fields = num_fields;
@@ -196,7 +194,7 @@ static struct hashtable * build_hash_table (char const * file, int num_fields,
 	MEM(ht->table = talloc_zero_array(ht, struct mypasswd *, tablesize));
 	while (fgets(buffer, 1024, ht->fp)) {
 		if(*buffer && *buffer!='\n' && (!ignorenis || (*buffer != '+' && *buffer != '-')) ){
-			hashentry = mypasswd_alloc(buffer, num_fields, &len);
+			hashentry = mypasswd_alloc(ht, buffer, num_fields, &len);
 			if (!hashentry){
 				release_hash_table(ht);
 				return ht;
@@ -222,7 +220,7 @@ static struct hashtable * build_hash_table (char const * file, int num_fields,
 					for (nextlist = list; *nextlist && *nextlist!=','; nextlist++);
 					if (*nextlist) *nextlist++ = 0;
 					else nextlist = 0;
-					if(!(hashentry1 = mypasswd_alloc("", num_fields, &len))){
+					if(!(hashentry1 = mypasswd_alloc(ht, "", num_fields, &len))){
 						release_hash_table(ht);
 						return ht;
 					}
@@ -372,22 +370,22 @@ typedef struct {
 	bool			ignore_empty;
 } rlm_passwd_t;
 
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_INPUT | FR_TYPE_REQUIRED, rlm_passwd_t, filename) },
-	{ FR_CONF_OFFSET("format", FR_TYPE_STRING | FR_TYPE_REQUIRED, rlm_passwd_t, format) },
-	{ FR_CONF_OFFSET("delimiter", FR_TYPE_STRING, rlm_passwd_t, delimiter), .dflt = ":" },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("filename", CONF_FLAG_FILE_READABLE | CONF_FLAG_REQUIRED, rlm_passwd_t, filename) },
+	{ FR_CONF_OFFSET_FLAGS("format", CONF_FLAG_REQUIRED, rlm_passwd_t, format) },
+	{ FR_CONF_OFFSET("delimiter", rlm_passwd_t, delimiter), .dflt = ":" },
 
-	{ FR_CONF_OFFSET("ignore_nislike", FR_TYPE_BOOL, rlm_passwd_t, ignore_nislike), .dflt = "yes" },
+	{ FR_CONF_OFFSET("ignore_nislike", rlm_passwd_t, ignore_nislike), .dflt = "yes" },
 
-	{ FR_CONF_OFFSET("ignore_empty", FR_TYPE_BOOL, rlm_passwd_t, ignore_empty), .dflt = "yes" },
+	{ FR_CONF_OFFSET("ignore_empty", rlm_passwd_t, ignore_empty), .dflt = "yes" },
 
-	{ FR_CONF_OFFSET("allow_multiple_keys", FR_TYPE_BOOL, rlm_passwd_t, allow_multiple), .dflt = "no" },
+	{ FR_CONF_OFFSET("allow_multiple_keys", rlm_passwd_t, allow_multiple), .dflt = "no" },
 
-	{ FR_CONF_OFFSET("hash_size", FR_TYPE_UINT32, rlm_passwd_t, hash_size), .dflt = "100" },
+	{ FR_CONF_OFFSET("hash_size", rlm_passwd_t, hash_size), .dflt = "100" },
 	CONF_PARSER_TERMINATOR
 };
 
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
 	int			num_fields = 0, key_field = -1, listable = 0;
 	char const		*s;
@@ -395,7 +393,8 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 	size_t			len;
 	int			i;
 	fr_dict_attr_t const	*da;
-	rlm_passwd_t		*inst = instance;
+	rlm_passwd_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_passwd_t);
+	CONF_SECTION		*conf = mctx->mi->conf;
 
 	fr_assert(inst->filename && *inst->filename);
 	fr_assert(inst->format && *inst->format);
@@ -405,7 +404,7 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 		return -1;
 	}
 
-	lf = talloc_typed_strdup(inst, inst->format);
+	lf = talloc_strdup(inst, inst->format);
 	if (!lf) {
 		ERROR("Memory allocation failed for lf");
 		return -1;
@@ -449,7 +448,7 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 		return -1;
 	}
 
-	inst->pwd_fmt = mypasswd_alloc(inst->format, num_fields, &len);
+	inst->pwd_fmt = mypasswd_alloc(inst, inst->format, num_fields, &len);
 	if (!inst->pwd_fmt){
 		ERROR("Memory allocation failed");
 		release_ht(inst->ht);
@@ -501,15 +500,15 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 #undef inst
 }
 
-static int mod_detach (void *instance) {
-#define inst ((rlm_passwd_t *)instance)
-	if(inst->ht) {
+static int mod_detach(module_detach_ctx_t const *mctx)
+{
+	rlm_passwd_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_passwd_t);
+	if (inst->ht) {
 		release_ht(inst->ht);
 		inst->ht = NULL;
 	}
 	talloc_free(inst->pwd_fmt);
 	return 0;
-#undef inst
 }
 
 static void result_add(TALLOC_CTX *ctx, rlm_passwd_t const *inst, request_t *request,
@@ -522,20 +521,48 @@ static void result_add(TALLOC_CTX *ctx, rlm_passwd_t const *inst, request_t *req
 		if (inst->pwd_fmt->field[i] && *inst->pwd_fmt->field[i] && pw->field[i] &&
 		    (i != inst->key_field) && inst->pwd_fmt->listflag[i] == when) {
 			if (!inst->ignore_empty || pw->field[i][0] != 0 ) { /* if value in key/value pair is not empty */
-				vp = fr_pair_make(ctx, request->dict,
-						  vps, inst->pwd_fmt->field[i], pw->field[i], T_OP_EQ);
-				if (vp) {
-					RDEBUG2("Added %s: '%s' to %s ", inst->pwd_fmt->field[i], pw->field[i], listname);
+				fr_dict_attr_t const *da = fr_dict_attr_by_name(NULL, fr_dict_root(request->proto_dict), inst->pwd_fmt->field[i]);
+				size_t len;
+
+				if (!da) {
+					REDEBUG("Ignoring unknown attribute '%s'", inst->pwd_fmt->field[i]);
+					continue;
 				}
+
+				MEM(vp = fr_pair_afrom_da(ctx, da));
+
+				len = strlen(pw->field[i]);
+
+				switch (vp->vp_type) {
+				case FR_TYPE_STRING:
+					fr_pair_value_bstrndup(vp, pw->field[i], len, true);
+					break;
+
+				case FR_TYPE_OCTETS:
+					fr_pair_value_memdup(vp, (uint8_t const *) pw->field[i], len, true);
+					break;
+
+				default:
+					if (fr_pair_value_from_str(vp, pw->field[i], len, NULL, false) < 0) {
+						talloc_free(vp);
+						RPEDEBUG("Failed parsing '%s'", pw->field[i]);
+						continue;
+					}
+				}
+
+				PAIR_VERIFY(vp);
+				(void) fr_pair_append(vps, vp);
+
+				RDEBUG2("Added %s.%s: =  %s ", listname, inst->pwd_fmt->field[i], pw->field[i]);
 			} else
-				RDEBUG2("NOOP %s: '%s' to %s ", inst->pwd_fmt->field[i], pw->field[i], listname);
+				RDEBUG2("NOOP %s.%s = %s ", listname, inst->pwd_fmt->field[i], pw->field[i]);
 		}
 	}
 }
 
-static unlang_action_t CC_HINT(nonnull) mod_passwd_map(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_passwd_map(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_passwd_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_passwd_t);
+	rlm_passwd_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_passwd_t);
 
 	char			buffer[1024];
 	fr_pair_t		*key, *i;
@@ -543,18 +570,18 @@ static unlang_action_t CC_HINT(nonnull) mod_passwd_map(rlm_rcode_t *p_result, mo
 	fr_dcursor_t		cursor;
 	int			found = 0;
 
-	key = fr_pair_find_by_da(&request->request_pairs, inst->keyattr, 0);
-	if (!key) RETURN_MODULE_NOTFOUND;
+	key = fr_pair_find_by_da(&request->request_pairs, NULL, inst->keyattr);
+	if (!key) RETURN_UNLANG_NOTFOUND;
 
-	for (i = fr_dcursor_iter_by_da_init(&cursor, &request->request_pairs, inst->keyattr);
+	for (i = fr_pair_dcursor_by_da_init(&cursor, &request->request_pairs, inst->keyattr);
 	     i;
 	     i = fr_dcursor_next(&cursor)) {
 		/*
 		 *	Ensure we have the string form of the attribute
 		 */
-#ifdef __clang_analyzer__
+#ifdef STATIC_ANALYZER
 		/*
-		 *	clang scan misses that fr_pair_print_value_quoted
+		 *	static analyzer misses that fr_pair_print_value_quoted
 		 *	always terminates the buffer.
 		 */
 		buffer[0] = '\0';
@@ -574,23 +601,26 @@ static unlang_action_t CC_HINT(nonnull) mod_passwd_map(rlm_rcode_t *p_result, mo
 		if (!inst->allow_multiple) break;
 	}
 
-	if (!found) RETURN_MODULE_NOTFOUND;
+	if (!found) RETURN_UNLANG_NOTFOUND;
 
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
-extern module_t rlm_passwd;
-module_t rlm_passwd = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "passwd",
-	.inst_size	= sizeof(rlm_passwd_t),
-	.config		= module_config,
-	.instantiate	= mod_instantiate,
-	.detach		= mod_detach,
-	.methods = {
-		[MOD_AUTHORIZE]		= mod_passwd_map,
-		[MOD_ACCOUNTING]	= mod_passwd_map,
-		[MOD_POST_AUTH]		= mod_passwd_map,
+extern module_rlm_t rlm_passwd;
+module_rlm_t rlm_passwd = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "passwd",
+		.inst_size	= sizeof(rlm_passwd_t),
+		.config		= module_config,
+		.instantiate	= mod_instantiate,
+		.detach		= mod_detach
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME(CF_IDENT_ANY, CF_IDENT_ANY), .method = mod_passwd_map },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };
 #endif /* TEST */

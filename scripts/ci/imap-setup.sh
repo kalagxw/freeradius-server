@@ -1,4 +1,4 @@
-#!/bin/sh -e
+#!/bin/bash
 
 #
 # ### This is a script to setup a dovecot imap server for testing rlm_imap
@@ -14,13 +14,13 @@ BUILDDIR="${BASEDIR}/build/ci/dovecot"
 CERTDIR="${BASEDIR}/raddb/certs/rsa"
 ETCDIR="${BUILDDIR}/etc"
 
-# Directories for running dovecot 
+# Directories for running dovecot
 RUNDIR="${BUILDDIR}/run"
 TLSRUNDIR="${BUILDDIR}/tls_run"
 MAILDIR="${ETCDIR}/dovecot_mail"
 LOGDIR="${BUILDDIR}/log"
 
-# Important files for running dovecot 
+# Important files for running dovecot
 CONF="${ETCDIR}/dovecot.conf"
 TLSCONF="${ETCDIR}/tls_dovecot.conf"
 PASSPATH="${ETCDIR}/dovecot.passwd"
@@ -51,10 +51,14 @@ touch  "${PASSPATH}"
 
 # Make sure there are log files
 touch "${LOGPATH}"
-touch "${LOGINFOPATH}" 
+touch "${LOGINFOPATH}"
 
 # Get primary group name
-GROUP=$(id -gn)
+if [ -z "${USER}" ]; then
+       GROUP=$(id dovecot -gn)
+else
+       GROUP=$(id -gn)
+fi
 
 #
 # The Debian version of Dovecot cannot read password-protected private keys so
@@ -65,24 +69,12 @@ openssl rsa -in "${BASEDIR}/raddb/certs/rsa/server.key" -passin 'pass:whatever' 
 #
 # Add users to the password file
 #
-
-# Generate passwords for the users
-USER1P=$(doveadm -o stats_writer_socket_path= pw -p test1 -s CRYPT)
-USER2P=$(doveadm -o stats_writer_socket_path= pw -p test2 -s CRYPT)
-USER3P=$(doveadm -o stats_writer_socket_path= pw -p test3 -s CRYPT)
-
-# Add user password combinations
-echo "\
-user1:${USER1P}:::::: 
-" >"${PASSPATH}"
-
-echo "\
-user2:${USER2P}:::::: 
-" >>"${PASSPATH}"
-
-echo "\
-user3:${USER3P}:::::: 
-" >>"${PASSPATH}"
+rm -f ${PASSPATH}
+for i in {1..3}; do
+	PASS=$(doveadm -o stats_writer_socket_path= pw -p test${i} -s CRYPT)
+	echo "user${i}:${PASS}::::::
+" >> "${PASSPATH}"
+done
 
 #
 # Configure instance specific dovecot information
@@ -102,8 +94,7 @@ base_dir = ${RUNDIR}
 
 service imap-login {
 	process_min_avail = 16
-	user = ${USER} 
-	chroot =
+	user = ${USER:-dovecot}
 	inet_listener imap {
 		port = 1430
 	}
@@ -119,15 +110,14 @@ base_dir = ${TLSRUNDIR}
 
 service imap-login {
 	process_min_avail = 16
-	user = ${USER}
-	chroot =
+	user = ${USER:-dovecot}
 	inet_listener imap {
 		port = 1431
 	}
 	inet_listener imaps {
 		port = 1432
 	}
-} 
+}
 # TLS specific configurations
 ssl = required
 ssl_cert = <${CERTDIR}/server.pem
@@ -156,6 +146,11 @@ log_path = ${LOGPATH}
 info_log_path = ${LOGINFOPATH} \
 " >> "${CONFPATH}"
 
+# Get rejects to respond quickly
+echo "
+auth_failure_delay = 0secs
+" >> "${CONFPATH}"
+
 # Add the Password File to the config
 echo  "
 passdb {
@@ -170,16 +165,18 @@ mail_location = maildir:${MAILDIR} \
 
 # Set user for permissions
 echo "
-default_internal_user = ${USER}
+first_valid_uid=100
+first_valid_gid=100
+default_internal_user = ${USER:-dovecot}
 default_internal_group = ${GROUP}
-default_login_user = ${USER} \
+default_login_user = ${USER:-dovenull} \
 " >> "${CONFPATH}"
 
 #Configure the user mailbox privileges
 echo "
 userdb {
 	driver = static
-	args = uid=${USER} gid=${GROUP}
+	args = uid=${USER:-dovecot} gid=${GROUP}
 } \
 " >> "${CONFPATH}"
 

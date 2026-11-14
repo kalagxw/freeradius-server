@@ -30,8 +30,10 @@ RCSIDH(clients_h, "$Id$")
 extern "C" {
 #endif
 
-typedef struct rad_client RADCLIENT;
-typedef struct rad_client_list RADCLIENT_LIST;
+#include <freeradius-devel/server/cf_util.h>
+
+typedef struct fr_client_s fr_client_t;
+typedef struct fr_client_list_s fr_client_list_t;
 
 /** Callback for retrieving values when building client sections
  *
@@ -70,11 +72,12 @@ typedef int (*client_value_cb_t)(char **out, CONF_PAIR const *cp, void *data);
 #include <freeradius-devel/server/socket.h>
 #include <freeradius-devel/server/stats.h>
 #include <freeradius-devel/util/inet.h>
+#include <freeradius-devel/radius/radius.h>
 
 /** Describes a host allowed to send packets to the server
  *
  */
-struct rad_client {
+struct fr_client_s {
 	fr_rb_node_t		node;			//!< Entry in the client tree.
 
 	fr_ipaddr_t		ipaddr;			//!< IPv4/IPv6 address of the host.
@@ -86,14 +89,37 @@ struct rad_client {
 
 	char const		*secret;		//!< Secret PSK.
 
-	bool			message_authenticator;	//!< Require RADIUS message authenticator in requests.
+	/** Require RADIUS message authenticator for incoming packets
+	 */
+	fr_radius_require_ma_t	require_message_authenticator;
+
+	/** Whether require_message_authenticator is set in the configuration.
+	 */
+	bool			require_message_authenticator_is_set;
+
+	/** Whether to allow Proxy-State in incoming packets that don't contain a message authenticator.
+	 *
+	 * If Proxy-State is included, but Message-Authenticator is not, then an
+	 * attacker can potentially forge responses.
+	 */
+	fr_radius_limit_proxy_state_t			limit_proxy_state;
+
+	/** Whether limit_proxy_state is set in the configuration.
+	 */
+	bool			limit_proxy_state_is_set;
+
+	bool			blastradius_complaint;	//!< whether we already did a BlastRADIUS complaint
+	bool			protocol_error;		//!< Whether the client supports Protocol-Error
 	bool			dynamic;		//!< Whether the client was dynamically defined.
 	bool			active;			//!< for dynamic clients
 	bool			use_connected;		//!< do we use connected sockets for this client
-	bool			dedup_authenticator;	//!< more RADIUS stuff
 
 #ifdef WITH_TLS
 	bool			tls_required;		//!< whether TLS encryption is required.
+#endif
+
+#ifdef NAS_VIOLATES_RFC
+	bool			allow_vulnerable_clients; //!< for vendors who violate the RFCs.
 #endif
 
 	char const		*nas_type;		//!< Type of client (arbitrary).
@@ -116,35 +142,31 @@ struct rad_client {
 	fr_socket_limit_t	limit;			//!< Connections per client (TCP clients only).
 };
 
-RADCLIENT_LIST	*client_list_init(CONF_SECTION *cs);
+fr_client_list_t	*client_list_init(CONF_SECTION *cs);
 
 void		client_list_free(void);
 
-RADCLIENT_LIST	*client_list_parse_section(CONF_SECTION *section, int proto, bool tls_required);
+fr_client_list_t	*client_list_parse_section(CONF_SECTION *section, int proto, bool tls_required);
 
-void		client_free(RADCLIENT *client);
+void		client_free(fr_client_t *client);
 
-bool		client_add(RADCLIENT_LIST *clients, RADCLIENT *client);
+bool		client_add(fr_client_list_t *clients, fr_client_t *client);
 
-void		client_delete(RADCLIENT_LIST *clients, RADCLIENT *client);
+void		client_delete(fr_client_list_t *clients, fr_client_t *client);
 
-RADCLIENT	*client_afrom_request(TALLOC_CTX *ctx, request_t *request);
+fr_client_t	*client_afrom_request(TALLOC_CTX *ctx, request_t *request);
 
 int		client_map_section(CONF_SECTION *out, CONF_SECTION const *map, client_value_cb_t func, void *data);
 
-RADCLIENT	*client_afrom_cs(TALLOC_CTX *ctx, CONF_SECTION *cs, CONF_SECTION *server_cs);
+fr_client_t	*client_afrom_cs(TALLOC_CTX *ctx, CONF_SECTION *cs, CONF_SECTION *server_cs, size_t extra);
 
-RADCLIENT	*client_afrom_query(TALLOC_CTX *ctx, char const *identifier, char const *secret, char const *shortname,
-				    char const *type, char const *server, bool require_ma)
-		CC_HINT(nonnull(2, 3));
+fr_client_t	*client_find(fr_client_list_t const *clients, fr_ipaddr_t const *ipaddr, int proto);
 
-RADCLIENT	*client_find(RADCLIENT_LIST const *clients, fr_ipaddr_t const *ipaddr, int proto);
+fr_client_t	*client_findbynumber(fr_client_list_t const *clients, int number);
 
-RADCLIENT	*client_findbynumber(RADCLIENT_LIST const *clients, int number);
+fr_client_t	*client_read(char const *filename, CONF_SECTION *server_cs, bool check_dns);
 
-RADCLIENT	*client_read(char const *filename, CONF_SECTION *server_cs, bool check_dns);
-
-RADCLIENT	*client_from_request(request_t *request);
+fr_client_t	*client_from_request(request_t *request);
 #ifdef __cplusplus
 }
 #endif

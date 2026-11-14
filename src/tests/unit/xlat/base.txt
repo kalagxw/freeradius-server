@@ -23,6 +23,27 @@ xlat \
 match \\
 
 #
+#  Constant strings that contain a literal '%' adjacent to other text.  The
+#  tokenizer breaks the input at every '%' and emits a separate value-box per
+#  chunk; xlat_tokenize_input() must merge the adjacent constants into a
+#  single value-box so callers see exactly one constant child.
+#
+xlat 100%
+match 100\%
+
+xlat a%
+match a\%
+
+xlat x% y
+match x\% y
+
+xlat a%%b
+match a\%b
+
+xlat %%
+match \%
+
+#
 #  Literals mixed with attributes
 #
 xlat literal%{User-Password}
@@ -40,17 +61,6 @@ match {literal%{User-Password}literal}
 xlat \%{literal%{User-Password}literal}
 match \%{literal%{User-Password}literal}
 
-xlat literal%{%{User-Password}:-literal}
-match literal%{%{User-Password}:-literal}
-
-xlat literal%{%{User-Password}:-\%{lit}eral}
-match literal%{%{User-Password}:-\%{lit}eral}
-
-xlat literal%{%{User-Password}:-%{User-Name}\%literal}
-match literal%{%{User-Password}:-%{User-Name}\%literal}
-
-xlat literal%{%{User-Password}:-\%literal}
-match literal%{%{User-Password}:-\%literal}
 #
 #  Regex capture groups
 #
@@ -61,16 +71,16 @@ xlat %{32}
 match %{32}
 
 xlat %{33}
-match ERROR offset 2: Invalid regex reference.  Must be in range 0-32
+match ERROR: offset 2: Invalid regex reference.  Must be in range 0-32
 
 xlat %{3a}
-match ERROR offset 2: Unexpected text after attribute reference
+match ERROR: offset 2: Unexpected text after attribute reference
 
-xlat %{-3}
-match ERROR offset 2: Unresolved attributes not allowed in expansions here
+#xlat %{-3}
+#match ERROR offset 3: Unresolved attributes not allowed in expansions here
 
 xlat %{3
-match ERROR offset 3: Missing closing brace
+match ERROR: offset 3: Missing closing brace '}'
 
 #
 #  Tests for xlat expansion
@@ -78,8 +88,21 @@ match ERROR offset 3: Missing closing brace
 xlat %{Tunnel-Password}
 match %{Tunnel-Password}
 
-xlat %{test:bar}
-match %{test:bar}
+xlat %test_no_args('foo')
+match ERROR: offset 14: Too many arguments, expected 0, got 1
+
+xlat %test('bar')
+match %test('bar')
+
+#
+#  @todo - we now hoist the tmpl -> xlat -> tmpl to just a tmpl.  But
+#  we don't change the name of the parent group.  We may want to do that.
+#
+xlat %test(%{User-Name})
+match %test(%{User-Name})
+
+xlat %test()
+match ERROR: offset 6: Missing required arg 1
 
 xlat %{Tunnel-Password}
 match %{Tunnel-Password}
@@ -114,9 +137,6 @@ match %{Vendor-Specific.3GPP.SGSN-Address}
 xlat \"Hello %S goo\"
 match \"Hello %S goo\"
 
-xlat \"%{Foreach-Variable-0}\"
-match \"%{Foreach-Variable-0}\"
-
 #
 #  3GPP stuff
 #
@@ -132,140 +152,96 @@ match \"%{reply.Vendor-Specific.3GPP.IMSI[2]}\"
 xlat /([A-Z0-9\\-]*)_%{Calling-Station-Id}/
 match /([A-Z0-9\\-]*)_%{Calling-Station-Id}/
 
-xlat %(length:)
-match %(length:)
+xlat %length()
+match %length()
 
-xlat %(length:
-match ERROR offset 9: Missing closing brace
+xlat %length(
+match ERROR: offset 8: Missing closing brace ')'
 
-xlat %(length:1 + 2
-match ERROR offset 14: Missing closing brace
+xlat %length(1 + 2
+match ERROR: offset 13: Missing ')' after argument 1
 
 xlat \"%t\tfoo\"
 match \"%t\tfoo\"
 
-allow-unresolved yes
-xlat \"%t\t%{Client-IP-Address}\"
-match \"%t\t%{Client-IP-Address}\"
-allow-unresolved no
+xlat \"%t\t%{NAS-IP-Address}\"
+match \"%t\t%{NAS-IP-Address}\"
 
-xlat \"foo %{test:foo}\"
-match \"foo %{test:foo}\"
+xlat \"foo %test('foo')\"
+match \"foo %test('foo')\"
 
 #
 #  Alternations
 #
-xlat %{%{foo}:-%{bar}}
-match ERROR offset 4: Unresolved attributes not allowed in expansions here
+xlat %{%{foo} || %{bar}}
+match ERROR: offset 4: Attribute 'foo' not found.  Searched in: RADIUS, internal: Unresolved attributes are not allowed here
 
-xlat %{%{User-Name}:-%{bar}}
-match ERROR offset 18: Unresolved attributes not allowed in expansions here
-
-xlat %{%{User-Name}:-bar}
-match %{%{User-Name}:-bar}
-
-xlat foo %{%{User-Name}:-bar} baz
-match foo %{%{User-Name}:-bar} baz
-
-xlat %{%{test:bar}:-%{User-Name}}
-match %{%{test:bar}:-%{User-Name}}
-
-xlat %{%{test:bar}:-%{%{User-Name}:-bar}}
-match %{%{test:bar}:-%{%{User-Name}:-bar}}
-
-xlat %{%{User-Name}:-}
-match %{%{User-Name}:-}
-
-xlat %{%{Operator-Name}:-}
-match %{%{Operator-Name}:-}
-
-xlat %{%{%{User-Name}:-foo}:-bar}
-match %{%{%{User-Name}:-foo}:-bar}
-
-xlat %{%{%{User-Name}:-foo}:-%{%{test:bar}:-%{User-Name}}}
-match %{%{%{User-Name}:-foo}:-%{%{test:bar}:-%{User-Name}}}
-
-xlat %{:-}
-match ERROR offset 2: First item in alternation cannot be empty
-
-xlat %{:-%{User-Name}}
-match ERROR offset 2: First item in alternation cannot be empty
-
-xlat %{%{}:-}
-match ERROR offset 4: Empty expression is invalid
-
-xlat %{%{}:-foo}
-match ERROR offset 4: Empty expression is invalid
-
-xlat %{%{User-Name}:-
-match ERROR offset 16: Missing closing brace
-
-# Discuss - Not sure the offset/message is correct here, but not sure if we can determine the correct offset either
-xlat %{%{User-Name}:-foo
-match ERROR offset 19: Missing closing brace
-
-xlat %{%{User-Name}:}
-match ERROR offset 14: Expected ':-' after first expansion
-
-xlat %{%{User-Name}}
-match ERROR offset 14: Expected ':-' after first expansion
-
+xlat %{%{User-Name} || %{bar}}
+match ERROR: offset 20: Attribute 'bar' not found.  Searched in: RADIUS, internal: Unresolved attributes are not allowed here
 
 #
 #  Empty and malformed expansions
 #
 xlat %{
-match ERROR offset 2: Missing closing brace
+match ERROR: offset 2: Missing closing brace '}'
 
 xlat %{}
-match ERROR offset 2: Empty expression is invalid
+match ERROR: offset 2: Empty expressions are invalid
 
 xlat %{:}
-match ERROR offset 2: Missing expansion function
+match ERROR: offset 2: Unexpected input ':' when trying to read an attribute name
 
 xlat %{:bar}
-match ERROR offset 2: Missing expansion function
+match ERROR: offset 2: Unexpected input ':' when trying to read an attribute name
 
-xlat %{foo: bar}
-match ERROR offset 2: Unresolved expansion functions are not allowed here
+xlat %foo(' bar')
+match ERROR: offset 1: Unresolved expansion functions are not allowed here
 
 xlat %{[}
-match ERROR offset 2: Missing attribute name
+match ERROR: offset 2: Missing attribute name
 
 xlat %{[baz}
-match ERROR offset 2: Missing attribute name
+match ERROR: offset 2: Missing attribute name
+
+#
+#  A valid expression, but the braces aren't closed.
+#
+xlat %{1 + 2
+match ERROR: offset 7: Missing closing brace '}'
+
+xlat %{(1 + 2)
+match ERROR: offset 9: Missing closing brace '}'
 
 xlat %{ }
-match ERROR offset 2: Invalid char ' ' in expression
+match ERROR: offset 3: Unexpected input '}' when trying to read an attribute name
 
 xlat %{\t}
-match ERROR offset 2: Invalid attribute name
+match ERROR: offset 2: Unexpected input '\' when trying to read an attribute name
 
 xlat %{\n}
-match ERROR offset 2: Invalid attribute name
+match ERROR: offset 2: Unexpected input '\' when trying to read an attribute name
 
 xlat %{foo }
-match ERROR offset 5: Invalid char ' ' in expression
+match ERROR: offset 2: Attribute 'foo' not found.  Searched in: RADIUS, internal: Unresolved attributes are not allowed here
 
 xlat %{foo bar}
-match ERROR offset 5: Invalid char ' ' in expression
+match ERROR: offset 2: Attribute 'foo' not found.  Searched in: RADIUS, internal: Unresolved attributes are not allowed here
 
-xlat %{test:
-match ERROR offset 7: Missing closing brace
+xlat %test(
+match ERROR: offset 6: Missing closing brace ')'
 
-xlat %{test:%{User-Name
-match ERROR offset 18: Missing closing brace
+xlat %test(%{User-Name)
+match ERROR: offset 17: Missing closing brace '}'
 
-# Discuss - Not sure the offset/message is correct here, but not sure if we can determine the correct offset either
-xlat %{test:%{User-Name}
-match ERROR offset 19: Missing closing brace
+xlat %test(%{User-Name}
+match ERROR: offset 18: Missing ')' after argument 1
 
 xlat %{myfirstxlat
-match ERROR offset 13: Missing closing brace
+match ERROR: offset 13: Missing closing brace '}'
 
 # Issue seen in the wild that caused an SEGV during pass2
 xlat %{%{control.IP-Pool.Name}:%{reply.IP-Pool.Range}
-match ERROR offset 25: Expected ':-' after first expansion
+match ERROR: offset 48: Missing closing brace '}'
 
 #
 #  API to split xlat strings into argv-style arguments.
@@ -274,31 +250,149 @@ xlat_argv /bin/sh %{User-Name}
 match [0]{ /bin/sh }, [1]{ %{User-Name} }
 
 xlat_argv /bin/sh "%{User-Name}"
-match [0]{ /bin/sh }, [1]{ %{User-Name} }
+match [0]{ /bin/sh }, [1]{ "%{User-Name}" }
 
 # with quotes
 xlat_argv /bin/sh "foo" "%{User-Name}"
-match [0]{ /bin/sh }, [1]{ foo }, [2]{ %{User-Name} }
+match [0]{ /bin/sh }, [1]{ "foo" }, [2]{ "%{User-Name}" }
 
 # many spaces between arguments
 xlat_argv /bin/sh         "foo"       "%{User-Name}"
-match [0]{ /bin/sh }, [1]{ foo }, [2]{ %{User-Name} }
+match [0]{ /bin/sh }, [1]{ "foo" }, [2]{ "%{User-Name}" }
 
 # and spaces in quotes
 xlat_argv /bin/sh "foo bar" "%{User-Name}"
-match [0]{ /bin/sh }, [1]{ foo bar }, [2]{ %{User-Name} }
+match [0]{ /bin/sh }, [1]{ "foo bar" }, [2]{ "%{User-Name}" }
 
 # and multiple xlats inside of quotes
 xlat_argv /bin/sh "foo bar" "%{User-Name} %{Filter-Id}"
-match [0]{ /bin/sh }, [1]{ foo bar }, [2]{ %{User-Name} %{Filter-Id} }
+match [0]{ /bin/sh }, [1]{ "foo bar" }, [2]{ "%{User-Name} %{Filter-Id}" }
 
 # and errors
+#
+#  @todo - we should really be unescaping the input in the sbuff, OR passing in the terminals
+#  to xlat_tokenize_expansion()
+#
 xlat_argv /bin/sh "foo bar" "%{User-Name} %{Filter-Id"
-match ERROR offset 44: Missing closing brace
+match ERROR: offset 44: Unexpected text after attribute reference
 
 # and text immediately after a variable expansion
-xlat_argv echo hello %{Tmp-String-0}:1234 world
-match [0]{ echo }, [1]{ hello }, [2]{ %{Tmp-String-0}:1234 }, [3]{ world }
+xlat_argv echo hello %{Filter-Id}:1234 world
+match [0]{ echo }, [1]{ hello }, [2]{ %{Filter-Id}:1234 }, [3]{ world }
+
+#
+#  Double-quoted constant arguments which contain a literal '%'.  Without the
+#  value-box merge in xlat_tokenize_input(), the group node would contain
+#  multiple constant value-box children, and violate the assumptions of
+#  the rest of the code.
+#
+xlat_argv "100%"
+match [0]{ "100\%" }
+
+xlat_argv "a%%b"
+match [0]{ "a\%b" }
+
+xlat_argv /bin/sh "100%" "%{User-Name}"
+match [0]{ /bin/sh }, [1]{ "100\%" }, [2]{ "%{User-Name}" }
+
+xlat_argv foo "ratio is %" bar
+match [0]{ foo }, [1]{ "ratio is \%" }, [2]{ bar }
+
+#
+#  Double-quoted strings containing a `%{(<constant expression>)}` between
+#  literal text.  The `(...)` form takes the expression branch in
+#  xlat_tokenize_expansion(), and the inner expression is constant — so the
+#  resulting XLAT_GROUP has flags.constant=true.  xlat_tokenize_word's
+#  hoist-when-constant block used to assert dlist == 1, which failed here
+#  because head is [BOX text, GROUP %{(const)}, BOX text].  It now leaves
+#  the wrapper alone for the multi-constant case; hoist=true on the GROUP
+#  stringifies and concatenates at eval time.
+#
+xlat_argv "x%{(1)}y"
+match [0]{ "x%{1}y" }
+
+xlat_argv "x%{((1))}y"
+match [0]{ "x%{1}y" }
+
+xlat_argv "x%{(true)}y"
+match [0]{ "x%{true}y" }
+
+xlat_argv "a%{(1)}"
+match [0]{ "a%{1}" }
+
+xlat_argv "%{(1)}b"
+match [0]{ "%{1}b" }
+
+xlat_argv "x%{(1 + 2)}y"
+match [0]{ "x%{(1 + 2)}y" }
+
+xlat %debug(5)
+match %debug(5)
+
+xlat %debug( 5)
+match %debug(5)
+
+xlat %debug("foo")
+match ERROR: offset 7: Invalid argument 1 - Failed parsing string as type 'int8'
+
+#
+#  This is correct.
+#
+xlat %str.rpad(User-Name, 5, 'x')
+match %str.rpad(User-Name, 5, 'x')
+
+#
+#  The second argument should be an integer.
+#
+#  @todo - parsing - we don't currently track string offsets for intermediate nodes,
+#  so the "offset" is wrong.  It also doesn't say *which* string is wrong.  We'll fix that later.
+#
+xlat %str.rpad(User-Name, 'foo', 'x')
+match ERROR: offset 21: Invalid argument 2 - Failed parsing string as type 'uint64'
+
+#
+#  Argument quoting
+#
+xlat %hash.md5('"arg"')
+match %hash.md5(0x2261726722)
+
+#
+#  Arguably this should be a parse error.  There's trailing text "}
+#  after the function call.
+#
+#  @todo - this is a side effect of command_xlat_normalize(), which passes in
+#  escape_rules_double, but does NOT look for leading or trailing ".  AND it
+#  doesn't pass in a terminal which says to stop at ".
+#
+xlat %hash.md5('"arg')"}
+match %hash.md5(0x22617267)\"}
+
+xlat %hash.md5('"arg')
+match %hash.md5(0x22617267)
+
+xlat %hash.md5('"arg\""')
+match %hash.md5(0x226172675c2222)
+
+xlat %hash.md5('arg')
+match %hash.md5(0x617267)
+
+xlat %hash.md5('arg"')
+match %hash.md5(0x61726722)
+
+#
+#  The parsers call each other, so a nested input grows the C stack.  tmpl_rules_t.depth
+#  counts the nesting, and TMPL_MAX_NESTING bounds the count.
+#
+#  An expansion inside an expansion recurses through xlat_tokenize_expansion.
+#
+xlat %{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{%{User-Name}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+match ERROR: offset 38: The input is too deeply nested to be parsed
+
+#
+#  A function argument recurses through xlat_tokenize_argv.
+#
+xlat %str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower(%str.lower("x"))))))))))))))))))))))))))))))
+match ERROR: offset 176: The input is too deeply nested to be parsed
 
 count
-match 179
+match 199

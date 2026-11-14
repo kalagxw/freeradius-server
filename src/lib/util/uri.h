@@ -44,18 +44,32 @@ typedef int (*fr_uri_escape_func_t)(fr_value_box_t *vb, void *uctx);
  *
  */
 typedef struct {
-	char const		*name;				//!< Name of this part of the URI
-	fr_sbuff_term_t const	*terminals;			//!< Characters that mark the end of this part.
-	uint8_t const		part_adv[UINT8_MAX + 1];	//!< How many parts to advance for a specific terminal
-	size_t			extra_skip;			//!< How many additional characters to skip after
-								///< the terminal
-	bool			tainted_allowed;		//!< Do we accept tainted values for this part
-	fr_uri_escape_func_t	func;				//!< Function to use to escape tainted values
+	char const			*name;				//!< Name of this part of the URI
+	fr_sbuff_term_t const		*terminals;			//!< Characters that mark the end of this part.
+	uint8_t const			part_adv[UINT8_MAX + 1];	//!< How many parts to advance for a specific terminal
+	size_t				extra_skip;			//!< How many additional characters to skip after
+									///< the terminal
+	fr_value_box_safe_for_t 	safe_for;			//!< What type of value is safe for this part
+	fr_uri_escape_func_t		func;				//!< Function to use to escape tainted values
 } fr_uri_part_t;
 
-#define XLAT_URI_PART_TERMINATOR { .name = NULL, .terminals = NULL, .tainted_allowed = false, .func = NULL }
+/** uctx to pass to fr_uri_escape
+ *
+ * @note Should not be passed to fr_uri_escape_list. That takes the uctx to pass to the fr_uri_escape_func_t directly.
+ */
+typedef struct {
+	fr_uri_part_t const	*uri_part;			//!< Start of the uri parts array.  Will be updated
+								///< as boxes are escaped.
+	void			*uctx;				//!< to pass to fr_uri_escape_func_t.
+} fr_uri_escape_ctx_t;
 
-int fr_uri_escape(fr_value_box_list_t *uri, fr_uri_part_t const *uri_parts, void *uctx);
+#define XLAT_URI_PART_TERMINATOR { .name = NULL, .terminals = NULL, .safe_for = 0, .func = NULL }
+
+int fr_uri_escape_list(fr_value_box_list_t *uri, fr_uri_part_t const *uri_parts, void *uctx);
+
+int fr_uri_escape(fr_value_box_t *uri_vb, void *uctx);
+
+int fr_uri_has_scheme(fr_value_box_list_t *uri, fr_table_num_sorted_t const *schemes, size_t schemes_len, int def);
 
 #ifdef __cplusplus
 }

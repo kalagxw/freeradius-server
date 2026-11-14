@@ -28,16 +28,23 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/util/conf.h>
+#include <freeradius-devel/util/syserror.h>
+#include <freeradius-devel/util/atexit.h>
+#include <freeradius-devel/util/pair_legacy.h>
 #include <freeradius-devel/util/time.h>
+#include <freeradius-devel/server/packet.h>
 #include <freeradius-devel/radius/list.h>
 #include <freeradius-devel/radius/radius.h>
-#include <ctype.h>
+#include <freeradius-devel/util/chap.h>
+#ifdef HAVE_OPENSSL_SSL_H
+#include <openssl/ssl.h>
+#include <freeradius-devel/util/md4.h>
+#endif
 
 #ifdef HAVE_GETOPT_H
 #  include <getopt.h>
 #endif
 
-#include <assert.h>
 
 typedef struct request_s request_t;	/* to shut up warnings about mschap.h */
 
@@ -46,15 +53,22 @@ typedef struct request_s request_t;	/* to shut up warnings about mschap.h */
 
 #include "radclient.h"
 
-#define pair_update_request(_attr, _da) fr_pair_update_by_da(request, _attr, &request->request_pairs, _da, 0)
-#define request_pairs	request_list
-#define reply_pairs	reply_list
+#define pair_update_request(_attr, _da) do { \
+		_attr = fr_pair_find_by_da(&request->request_pairs, NULL, _da); \
+		if (!_attr) { \
+			_attr = fr_pair_afrom_da(request, _da); \
+			fr_assert(_attr != NULL); \
+			fr_pair_append(&request->request_pairs, _attr); \
+		} \
+	} while (0)
 
 static int retries = 3;
-static fr_time_delta_t timeout = ((fr_time_delta_t) 5) * NSEC;
-static fr_time_delta_t sleep_time = -1;
+static fr_time_delta_t timeout = fr_time_delta_wrap((int64_t)5 * NSEC);	/* 5 seconds */
+static fr_time_delta_t sleep_time = fr_time_delta_wrap(-1);
 static char *secret = NULL;
 static bool do_output = true;
+
+static const char *attr_coa_filter_name = "User-Name";
 
 static rc_stats_t stats;
 
@@ -62,32 +76,38 @@ static uint16_t server_port = 0;
 static int packet_code = FR_RADIUS_CODE_UNDEFINED;
 static fr_ipaddr_t server_ipaddr;
 static int resend_count = 1;
+static int ignore_count = 0;
 static bool done = true;
 static bool print_filename = false;
+static bool blast_radius = false;
 
 static fr_ipaddr_t client_ipaddr;
 static uint16_t client_port = 0;
 
 static int sockfd;
 static int last_used_id = -1;
+static int fixed_id = -1;
 
 static int ipproto = IPPROTO_UDP;
 
+static bool do_coa = false;
+static int coafd;
+static uint16_t coa_port = FR_COA_UDP_PORT;
+static fr_rb_tree_t *coa_tree = NULL;
+
 static fr_packet_list_t *packet_list = NULL;
 
-static rc_request_t *request_head = NULL;
-static rc_request_t *rc_request_tail = NULL;
+static FR_DLIST_HEAD(rc_request_list) rc_request_list;
 
-static char const *radclient_version = RADIUSD_VERSION_STRING_BUILD("radclient");
+static char const *radclient_version = RADIUSD_VERSION_BUILD("radclient");
 
 static fr_dict_t const *dict_freeradius;
 static fr_dict_t const *dict_radius;
 
-extern fr_dict_autoload_t radclient_dict[];
-fr_dict_autoload_t radclient_dict[] = {
+static const fr_dict_autoload_t radclient_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_cleartext_password;
@@ -96,69 +116,73 @@ static fr_dict_attr_t const *attr_ms_chap_challenge;
 static fr_dict_attr_t const *attr_ms_chap_password;
 static fr_dict_attr_t const *attr_ms_chap_response;
 
-static fr_dict_attr_t const *attr_packet_dst_ip_address;
-static fr_dict_attr_t const *attr_packet_dst_ipv6_address;
-static fr_dict_attr_t const *attr_packet_dst_port;
-static fr_dict_attr_t const *attr_packet_src_ip_address;
-static fr_dict_attr_t const *attr_packet_src_ipv6_address;
-static fr_dict_attr_t const *attr_packet_src_port;
-
 static fr_dict_attr_t const *attr_radclient_test_name;
 static fr_dict_attr_t const *attr_request_authenticator;
 
 static fr_dict_attr_t const *attr_chap_password;
 static fr_dict_attr_t const *attr_chap_challenge;
 static fr_dict_attr_t const *attr_packet_type;
+static fr_dict_attr_t const *attr_user_name;
 static fr_dict_attr_t const *attr_user_password;
+static fr_dict_attr_t const *attr_proxy_state;
+static fr_dict_attr_t const *attr_message_authenticator;
 
-extern fr_dict_attr_autoload_t radclient_dict_attr[];
-fr_dict_attr_autoload_t radclient_dict_attr[] = {
+static fr_dict_attr_t const *attr_radclient_coa_filename;
+static fr_dict_attr_t const *attr_radclient_coa_filter;
+
+static fr_dict_attr_t const *attr_coa_match_attr = NULL;
+
+static const fr_dict_attr_autoload_t radclient_dict_attr[] = {
 	{ .out = &attr_cleartext_password, .name = "Password.Cleartext", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 	{ .out = &attr_ms_chap_challenge, .name = "Vendor-Specific.Microsoft.CHAP-Challenge", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_ms_chap_password, .name = "Password.MS-CHAP", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 	{ .out = &attr_ms_chap_response, .name = "Vendor-Specific.Microsoft.CHAP-Response", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 
-	{ .out = &attr_packet_dst_ip_address, .name = "Packet-Dst-IP-Address", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_dst_ipv6_address, .name = "Packet-Dst-IPv6-Address", .type = FR_TYPE_IPV6_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_dst_port, .name = "Packet-Dst-Port", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
-	{ .out = &attr_packet_src_ip_address, .name = "Packet-Src-IP-Address", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_src_ipv6_address, .name = "Packet-Src-IPv6-Address", .type = FR_TYPE_IPV6_ADDR, .dict = &dict_freeradius },
-	{ .out = &attr_packet_src_port, .name = "Packet-Src-Port", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
 	{ .out = &attr_radclient_test_name, .name = "Radclient-Test-Name", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 	{ .out = &attr_request_authenticator, .name = "Request-Authenticator", .type = FR_TYPE_OCTETS, .dict = &dict_freeradius },
 
+	{ .out = &attr_radclient_coa_filename, .name = "Radclient-CoA-Filename", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
+	{ .out = &attr_radclient_coa_filter, .name = "Radclient-CoA-Filter", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
+
 	{ .out = &attr_chap_password, .name = "CHAP-Password", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
-	{ .out = &attr_chap_password, .name = "CHAP-Challenge", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_chap_challenge, .name = "CHAP-Challenge", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_radius },
 	{ .out = &attr_user_password, .name = "User-Password", .type = FR_TYPE_STRING, .dict = &dict_radius },
-	{ NULL }
+	{ .out = &attr_user_name, .name = "User-Name", .type = FR_TYPE_STRING, .dict = &dict_radius },
+	{ .out = &attr_proxy_state, .name = "Proxy-State", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_message_authenticator, .name = "Message-Authenticator", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static NEVER_RETURNS void usage(void)
 {
 	fprintf(stderr, "Usage: radclient [options] server[:port] <command> [<secret>]\n");
 
-	fprintf(stderr, "  <command>              One of auth, acct, status, coa, disconnect or auto.\n");
-	fprintf(stderr, "  -4                     Use IPv4 address of server\n");
-	fprintf(stderr, "  -6                     Use IPv6 address of server.\n");
-	fprintf(stderr, "  -C <client_port>       Assigning port number to client socket. Values may be 1..65535\n");
-	fprintf(stderr, "  -c <count>             Send each packet 'count' times.\n");
-	fprintf(stderr, "  -d <raddb>             Set user dictionary directory (defaults to " RADDBDIR ").\n");
-	fprintf(stderr, "  -D <dictdir>           Set main dictionary directory (defaults to " DICTDIR ").\n");
-	fprintf(stderr, "  -f <file>[:<file>]     Read packets from file, not stdin.\n");
-	fprintf(stderr, "                         If a second file is provided, it will be used to verify responses\n");
-	fprintf(stderr, "  -F                     Print the file name, packet number and reply code.\n");
-	fprintf(stderr, "  -h                     Print usage help information.\n");
-	fprintf(stderr, "  -i <id>                Set request id to 'id'.  Values may be 0..255\n");
-	fprintf(stderr, "  -n <num>               Send N requests/s\n");
-	fprintf(stderr, "  -p <num>               Send 'num' packets from a file in parallel.\n");
-	fprintf(stderr, "  -P <proto>             Use proto (tcp or udp) for transport.\n");
-	fprintf(stderr, "  -r <retries>           If timeout, retry sending the packet 'retries' times.\n");
-	fprintf(stderr, "  -s                     Print out summary information of auth results.\n");
-	fprintf(stderr, "  -S <file>              read secret from file, not command line.\n");
-	fprintf(stderr, "  -t <timeout>           Wait 'timeout' seconds before retrying (may be a floating point number).\n");
-	fprintf(stderr, "  -v                     Show program version information.\n");
-	fprintf(stderr, "  -x                     Debugging mode.\n");
+	fprintf(stderr, "  <command>                         One of auth, acct, status, coa, disconnect or auto.\n");
+	fprintf(stderr, "  -4                                Use IPv4 address of server\n");
+	fprintf(stderr, "  -6                                Use IPv6 address of server.\n");
+	fprintf(stderr, "  -A <attribute>		     Use named 'attribute' to match CoA requests to packets.  Default is User-Name\n");
+	fprintf(stderr, "  -b                                Mandate checks for Blast RADIUS issue (this is not set by default).\n");
+	fprintf(stderr, "  -C [<client_ip>:]<client_port>    Client source port and source IP address.  Port values may be 1..65535\n");
+	fprintf(stderr, "  -c <count>			     Send each packet 'count' times.\n");
+	fprintf(stderr, "  -d <confdir>                      Set user dictionary directory (defaults to " CONFDIR ").\n");
+	fprintf(stderr, "  -D <dictdir>                      Set main dictionary directory (defaults to " DICTDIR ").\n");
+	fprintf(stderr, "  -f <request>[:<expected>][:<coa_reply>][:<coa_expected>]  Read packets from file, not stdin.\n");
+	fprintf(stderr, "                                    If a second file is provided, it will be used to verify responses\n");
+	fprintf(stderr, "  -F                                Print the file name, packet number and reply code.\n");
+	fprintf(stderr, "  -h                                Print usage help information.\n");
+	fprintf(stderr, "  -i <id>                           Set request id to 'id'.  Values may be 0..255\n");
+	fprintf(stderr, "  -n <num>                          Send N requests/s\n");
+	fprintf(stderr, "  -o <port>                         Set CoA listening port (defaults to 3799)\n");
+	fprintf(stderr, "  -p <num>                          Send 'num' packets from a file in parallel.\n");
+	fprintf(stderr, "  -P <proto>                        Use proto (tcp or udp) for transport.\n");
+	fprintf(stderr, "  -r <retries>                      If timeout, retry sending the packet 'retries' times.\n");
+	fprintf(stderr, "  -s                                Print out summary information of auth results.\n");
+	fprintf(stderr, "  -S <file>                         read secret from file, not command line.\n");
+	fprintf(stderr, "  -t <timeout>                      Wait 'timeout' seconds before retrying (may be a floating point number).\n");
+	fprintf(stderr, "  -v                                Show program version information.\n");
+	fprintf(stderr, "  -x                                Debugging mode.\n");
 
 	fr_exit_now(EXIT_SUCCESS);
 }
@@ -169,31 +193,76 @@ static NEVER_RETURNS void usage(void)
  */
 static int _rc_request_free(rc_request_t *request)
 {
-	rc_request_t *prev, *next;
+	rc_request_list_remove(&rc_request_list, request);
 
-	prev = request->prev;
-	next = request->next;
-
-	if (prev) {
-		assert(request_head != request);
-		prev->next = next;
-	} else if (request_head) {
-		assert(request_head == request);
-		request_head = next;
-	}
-
-	if (next) {
-		assert(rc_request_tail != request);
-		next->prev = prev;
-	} else if (rc_request_tail) {
-		assert(rc_request_tail == request);
-		rc_request_tail = prev;
+	if (do_coa && fr_rb_node_inline_in_tree(&request->node) && !coa_tree->being_freed) {
+		(void) fr_rb_delete_by_inline_node(coa_tree, &request->node);
 	}
 
 	return 0;
 }
 
-static int mschapv1_encode(fr_radius_packet_t *packet, fr_pair_list_t *list,
+#ifdef HAVE_OPENSSL_SSL_H
+#include <openssl/provider.h>
+
+static OSSL_PROVIDER *openssl_default_provider = NULL;
+static OSSL_PROVIDER *openssl_legacy_provider = NULL;
+
+static int openssl3_init(void)
+{
+	/*
+	 *	Load the default provider for most algorithms
+	 */
+	openssl_default_provider = OSSL_PROVIDER_load(NULL, "default");
+	if (!openssl_default_provider) {
+		ERROR("(TLS) Failed loading default provider");
+		return -1;
+	}
+
+	/*
+	 *	Needed for MD4
+	 *
+	 *	https://www.openssl.org/docs/man3.0/man7/migration_guide.html#Legacy-Algorithms
+	 */
+	openssl_legacy_provider = OSSL_PROVIDER_load(NULL, "legacy");
+	if (!openssl_legacy_provider) {
+		ERROR("(TLS) Failed loading legacy provider");
+		return -1;
+	}
+
+	fr_md5_openssl_init();
+	fr_md4_openssl_init();
+
+	return 0;
+}
+
+static void openssl3_free(void)
+{
+	if (openssl_default_provider && !OSSL_PROVIDER_unload(openssl_default_provider)) {
+		ERROR("Failed unloading default provider");
+	}
+	openssl_default_provider = NULL;
+
+	if (openssl_legacy_provider && !OSSL_PROVIDER_unload(openssl_legacy_provider)) {
+		ERROR("Failed unloading legacy provider");
+	}
+	openssl_legacy_provider = NULL;
+
+	fr_md5_openssl_free();
+	fr_md4_openssl_free();
+}
+#else
+static int openssl3_init(void)
+{
+	return 0;
+}
+
+static void openssl3_free(void)
+{
+}
+#endif
+
+static int mschapv1_encode(fr_packet_t *packet, fr_pair_list_t *list,
 			   char const *password)
 {
 	unsigned int		i;
@@ -207,17 +276,18 @@ static int mschapv1_encode(fr_radius_packet_t *packet, fr_pair_list_t *list,
 	MEM(challenge = fr_pair_afrom_da(packet, attr_ms_chap_challenge));
 
 	fr_pair_append(list, challenge);
-	challenge->vp_length = 8;
-	challenge->vp_octets = p = talloc_array(challenge, uint8_t, challenge->vp_length);
+
+	MEM(p = talloc_array(challenge, uint8_t, 8));
+	fr_pair_value_memdup_buffer_shallow(challenge, p, false);
+
 	for (i = 0; i < challenge->vp_length; i++) {
 		p[i] = fr_rand();
 	}
 
 	MEM(reply = fr_pair_afrom_da(packet, attr_ms_chap_response));
 	fr_pair_append(list, reply);
-	reply->vp_length = 50;
-	reply->vp_octets = p = talloc_array(reply, uint8_t, reply->vp_length);
-	memset(p, 0, reply->vp_length);
+	p = talloc_zero_array(reply, uint8_t, 50); /* really reply->da->flags.length */
+	fr_pair_value_memdup_buffer_shallow(reply, p, false);
 
 	p[1] = 0x01; /* NT hash */
 
@@ -317,6 +387,99 @@ static bool already_hex(fr_pair_t *vp)
 	return false;
 }
 
+/** Read one CoA reply and potentially a filter
+ *
+ *
+ */
+static int coa_init(rc_request_t *parent,
+		    FILE *coa_reply, char const *reply_filename, bool *coa_reply_done,
+		    FILE *coa_filter, char const *filter_filename, bool *coa_filter_done)
+{
+	rc_request_t	*request;
+	fr_pair_t	*vp;
+
+	/*
+	 *	Allocate it.
+	 */
+	MEM(request = talloc_zero(parent, rc_request_t));
+	MEM(request->reply = fr_packet_alloc(request, false));
+
+	/*
+	 *	Don't initialize src/dst IP/port, or anything else.  That will be read from the network.
+	 */
+	fr_pair_list_init(&request->filter);
+	fr_pair_list_init(&request->request_pairs);
+	fr_pair_list_init(&request->reply_pairs);
+
+	/*
+	 *	Read the reply VP's.
+	 */
+	if (fr_pair_list_afrom_file(request, dict_radius,
+				    &request->reply_pairs, coa_reply, coa_reply_done, true) < 0) {
+		REDEBUG("Error parsing \"%s\"", reply_filename);
+	error:
+		talloc_free(request);
+		return -1;
+	}
+
+	/*
+	 *	The reply can be empty.  In which case we just send an empty ACK.
+	 */
+	vp = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_packet_type);
+	if (vp) request->reply->code = vp->vp_uint32;
+
+	/*
+	 *	Read in filter VP's.
+	 */
+	if (coa_filter) {
+		if (fr_pair_list_afrom_file(request, dict_radius,
+					    &request->filter, coa_filter, coa_filter_done, true) < 0) {
+			REDEBUG("Error parsing \"%s\"", filter_filename);
+			goto error;
+		}
+
+		if (*coa_filter_done && !*coa_reply_done) {
+			REDEBUG("Differing number of replies/filters in %s:%s "
+				"(too many replies)", reply_filename, filter_filename);
+			goto error;
+		}
+
+		if (!*coa_filter_done && *coa_reply_done) {
+			REDEBUG("Differing number of replies/filters in %s:%s "
+				"(too many filters)", reply_filename, filter_filename);
+			goto error;
+		}
+
+		/*
+		 *	This allows efficient list comparisons later
+		 */
+		fr_pair_list_sort(&request->filter, fr_pair_cmp_by_da);
+	}
+
+	request->name = parent->name;
+
+	/*
+	 *	Automatically set the response code from the request code
+	 *	(if one wasn't already set).
+	 */
+	if (request->filter_code == FR_RADIUS_CODE_UNDEFINED) {
+		request->filter_code = FR_RADIUS_CODE_COA_REQUEST;
+	}
+
+	parent->coa = request;
+
+	/*
+	 *	Ensure that the packet is also tracked in the CoA tree.
+	 */
+	fr_assert(coa_tree);
+	if (fr_rb_insert(coa_tree, parent) != 0) {
+		ERROR("Failed inserting packet from %s into CoA tree", request->name);
+		fr_exit_now(1);
+	}
+
+	return 0;
+}
+
 /*
  *	Initialize a radclient data structure and add it to
  *	the global linked list.
@@ -324,18 +487,25 @@ static bool already_hex(fr_pair_t *vp)
 static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 {
 	FILE		*packets, *filters = NULL;
+	bool		read_from_stdin;
 
 	fr_pair_t	*vp;
-	rc_request_t	*request;
+	rc_request_t	*request = NULL;
 	bool		packets_done = false;
 	uint64_t	num = 0;
 
-	assert(files->packets != NULL);
+	FILE		*coa_reply = NULL;
+	FILE		*coa_filter = NULL;
+	bool		coa_reply_done = false;
+	bool		coa_filter_done = false;
+
+	fr_assert(files->packets != NULL);
 
 	/*
 	 *	Determine where to read the VP's from.
 	 */
-	if (strcmp(files->packets, "-") != 0) {
+	read_from_stdin = (strcmp(files->packets, "-") == 0);
+	if (!read_from_stdin) {
 		packets = fopen(files->packets, "r");
 		if (!packets) {
 			ERROR("Error opening %s: %s", files->packets, fr_syserror(errno));
@@ -349,8 +519,23 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 			filters = fopen(files->filters, "r");
 			if (!filters) {
 				ERROR("Error opening %s: %s", files->filters, fr_syserror(errno));
-				fclose(packets);
-				return -1;
+				goto error;
+			}
+		}
+
+		if (files->coa_reply) {
+			coa_reply = fopen(files->coa_reply, "r");
+			if (!coa_reply) {
+				ERROR("Error opening %s: %s", files->coa_reply, fr_syserror(errno));
+				goto error;
+			}
+		}
+
+		if (files->coa_filter) {
+			coa_filter = fopen(files->coa_filter, "r");
+			if (!coa_filter) {
+				ERROR("Error opening %s: %s", files->coa_filter, fr_syserror(errno));
+				goto error;
 			}
 		}
 	} else {
@@ -361,27 +546,21 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 	 *	Loop until the file is done.
 	 */
 	do {
+		char const *coa_reply_filename = NULL;
+		char const *coa_filter_filename = NULL;
+
 		/*
 		 *	Allocate it.
 		 */
-		request = talloc_zero(ctx, rc_request_t);
-		if (!request) {
-			ERROR("Out of memory");
-			goto error;
-		}
-
-		request->packet = fr_radius_packet_alloc(request, true);
-		if (!request->packet) {
-			ERROR("Out of memory");
-			goto error;
-		}
+		MEM(request = talloc_zero(ctx, rc_request_t));
+		MEM(request->packet = fr_packet_alloc(request, true));
 		request->packet->uctx = request;
 
 		request->packet->socket.inet.src_ipaddr = client_ipaddr;
 		request->packet->socket.inet.src_port = client_port;
 		request->packet->socket.inet.dst_ipaddr = server_ipaddr;
 		request->packet->socket.inet.dst_port = server_port;
-		request->packet->socket.proto = ipproto;
+		request->packet->socket.type = (ipproto == IPPROTO_TCP) ? SOCK_STREAM : SOCK_DGRAM;
 
 		request->files = files;
 		request->packet->id = last_used_id;
@@ -395,7 +574,7 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 		 *	Read the request VP's.
 		 */
 		if (fr_pair_list_afrom_file(request, dict_radius,
-					    &request->request_pairs, packets, &packets_done) < 0) {
+					    &request->request_pairs, packets, &packets_done, true) < 0) {
 			char const *input;
 
 			if ((files->packets[0] == '-') && (files->packets[1] == '\0')) {
@@ -424,7 +603,7 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 			bool filters_done;
 
 			if (fr_pair_list_afrom_file(request, dict_radius,
-						    &request->filter, filters, &filters_done) < 0) {
+						    &request->filter, filters, &filters_done, true) < 0) {
 				REDEBUG("Error parsing \"%s\"", files->filters);
 				goto error;
 			}
@@ -441,33 +620,16 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 				goto error;
 			}
 
-			/*
-			 *	xlat expansions aren't supported here
-			 */
-			for (vp = fr_pair_list_head(&request->filter);
-			     vp;
-			     vp = fr_pair_list_next(&request->filter, vp)) {
-			     again:
-				/*
-				 *	Xlat expansions are not supported. Convert xlat to value box (if possible).
-				 */
-				if (vp->type == VT_XLAT) {
-					if (fr_value_box_from_str(vp, &vp->data, vp->da->type, NULL, vp->xlat, -1, '\0', false) < 0) {
-						fr_perror("radclient");
-						goto error;
-					}
-					vp->type = VT_DATA;
+			vp = fr_pair_find_by_da(&request->filter, NULL, attr_packet_type);
+			if (vp) {
+				if (!FR_RADIUS_PACKET_CODE_VALID(vp->vp_uint32)) {
+					REDEBUG("Invalid filter code %u in %s:%s", vp->vp_uint32,
+						files->packets, files->filters);
+					goto error;
 				}
 
-				if (vp->da == attr_packet_type) {
-					fr_pair_t *next;
-					next = fr_pair_list_next(&request->filter, vp);	/* so we don't break the filter */
-					request->filter_code = vp->vp_uint32;
-					fr_pair_delete(&request->filter, vp);
-					vp = next;
-					if (!vp) break;
-					goto again;
-				}
+				request->filter_code = vp->vp_uint32;
+				fr_pair_delete(&request->filter, vp);
 			}
 
 			/*
@@ -483,38 +645,18 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 		     vp;
 		     vp = fr_pair_list_next(&request->request_pairs, vp)) {
 			/*
-			 *	Xlat expansions are not supported. Convert xlat to value box (if possible).
-			 */
-			if (vp->type == VT_XLAT) {
-				if (fr_value_box_from_str(vp, &vp->data, vp->da->type, NULL, vp->xlat, -1, '\0', false) < 0) {
-					fr_perror("radclient");
-					goto error;
-				}
-				vp->type = VT_DATA;
-			}
-
-			/*
 			 *	Allow it to set the packet type in
 			 *	the attributes read from the file.
 			 */
 			if (vp->da == attr_packet_type) {
-				request->packet->code = vp->vp_uint32;
-			} else if (vp->da == attr_packet_dst_port) {
-				request->packet->socket.inet.dst_port = vp->vp_uint16;
-			} else if ((vp->da == attr_packet_dst_ip_address) ||
-				   (vp->da == attr_packet_dst_ipv6_address)) {
-				memcpy(&request->packet->socket.inet.dst_ipaddr, &vp->vp_ip, sizeof(request->packet->socket.inet.dst_ipaddr));
-			} else if (vp->da == attr_packet_src_port) {
-				if (vp->vp_uint16 < 1024) {
-					ERROR("Invalid value '%u' for Packet-Src-Port", vp->vp_uint16);
+				if (!FR_RADIUS_PACKET_CODE_VALID(vp->vp_uint32)) {
+					REDEBUG("Invalid Packet-Type %u in %s", vp->vp_uint32, files->packets);
 					goto error;
 				}
-				request->packet->socket.inet.src_port = vp->vp_uint16;
-			} else if ((vp->da == attr_packet_src_ip_address) ||
-				   (vp->da == attr_packet_src_ipv6_address)) {
-				memcpy(&request->packet->socket.inet.src_ipaddr, &vp->vp_ip, sizeof(request->packet->socket.inet.src_ipaddr));
+
+				request->packet->code = vp->vp_uint32;
 			} else if (vp->da == attr_request_authenticator) {
-				if (vp->vp_length > sizeof(request->packet->vector)) {
+				if (vp->vp_length >= sizeof(request->packet->vector)) {
 					memcpy(request->packet->vector, vp->vp_octets, sizeof(request->packet->vector));
 				} else {
 					memset(request->packet->vector, 0, sizeof(request->packet->vector));
@@ -534,14 +676,25 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 				/*
 				 *	CHAP-Password is octets, so it may not be zero terminated.
 				 */
-				MEM(pair_update_request(&request->password, attr_cleartext_password) >= 0);
+				pair_update_request(request->password, attr_cleartext_password);
 				fr_pair_value_bstrndup(request->password, vp->vp_strvalue, vp->vp_length, true);
-			} else if ((vp->da == attr_user_password) ||
-				   (vp->da == attr_ms_chap_password)) {
-				MEM(pair_update_request(&request->password, attr_cleartext_password) >= 0);
+			} else if (vp->da == attr_ms_chap_password) {
+				pair_update_request(request->password, attr_cleartext_password);
 				fr_pair_value_bstrndup(request->password, vp->vp_strvalue, vp->vp_length, true);
+
 			} else if (vp->da == attr_radclient_test_name) {
 				request->name = vp->vp_strvalue;
+
+			/*
+			 *	Allow these to be dynamically specified
+			 *	in the request file, as well as on the
+			 *	command line.
+			 */
+			} else if (vp->da == attr_radclient_coa_filename) {
+				coa_reply_filename = vp->vp_strvalue;
+
+			} else if (vp->da == attr_radclient_coa_filter) {
+				coa_filter_filename = vp->vp_strvalue;
 			}
 		} /* loop over the VP's we read in */
 
@@ -549,6 +702,12 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 		 *	Use the default set on the command line
 		 */
 		if (request->packet->code == FR_RADIUS_CODE_UNDEFINED) request->packet->code = packet_code;
+
+		/*
+		 *	Fill in the packet header from attributes, and then
+		 *	re-realize the attributes.
+		 */
+		fr_packet_net_from_pairs(request->packet, &request->request_pairs);
 
 		/*
 		 *	Default to the filename
@@ -599,7 +758,7 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 				goto error;
 
 			default:
-				REDEBUG("Can't determine expected &reply.Packet-Type for Packet-Type %i",
+				REDEBUG("Can't determine expected reply.Packet-Type for Packet-Type %u",
 					request->packet->code);
 				goto error;
 			}
@@ -629,7 +788,7 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 				break;
 
 			default:
-				REDEBUG("Can't determine expected Packet-Type for &reply.Packet-Type %i",
+				REDEBUG("Can't determine expected Packet-Type for reply.Packet-Type %u",
 					request->filter_code);
 				goto error;
 			}
@@ -647,19 +806,66 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 		}
 
 		/*
+		 *	Read in the CoA filename and filter.
+		 */
+		if (coa_reply_filename) {
+			if (coa_reply) {
+				RDEBUG("Cannot specify CoA file on both the command line and via Radclient-CoA-Filename");
+				goto error;
+			}
+
+			coa_reply = fopen(coa_reply_filename, "r");
+			if (!coa_reply) {
+				ERROR("Error opening %s: %s", coa_reply_filename, fr_syserror(errno));
+				goto error;
+			}
+
+			if (coa_filter_filename) {
+				coa_filter = fopen(coa_filter_filename, "r");
+				if (!coa_filter) {
+					ERROR("Error opening %s: %s", coa_filter_filename, fr_syserror(errno));
+					goto error;
+				}
+			} else {
+				coa_filter = NULL;
+			}
+
+			/*
+			 *	Read in one CoA reply and/or filter
+			 */
+			if (coa_init(request,
+				     coa_reply, coa_reply_filename, &coa_reply_done,
+				     coa_filter, coa_filter_filename, &coa_filter_done) < 0) {
+				goto error;
+			}
+
+			fclose(coa_reply);
+			coa_reply = NULL;
+			if (coa_filter) {
+				fclose(coa_filter);
+				coa_filter = NULL;
+			}
+			do_coa = true;
+
+		} else if (coa_reply) {
+			if (coa_init(request,
+				     coa_reply, coa_reply_filename, &coa_reply_done,
+				     coa_filter, coa_filter_filename, &coa_filter_done) < 0) {
+				goto error;
+			}
+
+			if (coa_reply_done != packets_done) {
+				REDEBUG("Differing number of packets in input file and coa_reply in %s:%s ",
+				        files->packets, files->coa_reply);
+				goto error;
+
+			}
+		}
+
+		/*
 		 *	Add it to the tail of the list.
 		 */
-		if (!request_head) {
-			assert(rc_request_tail == NULL);
-			request_head = request;
-			request->prev = NULL;
-		} else {
-			assert(rc_request_tail->next == NULL);
-			rc_request_tail->next = request;
-			request->prev = rc_request_tail;
-		}
-		rc_request_tail = request;
-		request->next = NULL;
+		rc_request_list_insert_tail(&rc_request_list, request);
 
 		/*
 		 *	Set the destructor so it removes itself from the
@@ -670,8 +876,10 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 		talloc_set_destructor(request, _rc_request_free);
 	} while (!packets_done); /* loop until the file is done. */
 
-	if (packets != stdin) fclose(packets);
+	if (!read_from_stdin) fclose(packets);
 	if (filters) fclose(filters);
+	if (coa_reply) fclose(coa_reply);
+	if (coa_filter) fclose(coa_filter);
 
 	/*
 	 *	And we're done.
@@ -681,8 +889,10 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 error:
 	talloc_free(request);
 
-	if (packets != stdin) fclose(packets);
+	if (!read_from_stdin) fclose(packets);
 	if (filters) fclose(filters);
+	if (coa_reply) fclose(coa_reply);
+	if (coa_filter) fclose(coa_filter);
 
 	return -1;
 }
@@ -718,21 +928,20 @@ static int radclient_sane(rc_request_t *request)
 }
 
 
-/*
- *	For request handling.
- */
-static int8_t filename_cmp(void const *one, void const *two)
+static fr_cmp_ret_t request_cmp(void const *one, void const *two)
 {
-	rc_file_pair_t const *a = one, *b = two;
-	int ret;
+	rc_request_t const *a = one, *b = two;
+	fr_pair_t *vp1, *vp2;
 
-	ret = strcmp(a->packets, b->packets);
-	ret = CMP(ret, 0);
-	if (ret != 0) return ret;
+	vp1 = fr_pair_find_by_da(&a->request_pairs, NULL, attr_coa_match_attr);
+	vp2 = fr_pair_find_by_da(&b->request_pairs, NULL, attr_coa_match_attr);
 
-	ret = strcmp(a->filters, b->filters);
-	return CMP(ret, 0);
+	if (!vp1) return CMP_LT;
+	if (!vp2) return CMP_GT;
+
+	return fr_value_box_cmp(&vp1->data, &vp2->data);
 }
+
 
 /*
  *	Deallocate packet ID, etc.
@@ -755,7 +964,7 @@ static void deallocate_id(rc_request_t *request)
 	 *	authentication vector.
 	 */
 	if (request->packet->data) TALLOC_FREE(request->packet->data);
-	if (request->reply) fr_radius_packet_free(&request->reply);
+	if (request->reply) fr_packet_free(&request->reply);
 }
 
 /*
@@ -763,13 +972,21 @@ static void deallocate_id(rc_request_t *request)
  */
 static int send_one_packet(rc_request_t *request)
 {
-	assert(request->done == false);
+	fr_pair_t *vp;
+
+	fr_assert(request->done == false);
+
+#ifdef STATIC_ANALYZER
+	if (!secret) fr_exit_now(1);
+#endif
 
 	/*
 	 *	Remember when we have to wake up, to re-send the
 	 *	request, of we didn't receive a reply.
 	 */
-	if ((sleep_time == -1) || (sleep_time > timeout)) sleep_time = timeout;
+	if ((fr_time_delta_eq(sleep_time, fr_time_delta_wrap(-1)) || (fr_time_delta_gt(sleep_time, timeout)))) {
+		sleep_time = timeout;
+	}
 
 	/*
 	 *	Haven't sent the packet yet.  Initialize it.
@@ -777,7 +994,7 @@ static int send_one_packet(rc_request_t *request)
 	if (!request->tries || request->packet->id == -1) {
 		bool rcode;
 
-		assert(request->reply == NULL);
+		fr_assert(request->reply == NULL);
 
 		/*
 		 *	Didn't find a free packet ID, we're not done,
@@ -786,16 +1003,23 @@ static int send_one_packet(rc_request_t *request)
 		 */
 	retry:
 		request->packet->socket.inet.src_ipaddr.af = server_ipaddr.af;
+		request->packet->socket.inet.src_port = 0;
+
 		rcode = fr_packet_list_id_alloc(packet_list, ipproto, request->packet, NULL);
 		if (!rcode) {
 			int mysockfd;
 
+			if ((fixed_id >0) && (request->packet->id == fixed_id)) {
+				fr_perror("Failed assigning fixed ID %d", fixed_id);
+				return -1;
+			}
+
 			if (ipproto == IPPROTO_TCP) {
-				mysockfd = fr_socket_client_tcp(NULL,
+				mysockfd = fr_socket_client_tcp(NULL, NULL,
 								&request->packet->socket.inet.dst_ipaddr,
 								request->packet->socket.inet.dst_port, false);
 				if (mysockfd < 0) {
-					fr_perror("Error opening socket");
+					fr_perror("Error opening client TCP socket");
 					return -1;
 				}
 			} else {
@@ -803,11 +1027,11 @@ static int send_one_packet(rc_request_t *request)
 
 				mysockfd = fr_socket_server_udp(&client_ipaddr, &port, NULL, true);
 				if (mysockfd < 0) {
-					fr_perror("Error opening socket");
+					fr_perror("Error opening client UDP socket");
 					return -1;
 				}
 
-				if (fr_socket_bind(mysockfd, &client_ipaddr, &port, NULL) < 0) {
+				if (fr_socket_bind(mysockfd, NULL, &client_ipaddr, &port) < 0) {
 					fr_perror("Error binding socket");
 					return -1;
 				}
@@ -822,42 +1046,37 @@ static int send_one_packet(rc_request_t *request)
 			goto retry;
 		}
 
-		assert(request->packet->id != -1);
-		assert(request->packet->data == NULL);
+		fr_assert(request->packet->id != -1);
+		fr_assert(request->packet->data == NULL);
 
 		/*
 		 *	Update the password, so it can be encrypted with the
 		 *	new authentication vector.
 		 */
 		if (request->password) {
-			fr_pair_t *vp;
-
-			if ((vp = fr_pair_find_by_da(&request->request_pairs, attr_user_password, 0)) != NULL) {
-				fr_pair_value_strdup(vp, request->password->vp_strvalue);
-
-			} else if ((vp = fr_pair_find_by_da(&request->request_pairs, attr_chap_password, 0)) != NULL) {
+			if ((vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_chap_password)) != NULL) {
 				uint8_t		buffer[17];
 				fr_pair_t	*challenge;
-				uint8_t	const	*vector;
 
 				/*
-				 *	Use Chap-Challenge pair if present,
-				 *	Request Authenticator otherwise.
+				 *	Use CHAP-Challenge pair if present, otherwise create CHAP-Challenge and
+				 *	populate with current Request Authenticator.
+				 *
+				 *	Request Authenticator is re-calculated by fr_packet_sign
 				 */
-				challenge = fr_pair_find_by_da(&request->request_pairs, attr_chap_challenge, 0);
-				if (challenge && (challenge->vp_length == RADIUS_AUTH_VECTOR_LENGTH)) {
-					vector = challenge->vp_octets;
-				} else {
-					vector = request->packet->vector;
+				challenge = fr_pair_find_by_da(&request->request_pairs, NULL, attr_chap_challenge);
+				if (!challenge || (challenge->vp_length < 7)) {
+					pair_update_request(challenge, attr_chap_challenge);
+					fr_pair_value_memdup(challenge, request->packet->vector, RADIUS_AUTH_VECTOR_LENGTH, false);
 				}
 
-				fr_radius_encode_chap_password(buffer,
-							       fr_rand() & 0xff, vector,
-							       request->password->vp_strvalue,
-							       request->password->vp_length);
+				fr_chap_encode(buffer,
+					       fr_rand() & 0xff, challenge->vp_octets, challenge->vp_length,
+					       request->password->vp_strvalue,
+					       request->password->vp_length);
 				fr_pair_value_memdup(vp, buffer, sizeof(buffer), false);
 
-			} else if (fr_pair_find_by_da(&request->request_pairs, attr_ms_chap_password, 0) != NULL) {
+			} else if (fr_pair_find_by_da_nested(&request->request_pairs, attr_ms_chap_password) != NULL) {
 				mschapv1_encode(request->packet, &request->request_pairs, request->password->vp_strvalue);
 
 			} else {
@@ -870,7 +1089,7 @@ static int send_one_packet(rc_request_t *request)
 		request->resend++;
 
 	} else {		/* request->packet->id >= 0 */
-		fr_time_delta_t now = fr_time();
+		fr_time_t now = fr_time();
 
 		/*
 		 *	FIXME: Accounting packets are never retried!
@@ -882,15 +1101,14 @@ static int send_one_packet(rc_request_t *request)
 		/*
 		 *	Not time for a retry, do so.
 		 */
-		if ((now - request->timestamp) < timeout) {
-			/*
-			 *	When we walk over the tree sending
-			 *	packets, we update the minimum time
-			 *	required to sleep.
-			 */
-			if ((sleep_time == -1) ||
-			    (sleep_time > (now - request->timestamp))) {
-				sleep_time = now - request->timestamp;
+		if (fr_time_delta_lt(fr_time_sub(now, request->timestamp), timeout)) {
+			fr_time_delta_t remaining;
+
+			remaining = fr_time_delta_sub(timeout, fr_time_sub(now, request->timestamp));
+
+			if (fr_time_delta_eq(sleep_time, fr_time_delta_wrap(-1)) ||
+			    fr_time_delta_gt(sleep_time, remaining)) {
+				sleep_time = remaining;
 			}
 			return 0;
 		}
@@ -899,7 +1117,7 @@ static int send_one_packet(rc_request_t *request)
 		 *	We're not trying later, maybe the packet is done.
 		 */
 		if (request->tries == retries) {
-			assert(request->packet->id >= 0);
+			fr_assert(request->packet->id >= 0);
 
 			/*
 			 *	Delete the request from the tree of
@@ -930,30 +1148,354 @@ static int send_one_packet(rc_request_t *request)
 	}
 
 	/*
+	 *	If there's a Message-Authenticator in the packet, AND it has a "don't send" operator, then
+	 *	delete it.  We manually encode the packet (which also prints out Message-Authenticator), and
+	 *	then manually remove the Message-Authenticator bytes from the packet.  The encoder still
+	 *	prints out that it's sending Message-Authenticator, but oh well.
+	 */
+	vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_message_authenticator);
+	if (vp && (vp->op == T_OP_CMP_FALSE) && !request->packet->data &&
+	    (request->packet->code == FR_RADIUS_CODE_ACCESS_REQUEST)) {
+		fr_pair_delete(&request->request_pairs, vp);
+
+		if (fr_radius_packet_encode(request->packet, &request->request_pairs, NULL, secret) < 0) {
+			REDEBUG("Failed to encode packet for ID %d", request->packet->id);
+			goto error;
+		}
+
+		/*
+		 *	Manually re-write the packet to get rid of Message-Authenticator.
+		 */
+		if ((request->packet->data_len >= (RADIUS_HEADER_LENGTH + 18)) &&
+		    (request->packet->data[RADIUS_HEADER_LENGTH] == attr_message_authenticator->attr) &&
+		    (request->packet->data[RADIUS_HEADER_LENGTH + 1] == 18)) {
+			memmove(request->packet->data + RADIUS_HEADER_LENGTH,
+				request->packet->data + RADIUS_HEADER_LENGTH + 18,
+				request->packet->data_len - RADIUS_HEADER_LENGTH - 18);
+			request->packet->data_len -= 18;
+			fr_nbo_from_uint16(request->packet->data + 2, request->packet->data_len);
+		}
+
+		if (fr_radius_packet_sign(request->packet, NULL, secret) < 0) {
+			REDEBUG("Failed to sign packet for ID %d", request->packet->id);
+			goto error;
+		}
+	}
+
+	/*
 	 *	Send the packet.
 	 */
 	if (fr_radius_packet_send(request->packet, &request->request_pairs, NULL, secret) < 0) {
 		REDEBUG("Failed to send packet for ID %d", request->packet->id);
+	error:
 		deallocate_id(request);
 		request->done = true;
 		return -1;
 	}
 
-	fr_packet_log(&default_log, request->packet, &request->request_pairs, false);
+	fr_radius_packet_log(&default_log, request->packet, &request->request_pairs, false);
 
+	return 0;
+}
+
+/*
+ *	Receive a CoA packet, maybe.
+ */
+static int recv_coa_packet(fr_time_delta_t wait_time)
+{
+	fd_set			set;
+	fr_time_delta_t		our_wait_time;
+	rc_request_t		*request, *parent;
+	fr_packet_t		*packet;
+	rc_request_t		my;
+
+#ifdef STATIC_ANALYZER
+	if (!secret) fr_exit_now(1);
+#endif
+
+	/* And wait for reply, timing out as necessary */
+	FD_ZERO(&set);
+	FD_SET(coafd, &set);
+
+	our_wait_time = !fr_time_delta_ispos(wait_time) ? fr_time_delta_from_sec(0) : wait_time;
+
+	/*
+	 *	No packet was received.
+	 */
+	if (select(coafd + 1, &set, NULL, NULL, &fr_time_delta_to_timeval(our_wait_time)) <= 0) return 0;
+
+	/*
+	 *	Read a packet from a network.
+	 */
+	packet = fr_packet_recv(NULL, coafd, 0, 200, false);
+	if (!packet) {
+		DEBUG("Failed reading CoA packet");
+		return 0;
+	}
+
+	/*
+	 *	Fails the signature validation: not a real reply
+	 */
+	if (fr_radius_packet_verify(packet, NULL, secret) < 0) {
+		DEBUG("CoA verification failed");
+		talloc_free(packet);
+		return 0;
+	}
+
+	fr_pair_list_init(&my.request_pairs);
+
+	/*
+	 *	Decode the packet before looking up the parent, so that we can compare the pairs.
+	 */
+	if (fr_radius_decode_simple(packet, &my.request_pairs,
+				    packet->data, packet->data_len,
+				    NULL, secret) < 0) {
+		DEBUG("Failed decoding CoA packet");
+		talloc_free(packet);
+		return 0;
+	}
+
+	fr_radius_packet_log(&default_log, packet, &my.request_pairs, true);
+
+	/*
+	 *	Find a Access-Request which has the same User-Name / etc. as this CoA packet.
+	 */
+	my.name = "receive CoA request";
+	my.packet = packet;
+
+	fr_rb_find((void **)&parent, coa_tree, &my);
+	if (!parent) {
+		DEBUG("No matching request packet for CoA packet %u %u", packet->data[0], packet->data[1]);
+		talloc_free(packet);
+		return 0;
+	}
+	fr_assert(parent->coa);
+
+	request = parent->coa;
+	request->packet = talloc_steal(request, packet);
+
+	fr_pair_list_steal(request, &my.request_pairs);
+	fr_pair_list_append(&request->request_pairs, &my.request_pairs);
+
+	/*
+	 *	If we had an expected response code, check to see if the
+	 *	packet matched that.
+	 */
+	if (request->packet->code != request->filter_code) {
+		if (FR_RADIUS_PACKET_CODE_VALID(request->reply->code)) {
+			REDEBUG("%s: Expected %s got %s", request->name, fr_radius_packet_name[request->filter_code],
+				fr_radius_packet_name[request->packet->code]);
+		} else {
+			REDEBUG("%s: Expected %u got %u", request->name, request->filter_code,
+				request->packet->code);
+		}
+		stats.failed++;
+
+	/*
+	 *	Check if the contents of the packet matched the filter
+	 */
+	} else if (fr_pair_list_empty(&request->filter)) {
+		stats.passed++;
+
+	} else {
+		fr_pair_t const *failed[2];
+
+		fr_pair_list_sort(&request->request_pairs, fr_pair_cmp_by_da);
+		if (fr_pair_validate(failed, &request->filter, &request->request_pairs)) {
+			RDEBUG("%s: CoA request passed filter", request->name);
+			stats.passed++;
+		} else {
+			fr_pair_validate_debug(failed);
+			REDEBUG("%s: CoA Request for failed filter", request->name);
+			stats.failed++;
+		}
+	}
+
+	request->reply->id = request->packet->id;
+
+	request->reply->socket.type = SOCK_DGRAM;
+	request->reply->socket.af = client_ipaddr.af;
+	request->reply->socket.fd = coafd;
+	request->reply->socket.inet.src_ipaddr = client_ipaddr;
+	request->reply->socket.inet.src_port = coa_port;
+	request->reply->socket.inet.dst_ipaddr = packet->socket.inet.src_ipaddr;
+	request->reply->socket.inet.dst_port = packet->socket.inet.src_port;
+
+	if (!request->reply->code) switch (packet->code) {
+	case FR_RADIUS_CODE_COA_REQUEST:
+		request->reply->code = FR_RADIUS_CODE_COA_ACK;
+		break;
+
+	case FR_RADIUS_CODE_DISCONNECT_REQUEST:
+		request->reply->code = FR_RADIUS_CODE_DISCONNECT_ACK;
+		break;
+
+	default:
+		RDEBUG("Failed getting reply packet type");
+		return 0;
+	}
+
+	fr_radius_packet_log(&default_log, request->reply, &request->reply_pairs, false);
+
+
+	/*
+	 *	Send reply.
+	 */
+	if (fr_radius_packet_send(request->reply, &request->reply_pairs, packet, secret) < 0) {
+		REDEBUG("Failed sending CoA reply");
+		return 0;
+	}
+
+	fr_rb_remove(NULL, coa_tree, parent);
+
+	/*
+	 *	No longer waiting for a CoA packet for this request.
+	 */
+	TALLOC_FREE(parent->coa);
+	return 0;
+}
+
+
+/*
+ *	Do Blast RADIUS checks.
+ *
+ *	The request is an Access-Request, and does NOT contain Proxy-State.
+ *
+ *	The reply is a raw packet, and is NOT yet decoded.
+ */
+static int blast_radius_check(rc_request_t *request, fr_packet_t *reply)
+{
+	uint8_t *attr, *end;
+	fr_pair_t *vp;
+	bool have_message_authenticator = false;
+
+	/*
+	 *	We've received a raw packet.  Nothing has (as of yet) checked
+	 *	anything in it other than the length, and that it's a
+	 *	well-formed RADIUS packet.
+	 */
+	switch (reply->data[0]) {
+	case FR_RADIUS_CODE_ACCESS_ACCEPT:
+	case FR_RADIUS_CODE_ACCESS_REJECT:
+	case FR_RADIUS_CODE_ACCESS_CHALLENGE:
+	case FR_RADIUS_CODE_PROTOCOL_ERROR:
+		if (reply->data[1] != request->packet->id) {
+			ERROR("Invalid reply ID %d to Access-Request ID %d", reply->data[1], request->packet->id);
+			return -1;
+		}
+		break;
+
+	default:
+		ERROR("Invalid reply code %d to Access-Request", reply->data[0]);
+		return -1;
+	}
+
+	/*
+	 *	If the reply has a Message-Authenticator, then it MIGHT be fine.
+	 */
+	attr = reply->data + 20;
+	end = reply->data + reply->data_len;
+
+	/*
+	 *	It should be the first attribute, so we warn if it isn't there.
+	 *
+	 *	But it's not a fatal error.
+	 */
+	if (blast_radius && (attr[0] != FR_MESSAGE_AUTHENTICATOR)) {
+		RDEBUG("WARNING The %s reply packet does not have Message-Authenticator as the first attribute.  The packet may be vulnerable to Blast RADIUS attacks.",
+		       fr_radius_packet_name[reply->data[0]]);
+	}
+
+	/*
+	 *	Set up for Proxy-State checks.
+	 *
+	 *	If we see a Proxy-State in the reply which we didn't send, then it's a Blast RADIUS attack.
+	 */
+	vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_proxy_state);
+
+	while (attr < end) {
+		/*
+		 *	Blast RADIUS work-arounds require that
+		 *	Message-Authenticator is the first attribute in the
+		 *	reply.  Note that we don't check for it being the
+		 *	first attribute, but simply that it exists.
+		 *
+		 *	That check is a balance between securing the reply
+		 *	packet from attacks, and not violating the RFCs which
+		 *	say that there is no order to attributes in the
+		 *	packet.
+		 *
+		 *	However, no matter the status of the '-b' flag we
+		 *	still can check for the signature of the attack, and
+		 *	discard packets which are suspicious.  This behavior
+		 *	protects radclient from the attack, without mandating
+		 *	new behavior on the server side.
+		 *
+		 *	Note that we don't set the '-b' flag by default.
+		 *	radclient is intended for testing / debugging, and is
+		 *	not intended to be used as part of a secure login /
+		 *	user checking system.
+		 */
+		if (attr[0] == FR_MESSAGE_AUTHENTICATOR) {
+			have_message_authenticator = true;
+			goto next;
+		}
+
+		/*
+		 *	If there are Proxy-State attributes in the reply, they must
+		 *	match EXACTLY the Proxy-State attributes in the request.
+		 *
+		 *	Note that we don't care if there are more Proxy-States
+		 *	in the request than in the reply.  The Blast RADIUS
+		 *	issue requires _adding_ Proxy-State attributes, and
+		 *	cannot work when the server _deletes_ Proxy-State
+		 *	attributes.
+		 */
+		if (attr[0] == FR_PROXY_STATE) {
+			if (!vp || (vp->vp_length != (size_t) (attr[1] - 2)) || (memcmp(vp->vp_octets, attr + 2, vp->vp_length) != 0)) {
+				ERROR("Invalid reply to Access-Request ID %d - Discarding packet due to Blast RADIUS attack being detected.", request->packet->id);
+				ERROR("We received a Proxy-State in the reply which we did not send, or which is different from what we sent.");
+				return -1;
+			}
+
+			vp = fr_pair_find_by_da(&request->request_pairs, vp, attr_proxy_state);
+		}
+
+	next:
+		attr += attr[1];
+	}
+
+	/*
+	 *	If "-b" is set, then we require Message-Authenticator in the reply.
+	 */
+	if (blast_radius && !have_message_authenticator) {
+		ERROR("The %s reply packet does not contain Message-Authenticator - discarding packet due to Blast RADIUS checks.",
+		      fr_radius_packet_name[reply->data[0]]);
+		return -1;
+	}
+
+	/*
+	 *	The packet doesn't look like it's a Blast RADIUS attack.  The
+	 *	caller will now verify the packet signature.
+	 */
 	return 0;
 }
 
 /*
  *	Receive one packet, maybe.
  */
-static int recv_one_packet(fr_time_t wait_time)
+static int recv_one_packet(fr_time_delta_t wait_time)
 {
+	int			rcode;
 	fd_set			set;
 	fr_time_delta_t		our_wait_time;
 	rc_request_t		*request;
-	fr_radius_packet_t	*reply, *packet;
+	fr_packet_t		*reply, *packet;
 	volatile int		max_fd;
+
+#ifdef STATIC_ANALYZER
+	if (!secret) fr_exit_now(1);
+#endif
 
 	/* And wait for reply, timing out as necessary */
 	FD_ZERO(&set);
@@ -961,19 +1503,36 @@ static int recv_one_packet(fr_time_t wait_time)
 	max_fd = fr_packet_list_fd_set(packet_list, &set);
 	if (max_fd < 0) fr_exit_now(1); /* no sockets to listen on! */
 
-	our_wait_time = (wait_time <= 0) ? 0 : wait_time;
+	our_wait_time = !fr_time_delta_ispos(wait_time) ? fr_time_delta_from_sec(0) : wait_time;
+
+	if (do_coa && fr_rb_num_elements(coa_tree) > 0) {
+		FD_SET(coafd, &set);
+		if (coafd >= max_fd) max_fd = coafd + 1;
+	}
 
 	/*
-	 *	No packet was received.
+	 *	See if a packet was received.
 	 */
+retry:
 	if (select(max_fd, &set, NULL, NULL, &fr_time_delta_to_timeval(our_wait_time)) <= 0) return 0;
+
+	/*
+	 *	Read a CoA packet
+	 */
+	if (FD_ISSET(coafd, &set)) {
+		recv_coa_packet(fr_time_delta_wrap(0));
+		FD_CLR(coafd, &set);
+		our_wait_time = fr_time_delta_from_sec(0);
+		goto retry;
+	}
 
 	/*
 	 *	Look for the packet.
 	 */
-	reply = fr_packet_list_recv(packet_list, &set, RADIUS_MAX_ATTRIBUTES, false);
-	if (!reply) {
+	rcode = fr_packet_list_recv(packet_list, &set, NULL, &reply, RADIUS_MAX_ATTRIBUTES, false);
+	if (rcode < 0) {
 		ERROR("Received bad packet");
+
 		/*
 		 *	If the packet is bad, we close the socket.
 		 *	I'm not sure how to do that now, so we just
@@ -994,6 +1553,8 @@ static int recv_one_packet(fr_time_t wait_time)
 	 */
 	reply->socket.inet.dst_ipaddr = client_ipaddr;
 	reply->socket.inet.dst_port = client_port;
+	reply->code = reply->data[0];
+	reply->id = reply->data[1];
 
 	/*
 	 *	TCP sockets don't use recvmsg(), and thus don't get
@@ -1010,10 +1571,24 @@ static int recv_one_packet(fr_time_t wait_time)
 	if (!packet) {
 		ERROR("Received reply to request we did not send. (id=%d socket %d)",
 		      reply->id, reply->socket.fd);
-		fr_radius_packet_free(&reply);
+		fr_packet_free(&reply);
 		return -1;	/* got reply to packet we didn't send */
 	}
 	request = packet->uctx;
+
+	/*
+	 *	We want radclient to be able to send any packet, including
+	 *	imperfect ones.  However, we do NOT want to be vulnerable to
+	 *	the "Blast RADIUS" issue.  Instead of adding command-line
+	 *	flags to enable/disable similar flags to what the server
+	 *	sends, we just do a few more smart checks to double-check
+	 *	things.
+	 */
+	if ((request->packet->code == FR_RADIUS_CODE_ACCESS_REQUEST) &&
+	    blast_radius_check(request, reply) < 0) {
+		fr_packet_free(&reply);
+		return -1;
+	}
 
 	/*
 	 *	Fails the signature validation: not a real reply.
@@ -1026,7 +1601,12 @@ static int recv_one_packet(fr_time_t wait_time)
 	}
 
 	if (print_filename) {
-		RDEBUG("%s response code %d", request->files->packets, reply->code);
+		RDEBUG("%s response code %u", request->files->packets, reply->code);
+	}
+
+	if (request->tries < ignore_count) {
+		RDEBUG("Ignoring response %d due to -e ignore_count=%d", request->tries, ignore_count);
+		goto packet_done;
 	}
 
 	deallocate_id(request);
@@ -1036,14 +1616,15 @@ static int recv_one_packet(fr_time_t wait_time)
 	/*
 	 *	If this fails, we're out of memory.
 	 */
-	if (fr_radius_packet_decode(request->reply, &request->reply_pairs,
-				    request->packet, RADIUS_MAX_ATTRIBUTES, false, secret) != 0) {
+	if (fr_radius_decode_simple(request, &request->reply_pairs,
+				    request->reply->data, request->reply->data_len,
+				    request->packet->vector, secret) < 0) {
 		REDEBUG("Reply decode failed");
 		stats.lost++;
 		goto packet_done;
 	}
-
-	fr_packet_log(&default_log, request->reply, &request->reply_pairs, true);
+	PAIR_LIST_VERIFY(&request->reply_pairs);
+	fr_radius_packet_log(&default_log, request->reply, &request->reply_pairs, true);
 
 	/*
 	 *	Increment counters...
@@ -1059,6 +1640,9 @@ static int recv_one_packet(fr_time_t wait_time)
 	case FR_RADIUS_CODE_ACCESS_CHALLENGE:
 		break;
 
+	case FR_RADIUS_CODE_PROTOCOL_ERROR:
+		stats.error++;
+		break;
 	default:
 		stats.rejected++;
 	}
@@ -1070,11 +1654,11 @@ static int recv_one_packet(fr_time_t wait_time)
 	 *	packet matched that.
 	 */
 	if ((request->filter_code != FR_RADIUS_CODE_UNDEFINED) && (request->reply->code != request->filter_code)) {
-		if (is_radius_code(request->reply->code)) {
-			REDEBUG("%s: Expected %s got %s", request->name, fr_packet_codes[request->filter_code],
-				fr_packet_codes[request->reply->code]);
+		if (FR_RADIUS_PACKET_CODE_VALID(request->reply->code)) {
+			REDEBUG("%s: Expected %s got %s", request->name, fr_radius_packet_name[request->filter_code],
+				fr_radius_packet_name[request->reply->code]);
 		} else {
-			REDEBUG("%s: Expected %u got %i", request->name, request->filter_code,
+			REDEBUG("%s: Expected %u got %u", request->name, request->filter_code,
 				request->reply->code);
 		}
 		stats.failed++;
@@ -1091,7 +1675,7 @@ static int recv_one_packet(fr_time_t wait_time)
 			RDEBUG("%s: Response passed filter", request->name);
 			stats.passed++;
 		} else {
-			fr_pair_validate_debug(request, failed);
+			fr_pair_validate_debug(failed);
 			REDEBUG("%s: Response for failed filter", request->name);
 			stats.failed++;
 		}
@@ -1102,8 +1686,8 @@ static int recv_one_packet(fr_time_t wait_time)
 	}
 
 packet_done:
-	fr_radius_packet_free(&request->reply);
-	fr_radius_packet_free(&reply);	/* may be NULL */
+	fr_packet_free(&request->reply);
+	fr_packet_free(&reply);	/* may be NULL */
 
 	return 0;
 }
@@ -1114,18 +1698,21 @@ packet_done:
  */
 int main(int argc, char **argv)
 {
+	int		ret = EXIT_SUCCESS;
 	int		c;
-	char		const *raddb_dir = RADDBDIR;
+	char		const *confdir = CONFDIR;
 	char		const *dict_dir = DICTDIR;
 	char		filesecret[256];
 	FILE		*fp;
 	int		do_summary = false;
 	int		persec = 0;
 	int		parallel = 1;
-	rc_request_t	*this;
 	int		force_af = AF_UNSPEC;
+#ifndef NDEBUG
 	TALLOC_CTX	*autofree;
-	fr_rb_tree_t	*filename_tree = NULL;
+#endif
+	fr_dlist_head_t	filenames;
+	rc_request_t	*request;
 
 	/*
 	 *	It's easier having two sets of flags to set the
@@ -1140,10 +1727,10 @@ int main(int argc, char **argv)
 	 */
 	fr_atexit_global_setup();
 
+#ifndef NDEBUG
 	autofree = talloc_autofree_context();
 
-#ifndef NDEBUG
-	if (fr_fault_setup(autofree, getenv("PANIC_ACTION"), argv[0]) < 0) {
+	if (fr_fault_setup(autofree, getenv("PANIC_ACTION"), argv[0], PANIC_ACTION_SIGNALS) < 0) {
 		fr_perror("radclient");
 		fr_exit_now(EXIT_FAILURE);
 	}
@@ -1151,12 +1738,9 @@ int main(int argc, char **argv)
 
 	talloc_set_log_stderr();
 
-	filename_tree = fr_rb_inline_talloc_alloc(NULL, rc_file_pair_t, node, filename_cmp, NULL);
-	if (!filename_tree) {
-	oom:
-		ERROR("Out of memory");
-		fr_exit_now(EXIT_FAILURE);
-	}
+	rc_request_list_talloc_init(&rc_request_list);
+
+	fr_dlist_talloc_init(&filenames, rc_file_pair_t, entry);
 
 	/*
 	 *	Always log to stdout
@@ -1165,7 +1749,7 @@ int main(int argc, char **argv)
 	default_log.fd = STDOUT_FILENO;
 	default_log.print_level = false;
 
-	while ((c = getopt(argc, argv, "46c:C:d:D:f:Fhi:n:p:P:r:sS:t:vx")) != -1) switch (c) {
+	while ((c = getopt(argc, argv, "46bc:A:C:d:D:e:f:Fhi:n:o:p:P:r:sS:t:vx")) != -1) switch (c) {
 		case '4':
 			force_af = AF_INET;
 			break;
@@ -1174,8 +1758,16 @@ int main(int argc, char **argv)
 			force_af = AF_INET6;
 			break;
 
+		case 'A':
+			attr_coa_filter_name = optarg;
+			break;
+
+		case 'b':
+			blast_radius = true;
+			break;
+
 		case 'c':
-			if (!isdigit((int) *optarg)) usage();
+			if (!isdigit((uint8_t) *optarg)) usage();
 
 			resend_count = atoi(optarg);
 
@@ -1185,6 +1777,15 @@ int main(int argc, char **argv)
 		case 'C':
 		{
 			int tmp;
+
+			if (strchr(optarg, ':')) {
+				if (fr_inet_pton_port(&client_ipaddr, &client_port,
+						      optarg, -1, AF_UNSPEC, true, false) < 0) {
+					fr_perror("Failed parsing source address");
+					fr_exit_now(1);
+				}
+				break;
+			}
 
 			tmp = atoi(optarg);
 			if (tmp < 1 || tmp > 65535) usage();
@@ -1198,27 +1799,63 @@ int main(int argc, char **argv)
 			break;
 
 		case 'd':
-			raddb_dir = optarg;
+			confdir = optarg;
 			break;
 
+		case 'e':	/* magical extra stuff */
+			if (strncmp(optarg, "ignore_count=", 13) == 0) {
+				ignore_count = atoi(optarg + 13);
+				break;
+			}
+			usage();
+
+			/*
+			 *	packet,filter,coa_reply,coa_filter
+			 */
 		case 'f':
 		{
 			char const *p;
 			rc_file_pair_t *files;
 
-			files = talloc(talloc_autofree_context(), rc_file_pair_t);
-			if (!files) goto oom;
+			MEM(files = talloc_zero(talloc_autofree_context(), rc_file_pair_t));
 
-			p = strchr(optarg, ':');
-			if (p) {
-				files->packets = talloc_strndup(files, optarg, p - optarg);
-				if (!files->packets) goto oom;
-				files->filters = p + 1;
-			} else {
+			/*
+			 *	Commas are nicer than colons.
+			 */
+			c = ':';
+
+			p = strchr(optarg, c);
+			if (!p) {
+				c = ',';
+				p = strchr(optarg, c);
+			}
+			if (!p) {
 				files->packets = optarg;
 				files->filters = NULL;
+			} else {
+				char *q;
+
+				MEM(files->packets = talloc_strndup(files, optarg, p - optarg));
+				files->filters = p + 1;
+
+				/*
+				 *	Look for CoA filename
+				 */
+				q = UNCONST(char *, strchr(files->filters, c));
+				if (q) {
+					do_coa = true;
+
+					*(q++) = '\0';
+					files->coa_reply = q;
+
+					q = UNCONST(char *, strchr(files->coa_reply, c));
+					if (q) {
+						*(q++) = '\0';
+						files->coa_filter = q;
+					}
+				}
 			}
-			fr_rb_insert(filename_tree, (void *) files);
+			fr_dlist_insert_tail(&filenames, files);
 		}
 			break;
 
@@ -1227,9 +1864,10 @@ int main(int argc, char **argv)
 			break;
 
 		case 'i':
-			if (!isdigit((int) *optarg))
+			if (!isdigit((uint8_t) *optarg)) {
 				usage();
-			last_used_id = atoi(optarg);
+			}
+			fixed_id = last_used_id = atoi(optarg);
 			if ((last_used_id < 0) || (last_used_id > 255)) {
 				usage();
 			}
@@ -1238,6 +1876,15 @@ int main(int argc, char **argv)
 		case 'n':
 			persec = atoi(optarg);
 			if (persec <= 0) usage();
+			break;
+
+		case 'o':
+		{
+			int port = atoi(optarg);
+
+			if ((port <= 0) || (port > UINT16_MAX)) usage();
+			coa_port = (uint16_t) port;
+		}
 			break;
 
 			/*
@@ -1263,7 +1910,7 @@ int main(int argc, char **argv)
 			break;
 
 		case 'r':
-			if (!isdigit((int) *optarg)) usage();
+			if (!isdigit((uint8_t) *optarg)) usage();
 			retries = atoi(optarg);
 			if ((retries == 0) || (retries > 1000)) usage();
 			break;
@@ -1303,7 +1950,7 @@ int main(int argc, char **argv)
 		       break;
 
 		case 't':
-			if (fr_time_delta_from_str(&timeout, optarg, FR_TIME_RES_SEC) < 0) {
+			if (fr_time_delta_from_str(&timeout, optarg, strlen(optarg), FR_TIME_RES_SEC) < 0) {
 				fr_perror("Failed parsing timeout value");
 				fr_exit_now(EXIT_FAILURE);
 			}
@@ -1338,12 +1985,12 @@ int main(int argc, char **argv)
 		fr_exit_now(EXIT_FAILURE);
 	}
 
-	if (!fr_dict_global_ctx_init(autofree, dict_dir)) {
+	if (!fr_dict_global_ctx_init(NULL, true, dict_dir)) {
 		fr_perror("radclient");
 		fr_exit_now(EXIT_FAILURE);
 	}
 
-	if (fr_radius_init() < 0) {
+	if (fr_radius_global_init() < 0) {
 		fr_perror("radclient");
 		fr_exit_now(EXIT_FAILURE);
 	}
@@ -1358,24 +2005,45 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	if (fr_dict_read(fr_dict_unconst(dict_freeradius), raddb_dir, FR_DICTIONARY_FILE) == -1) {
+	if (fr_dict_read(fr_dict_unconst(dict_freeradius), confdir, FR_DICTIONARY_FILE) == -1) {
 		fr_log_perror(&default_log, L_ERR, __FILE__, __LINE__, NULL,
 			      "Failed to initialize the dictionaries");
 		exit(EXIT_FAILURE);
 	}
+
+	if (do_coa) {
+		attr_coa_match_attr = fr_dict_attr_by_name(NULL, fr_dict_root(dict_radius), attr_coa_filter_name);
+		if (!attr_coa_match_attr) {
+			ERROR("Unknown or invalid CoA filter attribute %s", attr_coa_filter_name);
+			fr_exit_now(1);
+		}
+
+		MEM(coa_tree = fr_rb_inline_talloc_alloc(NULL, rc_request_t, node, request_cmp, NULL));
+	}
+	packet_global_init();
+
 	fr_strerror_clear();	/* Clear the error buffer */
 
 	/*
 	 *	Get the request type
 	 */
-	if (!isdigit((int) argv[2][0])) {
-		packet_code = fr_table_value_by_str(fr_request_types, argv[2], -2);
+	if (!isdigit((uint8_t) argv[2][0])) {
+		packet_code = fr_table_value_by_str(fr_radius_request_name_table, argv[2], -2);
 		if (packet_code == -2) {
 			ERROR("Unrecognised request type \"%s\"", argv[2]);
 			usage();
 		}
 	} else {
 		packet_code = atoi(argv[2]);
+	}
+
+	/*
+	 *	"auto" is FR_RADIUS_CODE_UNDEFINED, and the code is then
+	 *	chosen from the destination port.
+	 */
+	if ((packet_code != FR_RADIUS_CODE_UNDEFINED) && !FR_RADIUS_PACKET_CODE_VALID(packet_code)) {
+		ERROR("Invalid request type \"%s\"", argv[2]);
+		usage();
 	}
 
 	/*
@@ -1397,12 +2065,15 @@ int main(int argc, char **argv)
 	/*
 	 *	Add the secret.
 	 */
-	if (argv[3]) secret = talloc_strdup(NULL, argv[3]);
+	if (argv[3]) {
+		talloc_free(secret);
+		secret = talloc_strdup(NULL, argv[3]);
+	}
 
 	/*
 	 *	If no '-f' is specified, we're reading from stdin.
 	 */
-	if (fr_rb_num_elements(filename_tree) == 0) {
+	if (fr_dlist_num_elements(&filenames) == 0) {
 		rc_file_pair_t *files;
 
 		files = talloc_zero(talloc_autofree_context(), rc_file_pair_t);
@@ -1413,70 +2084,80 @@ int main(int argc, char **argv)
 	/*
 	 *	Walk over the list of filenames, creating the requests.
 	 */
-	{
-		fr_rb_iter_inorder_t	iter;
-		rc_file_pair_t			*files;
-
-		for (files = fr_rb_iter_init_inorder(&iter, filename_tree);
-		     files;
-		     files = fr_rb_iter_next_inorder(&iter)) {
-			if (radclient_init(files, files)) {
-				ERROR("Failed parsing input files");
-				fr_exit_now(1);
-			}
+	fr_dlist_foreach(&filenames, rc_file_pair_t, files) {
+		if (radclient_init(files, files)) {
+			ERROR("Failed parsing input files");
+			fr_exit_now(1);
 		}
 	}
 
 	/*
 	 *	No packets read.  Die.
 	 */
-	if (!request_head) {
+	if (!rc_request_list_num_elements(&rc_request_list)) {
 		ERROR("Nothing to send");
 		fr_exit_now(1);
+	}
+
+	if (openssl3_init() < 0) {
+		fr_perror("radclient");
+		fr_exit_now(EXIT_FAILURE);
 	}
 
 	/*
 	 *	Bind to the first specified IP address and port.
 	 *	This means we ignore later ones.
 	 */
-	if (request_head->packet->socket.inet.src_ipaddr.af == AF_UNSPEC) {
-		memset(&client_ipaddr, 0, sizeof(client_ipaddr));
-		client_ipaddr.af = server_ipaddr.af;
-	} else {
-		client_ipaddr = request_head->packet->socket.inet.src_ipaddr;
+	request = rc_request_list_head(&rc_request_list);
+
+	if (client_ipaddr.af == AF_UNSPEC) {
+		if (request->packet->socket.inet.src_ipaddr.af == AF_UNSPEC) {
+			memset(&client_ipaddr, 0, sizeof(client_ipaddr));
+			client_ipaddr.af = server_ipaddr.af;
+		} else {
+			client_ipaddr = request->packet->socket.inet.src_ipaddr;
+		}
 	}
 
-	if (client_port == 0) client_port = request_head->packet->socket.inet.src_port;
+	if (client_port == 0) client_port = request->packet->socket.inet.src_port;
 
 	if (ipproto == IPPROTO_TCP) {
-		sockfd = fr_socket_client_tcp(NULL, &server_ipaddr, server_port, false);
+		sockfd = fr_socket_client_tcp(NULL, NULL, &server_ipaddr, server_port, false);
 		if (sockfd < 0) {
-			ERROR("Failed opening socket");
+			ERROR("Failed opening client TCP socket");
 			return -1;
 		}
 
 	} else {
 		sockfd = fr_socket_server_udp(&client_ipaddr, &client_port, NULL, false);
 		if (sockfd < 0) {
-			fr_perror("Error opening socket");
+			fr_perror("Error opening client UDP socket");
 			return -1;
 		}
 
-		if (fr_socket_bind(sockfd, &client_ipaddr, &client_port, NULL) < 0) {
+		if (fr_socket_bind(sockfd, NULL, &client_ipaddr, &client_port) < 0) {
 			fr_perror("Error binding socket");
 			return -1;
 		}
 	}
 
-	packet_list = fr_packet_list_create(1);
-	if (!packet_list) {
-		ERROR("Out of memory");
-		fr_exit_now(1);
+	if (do_coa) {
+		coafd = fr_socket_server_udp(&client_ipaddr, &coa_port, NULL, false);
+		if (coafd < 0) {
+			fr_perror("Error opening CoA socket");
+			return -1;
+		}
+
+		if (fr_socket_bind(coafd, NULL, &client_ipaddr, &coa_port) < 0) {
+			fr_perror("Error binding socket");
+			return -1;
+		}
 	}
 
+	MEM(packet_list = fr_packet_list_create(1));
 	if (!fr_packet_list_socket_add(packet_list, sockfd, ipproto, &server_ipaddr,
 				       server_port, NULL)) {
-		ERROR("Failed adding socket");
+		fr_perror("Failed adding socket");
 		fr_exit_now(1);
 	}
 
@@ -1484,7 +2165,7 @@ int main(int argc, char **argv)
 	 *	Walk over the list of packets, sanity checking
 	 *	everything.
 	 */
-	for (this = request_head; this != NULL; this = this->next) {
+	rc_request_list_foreach(&rc_request_list, this) {
 		this->packet->socket.inet.src_ipaddr = client_ipaddr;
 		this->packet->socket.inet.src_port = client_port;
 		if (radclient_sane(this) != 0) {
@@ -1503,30 +2184,41 @@ int main(int argc, char **argv)
 	 */
 	do {
 		int n = parallel;
-		rc_request_t *next;
 		char const *filename = NULL;
 
 		done = true;
-		sleep_time = -1;
+		sleep_time = fr_time_delta_wrap(-1);
 
 		/*
 		 *	Walk over the packets, sending them.
+		 *
+		 *	This essentially ends up handling
+		 *	retries as well, as requests to
+		 *	retry stay in the request list, and
+		 *	then get sent again on the next
+		 *	iteration of the outer loop.
 		 */
-
-		for (this = request_head; this != NULL; this = next) {
-			next = this->next;
-
+		rc_request_list_foreach(&rc_request_list, this) {
 			/*
 			 *	If there's a packet to receive,
 			 *	receive it, but don't wait for a
 			 *	packet.
 			 */
-			recv_one_packet(0);
+			recv_one_packet(fr_time_delta_wrap(0));
 
 			/*
 			 *	This packet is done.  Delete it.
 			 */
 			if (this->done) {
+				/*
+				 *	We still have a CoA reply to
+				 *	receive for this packet.
+				 */
+				if (this->coa) {
+					recv_coa_packet(fr_time_delta_wrap(0));
+					if (this->coa) continue;
+				}
+
 				talloc_free(this);
 				continue;
 			}
@@ -1563,12 +2255,12 @@ int main(int argc, char **argv)
 				if (persec) {
 					fr_time_delta_t psec;
 
-					psec = (persec == 1) ? fr_time_delta_from_sec(1) : (1000000 / persec);
+					psec = (persec == 1) ? fr_time_delta_from_sec(1) : fr_time_delta_wrap(1000000 / persec);
 
 					/*
 					 *	Don't sleep elsewhere.
 					 */
-					sleep_time = 0;
+					sleep_time = fr_time_delta_wrap(0);
 
 
 					/*
@@ -1591,15 +2283,15 @@ int main(int argc, char **argv)
 					int i;
 
 					done = false;
-					sleep_time = 0;
+					sleep_time = fr_time_delta_wrap(0);
 
 					for (i = 0; i < 4; i++) {
 						((uint32_t *) this->packet->vector)[i] = fr_rand();
 					}
 				}
 			} else { /* haven't sent this packet, we're not done */
-				assert(this->done == false);
-				assert(this->reply == NULL);
+				fr_assert(this->done == false);
+				fr_assert(this->reply == NULL);
 				done = false;
 			}
 		}
@@ -1610,7 +2302,7 @@ int main(int argc, char **argv)
 		if (fr_packet_list_num_elements(packet_list) > 0) {
 			done = false;
 		} else {
-			sleep_time = 0;
+			sleep_time = fr_time_delta_wrap(0);
 		}
 
 		/*
@@ -1620,41 +2312,56 @@ int main(int argc, char **argv)
 		 *	sending more packets (if necessary), and updating
 		 *	the sleep time.
 		 */
-		if (!done && (sleep_time > 0)) {
+		if (!done && fr_time_delta_ispos(sleep_time)) {
 			recv_one_packet(sleep_time);
 		}
 	} while (!done);
 
-	talloc_free(filename_tree);
-
 	fr_packet_list_free(packet_list);
 
-	while (request_head) TALLOC_FREE(request_head);
+	rc_request_list_talloc_free(&rc_request_list);
+
+	talloc_free(coa_tree);
 
 	talloc_free(secret);
 
-	fr_radius_free();
+	fr_radius_global_free();
 
-	fr_dict_autofree(radclient_dict);
+	if (fr_dict_autofree(radclient_dict) < 0) {
+		fr_perror("radclient");
+		ret = EXIT_FAILURE;
+	}
+
+#ifndef NDEBUG
+	talloc_free(autofree);
+#endif
 
 	if (do_summary) {
 		fr_perror("Packet summary:\n"
 		      "\tAccepted      : %" PRIu64 "\n"
 		      "\tRejected      : %" PRIu64 "\n"
 		      "\tLost          : %" PRIu64 "\n"
+		      "\tErrored       : %" PRIu64 "\n"
 		      "\tPassed filter : %" PRIu64 "\n"
 		      "\tFailed filter : %" PRIu64,
 		      stats.accepted,
 		      stats.rejected,
 		      stats.lost,
+		      stats.error,
 		      stats.passed,
 		      stats.failed
 		);
 	}
 
-	if ((stats.lost > 0) || (stats.failed > 0)) {
-		fr_exit_now(EXIT_FAILURE);
-	}
+	/*
+	 *	Ensure our atexit handlers run before any other
+	 *	atexit handlers registered by third party libraries.
+	 */
+	fr_atexit_global_trigger_all();
 
-	fr_exit_now(EXIT_SUCCESS);
+	if ((stats.lost > 0) || (stats.failed > 0)) return EXIT_FAILURE;
+
+	openssl3_free();
+
+	return ret;
 }

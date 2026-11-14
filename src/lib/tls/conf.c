@@ -20,28 +20,39 @@
  * @file tls/conf.c
  * @brief Configuration parsing for TLS servers and clients.
  *
- * @copyright 2001 hereUare Communications, Inc. (raghud@hereuare.com)
- * @copyright 2003 Alan DeKok (aland@freeradius.org)
- * @copyright 2006-2016 The FreeRADIUS server project
+ * @copyright 2026 Network RADIUS SAS (legal@networkradius.com)
  */
 RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #ifdef WITH_TLS
-#define LOG_PREFIX "tls - "
+#define LOG_PREFIX "tls"
 
 #ifdef HAVE_SYS_STAT_H
 #  include <sys/stat.h>
 #endif
 #include <openssl/conf.h>
+#include <openssl/pem.h>
 
-#include <freeradius-devel/server/base.h>
 #include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/virtual_servers.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/syserror.h>
+#include <freeradius-devel/util/rand.h>
+#include <freeradius-devel/util/math.h>
 
 #include "base.h"
 #include "log.h"
+#include "strerror.h"
+#include "utils.h"
+
+static int tls_conf_parse_server_cache_mode(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule);
+static int tls_conf_parse_client_cache_mode(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule);
+static int tls_virtual_server_cf_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule);
+static int tls_fragment_size_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule);
+static int tls_padding_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule);
+static int tls_ticket_lifetime_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule);
+static int tls_chain_private_key_file_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule);
 
 /** Certificate formats
  *
@@ -61,10 +72,10 @@ static fr_table_num_sorted_t const chain_verify_mode_table[] = {
 static size_t chain_verify_mode_table_len = NUM_ELEMENTS(chain_verify_mode_table);
 
 static fr_table_num_sorted_t const cache_mode_table[] = {
-	{ L("auto"),			FR_TLS_CACHE_AUTO			},
-	{ L("disabled"),		FR_TLS_CACHE_DISABLED			},
-	{ L("stateful"),		FR_TLS_CACHE_STATEFUL			},
-	{ L("stateless"),		FR_TLS_CACHE_STATELESS			}
+	{ L("auto"),			FR_TLS_TICKET_AUTO			},
+	{ L("disabled"),		FR_TLS_TICKET_DISABLED			},
+	{ L("stateful"),		FR_TLS_TICKET_STATEFUL			},
+	{ L("stateless"),		FR_TLS_TICKET_STATELESS			}
 };
 static size_t cache_mode_table_len = NUM_ELEMENTS(cache_mode_table);
 
@@ -77,444 +88,763 @@ static fr_table_num_sorted_t const verify_mode_table[] = {
 };
 static size_t verify_mode_table_len = NUM_ELEMENTS(verify_mode_table);
 
-static CONF_PARSER tls_cache_config[] = {
-	{ FR_CONF_OFFSET("mode", FR_TYPE_UINT32, fr_tls_cache_conf_t, mode),
-			 .func = cf_table_parse_int,
+/*
+ *	The client and server share ticket configurations.  However, their parsers for "mode" are different,
+ *	because the client just calls load / store session, and the server can call encode / decode session.
+ */
+#define TLS_TICKET_CONFIG_COMMON \
+	{ FR_CONF_OFFSET_HINT_TYPE("name", FR_TYPE_STRING, fr_tls_ticket_conf_t, id_name), \
+			 .dflt = "%{EAP-Type}%interpreter('server')", .quote = T_DOUBLE_QUOTED_STRING }, \
+	{ FR_CONF_OFFSET("lifetime", fr_tls_ticket_conf_t, lifetime), .func = tls_ticket_lifetime_parse, .dflt = "1d" }, \
+	{ FR_CONF_OFFSET_IS_SET("min_lifetime", FR_TYPE_TIME_DELTA, 0, fr_tls_ticket_conf_t, min_lifetime), \
+			 .dflt = "10s" }, \
+	{ FR_CONF_OFFSET("require_extended_master_secret", fr_tls_ticket_conf_t, require_extms), .dflt = "yes" }, \
+	{ FR_CONF_OFFSET("require_perfect_forward_secrecy", fr_tls_ticket_conf_t, require_pfs), .dflt = "no" }, \
+	{ FR_CONF_OFFSET("session_ticket_key", fr_tls_ticket_conf_t, session_ticket_key) }, \
+	{ FR_CONF_V3_DEPRECATED("enable", fr_tls_ticket_conf_t, NULL) }, \
+	{ FR_CONF_V3_DEPRECATED("max_entries", fr_tls_ticket_conf_t, NULL) }, \
+	{ FR_CONF_V3_DEPRECATED("persist_dir", fr_tls_ticket_conf_t, NULL) },
+
+static conf_parser_t tls_server_ticket_config[] = {
+	{ FR_CONF_OFFSET("mode", fr_tls_ticket_conf_t, mode),
+			 .func = tls_conf_parse_server_cache_mode,
 			 .uctx = &(cf_table_parse_ctx_t){
-			 	.table = cache_mode_table,
-			 	.len = &cache_mode_table_len
+				 .table = cache_mode_table,
+				 .len = &cache_mode_table_len
 			 },
-			 .dflt = "auto" },
-	{ FR_CONF_OFFSET("name", FR_TYPE_TMPL, fr_tls_cache_conf_t, id_name),
-			 .dflt = "%{EAP-Type}%{Virtual-Server}", .quote = T_DOUBLE_QUOTED_STRING },
-	{ FR_CONF_OFFSET("lifetime", FR_TYPE_UINT32, fr_tls_cache_conf_t, lifetime), .dflt = "86400" },
-
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
-	{ FR_CONF_OFFSET("require_extended_master_secret", FR_TYPE_BOOL, fr_tls_cache_conf_t, require_extms), .dflt = "yes" },
-	{ FR_CONF_OFFSET("require_perfect_forward_secrecy", FR_TYPE_BOOL, fr_tls_cache_conf_t, require_pfs), .dflt = "no" },
-#endif
-
-	/*
-	 *	Deprecated
-	 */
-	{ FR_CONF_DEPRECATED("enable", FR_TYPE_BOOL, fr_tls_cache_conf_t, NULL) },
-	{ FR_CONF_DEPRECATED("max_entries", FR_TYPE_UINT32, fr_tls_cache_conf_t, NULL) },
-	{ FR_CONF_DEPRECATED("persist_dir", FR_TYPE_STRING, fr_tls_cache_conf_t, NULL) },
+			 .dflt = "disabled" },
+	TLS_TICKET_CONFIG_COMMON
 
 	CONF_PARSER_TERMINATOR
 };
 
-static CONF_PARSER tls_chain_config[] = {
-	{ FR_CONF_OFFSET("format", FR_TYPE_VOID, fr_tls_chain_conf_t, file_format),
+static conf_parser_t tls_client_ticket_config[] = {
+	{ FR_CONF_OFFSET("mode", fr_tls_ticket_conf_t, mode),
+			 .func = tls_conf_parse_client_cache_mode,
+			 .uctx = &(cf_table_parse_ctx_t){
+				 .table = cache_mode_table,
+				 .len = &cache_mode_table_len
+			 },
+			 .dflt = "disabled" },
+	TLS_TICKET_CONFIG_COMMON
+
+	CONF_PARSER_TERMINATOR
+};
+
+static conf_parser_t tls_chain_config[] = {
+	{ FR_CONF_OFFSET("format", fr_tls_chain_conf_t, file_format),
 			 .func = cf_table_parse_int,
 			 .uctx = &(cf_table_parse_ctx_t){
 			 	.table = certificate_format_table,
 			 	.len = &certificate_format_table_len
 			 },
 			 .dflt = "pem" },
-	{ FR_CONF_OFFSET("certificate_file", FR_TYPE_FILE_INPUT | FR_TYPE_FILE_EXISTS | FR_TYPE_REQUIRED , fr_tls_chain_conf_t, certificate_file) },
-	{ FR_CONF_OFFSET("private_key_password", FR_TYPE_STRING | FR_TYPE_SECRET, fr_tls_chain_conf_t, password) },
-	{ FR_CONF_OFFSET("private_key_file", FR_TYPE_FILE_INPUT | FR_TYPE_FILE_EXISTS | FR_TYPE_REQUIRED, fr_tls_chain_conf_t, private_key_file) },
+	/*
+	 *	private_key_file must be the last file row.  Its parse
+	 *	callback loads every file in the section.
+	 */
+	{ FR_CONF_OFFSET_FLAGS("ca_file", CONF_FLAG_FILE_READABLE | CONF_FLAG_MULTI, fr_tls_chain_conf_t, ca_files) },
+	{ FR_CONF_OFFSET_FLAGS("certificate_file", CONF_FLAG_FILE_READABLE | CONF_FLAG_FILE_EXISTS | CONF_FLAG_REQUIRED, fr_tls_chain_conf_t, certificate_file) },
+	{ FR_CONF_OFFSET_FLAGS("private_key_password", CONF_FLAG_SECRET, fr_tls_chain_conf_t, password) },
+	{ FR_CONF_OFFSET_FLAGS("private_key_file", CONF_FLAG_FILE_READABLE | CONF_FLAG_FILE_EXISTS | CONF_FLAG_REQUIRED, fr_tls_chain_conf_t, private_key_file),
+			 .func = tls_chain_private_key_file_parse },
 
-	{ FR_CONF_OFFSET("ca_file", FR_TYPE_FILE_INPUT | FR_TYPE_MULTI, fr_tls_chain_conf_t, ca_files) },
-
-	{ FR_CONF_OFFSET("verify_mode", FR_TYPE_VOID, fr_tls_chain_conf_t, verify_mode),
-			 .func = cf_table_parse_int,
+	{ FR_CONF_OFFSET("verify_mode", fr_tls_chain_conf_t, verify_mode),
+			 .func = cf_table_parse_uint8,
 			 .uctx = &(cf_table_parse_ctx_t){
 			 	.table = chain_verify_mode_table,
 			 	.len = &chain_verify_mode_table_len
 			 },
 			 .dflt = "hard" },
-	{ FR_CONF_OFFSET("include_root_ca", FR_TYPE_BOOL, fr_tls_chain_conf_t, include_root_ca), .dflt = "no" },
+	{ FR_CONF_OFFSET("include_root_ca", fr_tls_chain_conf_t, include_root_ca), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
-static CONF_PARSER tls_verify_config[] = {
-	{ FR_CONF_OFFSET("mode", FR_TYPE_VOID, fr_tls_verify_conf_t, mode),
-			 .func = cf_table_parse_int,
+static conf_parser_t tls_verify_config[] = {
+	{ FR_CONF_OFFSET("mode", fr_tls_verify_conf_t, mode),
+			 .func = cf_table_parse_uint8,
 			 .uctx = &(cf_table_parse_ctx_t){
 			 	.table = verify_mode_table,
 			 	.len = &verify_mode_table_len
 			 },
 			 .dflt = "all" },
-	{ FR_CONF_OFFSET("pair_mode", FR_TYPE_VOID, fr_tls_verify_conf_t, pair_mode),
-			 .func = cf_table_parse_int,
+	{ FR_CONF_OFFSET("attribute_mode", fr_tls_verify_conf_t, attribute_mode),
+			 .func = cf_table_parse_uint8,
 			 .uctx = &(cf_table_parse_ctx_t){
 			 	.table = verify_mode_table,
 			 	.len = &verify_mode_table_len
 			 },
 			 .dflt = "client-and-issuer" },
-	{ FR_CONF_OFFSET("check_crl", FR_TYPE_BOOL, fr_tls_verify_conf_t, check_crl), .dflt = "no" },
-	{ FR_CONF_OFFSET("allow_expired_crl", FR_TYPE_BOOL, fr_tls_verify_conf_t, allow_expired_crl) },
+	{ FR_CONF_OFFSET("der_decode", fr_tls_verify_conf_t, der_decode) },
 	CONF_PARSER_TERMINATOR
 };
 
-CONF_PARSER fr_tls_server_config[] = {
-	{ FR_CONF_OFFSET("virtual_server", FR_TYPE_VOID, fr_tls_conf_t, virtual_server), .func = virtual_server_cf_parse },
-
-	{ FR_CONF_OFFSET("auto_chain", FR_TYPE_BOOL, fr_tls_conf_t, auto_chain), .dflt = "yes" },
-
-	{ FR_CONF_OFFSET("chain", FR_TYPE_SUBSECTION | FR_TYPE_MULTI, fr_tls_conf_t, chains),
-	  .subcs_size = sizeof(fr_tls_chain_conf_t), .subcs_type = "fr_tls_chain_conf_t",
-	  .subcs = tls_chain_config, .ident2 = CF_IDENT_ANY },
-
-	{ FR_CONF_DEPRECATED("pem_file_type", FR_TYPE_BOOL, fr_tls_conf_t, NULL) },
-	{ FR_CONF_DEPRECATED("certificate_file", FR_TYPE_FILE_INPUT, fr_tls_conf_t, NULL) },
-	{ FR_CONF_DEPRECATED("private_key_password", FR_TYPE_STRING | FR_TYPE_SECRET, fr_tls_conf_t, NULL) },
-	{ FR_CONF_DEPRECATED("private_key_file", FR_TYPE_FILE_INPUT, fr_tls_conf_t, NULL) },
-
-	{ FR_CONF_OFFSET("verify_depth", FR_TYPE_UINT32, fr_tls_conf_t, verify_depth), .dflt = "0" },
-	{ FR_CONF_OFFSET("ca_path", FR_TYPE_FILE_INPUT, fr_tls_conf_t, ca_path) },
-	{ FR_CONF_OFFSET("ca_file", FR_TYPE_FILE_INPUT, fr_tls_conf_t, ca_file) },
 #ifdef PSK_MAX_IDENTITY_LEN
-	{ FR_CONF_OFFSET("psk_identity", FR_TYPE_STRING, fr_tls_conf_t, psk_identity) },
-	{ FR_CONF_OFFSET("psk_hexphrase", FR_TYPE_STRING | FR_TYPE_SECRET, fr_tls_conf_t, psk_password) },
-	{ FR_CONF_OFFSET("psk_query", FR_TYPE_STRING, fr_tls_conf_t, psk_query) },
+static conf_parser_t tls_psk_config[] = {
+	{ FR_CONF_OFFSET("identity", fr_tls_psk_conf_t, identity) },
+	{ FR_CONF_OFFSET_FLAGS("key", CONF_FLAG_SECRET, fr_tls_psk_conf_t, key) },
+	CONF_PARSER_TERMINATOR
+};
 #endif
-	{ FR_CONF_OFFSET("dh_file", FR_TYPE_FILE_INPUT, fr_tls_conf_t, dh_file) },
-	{ FR_CONF_OFFSET("fragment_size", FR_TYPE_UINT32, fr_tls_conf_t, fragment_size), .dflt = "1024" },
-	{ FR_CONF_OFFSET("padding", FR_TYPE_UINT32, fr_tls_conf_t, padding_block_size), },
 
-	{ FR_CONF_OFFSET("disable_single_dh_use", FR_TYPE_BOOL, fr_tls_conf_t, disable_single_dh_use) },
+conf_parser_t fr_tls_server_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("virtual_server", FR_TYPE_VOID, 0, fr_tls_conf_t, virtual_server), .func = tls_virtual_server_cf_parse },
 
-	{ FR_CONF_OFFSET("cipher_list", FR_TYPE_STRING, fr_tls_conf_t, cipher_list) },
-	{ FR_CONF_OFFSET("cipher_server_preference", FR_TYPE_BOOL, fr_tls_conf_t, cipher_server_preference), .dflt = "yes" },
+	{ FR_CONF_SUBSECTION_ALLOC_MULTI("chain", 0, fr_tls_conf_t, chains, tls_chain_config),
+	  .subcs_type = "fr_tls_chain_conf_t", .name2 = CF_IDENT_ANY },
+
+	{ FR_CONF_V3_DEPRECATED("pem_file_type", fr_tls_conf_t, NULL) },
+	{ FR_CONF_V3_DEPRECATED("certificate_file", fr_tls_conf_t, NULL) },
+	{ FR_CONF_V3_DEPRECATED("private_key_password", fr_tls_conf_t, NULL) },
+	{ FR_CONF_V3_DEPRECATED("private_key_file", fr_tls_conf_t, NULL) },
+
+	{ FR_CONF_OFFSET("verify_depth", fr_tls_conf_t, verify_depth), .dflt = "0" },
+	{ FR_CONF_OFFSET_FLAGS("ca_path", CONF_FLAG_FILE_READABLE, fr_tls_conf_t, ca_path) },
+	{ FR_CONF_OFFSET_FLAGS("ca_file", CONF_FLAG_FILE_READABLE, fr_tls_conf_t, ca_file) },
+
+#ifdef PSK_MAX_IDENTITY_LEN
+	{ FR_CONF_OFFSET_SUBSECTION("psk", 0, fr_tls_conf_t, psk, tls_psk_config) },
+	{ FR_CONF_V3_DEPRECATED("psk_identity", fr_tls_conf_t, NULL) },
+	{ FR_CONF_V3_DEPRECATED("psk_hexphrase", fr_tls_conf_t, NULL) },
+	{ FR_CONF_V3_DEPRECATED("psk_query", fr_tls_conf_t, NULL) },
+#endif
+	{ FR_CONF_OFFSET("keylog_file", fr_tls_conf_t, keylog_file) },
+
+	{ FR_CONF_OFFSET_FLAGS("dh_file", CONF_FLAG_FILE_READABLE, fr_tls_conf_t, dh_file) },
+	{ FR_CONF_OFFSET("fragment_size", fr_tls_conf_t, fragment_size), .func = tls_fragment_size_parse, .dflt = "1024" },
+	{ FR_CONF_OFFSET("padding", fr_tls_conf_t, padding_block_size), .func = tls_padding_parse },
+
+	{ FR_CONF_OFFSET("disable_single_dh_use", fr_tls_conf_t, disable_single_dh_use) },
+
+	{ FR_CONF_OFFSET("cipher_list", fr_tls_conf_t, cipher_list) },
+	{ FR_CONF_OFFSET("cipher_suites", fr_tls_conf_t, cipher_suites) },
+	{ FR_CONF_OFFSET("group_list", fr_tls_conf_t, group_list) },
+	{ FR_CONF_OFFSET("cipher_server_preference", fr_tls_conf_t, cipher_server_preference), .dflt = "yes" },
 #ifdef SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS
-	{ FR_CONF_OFFSET("allow_renegotiation", FR_TYPE_BOOL, fr_tls_conf_t, allow_renegotiation), .dflt = "no" },
+	{ FR_CONF_OFFSET("allow_renegotiation", fr_tls_conf_t, allow_renegotiation), .dflt = "no" },
 #endif
 
 #ifndef OPENSSL_NO_ECDH
-	{ FR_CONF_OFFSET("ecdh_curve", FR_TYPE_STRING, fr_tls_conf_t, ecdh_curve), .dflt = "prime256v1" },
+	{ FR_CONF_OFFSET("ecdh_curve", fr_tls_conf_t, ecdh_curve), .dflt = "prime256v1" },
 #endif
-	{ FR_CONF_OFFSET("tls_max_version", FR_TYPE_FLOAT32, fr_tls_conf_t, tls_max_version) },
+	{ FR_CONF_OFFSET("tls_max_version", fr_tls_conf_t, tls_max_version) },
 
-	{ FR_CONF_OFFSET("tls_min_version", FR_TYPE_FLOAT32, fr_tls_conf_t, tls_min_version), .dflt = "1.2" },
+	{ FR_CONF_OFFSET("tls_min_version", fr_tls_conf_t, tls_min_version), .dflt = "1.2" },
 
-	{ FR_CONF_OFFSET("session", FR_TYPE_SUBSECTION, fr_tls_conf_t, cache), .subcs = (void const *) tls_cache_config },
+	{ FR_CONF_OFFSET("client_hello_parse", fr_tls_conf_t, client_hello_parse )},
 
-	{ FR_CONF_OFFSET("verify", FR_TYPE_SUBSECTION, fr_tls_conf_t, verify), .subcs = (void const *) tls_verify_config },
+	{ FR_CONF_OFFSET_SUBSECTION("session", 0, fr_tls_conf_t, cache, tls_server_ticket_config) },
 
-	{ FR_CONF_DEPRECATED("check_cert_issuer", FR_TYPE_STRING, fr_tls_conf_t, check_cert_issuer) },
-	{ FR_CONF_DEPRECATED("check_cert_cn", FR_TYPE_STRING, fr_tls_conf_t, check_cert_cn) },
+	{ FR_CONF_OFFSET_SUBSECTION("verify", 0, fr_tls_conf_t, verify, tls_verify_config) },
+
+	{ FR_CONF_OFFSET_SUBSECTION("cache", CONF_FLAG_V3_DEPRECATED, fr_tls_conf_t, cache, tls_server_ticket_config) },
+	{ FR_CONF_V3_DEPRECATED("check_cert_issuer", fr_tls_conf_t, check_cert_issuer) },
+	{ FR_CONF_V3_DEPRECATED("check_cert_cn", fr_tls_conf_t, check_cert_cn) },
 	CONF_PARSER_TERMINATOR
 };
 
-CONF_PARSER fr_tls_client_config[] = {
-	{ FR_CONF_OFFSET("chain", FR_TYPE_SUBSECTION | FR_TYPE_MULTI, fr_tls_conf_t, chains),
-	  .subcs_size = sizeof(fr_tls_chain_conf_t), .subcs_type = "fr_tls_chain_conf_t",
-	  .subcs = tls_chain_config },
+conf_parser_t fr_tls_client_config[] = {
+	/*
+	 *	Optional.  Without it a client validates the server certificate
+	 *	with OpenSSL alone, which is what a caller that owns its own
+	 *	transport wants.  With it, fr_tls_session_alloc_client() runs
+	 *	the `verify certificate` section of the named virtual server.
+	 */
+	{ FR_CONF_OFFSET_TYPE_FLAGS("virtual_server", FR_TYPE_VOID, CONF_FLAG_OK_MISSING, fr_tls_conf_t, virtual_server),
+	  .func = tls_virtual_server_cf_parse },
 
-	{ FR_CONF_DEPRECATED("pem_file_type", FR_TYPE_BOOL, fr_tls_conf_t, NULL) },
-	{ FR_CONF_DEPRECATED("certificate_file", FR_TYPE_FILE_INPUT, fr_tls_conf_t, NULL) },
-	{ FR_CONF_DEPRECATED("private_key_password", FR_TYPE_STRING | FR_TYPE_SECRET, fr_tls_conf_t, NULL) },
-	{ FR_CONF_DEPRECATED("private_key_file", FR_TYPE_FILE_INPUT, fr_tls_conf_t, NULL) },
+	{ FR_CONF_SUBSECTION_ALLOC_MULTI("chain", CONF_FLAG_OK_MISSING, fr_tls_conf_t, chains, tls_chain_config),
+	  .subcs_type = "fr_tls_chain_conf_t" },
 
-	{ FR_CONF_OFFSET("verify_depth", FR_TYPE_UINT32, fr_tls_conf_t, verify_depth), .dflt = "0" },
-	{ FR_CONF_OFFSET("ca_path", FR_TYPE_FILE_INPUT, fr_tls_conf_t, ca_path) },
+	{ FR_CONF_OFFSET_SUBSECTION("verify", 0, fr_tls_conf_t, verify, tls_verify_config) },
 
-	{ FR_CONF_OFFSET("ca_file", FR_TYPE_FILE_INPUT, fr_tls_conf_t, ca_file) },
-	{ FR_CONF_OFFSET("dh_file", FR_TYPE_STRING, fr_tls_conf_t, dh_file) },
-	{ FR_CONF_OFFSET("random_file", FR_TYPE_STRING, fr_tls_conf_t, random_file) },
-	{ FR_CONF_OFFSET("fragment_size", FR_TYPE_UINT32, fr_tls_conf_t, fragment_size), .dflt = "1024" },
+	{ FR_CONF_OFFSET_SUBSECTION("session", 0, fr_tls_conf_t, cache, tls_client_ticket_config) },
 
-	{ FR_CONF_OFFSET("cipher_list", FR_TYPE_STRING, fr_tls_conf_t, cipher_list) },
+	{ FR_CONF_V3_DEPRECATED("pem_file_type", fr_tls_conf_t, NULL) },
+	{ FR_CONF_V3_DEPRECATED("certificate_file", fr_tls_conf_t, NULL) },
+	{ FR_CONF_V3_DEPRECATED("private_key_password", fr_tls_conf_t, NULL) },
+	{ FR_CONF_V3_DEPRECATED("private_key_file", fr_tls_conf_t, NULL) },
+
+#ifdef PSK_MAX_IDENTITY_LEN
+	{ FR_CONF_OFFSET_SUBSECTION("psk", 0, fr_tls_conf_t, psk, tls_psk_config) },
+	{ FR_CONF_V3_DEPRECATED("psk_identity", fr_tls_conf_t, NULL) },
+	{ FR_CONF_V3_DEPRECATED("psk_hexphrase", fr_tls_conf_t, NULL) },
+#endif
+
+	{ FR_CONF_OFFSET("keylog_file", fr_tls_conf_t, keylog_file) },
+
+	{ FR_CONF_OFFSET("verify_depth", fr_tls_conf_t, verify_depth), .dflt = "0" },
+	{ FR_CONF_OFFSET_FLAGS("ca_path", CONF_FLAG_FILE_READABLE, fr_tls_conf_t, ca_path) },
+
+	{ FR_CONF_OFFSET_FLAGS("ca_file", CONF_FLAG_FILE_READABLE, fr_tls_conf_t, ca_file) },
+	{ FR_CONF_OFFSET("dh_file", fr_tls_conf_t, dh_file) },
+	{ FR_CONF_OFFSET("random_file", fr_tls_conf_t, random_file) },
+	{ FR_CONF_OFFSET("fragment_size", fr_tls_conf_t, fragment_size), .func = tls_fragment_size_parse, .dflt = "1024" },
+
+	{ FR_CONF_OFFSET("cipher_list", fr_tls_conf_t, cipher_list) },
+	{ FR_CONF_OFFSET("cipher_suites", fr_tls_conf_t, cipher_suites) },
 
 #ifndef OPENSSL_NO_ECDH
-	{ FR_CONF_OFFSET("ecdh_curve", FR_TYPE_STRING, fr_tls_conf_t, ecdh_curve), .dflt = "prime256v1" },
+	{ FR_CONF_OFFSET("ecdh_curve", fr_tls_conf_t, ecdh_curve), .dflt = "prime256v1" },
 #endif
 
-	{ FR_CONF_OFFSET("tls_max_version", FR_TYPE_FLOAT32, fr_tls_conf_t, tls_max_version) },
+	{ FR_CONF_OFFSET("tls_max_version", fr_tls_conf_t, tls_max_version) },
 
-	{ FR_CONF_OFFSET("tls_min_version", FR_TYPE_FLOAT32, fr_tls_conf_t, tls_min_version), .dflt = "1.2" },
+	{ FR_CONF_OFFSET("tls_min_version", fr_tls_conf_t, tls_min_version), .dflt = "1.2" },
 
-	{ FR_CONF_DEPRECATED("check_cert_issuer", FR_TYPE_STRING, fr_tls_conf_t, check_cert_issuer) },
-	{ FR_CONF_DEPRECATED("check_cert_cn", FR_TYPE_STRING, fr_tls_conf_t, check_cert_cn) },
+	{ FR_CONF_OFFSET_SUBSECTION("cache", CONF_FLAG_V3_DEPRECATED, fr_tls_conf_t, cache, tls_client_ticket_config) },
+	{ FR_CONF_V3_DEPRECATED("check_cert_issuer", fr_tls_conf_t, check_cert_issuer) },
+	{ FR_CONF_V3_DEPRECATED("check_cert_cn", fr_tls_conf_t, check_cert_cn) },
 	CONF_PARSER_TERMINATOR
 };
 
-#ifdef __APPLE__
-/*
- *	We don't want to put the private key password in eap.conf, so check
- *	for our special string which indicates we should get the password
- *	programmatically.
- */
-static char const *special_string = "Apple:UsecertAdmin";
-
-/** Use cert_admin to retrieve the password for the private key
- *
- */
-static int conf_cert_admin_password(fr_tls_conf_t *conf)
+static int tls_virtual_server_cf_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule)
 {
-	size_t i, cnt;
+	fr_tls_conf_t	*conf = talloc_get_type_abort(parent, fr_tls_conf_t);
+	virtual_server_t const	*vs = NULL;
 
-	if (!conf->chains) return 0;
+	if (virtual_server_cf_parse(ctx, &vs, parent, ci, rule) < 0) return -1;
 
-	cnt = talloc_array_length(conf->chains);
-	for (i = 0; i < cnt; i++) {
-		char		cmd[256];
-		char		*password;
-		long const	max_password_len = 128;
-		FILE		*cmd_pipe;
+	if (!vs) return 0;
 
-		if (!conf->chains[i]->password) continue;
+	/*
+	 *	`out` points to conf->virtual_server
+	 */
+	*((CONF_SECTION const **)out) = virtual_server_cs(vs);
 
-		if (strncmp(conf->chains[i]->password, special_string, strlen(special_string)) != 0) continue;
+#define EXISTS(_x, _y) (cf_section_find(conf->virtual_server, _x, _y) != NULL)
 
-		snprintf(cmd, sizeof(cmd) - 1, "/usr/sbin/certadmin --get-private-key-passphrase \"%s\"",
-			 conf->chains[i]->private_key_file);
-
-		DEBUG2("Getting private key passphrase using command \"%s\"", cmd);
-
-		cmd_pipe = popen(cmd, "r");
-		if (!cmd_pipe) {
-			ERROR("%s command failed: Unable to get private_key_password", cmd);
-			ERROR("Error reading private_key_file %s", conf->chains[i]->private_key_file);
-			return -1;
-		}
-
-		password = talloc_array(conf, char, max_password_len);
-		if (!password) {
-			ERROR("Can't allocate space for private_key_password");
-			ERROR("Error reading private_key_file %s", conf->chains[i]->private_key_file);
-			pclose(cmd_pipe);
-			return -1;
-		}
-
-		fgets(password, max_password_len, cmd_pipe);
-		pclose(cmd_pipe);
-
-		/* Get rid of newline at end of password. */
-		password[strlen(password) - 1] = '\0';
-
-		DEBUG3("Password from command = \"%s\"", password);
-		talloc_const_free(conf->chains[i]->password);
-		conf->chains[i]->password = password;
+	conf->verify_certificate = EXISTS("verify", "certificate");
+	conf->new_session = EXISTS("new", "session");
+	conf->establish_session = EXISTS("establish", "session");
+	conf->fail_session = EXISTS("fail", "session");
+	conf->encode_session = EXISTS("encode", "session");
+	conf->decode_session = EXISTS("decode", "session");
+	conf->load_session = EXISTS("load", "session");
+	conf->store_session = EXISTS("store", "session");
+	conf->clear_session = EXISTS("clear", "session");
+#ifdef PSK_MAX_IDENTITY_LEN
+	conf->load_psk = EXISTS("load", "psk");
+#else
+	if (cf_section_find(conf->virtual_server, "load", "psk")) {
+		cf_log_err(ci, "Specified virtual_server has a \"load psk { ... }\" section, "
+			   "but OpenSSL was built without PSK support");
+		return -1;
 	}
-
-	return 0;
-}
 #endif
-
-#ifdef HAVE_OPENSSL_OCSP_H
-/*
- * 	Create Global X509 revocation store and use it to verify
- * 	OCSP responses
- *
- * 	- Load the trusted CAs
- * 	- Load the trusted issuer certificates
- */
-static X509_STORE *conf_ocsp_revocation_store(fr_tls_conf_t *conf)
-{
-	X509_STORE *store = NULL;
-
-	store = X509_STORE_new();
-
-	/* Load the CAs we trust */
-	if (conf->ca_file || conf->ca_path)
-		if (!X509_STORE_load_locations(store, conf->ca_file, conf->ca_path)) {
-			fr_tls_log_error(NULL, "Error reading Trusted root CA list \"%s\"", conf->ca_file);
-			X509_STORE_free(store);
-			return NULL;
-		}
-
-#ifdef X509_V_FLAG_CRL_CHECK_ALL
-	if (conf->verify.check_crl) X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
-#endif
-
-	return store;
-}
-#endif
-
-/*
- *	Free TLS client/server config
- *	Should not be called outside this code, as a callback is
- *	added to automatically free the data when the CONF_SECTION
- *	is freed.
- */
-static int _conf_server_free(fr_tls_conf_t *conf)
-{
-	memset(conf, 0, sizeof(*conf));
 	return 0;
 }
 
-fr_tls_conf_t *fr_tls_conf_alloc(TALLOC_CTX *ctx)
+/** Generate the session ticket key if the mode needs one, and write out the mode
+ *
+ */
+static int tls_conf_cache_mode_set(fr_tls_conf_t *conf, int cache_mode, void *out)
 {
-	fr_tls_conf_t *conf;
-
-	conf = talloc_zero(ctx, fr_tls_conf_t);
-	if (!conf) {
-		ERROR("Out of memory");
-		return NULL;
+	/*
+	 *	Generate random, ephemeral, session-ticket keys.
+	 */
+	if (cache_mode & FR_TLS_TICKET_STATELESS) {
+		/*
+		 *	Fill the key with randomness if one wasn't specified by the user.
+		 */
+		if (!conf->cache.session_ticket_key) {
+			MEM(conf->cache.session_ticket_key = talloc_array(conf, uint8_t, 256));
+			fr_rand_buffer(UNCONST(uint8_t *, conf->cache.session_ticket_key),
+				       talloc_array_length(conf->cache.session_ticket_key));
+		}
 	}
 
-	talloc_set_destructor(conf, _conf_server_free);
+	*((int *)out) = cache_mode;
 
-	return conf;
+	return 0;
 }
 
-fr_tls_conf_t *fr_tls_conf_parse_server(CONF_SECTION *cs)
+#define CHECK_MODE(_x) \
+	do { \
+		if (!conf->_x ## _session) { \
+			cf_log_err(ci, "Virtual server %s must contain a \"" STRINGIFY(_x) " session { ... }\" section when session.mode = \"%s\"", cf_section_name2(conf->virtual_server), fr_table_str_by_value(cache_mode_table, cache_mode, "disabled")); \
+			return -1; \
+		} \
+	} while (0)
+
+/** Parse cache mode for a TLS server
+ *
+ * Stateless tickets need `encode session` and `decode session`.  @todo - arguable also `clear session` for
+ * "oopsies" like TTLS.
+ *
+ * Stateful tickets need `load session`, `store session`, and `clear session`.
+ */
+static int tls_conf_parse_server_cache_mode(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule)
 {
-	fr_tls_conf_t *conf;
+	fr_tls_conf_t	*conf = talloc_get_type_abort((uint8_t *)parent - offsetof(fr_tls_conf_t, cache), fr_tls_conf_t);
+	int		cache_mode;
+
+	if (cf_table_parse_int(ctx, &cache_mode, parent, ci, rule) < 0) return -1;
+
+	conf->cache.mode_is_auto = (cache_mode == FR_TLS_TICKET_AUTO);
 
 	/*
-	 *	If cs has already been parsed there should be a cached copy
-	 *	of conf already stored, so just return that.
+	 *	Modes other than "disabled" (0) require a virtual server.
 	 */
-	conf = cf_data_value(cf_data_find(cs, fr_tls_conf_t, NULL));
-	if (conf) {
-		DEBUG("Using cached TLS configuration from previous invocation");
-		return conf;
+	if (cache_mode && !conf->virtual_server) {
+		cf_log_err(ci, "A virtual_server must be set when session.mode = \"%s\"",
+			   fr_table_str_by_value(cache_mode_table, cache_mode, "disabled"));
+		return -1;
 	}
-
-	if (cf_section_rules_push(cs, fr_tls_server_config) < 0) return NULL;
-
-	conf = fr_tls_conf_alloc(cs);
-
-	if ((cf_section_parse(conf, conf, cs) < 0) ||
-	    (cf_section_parse_pass2(conf, cs) < 0)) {
-	error:
-		talloc_free(conf);
-		return NULL;
-	}
-
-	/*
-	 *	Save people from their own stupidity.
-	 */
-	if (conf->fragment_size < 100) conf->fragment_size = 100;
-
-	FR_INTEGER_BOUND_CHECK("padding", conf->padding_block_size, <=, SSL3_RT_MAX_PLAIN_LENGTH);
-
-#ifdef __APPLE__
-	if (conf_cert_admin_password(conf) < 0) goto error;
-#endif
 
 	/*
 	 *	Ensure our virtual server contains the
 	 *      correct sections for the specified
 	 *      cache mode.
 	 */
-	switch (conf->cache.mode) {
-	case FR_TLS_CACHE_DISABLED:
-	case FR_TLS_CACHE_STATELESS:
+	switch (cache_mode) {
+	case FR_TLS_TICKET_DISABLED:
 		break;
 
-	case FR_TLS_CACHE_STATEFUL:
-		if (!conf->virtual_server) {
-			ERROR("A virtual_server must be set when cache.mode = \"stateful\"");
-			goto error;
-		}
-
-		if (!cf_section_find(conf->virtual_server, "load", "session")) {
-			ERROR("Specified virtual_server must contain a \"load session { ... }\" section "
-			      "when cache.mode = \"stateful\"");
-			goto error;
-		}
-
-		if (!cf_section_find(conf->virtual_server, "store", "session")) {
-			ERROR("Specified virtual_server must contain a \"store session { ... }\" section "
-			      "when cache.mode = \"stateful\"");
-			goto error;
-		}
-
-		if (!cf_section_find(conf->virtual_server, "clear", "session")) {
-			ERROR("Specified virtual_server must contain a \"clear session { ... }\" section "
-			      "when cache.mode = \"stateful\"");
-			goto error;
-		}
-
-		if (conf->tls_min_version >= (float)1.3) {
-			ERROR("cache.mode = \"stateful\" is not supported with tls_min_version >= 1.3");
-			goto error;
-		}
+	case FR_TLS_TICKET_STATELESS:
+		CHECK_MODE(encode);
+		CHECK_MODE(decode);
 		break;
 
-	case FR_TLS_CACHE_AUTO:
-		if (!conf->virtual_server) {
-			WARN("A virtual_server must be provided for stateful caching. "
-			     "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
-		cache_stateless:
-			conf->cache.mode = FR_TLS_CACHE_STATELESS;
+	case FR_TLS_TICKET_STATEFUL:
+	check_stateful:
+		CHECK_MODE(load);
+		CHECK_MODE(store);
+		CHECK_MODE(clear);
+		break;
+
+	case FR_TLS_TICKET_AUTO:
+		if (!conf->encode_session) {
+			cf_log_warn(ci, "Virtual server %s is missing an \"encode session { ... }\" section. "
+				    "Rewriting session.mode = \"auto\" to \"stateful\"",
+				    cf_section_name2(conf->virtual_server));
+			cache_mode = FR_TLS_TICKET_STATEFUL;
+			goto check_stateful;
+		}
+
+		if (!conf->decode_session) {
+			cf_log_warn(ci, "Virtual server %s is missing a \"decode session { ... }\" section. "
+				    "Rewriting session.mode = \"auto\" to \"stateful\"",
+				    cf_section_name2(conf->virtual_server));
+			cache_mode = FR_TLS_TICKET_STATEFUL;
+			goto check_stateful;
+		}
+
+		if (!conf->load_session) {
+			cf_log_warn(ci, "Virtual server %s is missing a \"load session { ... }\" section. "
+				    "Rewriting session.mode = \"auto\" to \"stateless\"",
+				    cf_section_name2(conf->virtual_server));
+			cache_mode = FR_TLS_TICKET_STATELESS;
 			break;
 		}
 
-		if (!cf_section_find(conf->virtual_server, "load", "session")) {
-			WARN("Specified virtual_server missing \"load session { ... }\" section. "
-			     "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
-			goto cache_stateless;
+		if (!conf->store_session) {
+			cf_log_warn(ci, "Virtual server %s is missing a \"store session { ... }\" section. "
+				    "Rewriting session.mode = \"auto\" to \"stateless\"",
+				    cf_section_name2(conf->virtual_server));
+			cache_mode = FR_TLS_TICKET_STATELESS;
+			break;
 		}
 
-		if (!cf_section_find(conf->virtual_server, "store", "session")) {
-			WARN("Specified virtual_server missing \"store session { ... }\" section. "
-			     "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
-			goto cache_stateless;
-		}
-
-		if (!cf_section_find(conf->virtual_server, "clear", "session")) {
-			WARN("Specified virtual_server missing \"clear cache { ... }\" section. "
-			     "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
-			goto cache_stateless;
-		}
-
-		if (conf->tls_min_version >= (float)1.3) {
-			ERROR("stateful session-resumption is not supported with tls_min_version >= 1.3. "
-			      "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
-			goto error;
+		if (!conf->clear_session) {
+			cf_log_warn(ci, "Virtual server %s is missing a \"clear session { ... }\" section. "
+				    "Rewriting session.mode = \"auto\" to \"stateless\"",
+				    cf_section_name2(conf->virtual_server));
+			cache_mode = FR_TLS_TICKET_STATELESS;
+			break;
 		}
 		break;
 	}
 
-	/*
-	 *	Generate random, ephemeral, session-ticket keys.
-	 */
-	if (conf->cache.mode & FR_TLS_CACHE_STATELESS) {
-		fr_rand_buffer(conf->cache.session_ticket_key_rand, sizeof(conf->cache.session_ticket_key_rand));
-	}
-
-	/*
-	 *	Cache conf in cs in case we're asked to parse this again.
-	 */
-	cf_data_add(cs, conf, NULL, false);
-
-	return conf;
+	return tls_conf_cache_mode_set(conf, cache_mode, out);
 }
 
-fr_tls_conf_t *fr_tls_conf_parse_client(CONF_SECTION *cs)
+/** Parse "mode" for a TLS client
+ *
+ * A client tells a server whether it supports stateful or stateless session tickets, because a server
+ * responds slightly differently to each one.  Yay TLS magic.
+ *
+ * However, the client mashes both types of tickets into `load session` and `store session`, because it can't
+ * do anything else with them.
+ */
+static int tls_conf_parse_client_cache_mode(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule)
 {
-	fr_tls_conf_t *conf;
+	fr_tls_conf_t	*conf = talloc_get_type_abort((uint8_t *)parent - offsetof(fr_tls_conf_t, cache), fr_tls_conf_t);
+	int		cache_mode;
 
-	conf = cf_data_value(cf_data_find(cs, fr_tls_conf_t, NULL));
-	if (conf) {
-		DEBUG2("Using cached TLS configuration from previous invocation");
-		return conf;
+	if (cf_table_parse_int(ctx, &cache_mode, parent, ci, rule) < 0) return -1;
+
+	/*
+	 *	Modes other than "disabled" (0) require a virtual server.
+	 */
+	if (cache_mode && !conf->virtual_server) {
+		cf_log_err(ci, "A virtual_server must be set when session.mode = \"%s\"",
+			   fr_table_str_by_value(cache_mode_table, cache_mode, "disabled"));
+		return -1;
 	}
 
-	if (cf_section_rules_push(cs, fr_tls_client_config) < 0) return NULL;
+	switch (cache_mode) {
+	case FR_TLS_TICKET_DISABLED:
+		break;
 
-	conf = fr_tls_conf_alloc(cs);
+	case FR_TLS_TICKET_STATELESS:
+	case FR_TLS_TICKET_AUTO:
+		cf_log_warn(ci, "A TLS client always uses \"store session { ... }\" and "
+			    "\"load session { ... }\" to store tickets.  Rewriting session.mode = \"%s\" to \"stateful\"",
+			    (cache_mode == FR_TLS_TICKET_AUTO) ? "auto" : "stateless");
+		cache_mode = FR_TLS_TICKET_STATEFUL;
+		FALL_THROUGH;
 
-	if ((cf_section_parse(conf, conf, cs) < 0) ||
-	    (cf_section_parse_pass2(conf, cs) < 0)) {
+	case FR_TLS_TICKET_STATEFUL:
+		CHECK_MODE(load);
+		CHECK_MODE(store);
+		CHECK_MODE(clear);
+		break;
+	}
+
+	return tls_conf_cache_mode_set(conf, cache_mode, out);
+}
+
+/** Keep `fragment_size` between 100 and the TLS record limit
+ *
+ * A TLS record holds at most SSL3_RT_MAX_PLAIN_LENGTH bytes, so a larger
+ * fragment size gains nothing.  The EAP RFCs ask for fragments of at least
+ * 1020 bytes, but the server accepts down to 100.
+ */
+static int tls_fragment_size_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule)
+{
+	uint32_t *fragment_size = out;
+
+	if (cf_pair_parse_value(ctx, out, parent, ci, rule) < 0) return -1;
+
+	if (*fragment_size < 100) {
+		cf_log_warn(ci, "Ignoring \"fragment_size = %u\", forcing to \"fragment_size = 100\"", *fragment_size);
+		*fragment_size = 100;
+	}
+	if (*fragment_size > SSL3_RT_MAX_PLAIN_LENGTH) {
+		cf_log_warn(ci, "Ignoring \"fragment_size = %u\", forcing to \"fragment_size = %u\"",
+			    *fragment_size, (unsigned int)SSL3_RT_MAX_PLAIN_LENGTH);
+		*fragment_size = SSL3_RT_MAX_PLAIN_LENGTH;
+	}
+
+	return 0;
+}
+
+/** Parse padding, and clamp / round it.
+ *
+ * - 0 means "no padding"
+ * - >256 is clamped to 256
+ * - we round to multiples of 16.
+ *
+ * We mangle the padding before writing it to the configuration,
+ * because we can't write to the configuration afterwards, due to
+ * mprotect().
+ */
+static int tls_padding_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule)
+{
+	uint32_t *padding = out;
+
+	if (cf_pair_parse_value(ctx, out, parent, ci, rule) < 0) return -1;
+
+	if (!*padding) return 0;
+
+	if (*padding > FR_TLS_MAX_BLOCK_PADDING) {
+		cf_log_warn(ci, "Ignoring \"padding = %u\", forcing to \"padding = %u\"",
+			    *padding, (unsigned int) FR_TLS_MAX_BLOCK_PADDING);
+		*padding = FR_TLS_MAX_BLOCK_PADDING;
+	}
+
+	*padding = ROUND_UP_POW2(*padding, FR_TLS_BLOCK_PADDING_MULTIPLE);
+
+	return 0;
+}
+
+/** Keep `session.lifetime` at or below #FR_TLS_MAX_SESSION_LIFETIME
+ *
+ */
+static int tls_ticket_lifetime_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule)
+{
+	fr_time_delta_t		*lifetime = out;
+	fr_time_delta_t const	max = fr_time_delta_from_sec(FR_TLS_MAX_SESSION_LIFETIME);
+
+	if (cf_pair_parse_value(ctx, out, parent, ci, rule) < 0) return -1;
+
+	if (fr_time_delta_gt(*lifetime, max)) {
+		cf_log_warn(ci, "Ignoring \"lifetime = %pV\", forcing to \"lifetime = %pV\"",
+			    fr_box_time_delta(*lifetime), fr_box_time_delta(max));
+		*lifetime = max;
+	}
+
+	return 0;
+}
+
 #ifdef __APPLE__
-	error:
+/*
+ *	Setting private_key_password to this marker reads the
+ *	password from certadmin instead.
+ */
+static char const *special_string = "Apple:UsecertAdmin";
+
+/** Read the private key password from certadmin
+ *
+ * @param[in,out] chain		whose password is replaced when set to the marker.
+ * @param[in] ci		for error messages.
+ * @return
+ *	- 0 on success, or if the password is not the marker.
+ *	- -1 if certadmin failed.
+ */
+static int tls_chain_password_certadmin(fr_tls_chain_conf_t *chain, CONF_ITEM *ci)
+{
+	char		cmd[256];
+	char		*password, *buf;
+	long const	max_password_len = 128;
+	FILE		*cmd_pipe;
+
+	if (!chain->password) return 0;
+	if (strncmp(chain->password, special_string, strlen(special_string)) != 0) return 0;
+
+	snprintf(cmd, sizeof(cmd) - 1, "/usr/sbin/certadmin --get-private-key-passphrase \"%s\"",
+		 chain->private_key_file);
+
+	DEBUG2("Getting private key passphrase using command \"%s\"", cmd);
+
+	cmd_pipe = popen(cmd, "r");
+	if (!cmd_pipe) {
+		cf_log_err(ci, "%s command failed: Unable to get private_key_password", cmd);
+		cf_log_err(ci, "Error reading private_key_file %s", chain->private_key_file);
+		return -1;
+	}
+
+	MEM(password = talloc_array(chain, char, max_password_len));
+
+	buf = fgets(password, max_password_len, cmd_pipe);
+	if (!buf || ferror(cmd_pipe)) {
+		pclose(cmd_pipe);
+		talloc_free(password);
+		cf_log_err(ci, "%s command failed: Unable to get private_key_password", cmd);
+		cf_log_err(ci, "Error reading private_key_file %s", chain->private_key_file);
+		return -1;
+	}
+	pclose(cmd_pipe);
+
+	/* Get rid of newline at end of password. */
+	for (buf = password; buf < (password + max_password_len); buf++) {
+		if ((unsigned char)*buf < ' ') {
+			*buf = '\0';
+			goto found;
+		}
+	}
+
+	talloc_free(password);
+	cf_log_err(ci, "%s command failed: Unable to get private_key_password", cmd);
+	cf_log_err(ci, "Error reading private_key_file %s - password is too long", chain->private_key_file);
+	return -1;
+
+found:
+	DEBUG3("Password from command = \"%s\"", password);
+	talloc_const_free(chain->password);
+	chain->password = password;
+
+	return 0;
+}
 #endif
-		talloc_free(conf);
+
+/** Free the OpenSSL objects that a chain section holds
+ */
+static int _tls_chain_conf_free(fr_tls_chain_conf_t *chain)
+{
+	if (chain->leaf) X509_free(chain->leaf);
+DIAG_OFF_OPTIONAL(used-but-marked-unused)	/* fix spurious warnings for sk macros */
+	if (chain->extra) sk_X509_pop_free(chain->extra, X509_free);
+DIAG_ON_OPTIONAL(used-but-marked-unused)
+	if (chain->private_key) EVP_PKEY_free(chain->private_key);
+
+	return 0;
+}
+
+/** Read one certificate from a file
+ *
+ * @param[in] ci		for error messages.
+ * @param[in] fp		positioned at the next certificate.
+ * @param[in] format		SSL_FILETYPE_PEM or SSL_FILETYPE_ASN1.
+ * @param[in] aux		read the PEM auxiliary trust data, as OpenSSL does for the leaf.
+ * @return
+ *	- The certificate.
+ *	- NULL at the end of a PEM file, with the error queue empty.
+ *	- NULL on error, with the error left on the queue.
+ */
+static X509 *tls_chain_cert_read(CONF_ITEM *ci, FILE *fp, int format, bool aux)
+{
+	X509 *cert;
+
+	switch (format) {
+	case SSL_FILETYPE_PEM:
+		cert = aux ? PEM_read_X509_AUX(fp, NULL, NULL, NULL) : PEM_read_X509(fp, NULL, NULL, NULL);
+		if (!cert) {
+			unsigned long err = ERR_peek_last_error();
+
+			/*
+			 *	OpenSSL reports the end of a file by writing
+			 *	PEM_R_NO_START_LINE to the thread local buffer.
+			 */
+DIAG_OFF_OPTIONAL(used-but-marked-unused)	/* fix spurious warnings for ERR_GET macros */
+			if ((ERR_GET_LIB(err) == ERR_LIB_PEM) && (ERR_GET_REASON(err) == PEM_R_NO_START_LINE)) {
+				ERR_clear_error();
+			}
+DIAG_ON_OPTIONAL(used-but-marked-unused)
+		}
+		return cert;
+
+	case SSL_FILETYPE_ASN1:
+		return d2i_X509_fp(fp, NULL);
+
+	default:
+		cf_log_err(ci, "Unknown certificate format %d", format);
 		return NULL;
 	}
+}
 
-	/*
-	 *	Save people from their own stupidity.
-	 */
-	if (conf->fragment_size < 100) conf->fragment_size = 100;
+/** Load the certificates and the private key of a `chain { ... }` section
+ *
+ * Reads certificate files in this order:
+ *
+ *  1. The leaf, then the remaining certificates, from certificate_file.
+ *  2. One certificate from each ca_file.
+ *  3. The private key from private_key_file.
+ *
+ * This callback stores the loaded objects in leaf, extra, and private_key,
+ * and records the earliest notAfter in valid_until.
+ */
+static int tls_chain_private_key_file_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, conf_parser_t const *rule)
+{
+	fr_tls_chain_conf_t	*chain = talloc_get_type_abort(parent, fr_tls_chain_conf_t);
+	FILE			*fp;
+	X509			*cert;
+	size_t			i, ca_cnt;
+	int			n;
 
-	/*
-	 *	Initialize TLS
-	 */
+	if (cf_pair_parse_value(ctx, out, parent, ci, rule) < 0) return -1;
+
 #ifdef __APPLE__
-	if (conf_cert_admin_password(conf) < 0) goto error;
+	if (tls_chain_password_certadmin(chain, ci) < 0) return -1;
 #endif
 
-	cf_data_add(cs, conf, NULL, false);
+	talloc_set_destructor(chain, _tls_chain_conf_free);
 
-	return conf;
+	/*
+	 *	The leaf comes first, then the rest of the chain.
+	 */
+	fp = fopen(chain->certificate_file, "r");
+	if (!fp) {
+		cf_log_err(ci, "Failed opening certificate_file \"%s\": %s", chain->certificate_file, fr_syserror(errno));
+		return -1;
+	}
+
+	chain->leaf = tls_chain_cert_read(ci, fp, chain->file_format, true);
+	if (!chain->leaf) {
+		fr_tls_strerror_printf("No certificate found");
+		cf_log_perr(ci, "Failed reading certificate_file \"%s\"", chain->certificate_file);
+		fclose(fp);
+		return -1;
+	}
+
+	MEM(chain->extra = sk_X509_new_null());
+	while ((cert = tls_chain_cert_read(ci, fp, chain->file_format, false))) {
+		if (chain->file_format != SSL_FILETYPE_PEM) {
+			X509_free(cert);
+			break;		/* A DER file holds exactly one certificate */
+		}
+DIAG_OFF_OPTIONAL(used-but-marked-unused)	/* fix spurious warnings for sk macros */
+		MEM(sk_X509_push(chain->extra, cert) > 0);
+DIAG_ON_OPTIONAL(used-but-marked-unused)
+	}
+	fclose(fp);
+	if (ERR_peek_error()) {
+		fr_tls_strerror_printf(NULL);
+		cf_log_perr(ci, "Failed reading certificate_file \"%s\"", chain->certificate_file);
+		return -1;
+	}
+
+	/*
+	 *	One certificate per ca_file.
+	 */
+	ca_cnt = chain->ca_files ? talloc_array_length(chain->ca_files) : 0;
+	for (i = 0; i < ca_cnt; i++) {
+		fp = fopen(chain->ca_files[i], "r");
+		if (!fp) {
+			cf_log_err(ci, "Failed opening ca_file \"%s\": %s", chain->ca_files[i], fr_syserror(errno));
+			return -1;
+		}
+		cert = tls_chain_cert_read(ci, fp, chain->file_format, false);
+		fclose(fp);
+		if (!cert) {
+			fr_tls_strerror_printf("No certificate found");
+			cf_log_perr(ci, "Failed reading ca_file \"%s\"", chain->ca_files[i]);
+			return -1;
+		}
+DIAG_OFF_OPTIONAL(used-but-marked-unused)	/* fix spurious warnings for sk macros */
+		MEM(sk_X509_push(chain->extra, cert) > 0);
+DIAG_ON_OPTIONAL(used-but-marked-unused)
+	}
+
+	/*
+	 *	The password callback stops OpenSSL prompting on stdin
+	 *	when the key is encrypted and no password is set.
+	 */
+	fp = fopen(chain->private_key_file, "r");
+	if (!fp) {
+		cf_log_err(ci, "Failed opening private_key_file \"%s\": %s", chain->private_key_file, fr_syserror(errno));
+		return -1;
+	}
+	switch (chain->file_format) {
+	case SSL_FILETYPE_PEM:
+		chain->private_key = PEM_read_PrivateKey(fp, NULL, fr_tls_session_password_cb,
+							 UNCONST(char *, chain->password));
+		break;
+
+	case SSL_FILETYPE_ASN1:
+		chain->private_key = d2i_PrivateKey_fp(fp, NULL);
+		break;
+
+	default:
+		fr_assert(0);
+		break;
+	}
+	fclose(fp);
+	if (!chain->private_key) {
+		fr_tls_strerror_printf(NULL);
+		cf_log_perr(ci, "Failed reading private_key_file \"%s\"", chain->private_key_file);
+		return -1;
+	}
+
+	if (X509_check_private_key(chain->leaf, chain->private_key) != 1) {
+		fr_tls_strerror_printf(NULL);
+		cf_log_perr(ci, "Private key does not match the certificate public key");
+		return -1;
+	}
+
+	/*
+	 *	Record the earliest notAfter.
+	 */
+	chain->valid_until = fr_unix_time_wrap(0);
+DIAG_OFF_OPTIONAL(used-but-marked-unused)	/* fix spurious warnings for sk macros */
+	for (n = -1; n < sk_X509_num(chain->extra); n++) {
+		time_t not_after;
+
+		cert = (n < 0) ? chain->leaf : sk_X509_value(chain->extra, n);
+		if (fr_tls_utils_asn1time_to_epoch(&not_after, X509_get0_notAfter(cert)) < 0) {
+			cf_log_perr(ci, "Failed parsing notAfter time of certificate %d in the chain", n + 2);
+			return -1;
+		}
+		if (!fr_unix_time_ispos(chain->valid_until) ||
+		    fr_unix_time_gt(chain->valid_until, fr_unix_time_from_time(not_after))) {
+			chain->valid_until = fr_unix_time_from_time(not_after);
+		}
+	}
+DIAG_ON_OPTIONAL(used-but-marked-unused)
+
+	cf_log_debug(ci, "Certificate chain valid until %pV", fr_box_date(chain->valid_until));
+
+	return 0;
 }
 #endif	/* WITH_TLS */

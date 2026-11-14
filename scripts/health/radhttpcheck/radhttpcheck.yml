@@ -1,0 +1,18 @@
+# Address listened on for HTTP traffic
+listen:
+  address: '*'
+  port: 8080
+# URLs the healthcheck script will respond on, and the various types of requests they create
+healthchecks:
+  '/acct':
+    port: 1813
+    secret: testing123
+    type: Status-Server
+    attributes:
+      NAS-Identifier: 'healthcheck'
+  '/auth':
+    port: 1812
+    secret: testing123
+    type: Status-Server
+    attributes:
+      NAS-Identifier: 'healthcheck'

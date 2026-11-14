@@ -15,6 +15,11 @@ TEST := test.auth
 FILES := $(filter-out %.conf %.md %.attrs %.mk %~ %.rej,$(subst $(DIR)/,,$(wildcard $(DIR)/*)))
 
 $(eval $(call TEST_BOOTSTRAP))
+#
+#  The test loads modules at run time, so make needs telling about them.  The
+#  list comes from the config itself.
+#
+$(eval $(call TEST_CONFIG_LIBS,$(DIR)/unit_test_module.conf,$(FILES.$(TEST))))
 
 #
 #  Find which input files are needed by the tests
@@ -28,11 +33,12 @@ AUTH	 := $(subst $(DIR),$(OUTPUT),$(AUTH_NEEDS))
 AUTH_HAS	 := $(filter $(wildcard $(AUTH_EXISTS)),$(AUTH_EXISTS))
 AUTH_COPY	 := $(subst $(DIR),$(OUTPUT),$(AUTH_NEEDS))
 
+ifeq "$(filter clean%,$(MAKECMDGOALS))" ""
 #
 #  For each file, look for precursor test.
 #  Ensure that each test depends on its precursors.
 #
--include $(OUTPUT)/depends.mk
+-include $(BUILD_DIR)/depends.mk
 
 $(OUTPUT)/depends.mk: $(addprefix $(DIR)/,$(FILES)) | $(OUTPUT)
 	${Q}rm -f $@
@@ -45,6 +51,8 @@ $(OUTPUT)/depends.mk: $(addprefix $(DIR)/,$(FILES)) | $(OUTPUT)
 			echo "" >> $@; \
 		fi \
 	done
+endif
+
 #
 #  These ones get copied over from the default input
 #
@@ -69,9 +77,11 @@ $(OUTPUT)/%.attrs: $(DIR)/%.attrs | $(OUTPUT)
 #
 #  AUTH_MODULES := $(shell grep -- mods-enabled src/tests/auth/unit_test_module.conf | sed 's,.*/,,')
 #
+ifeq "$(filter clean%,$(MAKECMDGOALS))" ""
 $(OUTPUT)/enabled.mk: src/tests/auth/unit_test_module.conf | $(OUTPUT)
 	${Q}echo "auth_MODULES := " $$(grep -- mods-enabled src/tests/auth/unit_test_module.conf | sed 's,.*/,,' | tr '\n' ' ' ) > $@
 -include $(OUTPUT)/enabled.mk
+endif
 
 AUTH_RADDB	:= $(addprefix raddb/mods-enabled/,$(AUTH_MODULES))
 AUTH_LIBS	:= $(addsuffix .la,$(addprefix rlm_,$(AUTH_MODULES)))
@@ -92,13 +102,23 @@ AUTH_LIBS	:= $(addsuffix .la,$(addprefix rlm_,$(AUTH_MODULES)))
 #  Otherwise, check the log file for a parse error which matches the
 #  ERROR line in the input.
 #
+AUTH_CMD = \
+	TESTDIR=$(call SHELL_QUOTE,$(notdir $@)) \
+	$(TEST_BIN)/unit_test_module \
+	-D share/dictionary \
+	-d src/tests/auth/ \
+	-i $(call SHELL_QUOTE,$@.attrs) \
+	-f $(call SHELL_QUOTE,$@.attrs) \
+	-r $(call SHELL_QUOTE,$@) \
+	-xx
+
 $(OUTPUT)/%: $(DIR)/% $(OUTPUT)/%.attrs $(TEST_BIN_DIR)/unit_test_module | $(AUTH_RADDB) $(AUTH_LIBS) build.raddb
 	@echo "AUTH-TEST $(notdir $@)"
-	${Q}if ! TESTDIR=$(notdir $@) $(TEST_BIN)/unit_test_module -D share/dictionary -d src/tests/auth/ -i "$@.attrs" -f "$@.attrs" -r "$@" -xx > "$@.log" 2>&1 || ! test -f "$@"; then \
+	${Q}if ! $(AUTH_CMD) > "$@.log" 2>&1 || ! test -f "$@"; then \
 		if ! grep ERROR $< 2>&1 > /dev/null; then \
 			cat $@.log; \
 			echo "# $@.log"; \
-			echo "TESTDIR=$(notdir $@) $(TEST_BIN)/unit_test_module -D share/dictionary -d src/tests/auth/ -i \"$@.attrs\" -f \"$@.attrs\" -r \"$@\" -xxx > \"$@.log\" 2>&1"; \
+			echo $(call SHELL_QUOTE,$(AUTH_CMD)); \
 			rm -f $(BUILD_DIR)/tests/test.auth; \
 			exit 1; \
 		fi; \
@@ -107,7 +127,7 @@ $(OUTPUT)/%: $(DIR)/% $(OUTPUT)/%.attrs $(TEST_BIN_DIR)/unit_test_module | $(AUT
 		if [ "$$EXPECTED" != "$$FOUND" ]; then \
 			cat $@.log; \
 			echo "# $@.log"; \
-			echo "TESTDIR=$(notdir $@) $(TEST_BIN)/unit_test_module -D share/dictionary -d src/tests/auth/ -i \"$@.attrs\" -f \"$@.attrs\" -r \"$@\" -xxx > \"$@.log\" 2>&1"; \
+			echo $(call SHELL_QUOTE,$(AUTH_CMD)); \
 			rm -f $(BUILD_DIR)/tests/test.auth; \
 			exit 1; \
 		else \

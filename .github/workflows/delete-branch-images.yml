@@ -1,0 +1,103 @@
+name: Delete branch images
+
+#
+#  A branch that changes the continuous integration (CI) images publishes
+#  copies of the images, under a tag named after the branch.  Nothing else
+#  ever reads the copies, so once the branch is deleted the copies only
+#  waste registry space.  The `delete` event is the point at which the copies
+#  stop mattering.  The clean-up therefore runs on the `delete` event rather
+#  than on a sweep that would have to guess when a tag stopped mattering.
+#
+#  This workflow holds no list of image names.  Every image that this
+#  repository publishes sits under a path named after the repository.  The
+#  workflow therefore queries the registry for everything under the
+#  repository's path, and the answer cannot drift from what the repository
+#  published.
+#
+on:
+  delete:
+
+jobs:
+  common_vars:
+    name: Common vars
+    uses: ./.github/workflows/common_vars.yml
+
+  #
+  #  The organisation's registry answers on an internal name, so only the
+  #  organisation's own build machines resolve it.  A fork has no self-hosted
+  #  runner and no shared registry, so a fork runs on a GitHub-hosted runner
+  #  and the first step below skips.
+  #
+  delete-branch-images:
+    name: Delete branch images
+    needs: common_vars
+    if: ${{ github.event.ref_type == 'branch' }}
+    runs-on: ${{ needs.common_vars.outputs.selfhosted == '1' && 'self-hosted' || 'ubuntu-latest' }}
+
+    steps:
+      #
+      #  The default branch publishes as `latest`, which nothing here may touch.
+      #  The step skips a repository with no shared registry.  A fork
+      #  publishes to the fork's own GitHub Container Registry, which the
+      #  fork's owner prunes from the packages page.
+      #
+      - id: target
+        env:
+          registry: ${{ vars.DOCKER_REGISTRY }}
+          deleted_ref: ${{ github.event.ref }}
+          default_branch: ${{ github.event.repository.default_branch }}
+          repo_name: ${{ github.event.repository.name }}
+        run: |
+          if [ -z "$registry" ] || [ "$deleted_ref" = "$default_branch" ]; then
+            echo "Skipping prune, DOCKER_REGISTRY unset or the deleted ref is the default branch"
+            echo "run=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          #  Sanitise the deleted ref the same way that `common_vars.yml`
+          #  sanitises a branch name.
+          tag=$(printf '%s' "$deleted_ref" \
+                | tr 'A-Z' 'a-z' \
+                | tr -c 'a-z0-9_.-' '-' \
+                | cut -c1-128)
+          {
+            echo "run=yes"
+            echo "tag=$tag"
+            echo "registry=$registry"
+            echo "path=$repo_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - if: ${{ steps.target.outputs.run == 'yes' }}
+        uses: regclient/actions/regctl-installer@main
+
+      #
+      #  regctl removes the tag and leaves the manifest.  An image that the
+      #  branch happened to build byte for byte identical to the image that
+      #  `latest` points at therefore keeps the image's other tags.  Deleting
+      #  by digest would remove the other tags too.
+      #
+      - if: ${{ steps.target.outputs.run == 'yes' }}
+        env:
+          DOCKER_REGISTRY: ${{ steps.target.outputs.registry }}
+          DOCKER_PATH_PREFIX: ${{ steps.target.outputs.path }}
+          DOCKER_TAG: ${{ steps.target.outputs.tag }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_REPO_UPDATE_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_REPO_UPDATE_PASSWORD }}
+        run: |
+          set -u
+          printf '%s' "$DOCKER_PASSWORD" \
+            | regctl registry login "$DOCKER_REGISTRY" -u "$DOCKER_USERNAME" --pass-stdin
+
+          deleted=0 absent=0
+          for repo in $(regctl repo ls "$DOCKER_REGISTRY"); do
+            case "$repo" in
+              "$DOCKER_PATH_PREFIX"/*) ;;
+              *) continue ;;
+            esac
+            if regctl tag delete "$DOCKER_REGISTRY/$repo:$DOCKER_TAG" >/dev/null 2>&1; then
+              echo "deleted $repo:$DOCKER_TAG"
+              deleted=$((deleted + 1))
+            else
+              absent=$((absent + 1))
+            fi
+          done
+          echo "deleted $deleted, not published $absent"

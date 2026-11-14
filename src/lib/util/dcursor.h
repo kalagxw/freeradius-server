@@ -1,7 +1,7 @@
 #pragma once
 /*
  *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License, cursor 2 of the
+ *   it under the terms of the GNU General Public License, version 2 of the
  *   License as published by the Free Software Foundation.
  *
  *   This program is distributed in the hope that it will be useful,
@@ -31,12 +31,13 @@ extern "C" {
 #include <freeradius-devel/util/dlist.h>
 #include <freeradius-devel/util/talloc.h>
 
-#include <stddef.h>
-#include <stdbool.h>
+
+DIAG_OFF(unused-function)
+typedef struct fr_dcursor_s fr_dcursor_t;
 
 /** Callback for implementing custom iterators
  *
- * @param[in] list	head of the dlist.
+ * @param[in] cursor	the cursor
  * @param[in] to_eval	the next item in the list.  Iterator should check to
  *			see if it matches the iterator's filter, and if it doesn't
  *			iterate over the items until one is found that does.
@@ -45,27 +46,38 @@ extern "C" {
  *	- to_eval if to_eval matched, or a subsequent attribute if that matched.
  *	- NULL if no more matching attributes were found.
  */
-typedef void *(*fr_dcursor_iter_t)(fr_dlist_head_t *list, void *to_eval, void *uctx);
+typedef void *(*fr_dcursor_iter_t)(fr_dcursor_t *cursor, void *to_eval, void *uctx);
+
 /** Callback for performing additional actions on insert
  *
- * @param[in] list	head of the dlist.
+ * @param[in] cursor	the cursor
  * @param[in] to_insert	The item being inserted into the cursor.
  * @param[in] uctx	passed to #fr_dcursor_init.
  * @return
  *	- 0 on success.
  *	- -1 on failure.
  */
-typedef int (*fr_dcursor_insert_t)(fr_dlist_head_t *list, void *to_insert, void *uctx);
+typedef int (*fr_dcursor_insert_t)(fr_dcursor_t *cursor, void *to_insert, void *uctx);
+
 /** Callback for performing additional actions on removal
  *
- * @param[in] list	head of the dlist.
+ * @param[in] cursor	the cursor
  * @param[in] to_delete	The item being removed from the cursor.
  * @param[in] uctx	passed to #fr_dcursor_init.
  * @return
- *	- 0 on success.
+ *	- 0 on success if the caller should do the list removal.
+ *	- 1 on success if the callback has done the list removal.
  *	- -1 on failure.
  */
-typedef int (*fr_dcursor_delete_t)(fr_dlist_head_t *list, void *to_delete, void *uctx);
+typedef int (*fr_dcursor_remove_t)(fr_dcursor_t *cursor, void *to_delete, void *uctx);
+
+/** Copy callback for duplicating complex dcursor state
+ *
+ * @param[out] out	dcursor to copy to.
+ * @param[in] in	dcursor to copy from.
+ */
+typedef void (*fr_dcursor_copy_t)(fr_dcursor_t *out, fr_dcursor_t const *in);
+
 /** Type of evaluation functions to pass to the fr_dcursor_filter_*() functions.
  *
  * @param[in] item	the item to be evaluated
@@ -75,63 +87,96 @@ typedef int (*fr_dcursor_delete_t)(fr_dlist_head_t *list, void *to_delete, void 
  * 	- false if the evaluation function is not satisfied.
  */
 typedef bool (*fr_dcursor_eval_t)(void const *item, void const *uctx);
-typedef struct {
+
+struct fr_dcursor_s {
 	fr_dlist_head_t		*dlist;		//!< Head of the doubly linked list being iterated over.
-	void			*current;	//!< The current item in the dlist.
-	void			*prev;		//!< The previous item in the dlist.
+	void			*current;	//!< The current item in the cursor
+
 	fr_dcursor_iter_t	iter;		//!< Iterator function.
+	fr_dcursor_iter_t	peek;		//!< Distinct "peek" function.  This is sometimes necessary
+						///< for iterators with complex state.
+	void			*iter_uctx;	//!< to pass to iterator function.
+
 	fr_dcursor_insert_t	insert;		//!< Callback function on insert.
-	fr_dcursor_delete_t	delete;		//!< Callback function on delete.
-	void			*uctx;		//!< to pass to iterator function.
-} fr_dcursor_t;
+	fr_dcursor_remove_t	remove;		//!< Callback function on delete.
+	void			*mod_uctx;	//!< to pass to modification functions.
+
+	fr_dcursor_copy_t	copy;		//!< Copy dcursor state.
+
+	bool			is_const;	//!< The list we're iterating over is immutable.
+	bool			at_end;		//!< We're at the end of the list.
+};
 
 typedef struct {
 	uint8_t			depth;		//!< Which cursor is currently in use.
 	fr_dcursor_t		cursor[];	//!< Stack of cursors.
 } fr_dcursor_stack_t;
 
+#ifndef TALLOC_GET_TYPE_ABORT_NOOP
+#define VALIDATE(_item) do { if (cursor->dlist->type && (_item)) _talloc_get_type_abort(_item, cursor->dlist->type, __location__); } while (0)
+#else
+#define VALIDATE(_item)
+#endif
+
+/** If current is set to a NULL pointer, we record that fact
+ *
+ * This stops us jumping back to the start of the dlist.
+ */
+static inline void *dcursor_current_set(fr_dcursor_t *cursor, void *current)
+{
+	VALIDATE(current);
+
+	cursor->at_end = (current == NULL);
+	cursor->current = current;
+
+	return current;
+}
+
 /** Internal function to get the next item
  *
  * @param[in] cursor	to operate on.
+ * @param[in] iter	function.
  * @param[in] current	attribute.
  * @return
  *	- The next attribute.
  *	- NULL if no more attributes.
  */
-static inline void *dcursor_next(fr_dcursor_t *cursor, void *current)
+CC_NO_UBSAN(function)  /* UBSAN: false positive - Type specific dcursor pointer trips --fasanitize=function */
+static inline void *dcursor_next(fr_dcursor_t *cursor, fr_dcursor_iter_t iter, void *current)
 {
 	void *next;
 
 	/*
-	 *	First time next has been called
+	 *	Fast path without custom iter
+	 */
+	if (!iter) {
+		if (likely(current != NULL)) return fr_dlist_next(cursor->dlist, current);
+
+		if (cursor->at_end) return NULL;				/* At tail of the list */
+
+		return fr_dlist_head(cursor->dlist);
+	}
+
+	/*
+	 *	First time next has been called, or potentially
+	 *	another call after we hit the end of the list.
 	 */
 	if (!current) {
-		if (fr_dlist_empty(cursor->dlist)) return NULL;
-		if (cursor->prev) return NULL;					/* At tail of the list */
-		if (!cursor->iter) return (fr_dlist_head(cursor->dlist));	/* Fast path without custom iter */
+		if (cursor->at_end) return NULL;				/* At tail of the list */
 
-		current = fr_dlist_head(cursor->dlist);
-		return cursor->iter(cursor->dlist, current, cursor->uctx);
+		next = iter(cursor, NULL, cursor->iter_uctx);
+		VALIDATE(next);
+		return next;
 	}
-
-#ifndef TALLOC_GET_TYPE_ABORT_NOOP
-	if (cursor->dlist->type) _talloc_get_type_abort(current, cursor->dlist->type, __location__);
-#endif
-
-	if (!cursor->iter) {
-		return fr_dlist_next(cursor->dlist, current);			/* Fast path without custom iter */
-	}
+	VALIDATE(current);
 
 	/*
-	 *	Pre-advance current
+	 *	The iterator will advance to the next matching entry.
 	 */
-	next = fr_dlist_next(cursor->dlist, current);
+	next = iter(cursor, current, cursor->iter_uctx);
+	VALIDATE(next);
 
-	/*
-	 *	The iterator can just return what it was passed for curr
-	 *	if it just wants to advance by one.
-	 */
-	return cursor->iter(cursor->dlist, next, cursor->uctx);
+	return next;
 }
 
 /** Copy cursor parameters and state.
@@ -141,9 +186,39 @@ static inline void *dcursor_next(fr_dcursor_t *cursor, void *current)
  *
  * @hidecallergraph
  */
+CC_HINT(nonnull)
 static inline void fr_dcursor_copy(fr_dcursor_t *out, fr_dcursor_t const *in)
 {
 	memcpy(out, in, sizeof(*out));
+
+	if (in->copy) in->copy(out, in);
+}
+
+/** Copy a read-only iterator from a parent to a child cursor
+ *
+ * @param[out] out	Where to copy the cursor to.
+ * @param[in] in	cursor to copy.
+ *
+ * @hidecallergraph
+ */
+CC_HINT(nonnull)
+static inline void fr_dcursor_copy_iter(fr_dcursor_t *out, fr_dcursor_t const *in)
+{
+	fr_assert(!out->iter);
+	fr_assert(!out->iter_uctx);
+
+	out->iter = in->iter;
+	out->iter_uctx = in->iter_uctx;
+
+#ifndef NDEBUG
+	/*
+	 *	The output cursor has to be read-only.
+	 */
+	out->insert = NULL;
+	out->remove = NULL;
+	out->mod_uctx = NULL;
+	out->copy = NULL;
+#endif
 }
 
 /** Rewind cursor to the start of the list
@@ -153,11 +228,9 @@ static inline void fr_dcursor_copy(fr_dcursor_t *out, fr_dcursor_t const *in)
  *
  * @hidecallergraph
  */
+CC_HINT(nonnull)
 static inline void *fr_dcursor_head(fr_dcursor_t *cursor)
 {
-	if (unlikely(!cursor)) return NULL;
-
-	cursor->prev = NULL;
 	/*
 	 *	If we have a custom iterator, the dlist attribute
 	 *	may not be in the subset the iterator would
@@ -165,13 +238,13 @@ static inline void *fr_dcursor_head(fr_dcursor_t *cursor)
 	 *	dcursor_next figure it out.
 	 */
 	if (cursor->iter) {
-		cursor->current = dcursor_next(cursor, NULL);
-		return cursor->current;
+		cursor->at_end = false;	/* reset the flag, else next will just return NULL */
+
+		return dcursor_current_set(cursor, dcursor_next(cursor, cursor->iter, NULL));
 	}
 
-	cursor->current = fr_dlist_head(cursor->dlist);
-
-	return cursor->current;
+	fr_assert(cursor->dlist);
+	return dcursor_current_set(cursor, fr_dlist_head(cursor->dlist));
 }
 
 /** Wind cursor to the tail item in the list
@@ -181,18 +254,25 @@ static inline void *fr_dcursor_head(fr_dcursor_t *cursor)
  *
  * @hidecallergraph
  */
+CC_HINT(nonnull)
 static inline void *fr_dcursor_tail(fr_dcursor_t *cursor)
 {
-	if (!cursor || fr_dlist_empty(cursor->dlist)) return NULL;
+	/*
+	 *	Keep calling next on the custom iterator
+	 *      until we hit the end of the list.
+	 */
+	if (cursor->iter) {
+		void *current = cursor->current;
 
-	cursor->current = fr_dlist_tail(cursor->dlist);
-	if (cursor->current) {
-		cursor->prev = fr_dlist_prev(cursor->dlist, cursor->current);
-	} else {
-		cursor->prev = NULL;
+		while ((cursor->current = dcursor_next(cursor, cursor->iter, cursor->current))) {
+			current = cursor->current;
+		}
+
+		return dcursor_current_set(cursor, current);
 	}
 
-	return cursor->current;
+	fr_assert(cursor->dlist);
+	return dcursor_current_set(cursor, fr_dlist_tail(cursor->dlist));
 }
 
 /** Advanced the cursor to the next item
@@ -204,13 +284,10 @@ static inline void *fr_dcursor_tail(fr_dcursor_t *cursor)
  *
  * @hidecallergraph
  */
-static inline void * CC_HINT(hot) fr_dcursor_next(fr_dcursor_t *cursor)
+CC_HINT(nonnull)
+static inline void *fr_dcursor_next(fr_dcursor_t *cursor)
 {
-	if (!cursor || fr_dlist_empty(cursor->dlist)) return NULL;
-	cursor->current = dcursor_next(cursor, cursor->current);
-
-	cursor->prev = fr_dlist_prev(cursor->dlist, cursor->current);
-	return cursor->current;
+	return dcursor_current_set(cursor, dcursor_next(cursor, cursor->iter, cursor->current));
 }
 
 /** Return the next iterator item without advancing the cursor
@@ -222,9 +299,10 @@ static inline void * CC_HINT(hot) fr_dcursor_next(fr_dcursor_t *cursor)
  *
  * @hidecallergraph
  */
+CC_HINT(nonnull)
 static inline void *fr_dcursor_next_peek(fr_dcursor_t *cursor)
 {
-	return dcursor_next(cursor, cursor->current);
+	return dcursor_next(cursor, cursor->peek, cursor->current);
 }
 
 /** Returns the next list item without advancing the cursor
@@ -240,36 +318,10 @@ static inline void *fr_dcursor_next_peek(fr_dcursor_t *cursor)
  *
  * @hidecallergraph
  */
+CC_HINT(nonnull)
 static inline void *fr_dcursor_list_next_peek(fr_dcursor_t *cursor)
 {
-	if (!cursor || !cursor->current) return NULL;
-
-	return fr_dlist_next(cursor->dlist, cursor->current);
-}
-
-/** Returns the previous list item without rewinding the cursor
- *
- * @note This returns the previous item in the list, which may not be the
- *	 previous 'current' value.
- *
- * @param[in] cursor to operator on.
- * @return
- *	- Previous item.
- *	- NULL if no previous item available.
- *
- * @hidecallergraph
- */
-static inline void *fr_dcursor_list_prev_peek(fr_dcursor_t *cursor)
-{
-	if (unlikely(!cursor)) return NULL;
-
-	/*
-	 *	If cursor->current is not set then there's no prev.
-	 *	fr_dlist_prev would return the tail
-	 */
-	if (!cursor->prev) return NULL;
-
-	return fr_dlist_prev(cursor->dlist, cursor->current);
+	return dcursor_next(cursor, NULL, cursor->current);
 }
 
 /** Return the item the cursor current points to
@@ -281,10 +333,10 @@ static inline void *fr_dcursor_list_prev_peek(fr_dcursor_t *cursor)
  *
  * @hidecallergraph
  */
-static inline void * CC_HINT(hot) fr_dcursor_current(fr_dcursor_t *cursor)
+CC_HINT(nonnull)
+static inline void *fr_dcursor_current(fr_dcursor_t *cursor)
 {
-	if (unlikely(!cursor)) return NULL;
-
+	VALIDATE(cursor->current);
 	return cursor->current;
 }
 
@@ -298,15 +350,15 @@ static inline void * CC_HINT(hot) fr_dcursor_current(fr_dcursor_t *cursor)
  *
  * @hidecallergraph
  */
-static inline void * CC_HINT(hot) fr_dcursor_set_current(fr_dcursor_t *cursor, void *item)
+static inline void *fr_dcursor_set_current(fr_dcursor_t *cursor, void *item)
 {
-	if (!cursor || fr_dlist_empty(cursor->dlist)) return NULL;
-	if (!item) return NULL;
+	if (!fr_cond_assert_msg(!cursor->is_const, "attempting to modify const list")) return NULL;
 
-	cursor->current = item;
-	cursor->prev = fr_dlist_prev(cursor->dlist, item);
+	if (!item ||
+	    !fr_dlist_in_list(cursor->dlist, item) ||
+	    (cursor->iter && !cursor->iter(cursor, item, cursor->iter_uctx))) return NULL;
 
-	return cursor->current;
+	return dcursor_current_set(cursor, item);
 }
 
 /** Insert a single item at the start of the list
@@ -321,25 +373,22 @@ static inline void * CC_HINT(hot) fr_dcursor_set_current(fr_dcursor_t *cursor, v
  *
  * @hidecallergraph
  */
-static inline void CC_HINT(hot) fr_dcursor_prepend(fr_dcursor_t *cursor, void *v)
+static inline int fr_dcursor_prepend(fr_dcursor_t *cursor, void *v)
 {
-#ifndef TALLOC_GET_TYPE_ABORT_NOOP
-	if (cursor->dlist->type) _talloc_get_type_abort(v, cursor->dlist->type, __location__);
-#endif
+	int ret;
+
+	if (!fr_cond_assert_msg(!cursor->is_const, "attempting to modify const list")) return -1;
+
+	VALIDATE(v);
+
+	if (cursor->insert) if ((ret = cursor->insert(cursor, v, cursor->mod_uctx)) < 0) return ret;
 
 	/*
 	 *	Insert at the head of the list
 	 */
 	fr_dlist_insert_head(cursor->dlist, v);
 
-	/*
-	 *	Set previous if the cursor was already set but not
-	 *	prev - this will be if there was only one item in the
-	 *	list
-	 */
-	if (cursor->current && !cursor->prev) {
-		cursor->prev = v;
-	}
+	return 0;
 }
 
 /** Insert a single item at the end of the list
@@ -348,16 +397,27 @@ static inline void CC_HINT(hot) fr_dcursor_prepend(fr_dcursor_t *cursor, void *v
  *
  * @param[in] cursor to operate on.
  * @param[in] v to insert.
+ * @return
+ *	- 0 on success.
+ *	- -1 if the insert callback failed or a modification was attempted on a const'd list.
  *
  * @hidecallergraph
  */
-static inline void CC_HINT(hot) fr_dcursor_append(fr_dcursor_t *cursor, void *v)
+static inline int fr_dcursor_append(fr_dcursor_t *cursor, void *v)
 {
-#ifndef TALLOC_GET_TYPE_ABORT_NOOP
-	if (cursor->dlist->type) _talloc_get_type_abort(v, cursor->dlist->type, __location__);
-#endif
+	int ret;
+
+	if (!fr_cond_assert_msg(!cursor->is_const, "attempting to modify const list")) return -1;
+
+	VALIDATE(v);
+
+	if (cursor->insert) if ((ret = cursor->insert(cursor, v, cursor->mod_uctx)) < 0) return ret;
 
 	fr_dlist_insert_tail(cursor->dlist, v);
+
+	cursor->at_end = false;	/* Can't be at the end if we just inserted something */
+
+	return 0;
 }
 
 /** Insert directly after the current item
@@ -366,20 +426,30 @@ static inline void CC_HINT(hot) fr_dcursor_append(fr_dcursor_t *cursor, void *v)
  *
  * @param[in] cursor	to operate on.
  * @param[in] v		Item to insert.
+ * @return
+ *	- 0 on success.
+ *	- -1 if the insert callback failed or a modification was attempted on a const'd list.
  *
  * @hidecallergraph
  */
-static inline void fr_dcursor_insert(fr_dcursor_t *cursor, void *v)
+static inline int fr_dcursor_insert(fr_dcursor_t *cursor, void *v)
 {
-#ifndef TALLOC_GET_TYPE_ABORT_NOOP
-	if (cursor->dlist->type) _talloc_get_type_abort(v, cursor->dlist->type, __location__);
-#endif
+	int ret;
+
+	if (!fr_cond_assert_msg(!cursor->is_const, "attempting to modify const list")) return -1;
+
+	VALIDATE(v);
 
 	if (!cursor->current) {
-		fr_dcursor_append(cursor, v);
-		return;
+		if (fr_dcursor_append(cursor, v) < 0) return -1;
+		return 0;
 	}
+
+	if (cursor->insert) if ((ret = cursor->insert(cursor, v, cursor->mod_uctx)) < 0) return ret;
+
 	fr_dlist_insert_after(cursor->dlist, cursor->current, v);
+
+	return 0;
 }
 
 /** Remove the current item
@@ -407,28 +477,29 @@ static inline void fr_dcursor_insert(fr_dcursor_t *cursor, void *v)
  *
  * @hidecallergraph
  */
-static inline void * CC_HINT(hot) fr_dcursor_remove(fr_dcursor_t *cursor)
+static inline void *fr_dcursor_remove(fr_dcursor_t *cursor)
 {
-	void *v, *p;
+	void *v;
+	int i = 0;
+
+	if (!fr_cond_assert_msg(!cursor->is_const, "attempting to modify const list")) return NULL;
 
 	if (!cursor->current) return NULL;			/* don't do anything fancy, it's just a noop */
 
 	v = cursor->current;
-	p = fr_dcursor_list_prev_peek(cursor);
-	fr_dlist_remove(cursor->dlist, v);
+	VALIDATE(v);
 
-	if (fr_dlist_head(cursor->dlist) == v) {
-		cursor->current = NULL;
-		cursor->prev = NULL;
-	} else {
-		cursor->current = p;
-		cursor->prev = p;
+	if (cursor->remove) {
+		i = cursor->remove(cursor, v, cursor->mod_uctx);
+		if (i < 0) return NULL;
 	}
 
-	/*
-	 *	Advance the cursor to the next item after the one which we just removed.
-	 */
-	cursor->current = dcursor_next(cursor, cursor->current);
+	dcursor_current_set(cursor, dcursor_next(cursor, cursor->iter, v));
+
+	if (i > 0) return v;
+
+	fr_dlist_remove(cursor->dlist, v);
+
 	return v;
 }
 
@@ -450,12 +521,15 @@ static inline void fr_dcursor_merge(fr_dcursor_t *cursor, fr_dcursor_t *to_appen
 {
 	void		*v, *p;
 
+	if (!fr_cond_assert_msg(!cursor->is_const, "dst list in merge is const")) return;
+	if (!fr_cond_assert_msg(!to_append->is_const, "src list in merge is const")) return;
+
 	p = cursor->current;
 	while ((v = fr_dcursor_remove(to_append))) {
 		fr_dcursor_insert(cursor, v);
-		cursor->current = v;
+		dcursor_current_set(cursor, v);
 	}
-	cursor->current = p;
+	dcursor_current_set(cursor, p);
 }
 
 /** Return the next item, skipping the current item, that satisfies an evaluation function.
@@ -467,6 +541,7 @@ static inline void fr_dcursor_merge(fr_dcursor_t *cursor, fr_dcursor_t *to_appen
  *
  * @hidecallergraph
  */
+CC_NO_UBSAN(function)  /* UBSAN: false positive - Type specific dcursor pointer trips --fasanitize=function */
 static inline void *fr_dcursor_filter_next(fr_dcursor_t *cursor, fr_dcursor_eval_t eval, void const *uctx)
 {
 	void *item;
@@ -487,6 +562,7 @@ static inline void *fr_dcursor_filter_next(fr_dcursor_t *cursor, fr_dcursor_eval
  *
  * @hidecallergraph
  */
+CC_NO_UBSAN(function)  /* UBSAN: false positive - Type specific dcursor pointer trips --fasanitize=function */
 static inline void *fr_dcursor_filter_head(fr_dcursor_t *cursor, fr_dcursor_eval_t eval, void const *uctx)
 {
 	void *item;
@@ -506,6 +582,7 @@ static inline void *fr_dcursor_filter_head(fr_dcursor_t *cursor, fr_dcursor_eval
  *
  * @hidecallergraph
  */
+ CC_NO_UBSAN(function)  /* UBSAN: false positive - Type specific dcursor pointer trips --fasanitize=function */
 static inline void *fr_dcursor_filter_current(fr_dcursor_t *cursor, fr_dcursor_eval_t eval, void const *uctx)
 {
         void *item;
@@ -516,12 +593,6 @@ static inline void *fr_dcursor_filter_current(fr_dcursor_t *cursor, fr_dcursor_e
 
         return item;
 }
-
-/** @hidecallergraph */
-void *fr_dcursor_intersect_head(fr_dcursor_t *a, fr_dcursor_t *b) CC_HINT(nonnull);
-
-/** @hidecallergraph */
-void *fr_dcursor_intersect_next(fr_dcursor_t *a, fr_dcursor_t *b) CC_HINT(nonnull);
 
 /** Replace the current item
  *
@@ -536,9 +607,13 @@ void *fr_dcursor_intersect_next(fr_dcursor_t *a, fr_dcursor_t *b) CC_HINT(nonnul
  *
  * @hidecallergraph
  */
-static inline void * CC_HINT(hot) fr_dcursor_replace(fr_dcursor_t *cursor, void *r)
+static inline void *fr_dcursor_replace(fr_dcursor_t *cursor, void *r)
 {
-	void *v, *p;
+	void *v;
+
+	if (!fr_cond_assert_msg(!cursor->is_const, "attempting to modify const list")) return NULL;
+
+	VALIDATE(r);
 
 	/*
 	 *	Correct behaviour here is debatable
@@ -558,22 +633,19 @@ static inline void * CC_HINT(hot) fr_dcursor_replace(fr_dcursor_t *cursor, void 
 		fr_dcursor_append(cursor, r);
 		return NULL;
 	}
-	p = fr_dcursor_list_prev_peek(cursor);
+
+	if (cursor->remove) if (cursor->remove(cursor, v, cursor->mod_uctx) < 0) return NULL;
 
 	fr_dlist_replace(cursor->dlist, cursor->current, r);
 
 	/*
 	 *	Fixup current pointer.
 	 */
-	cursor->current = p;
-
-	/*
-	 *	re-advance the cursor.
-	 *
-	 *	This ensures if the iterator skips the item
-	 *	we just replaced, it doesn't become current.
-	 */
-	fr_dcursor_next(cursor);
+	if (cursor->iter) {
+		dcursor_current_set(cursor, cursor->iter(cursor, r, cursor->iter_uctx));	/* Verify r matches */
+	} else {
+		dcursor_current_set(cursor, r);			/* Current becomes replacement */
+	}
 
 	return v;
 }
@@ -592,6 +664,8 @@ static inline void fr_dcursor_free_list(fr_dcursor_t *cursor)
 {
 	void *v;
 
+	fr_assert(!cursor->is_const);
+
 	if (fr_dlist_empty(cursor->dlist)) return;	/* noop */
 
 	do {
@@ -600,46 +674,28 @@ static inline void fr_dcursor_free_list(fr_dcursor_t *cursor)
 	} while (v);
 }
 
-/** Initialise a cursor with runtime talloc type safety checks and a custom iterator
- *
- * @param[in] _cursor	to initialise.
- * @param[in] _head	of item list.
- * @param[in] _iter	function.
- * @param[in] _uctx	_iter function _uctx.
- * @param[in] _type	Talloc type i.e. fr_pair_t or fr_value_box_t.
- * @return
- *	- NULL if _head does not point to any items, or the iterator matches no items
- *	  in the current list.
- *	- The first item returned by the iterator.
- */
-#define fr_dcursor_talloc_iter_init(_cursor, _head, _iter, _uctx, _type) \
-	_fr_dcursor_init(_cursor, (fr_dlist_head_t const *)_head, _iter, NULL, NULL, _uctx)
-
 /** Initialise a cursor with a custom iterator
  *
  * @param[in] _cursor	to initialise.
  * @param[in] _head	of item list.
  * @param[in] _iter	function.
+ * @param[in] _peek	function.  If NULL _iter will be used for peeking.
  * @param[in] _uctx	_iter function _uctx.
  * @return
  *	- NULL if _head does not point to any items, or the iterator matches no items
  *	  in the current list.
  *	- The first item returned by the iterator.
  */
-#define fr_dcursor_iter_init(_cursor, _head, _iter, _uctx) \
-	_fr_dcursor_init(_cursor, (fr_dlist_head_t *)_head, _iter, NULL, NULL, _uctx)
-
-/** Initialise a cursor with runtime talloc type safety checks
- *
- * @param[in] _cursor	to initialise.
- * @param[in] _head	of item list.
- * @param[in] _type	Talloc type i.e. fr_pair_t or fr_value_box_t.
- * @return
- *	- NULL if _head does not point to any items.
- *	- The first item in the list.
- */
-#define fr_dcursor_talloc_init(_cursor, _head, _type) \
-	_fr_dcursor_init(_cursor, (fr_dlist_head_t const *)_head, NULL, NULL, NULL, NULL)
+#define fr_dcursor_iter_init(_cursor, _head, _iter, _peek, _uctx) \
+	_fr_dcursor_init(_cursor, \
+			 _head, \
+			 _iter, \
+			 _peek, \
+			 _uctx, \
+			 NULL, \
+			 NULL, \
+			 NULL, \
+			 IS_CONST(fr_dlist_head_t *, _head))
 
 /** Initialise a cursor
  *
@@ -650,38 +706,72 @@ static inline void fr_dcursor_free_list(fr_dcursor_t *cursor)
  *	- The first item in the list.
  */
 #define fr_dcursor_init(_cursor, _head) \
-	_fr_dcursor_init(_cursor, (fr_dlist_head_t const *)_head, NULL, NULL, NULL, NULL)
+	_fr_dcursor_init(_cursor, \
+			 _head, \
+			 NULL, \
+			 NULL, \
+			 NULL, \
+			 NULL, \
+			 NULL, \
+			 NULL, \
+			 IS_CONST(fr_dlist_head_t *, _head))
 
 /** Setup a cursor to iterate over attribute items in dlists
  *
  * @param[in] cursor	Where to initialise the cursor (uses existing structure).
  * @param[in] head	of dlist.
  * @param[in] iter	Iterator callback.
+ * @param[in] peek	Iterator callback that should not modify iterator state.
+ * @param[in] iter_uctx	to pass to iterator function.
  * @param[in] insert	Callback for inserts.
- * @param[in] delete	Callback for removals.
- * @param[in] uctx	to pass to iterator function.
+ * @param[in] remove	Callback for removals.
+ * @param[in] mod_uctx	to pass to modification functions.
+ * @param[in] is_const	Don't allow modification of the underlying list.
  * @return the attribute pointed to by v.
  *
  * @hidecallergraph
  */
-static inline void * CC_HINT(hot) _fr_dcursor_init(fr_dcursor_t *cursor, fr_dlist_head_t const *head,
-				     fr_dcursor_iter_t iter, fr_dcursor_insert_t insert,
-				     fr_dcursor_delete_t delete, void const *uctx)
+static inline CC_HINT(nonnull(1,2))
+void *_fr_dcursor_init(fr_dcursor_t *cursor, fr_dlist_head_t const *head,
+		       fr_dcursor_iter_t iter, fr_dcursor_iter_t peek, void const *iter_uctx,
+		       fr_dcursor_insert_t insert, fr_dcursor_remove_t remove, void const *mod_uctx, bool is_const)
 {
-	fr_dlist_head_t *v;
-
-	memcpy(&v, &head, sizeof(v));			/* stupid const hacks */
 	*cursor = (fr_dcursor_t){
-		.dlist = v,
+		.dlist = UNCONST(fr_dlist_head_t *, head),
 		.iter = iter,
-		.insert = insert,
-		.delete = delete,
-		.prev = NULL
+		.peek = peek ? peek : iter,
+		.iter_uctx = UNCONST(void *, iter_uctx),
+		.insert = is_const ? NULL : insert,
+		.remove = is_const ? NULL : remove,
+		.mod_uctx = UNCONST(void *, mod_uctx),
+		.is_const = is_const
 	};
-	memcpy(&cursor->uctx, &uctx, sizeof(cursor->uctx));
 	if (!fr_dlist_empty(cursor->dlist)) return fr_dcursor_next(cursor);	/* Initialise current */
 
+	if (iter) return fr_dcursor_next(cursor);	/* An iterator may do something, even on an empty list */
+
 	return NULL;
+}
+
+/** re-initialise a cursor, changing its list
+ *
+ * @param[in] _cursor	to re-initialise.
+ * @param[in] _head	of item list.
+ * @return
+ *	- NULL if _head does not point to any items.
+ *	- The first item in the list.
+ */
+#define fr_dcursor_reinit(_cursor, _head) \
+	_fr_dcursor_reinit(_cursor, \
+			   _head, \
+			   IS_CONST(fr_dlist_head_t *, _head))
+
+static inline CC_HINT(nonnull(1,2))
+void _fr_dcursor_list_reinit(fr_dcursor_t *cursor, fr_dlist_head_t const *head, bool is_const)
+{
+	cursor->dlist = UNCONST(fr_dlist_head_t *, head);
+	cursor->current = NULL;
+	cursor->is_const = is_const;
 }
 
 /** talloc_free the current item
@@ -691,6 +781,8 @@ static inline void * CC_HINT(hot) _fr_dcursor_init(fr_dcursor_t *cursor, fr_dlis
 static inline void fr_dcursor_free_item(fr_dcursor_t *cursor)
 {
 	if (!cursor) return;
+
+	fr_assert(!cursor->is_const);
 
 	talloc_free(fr_dcursor_remove(cursor));
 }
@@ -714,6 +806,189 @@ static inline fr_dcursor_stack_t *fr_dcursor_stack_alloc(TALLOC_CTX *ctx, uint8_
 
 	return stack;
 }
+
+#define fr_dcursor_list_next(_cursor, _ptr) fr_dlist_next((_cursor)->dlist, _ptr)
+
+#define fr_dcursor_list(_cursor) ((_cursor)->dlist)
+
+void *fr_dcursor_intersect_head(fr_dcursor_t *a, fr_dcursor_t *b);
+
+void *fr_dcursor_intersect_next(fr_dcursor_t *a, fr_dcursor_t *b);
+
+DIAG_OFF(unused-function)
+
+/** Expands to the type name used for the dcursor wrapper structure
+ *
+ * @param[in] _name	Prefix we add to type-specific structures.
+ * @return ``<name>_dcursor_t``
+ */
+#define FR_DCURSOR(_name) _name ## _dcursor_t
+
+/** Expands to the type name used for the dcursor iterator type
+ *
+ * @param[in] _name	Prefix we add to type-specific structures.
+ * @return ``<name>_iter_t``
+ */
+#define FR_DCURSOR_ITER(_name) _name ## _iter_t
+
+/** Expands to the type name used for the dcursor evaluator type
+ *
+ * @param[in] _name	Prefix we add to type-specific structures.
+ * @return ``<name>_eval_t``
+ */
+#define FR_DCURSOR_EVAL(_name) _name ## _eval_t
+
+/** Expands to the type name used for the dcursor insert function type
+ *
+ * @param[in] _name	Prefix we add to type-specific structures.
+ * @return ``<name>_insert_t``
+ */
+#define FR_DCURSOR_INSERT(_name) _name ## _insert_t
+
+/** Expands to the type name used for the dcursor remove function type
+ *
+ * @param[in] _name	Prefix we add to type-specific structures.
+ * @return ``<name>_remove_t``
+ */
+#define FR_DCURSOR_REMOVE(_name) _name ## _remove_t
+
+/** Expands to the type name used for the dcursor copy function type
+ *
+ * @param[in] _name	Prefix we add to type-specific structures.
+ * @return ``<name>_copy_t``
+ */
+#define FR_DCURSOR_COPY(_name) _name ## _copy_t
+
+/** Define type specific wrapper structs for dcursors
+ *
+ * @param[in] _name		Prefix we add to type-specific structures.
+ * @param[in] _list_name	The identifier used for type qualifying dlists.
+ *				Should be the same as that use for
+ *				- #FR_DLIST_HEAD
+ *				- #FR_DLIST_ENTRY
+ *				- #FR_DLIST_TYPES
+ *				- #FR_DLIST_FUNCS
+ * @param[in] _element_type	Type of element in the dlists.
+ *
+ * @note This macro should be used inside the header for the area of code
+ * which will use type specific functions.
+ */
+#define FR_DCURSOR_DLIST_TYPES(_name, _list_name, _element_type) \
+	typedef struct { fr_dcursor_t dcursor; } FR_DCURSOR(_name); \
+	typedef _element_type *(*FR_DCURSOR_ITER(_name))(fr_dcursor_t *cursor, _element_type *to_eval, void *uctx); \
+	typedef bool (*FR_DCURSOR_EVAL(_name))(_element_type const *item, void const *uctx); \
+	typedef int (*FR_DCURSOR_INSERT(_name))(fr_dcursor_t *cursor, FR_DLIST_ENTRY(_list_name) *to_insert, void *uctx); \
+	typedef int (*FR_DCURSOR_REMOVE(_name))(fr_dcursor_t *cursor, FR_DLIST_ENTRY(_list_name) *to_delete, void *uctx); \
+	typedef void (*FR_DCURSOR_COPY(_name))(FR_DCURSOR(_name) *out, FR_DCURSOR(_name) const *in);
+
+/** Define type specific wrapper functions for dcursors
+ *
+ * @note This macro should be used inside the source file that will use
+ * the type specific functions.
+ *
+ * @param[in] _name		Prefix we add to type-specific dcursor functions.
+ * @param[in] _list_name	Prefix for type-specific dlist used by this dcursor.
+ * @param[in] _element_type	Type of structure that'll be inserted into the dlist and returned by the dcursor.
+ */
+#define FR_DCURSOR_FUNCS(_name, _list_name, _element_type) \
+DIAG_OFF(unused-function) \
+	static inline CC_HINT(nonnull) _element_type *_name ## _init(FR_DCURSOR(_name) *dcursor, \
+								     FR_DLIST_HEAD(_list_name) *head) \
+		{ return (_element_type *)_fr_dcursor_init(&dcursor->dcursor, &head->head, \
+							   NULL, NULL, NULL, NULL, NULL, NULL, \
+							   IS_CONST(FR_DLIST_HEAD(_list_name) *, head)); } \
+\
+	static inline CC_HINT(nonnull(1,2)) _element_type *_name ## _iter_init(FR_DCURSOR(_name) *dcursor, \
+									       FR_DLIST_HEAD(_list_name) *head, \
+									       FR_DCURSOR_ITER(_name) iter, \
+									       FR_DCURSOR_ITER(_name) peek, \
+									       void const *iter_uctx) \
+		{ return (_element_type *)_fr_dcursor_init(&dcursor->dcursor, &head->head, \
+							   (fr_dcursor_iter_t)iter, \
+							   (fr_dcursor_iter_t)peek, \
+							   iter_uctx, \
+							   NULL, NULL, NULL, \
+							   IS_CONST(FR_DLIST_HEAD(_list_name) *, head)); } \
+\
+	static inline CC_HINT(nonnull) _element_type *_name ## _current(FR_DCURSOR(_name) *dcursor) \
+		{ return (_element_type *)fr_dcursor_current(&dcursor->dcursor); } \
+\
+	static inline CC_HINT(nonnull) _element_type *_name ## _next_peek(FR_DCURSOR(_name) *dcursor) \
+		{ return (_element_type *)fr_dcursor_next_peek(&dcursor->dcursor); } \
+\
+	static inline CC_HINT(nonnull) _element_type *_name ## _list_next_peek(FR_DCURSOR(_name) *dcursor) \
+		{ return (_element_type *)fr_dcursor_list_next_peek(&dcursor->dcursor); } \
+\
+	static inline CC_HINT(nonnull) _element_type *_name ## _next(FR_DCURSOR(_name) *dcursor) \
+		{ return (_element_type *)fr_dcursor_next(&dcursor->dcursor); } \
+\
+	static inline CC_HINT(nonnull) void _name ## _copy(FR_DCURSOR(_name) *out, \
+							   FR_DCURSOR(_name) const *in) \
+		{ fr_dcursor_copy(&out->dcursor, &in->dcursor); } \
+\
+	static inline CC_HINT(nonnull) _element_type *_name ## _head(FR_DCURSOR(_name) *dcursor) \
+		{ return (_element_type *)fr_dcursor_head(&dcursor->dcursor); } \
+\
+	static inline CC_HINT(nonnull) _element_type *_name ## _tail(FR_DCURSOR(_name) *dcursor) \
+		{ return (_element_type *)fr_dcursor_tail(&dcursor->dcursor); } \
+\
+	static inline CC_HINT(nonnull) _element_type *_name ## _set_current(FR_DCURSOR(_name) *dcursor, \
+									   _element_type *v) \
+		{ return (_element_type *)fr_dcursor_set_current(&dcursor->dcursor, v); } \
+\
+	static inline CC_HINT(nonnull) int _name ## _prepend(FR_DCURSOR(_name) *dcursor, \
+							     _element_type *v) \
+		{ return fr_dcursor_prepend(&dcursor->dcursor, v); } \
+\
+	static inline CC_HINT(nonnull) int _name ## _append(FR_DCURSOR(_name) *dcursor, \
+							    _element_type *v) \
+		{ return fr_dcursor_append(&dcursor->dcursor, v); } \
+\
+	static inline CC_HINT(nonnull) int _name ## _insert(FR_DCURSOR(_name) *dcursor, \
+							    _element_type *v) \
+		{ return fr_dcursor_insert(&dcursor->dcursor, v); } \
+\
+	static inline CC_HINT(nonnull) _element_type *_name ## _replace(FR_DCURSOR(_name) *dcursor, \
+									_element_type *v) \
+		{ return fr_dcursor_replace(&dcursor->dcursor, v); } \
+\
+	static inline CC_HINT(nonnull) _element_type *_name ## _remove(FR_DCURSOR(_name) *dcursor) \
+		{ return (_element_type *)fr_dcursor_remove(&dcursor->dcursor); } \
+\
+	static inline CC_HINT(nonnull) void _name ## _merge(FR_DCURSOR(_name) *cursor, \
+							    FR_DCURSOR(_name) *to_append) \
+		{ fr_dcursor_merge(&cursor->dcursor, &to_append->dcursor); } \
+\
+	static inline CC_HINT(nonnull) void _name ## _free_list(FR_DCURSOR(_name) *dcursor) \
+		{ fr_dcursor_free_list(&dcursor->dcursor); } \
+\
+	static inline CC_HINT(nonnull) void _name ## _free_item(FR_DCURSOR(_name) *dcursor) \
+		{ fr_dcursor_free_item(&dcursor->dcursor); } \
+\
+	static inline CC_HINT(nonnull) _element_type *_name ## _intersect_head(FR_DCURSOR(_name) *a, \
+									       FR_DCURSOR(_name) *b) \
+		{ return (_element_type *)fr_dcursor_intersect_head(&a->dcursor, &b->dcursor); } \
+\
+	static inline CC_HINT(nonnull) _element_type *_name ## _intersect_next(FR_DCURSOR(_name) *a, \
+									       FR_DCURSOR(_name) *b) \
+		{ return (_element_type *)fr_dcursor_intersect_next(&a->dcursor, &b->dcursor); } \
+\
+	static inline CC_HINT(nonnull(1,2)) _element_type *_name ## _filter_head(FR_DCURSOR(_name) *dcursor, \
+										 FR_DCURSOR_EVAL(_name) eval, \
+										 void const *uctx) \
+		{ return (_element_type *)fr_dcursor_filter_head(&dcursor->dcursor, (fr_dcursor_eval_t)eval, uctx); } \
+\
+	static inline CC_HINT(nonnull(1,2)) _element_type *_name ## _filter_next(FR_DCURSOR(_name) *dcursor, \
+										 FR_DCURSOR_EVAL(_name) eval, \
+										 void const *uctx) \
+		{ return (_element_type *)fr_dcursor_filter_next(&dcursor->dcursor, (fr_dcursor_eval_t)eval, uctx); } \
+\
+	static inline CC_HINT(nonnull(1,2)) _element_type *_name ## _filter_current(FR_DCURSOR(_name) *dcursor, \
+										    FR_DCURSOR_EVAL(_name) eval, \
+										    void const *uctx) \
+		{ return (_element_type *)fr_dcursor_filter_current(&dcursor->dcursor, (fr_dcursor_eval_t)eval, uctx); }
+
+DIAG_ON(unused-function)
 
 #ifdef __cplusplus
 }

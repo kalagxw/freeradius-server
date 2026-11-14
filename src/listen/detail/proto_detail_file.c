@@ -24,14 +24,12 @@
  */
 
 #include <freeradius-devel/io/application.h>
-#include <freeradius-devel/io/base.h>
 #include <freeradius-devel/io/listen.h>
 #include <freeradius-devel/io/schedule.h>
 
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/protocol.h>
-#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/server/main_config.h>
 
+#include <freeradius-devel/util/syserror.h>
 #include <freeradius-devel/util/misc.h>
 
 #include "proto_detail.h"
@@ -69,17 +67,17 @@ typedef struct proto_detail_work_s proto_detail_file_t;
  */
 typedef struct proto_detail_work_thread_s proto_detail_file_thread_t;
 
-static void work_init(proto_detail_file_thread_t *thread);
+static void work_init(proto_detail_file_thread_t *thread, bool triggered_by_delete);
 static void mod_vnode_delete(fr_event_list_t *el, int fd, UNUSED int fflags, void *ctx);
 
-static const CONF_PARSER file_listen_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_STRING | FR_TYPE_REQUIRED, proto_detail_file_t, filename ) },
+static const conf_parser_t file_listen_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("filename", CONF_FLAG_REQUIRED, proto_detail_file_t, filename ) },
 
-	{ FR_CONF_OFFSET("filename_work", FR_TYPE_STRING, proto_detail_file_t, filename_work ) },
+	{ FR_CONF_OFFSET("filename_work", proto_detail_file_t, filename_work ) },
 
-	{ FR_CONF_OFFSET("poll_interval", FR_TYPE_UINT32, proto_detail_file_t, poll_interval), .dflt = "5" },
+	{ FR_CONF_OFFSET("poll_interval", proto_detail_file_t, poll_interval), .dflt = "5" },
 
-	{ FR_CONF_OFFSET("immediate", FR_TYPE_BOOL, proto_detail_file_t, immediate) },
+	{ FR_CONF_OFFSET("immediate", proto_detail_file_t, immediate) },
 
 	CONF_PARSER_TERMINATOR
 };
@@ -95,15 +93,24 @@ static int mod_decode(void const *instance, request_t *request, uint8_t *const d
 	return inst->parent->work_io->decode(inst->parent->work_io_instance, request, data, data_len);
 }
 
-static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_time,
-			 uint8_t *buffer, size_t buffer_len, size_t written)
+#if 0
+static ssize_t mod_write(UNUSED fr_listen_instance_t *li, UNUSED void *packet_ctx, UNUSED fr_time_t request_time,
+			 UNUSED uint8_t *buffer, UNUSED size_t buffer_len, UNUSED size_t written)
 {
+#if 1
+	fr_assert(0);
+
+	return -1;
+#else
 	proto_detail_file_thread_t  *thread = talloc_get_type_abort(li->thread_instance, proto_detail_file_thread_t);
 
-	return thread->listen->app_io->write(thread->listen, packet_ctx, request_time, buffer, buffer_len, written);
+	return thread->li->listen->app_io->write(thread->li, packet_ctx, request_time, buffer, buffer_len,
+						     written);
+#endif
 }
+#endif
 
-static void mod_vnode_extend(fr_listen_t *li, UNUSED uint32_t fflags)
+static void mod_vnode_extend(fr_listen_instance_t *li, UNUSED uint32_t fflags)
 {
 	proto_detail_file_thread_t *thread = talloc_get_type_abort(li->thread_instance, proto_detail_file_thread_t);
 
@@ -115,17 +122,18 @@ static void mod_vnode_extend(fr_listen_t *li, UNUSED uint32_t fflags)
 
 	if (has_worker) return;
 
-	if (thread->ev) fr_event_timer_delete(&thread->ev);
+	FR_TIMER_DISARM(thread->ev);
 
-	work_init(thread);
+	work_init(thread, false);
 }
 
 /** Open a detail listener
  *
  */
-static int mod_open(fr_listen_t *li)
+static int mod_open(fr_listen_instance_t *li)
 {
-	proto_detail_file_t const  *inst = talloc_get_type_abort_const(li->app_io_instance, proto_detail_file_t);
+	proto_detail_file_t const  *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+								       proto_detail_file_t);
 	proto_detail_file_thread_t *thread = talloc_get_type_abort(li->thread_instance, proto_detail_file_thread_t);
 
 	if (inst->poll_interval == 0) {
@@ -137,18 +145,29 @@ static int mod_open(fr_listen_t *li)
 		oflag = O_RDONLY;
 #endif
 		li->fd = thread->fd = open(inst->directory, oflag);
+		if (thread->fd < 0) {
+			cf_log_err(inst->cs, "Failed opening %s: %s", inst->directory, fr_syserror(errno));
+			return -1;
+		}
 	} else {
-		li->fd = thread->fd = open("/dev/null", O_RDONLY);
+		li->fd = thread->fd = -1;
+		li->listen->non_socket_listener = true;
+		li->listen->needs_full_setup = true;
 	}
-	if (thread->fd < 0) {
-		cf_log_err(inst->cs, "Failed opening %s: %s", inst->directory, fr_syserror(errno));
-		return -1;
-	}
-
 	thread->inst = inst;
 	thread->name = talloc_typed_asprintf(thread, "detail_file which will read files matching %s", inst->filename);
 	thread->vnode_fd = -1;
 	pthread_mutex_init(&thread->worker_mutex, NULL);
+
+	li->listen->no_write_callback = true;
+
+	/*
+	 *	The I/O path for the work files.  Each one read is a
+	 *	socket of this one listener.
+	 */
+	MEM(thread->work_listen = fr_listen_alloc(thread, inst->parent->work_io_conf, inst->parent->server_cs,
+						  inst->parent->self, inst->parent,
+						  inst->parent->work_io, inst->parent->work_io_instance));
 
 	return 0;
 }
@@ -221,11 +240,11 @@ static int work_rename(proto_detail_file_thread_t *thread)
 /*
  *	Start polling again after a timeout.
  */
-static void work_retry_timer(UNUSED fr_event_list_t *el, UNUSED fr_time_t now, void *uctx)
+static void work_retry_timer(UNUSED fr_timer_list_t *tl, UNUSED fr_time_t now, void *uctx)
 {
 	proto_detail_file_thread_t *thread = talloc_get_type_abort(uctx, proto_detail_file_thread_t);
 
-	work_init(thread);
+	work_init(thread, false);
 }
 
 /*
@@ -236,7 +255,7 @@ static int work_exists(proto_detail_file_thread_t *thread, int fd)
 	proto_detail_file_t const *inst = thread->inst;
 	bool			opened = false;
 	proto_detail_work_thread_t     *work;
-	fr_listen_t		*li = NULL;
+	fr_listen_instance_t	       *li = NULL;
 	struct stat		st;
 
 	fr_event_vnode_func_t	funcs = { .delete = mod_vnode_delete };
@@ -247,7 +266,7 @@ static int work_exists(proto_detail_file_thread_t *thread, int fd)
 	 *	"detail.work" exists, try to lock it.
 	 */
 	if (rad_lockfd_nonblock(fd, 0) < 0) {
-		fr_time_t delay;
+		fr_time_delta_t delay;
 
 		DEBUG3("proto_detail (%s): Failed locking %s: %s",
 		       thread->name, inst->filename_work, fr_syserror(errno));
@@ -260,14 +279,18 @@ static int work_exists(proto_detail_file_thread_t *thread, int fd)
 		 *	Set the next interval, and ensure that we
 		 *	don't do massive busy-polling.
 		 */
-		thread->lock_interval += thread->lock_interval / 2;
-		if (thread->lock_interval > ((fr_time_delta_t) 30) * NSEC) thread->lock_interval = ((fr_time_delta_t) 30) * NSEC;
+		thread->lock_interval = fr_time_delta_add(thread->lock_interval,
+							  fr_time_delta_div(thread->lock_interval,
+									    fr_time_delta_wrap(2)));
+		if (fr_time_delta_gt(thread->lock_interval, fr_time_delta_from_sec(30))) {
+			thread->lock_interval = fr_time_delta_from_sec(30);
+		}
 
-		DEBUG3("proto_detail (%s): Waiting %d.%06ds for lock on file %s",
-		       thread->name, (int) (delay / NSEC), (int) ((delay % NSEC) / 1000), inst->filename_work);
+		DEBUG3("proto_detail (%s): Waiting %.6fs for lock on file %s",
+		       thread->name, fr_time_delta_to_sec_double(delay), inst->filename_work);
 
-		if (fr_event_timer_in(thread, thread->el, &thread->ev,
-				      delay, work_retry_timer, thread) < 0) {
+		if (fr_timer_in(thread, thread->el->tl, &thread->ev, delay,
+				false, work_retry_timer, thread) < 0) {
 			ERROR("Failed inserting retry timer for %s", inst->filename_work);
 		}
 		return 0;
@@ -299,30 +322,19 @@ static int work_exists(proto_detail_file_thread_t *thread, int fd)
 	 *	This listener is allocated in a thread-specific
 	 *	context, so it doesn't need a destructor,
 	 */
-	MEM(li = talloc_zero(NULL, fr_listen_t));
+	MEM(li = fr_listen_instance_alloc(NULL, thread->work_listen));
 
 	/*
-	 *	Create a new listener, and insert it into the
+	 *	A socket of the work file listener, inserted into the
 	 *	scheduler.  Shamelessly copied from proto_detail.c
 	 *	mod_open(), with changes.
 	 *
-	 *	This listener is parented from the worker.  So that
-	 *	when the worker goes away, so does the listener.
-	 */
-	li->app_io = inst->parent->work_io;
-
-	li->app = inst->parent->self;
-	li->app_instance = inst->parent;
-	li->server_cs = inst->parent->server_cs;
-
-	/*
-	 *	The worker may be in a different thread, so avoid
-	 *	talloc threading issues by using a NULL TALLOC_CTX.
+	 *	This socket is parented from the worker.  So that
+	 *	when the worker goes away, so does the socket.
 	 */
 	MEM(li->thread_instance = work = talloc_zero(li, proto_detail_work_thread_t));
 
-	li->app_io_instance = inst->parent->work_io_instance;
-	work->inst = li->app_io_instance;
+	work->inst = li->listen->app_io_instance;
 	work->file_parent = thread;
 	work->ev = NULL;
 
@@ -345,6 +357,7 @@ static int work_exists(proto_detail_file_thread_t *thread, int fd)
 	if (fr_event_filter_insert(thread, NULL, thread->el, fd, FR_EVENT_FILTER_VNODE,
 				   &funcs, NULL, thread) < 0) {
 		PERROR("Failed adding work socket to event loop");
+		close(li->fd);
 		close(fd);
 		talloc_free(li);
 		return -1;
@@ -359,31 +372,27 @@ static int work_exists(proto_detail_file_thread_t *thread, int fd)
 	 *	For us, this is the worker listener.
 	 *	For the worker, this is it's own parent
 	 */
-	thread->listen = li;
+	thread->li = li;
 
 	work->filename_work = talloc_strdup(work, inst->filename_work);
 
 	/*
 	 *	Set configurable parameters for message ring buffer.
 	 */
-	li->default_message_size = inst->parent->max_packet_size;
-	li->num_messages = inst->parent->num_messages;
-
-	pthread_mutex_lock(&thread->worker_mutex);
-	thread->num_workers++;
-	pthread_mutex_unlock(&thread->worker_mutex);
+	li->listen->default_message_size = inst->parent->max_packet_size;
+	li->listen->num_messages = inst->parent->num_messages;
 
 	/*
 	 *	Open the detail.work file.
 	 */
-	if (li->app_io->open(li) < 0) {
-		ERROR("Failed opening %s", li->app_io->name);
+	if (li->listen->app_io->open(li) < 0) {
+		ERROR("Failed opening %s", li->listen->app_io->common.name);
 		goto error;
 	}
 	opened = true;
 
-	fr_assert(li->app_io->get_name);
-	li->name = li->app_io->get_name(li);
+	fr_assert(li->listen->app_io->get_name);
+	li->name = li->listen->app_io->get_name(li);
 
 	if (!fr_schedule_listen_add(inst->parent->sc, li)) {
 	error:
@@ -394,9 +403,11 @@ static int work_exists(proto_detail_file_thread_t *thread, int fd)
 		thread->vnode_fd = -1;
 
 		if (opened) {
-			(void) li->app_io->close(li);
-			thread->listen = NULL;
+			(void) li->listen->app_io->close(li);
+			thread->li = NULL;
 			li = NULL;
+		} else {
+			close(li->fd);
 		}
 
 		talloc_free(li);
@@ -406,7 +417,11 @@ static int work_exists(proto_detail_file_thread_t *thread, int fd)
 	/*
 	 *	Tell the worker to clean itself up.
 	 */
-	work->listen = li;
+	work->li = li;
+
+	pthread_mutex_lock(&thread->worker_mutex);
+	thread->num_workers++;
+	pthread_mutex_unlock(&thread->worker_mutex);
 
 	return 0;
 }
@@ -445,11 +460,23 @@ static void mod_vnode_delete(fr_event_list_t *el, int fd, UNUSED int fflags, voi
 	 *	"move", which both deletes the old file, and creates
 	 *	the new one.
 	 */
-	work_init(thread);
+	work_init(thread, true);
 }
 
 
-static void work_init(proto_detail_file_thread_t *thread)
+/** Start processing a new work file
+ *
+ * @param[in] thread			the thread instance.
+ * @param[in] triggered_by_delete	true if this was triggered by a vnode_delete.
+ *					When a new file is moved over a workfile
+ *					vnode delete can serve as an indication
+ *					that new data is available.
+ *					It can also mean however, that the file
+ *					has just been deleted, so we shouldn't
+ *					treat this failure to open the new file
+ *					as a fatal error.
+ */
+static void work_init(proto_detail_file_thread_t *thread, bool triggered_by_delete)
 {
 	proto_detail_file_t const *inst = thread->inst;
 	int fd, rcode;
@@ -506,20 +533,35 @@ retry:
 		 */
 		if (!inst->poll_interval) return;
 
+		/*
+		 *	File really was deleted, and didn't have
+		 *	anything moved over the top.
+		 */
+		if (inst->immediate && triggered_by_delete) return;
+
 delay:
+		/*
+		 *	If we're processing one file and exiting, then the input file must exist.
+		 */
+		if (inst->immediate && inst->parent->exit_when_done) {
+			ERROR("Input file does not exist");
+			fr_exit(EXIT_FAILURE);
+		}
+
 		/*
 		 *	Check every N seconds.
 		 */
-		DEBUG3("Waiting %d.000000s for new files in %s", inst->poll_interval, thread->name);
+		DEBUG3("Waiting %" PRIu32 ".000000s for new files in %s", inst->poll_interval, thread->name);
 
-		if (fr_event_timer_in(thread, thread->el, &thread->ev,
-				      fr_time_delta_from_sec(inst->poll_interval), work_retry_timer, thread) < 0) {
+		if (fr_timer_in(thread, thread->el->tl, &thread->ev,
+				fr_time_delta_from_sec(inst->poll_interval),
+				false, work_retry_timer, thread) < 0) {
 			ERROR("Failed inserting poll timer for %s", inst->filename_work);
 		}
 		return;
 	}
 
-	thread->lock_interval = NSEC / 10;
+	thread->lock_interval = fr_time_delta_from_msec(100);
 
 	/*
 	 *	It exists, go process it!
@@ -548,15 +590,16 @@ delay:
  * @param[in] el the event list
  * @param[in] nr context from the network side
  */
-static void mod_event_list_set(fr_listen_t *li, fr_event_list_t *el, UNUSED void *nr)
+static void mod_event_list_set(fr_listen_instance_t *li, fr_event_list_t *el, UNUSED void *nr)
 {
-	proto_detail_file_t const  *inst = talloc_get_type_abort_const(li->app_io_instance, proto_detail_file_t);
+	proto_detail_file_t const  *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+								       proto_detail_file_t);
 	proto_detail_file_thread_t *thread = talloc_get_type_abort(li->thread_instance, proto_detail_file_thread_t);
 
 	thread->el = el;
 
 	if (inst->immediate) {
-		work_init(thread);
+		work_init(thread, false);
 		return;
 	}
 
@@ -567,14 +610,14 @@ static void mod_event_list_set(fr_listen_t *li, fr_event_list_t *el, UNUSED void
 	 *	therefore change permissions, so that libkqueue can
 	 *	read it.
 	 */
-	if (fr_event_timer_in(thread, thread->el, &thread->ev,
-			      fr_time_delta_from_sec(1), work_retry_timer, thread) < 0) {
-		ERROR("Failed inserting poll timer for %s", thread->filename_work);
+	if (fr_timer_in(thread, thread->el->tl, &thread->ev,
+			fr_time_delta_from_sec(1), false, work_retry_timer, thread) < 0) {
+		ERROR("Failed inserting poll timer for %s", inst->filename_work);
 	}
 }
 
 
-static char const *mod_name(fr_listen_t *li)
+static char const *mod_name(fr_listen_instance_t *li)
 {
 	proto_detail_file_thread_t *thread = talloc_get_type_abort(li->thread_instance, proto_detail_file_thread_t);
 
@@ -582,10 +625,31 @@ static char const *mod_name(fr_listen_t *li)
 }
 
 
-static int mod_bootstrap(void *instance, CONF_SECTION *cs)
+static fr_rb_tree_t *detail_file_tree = NULL;
+static pthread_mutex_t detail_file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/** Compare two thread instances based on node pointer
+ *
+ * @param[in] one	First thread specific xlat expansion instance.
+ * @param[in] two	Second thread specific xlat expansion instance.
+ * @return CMP(one, two)
+ */
+static fr_cmp_ret_t _detail_file_cmp(void const *one, void const *two)
 {
-	proto_detail_file_t	*inst = talloc_get_type_abort(instance, proto_detail_file_t);
-	dl_module_inst_t const	*dl_inst;
+	proto_detail_file_t const *a = one, *b = two;
+
+	return CMP(strcmp(a->filename, b->filename), 0);
+}
+
+/*
+ *	Check for multiple readers on the same set of files.
+ */
+static int mod_instantiate(module_inst_ctx_t const *mctx)
+{
+	proto_detail_file_t	*inst = talloc_get_type_abort(mctx->mi->data, proto_detail_file_t);
+	CONF_SECTION		*conf = mctx->mi->conf;
+
+	module_instance_t const	*mi;
 	char			*p;
 
 #ifdef __linux__
@@ -604,19 +668,18 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	if (!main_config->allow_core_dumps &&
 	    main_config->uid_is_set &&
 	    main_config->server_uid != 0) {
-		cf_log_err(cs, "Cannot start detail file reader due to Linux limitations.");
-		cf_log_err(cs, "Please set 'allow_core_dumps = true' in the main configuration file.");
+		cf_log_err(conf, "Cannot start detail file reader due to Linux limitations.");
+		cf_log_err(conf, "Please set 'allow_core_dumps = true' in the main configuration file.");
 		return -1;
 	}
 #endif
 
 	/*
-	 *	Find the dl_module_inst_t holding our instance data
+	 *	Find the module_instance_t holding our instance data
 	 *	so we can find out what the parent of our instance
 	 *	was.
 	 */
-	dl_inst = dl_module_instance_by_data(instance);
-	fr_assert(dl_inst);
+	mi = mctx->mi;
 
 #ifndef __linux__
 	/*
@@ -626,14 +689,14 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 #endif
 	FR_INTEGER_BOUND_CHECK("poll_interval", inst->poll_interval, <=, 3600);
 
-	inst->parent = talloc_get_type_abort(dl_inst->parent->data, proto_detail_t);
-	inst->cs = cs;
+	inst->parent = talloc_get_type_abort(mi->parent->data, proto_detail_t);
+	inst->cs = conf;
 
 	inst->directory = p = talloc_strdup(inst, inst->filename);
 
 	p = strrchr(p, '/');
 	if (!p) {
-		cf_log_err(cs, "Filename must contain '/'");
+		cf_log_err(conf, "Filename must contain '/'");
 		return -1;
 	}
 
@@ -648,51 +711,30 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	 */
 	inst->mode = O_RDWR;
 
-	return 0;
-}
-
-static fr_rb_tree_t *detail_file_tree = NULL;
-static pthread_mutex_t detail_file_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/** Compare two thread instances based on node pointer
- *
- * @param[in] one	First thread specific xlat expansion instance.
- * @param[in] two	Second thread specific xlat expansion instance.
- * @return CMP(one, two)
- */
-static int8_t _detail_file_cmp(void const *one, void const *two)
-{
-	proto_detail_file_t const *a = one, *b = two;
-
-	return strcmp(a->filename, b->filename);
-}
-
-/*
- *	Check for multiple readers on the same set of files.
- */
-static int mod_instantiate(void *instance, CONF_SECTION *cs)
-{
-	proto_detail_file_t *inst = talloc_get_type_abort(instance, proto_detail_file_t);
+	if (inst->parent->exit_when_done && !inst->immediate) {
+		cf_log_warn(conf, "Ignoring 'exit_when_done' due to 'immediate' flag not being set");
+		inst->parent->exit_when_done = false;
+	}
 
 	pthread_mutex_lock(&detail_file_mutex);
 	if (!detail_file_tree) {
-		detail_file_tree = fr_rb_inline_talloc_alloc(cs, proto_detail_file_t, filename_node, _detail_file_cmp, NULL);
+		detail_file_tree = fr_rb_inline_talloc_alloc(conf, proto_detail_file_t, filename_node, _detail_file_cmp, NULL);
 		if (!detail_file_tree) {
 			pthread_mutex_unlock(&detail_file_mutex);
-			cf_log_err(cs, "Failed initializing detail_file");
+			cf_log_err(conf, "Failed initializing detail_file");
 			return -1;
 		}
 	}
 
-	if (!fr_rb_insert(detail_file_tree, inst)) {
-		proto_detail_file_t const *old;
+	if (fr_rb_insert(detail_file_tree, inst) != 0) {
+		proto_detail_file_t *old;
 
-		old = fr_rb_find(detail_file_tree, inst);
+		fr_rb_find((void **)&old, detail_file_tree, inst);
 		fr_assert(old);
 
 		pthread_mutex_unlock(&detail_file_mutex);
-		cf_log_err(cs, "Duplicate detail listener %s", inst->filename);
-		cf_log_err(cs, "Original detail listener is in virtual server %s", cf_section_name2(old->parent->server_cs));
+		cf_log_err(conf, "Duplicate detail listener %s", inst->filename);
+		cf_log_err(conf, "Original detail listener is in virtual server %s", cf_section_name2(old->parent->server_cs));
 		return -1;
 	}
 	pthread_mutex_unlock(&detail_file_mutex);
@@ -701,23 +743,30 @@ static int mod_instantiate(void *instance, CONF_SECTION *cs)
 }
 
 
-static int mod_close(fr_listen_t *li)
+static int mod_close(fr_listen_instance_t *li)
 {
-	proto_detail_file_t const  *inst = talloc_get_type_abort_const(li->app_io_instance, proto_detail_file_t);
+	proto_detail_file_t const  *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+								       proto_detail_file_t);
 	proto_detail_file_thread_t *thread = talloc_get_type_abort(li->thread_instance, proto_detail_file_thread_t);
 
-	if (thread->nr) (void) fr_network_socket_delete(thread->nr, inst->parent->listen);
+	if (thread->nr) {
+		if (unlikely(fr_network_listen_delete(thread->nr, inst->parent->listen) < 0)) {
+			PERROR("Failed removing listener from network on detach");
+		}
+	}
 
 	/*
 	 *	@todo - have our OWN event loop for timers, and a
 	 *	"copy timer from -> to, which means we only have to
 	 *	delete our child event loop from the parent on close.
 	 */
-	close(thread->fd);
+	if (thread->fd >= 0) close(thread->fd);
 
 	if (thread->vnode_fd >= 0) {
 		if (thread->nr) {
-			(void) fr_network_socket_delete(thread->nr, inst->parent->listen);
+			if (unlikely(fr_network_listen_delete(thread->nr, inst->parent->listen) < 0)) {
+				PERROR("Failed removing listener from network on detach");
+			}
 		} else {
 			if (fr_event_fd_delete(thread->el, thread->vnode_fd, FR_EVENT_FILTER_VNODE) < 0) {
 				PERROR("Failed removing DELETE callback on detach");
@@ -725,9 +774,9 @@ static int mod_close(fr_listen_t *li)
 		}
 		close(thread->vnode_fd);
 		thread->vnode_fd = -1;
-
-		pthread_mutex_destroy(&thread->worker_mutex);
 	}
+
+	pthread_mutex_destroy(&thread->worker_mutex);
 
 	return 0;
 }
@@ -738,14 +787,14 @@ static int mod_close(fr_listen_t *li)
  */
 extern fr_app_io_t proto_detail_file;
 fr_app_io_t proto_detail_file = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "detail_file",
-	.config			= file_listen_config,
-	.inst_size		= sizeof(proto_detail_file_t),
-	.thread_inst_size	= sizeof(proto_detail_file_thread_t),
-	.bootstrap		= mod_bootstrap,
-	.instantiate		= mod_instantiate,
-
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "detail_file",
+		.config			= file_listen_config,
+		.inst_size		= sizeof(proto_detail_file_t),
+		.thread_inst_size	= sizeof(proto_detail_file_thread_t),
+		.instantiate		= mod_instantiate,
+	},
 	.default_message_size	= 65536,
 	.default_reply_size	= 32,
 
@@ -753,7 +802,7 @@ fr_app_io_t proto_detail_file = {
 	.close			= mod_close,
 	.vnode			= mod_vnode_extend,
 	.decode			= mod_decode,
-	.write			= mod_write,
+//	.write			= mod_write,
 	.event_list_set		= mod_event_list_set,
 	.get_name		= mod_name,
 };

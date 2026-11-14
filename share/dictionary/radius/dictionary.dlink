@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -16,10 +16,10 @@ VENDOR		Dlink				171
 
 BEGIN-VENDOR	Dlink
 
-ATTRIBUTE	User-Level				1	integer
-ATTRIBUTE	Ingress-Bandwidth-Assignment		2	integer
-ATTRIBUTE	Egress-Bandwidth-Assignment		3	integer
-ATTRIBUTE	1p-Priority				4	integer
+ATTRIBUTE	User-Level				1	uint32
+ATTRIBUTE	Ingress-Bandwidth-Assignment		2	uint32
+ATTRIBUTE	Egress-Bandwidth-Assignment		3	uint32
+ATTRIBUTE	1p-Priority				4	uint32
 ATTRIBUTE	VLAN-Name				10	string
 ATTRIBUTE	VLAN-ID					11	string
 ATTRIBUTE	ACL-Profile				12	string
@@ -35,3 +35,4 @@ VALUE	User-Level			Admin-Legacy		15
 
 END-VENDOR      Dlink
 
+ALIAS		Dlink					Vendor-Specific.Dlink

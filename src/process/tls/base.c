@@ -21,8 +21,7 @@
  *
  * @copyright 2021 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
-#include <freeradius-devel/server/protocol.h>
-#include <freeradius-devel/unlang/base.h>
+#include <freeradius-devel/unlang/interpret.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/protocol/tls/freeradius.h>
 
@@ -31,7 +30,7 @@ static fr_dict_t const *dict_tls;
 extern fr_dict_autoload_t process_tls_dict[];
 fr_dict_autoload_t process_tls_dict[] = {
 	{ .out = &dict_tls, .proto = "tls" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_packet_type;
@@ -39,14 +38,26 @@ static fr_dict_attr_t const *attr_packet_type;
 extern fr_dict_attr_autoload_t process_tls_dict_attr[];
 fr_dict_attr_autoload_t process_tls_dict_attr[] = {
 	{ .out = &attr_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_tls},
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 typedef struct {
+	uint64_t	nothing;		// so that the next field isn't at offset 0
+
+	CONF_SECTION	*verify_certificate;
+
+	CONF_SECTION	*new_session;
 	CONF_SECTION	*load_session;
 	CONF_SECTION	*store_session;
 	CONF_SECTION	*clear_session;
-	CONF_SECTION	*verify_certificate;
+
+	CONF_SECTION	*establish_session;
+	CONF_SECTION	*fail_session;
+
+	CONF_SECTION	*encode_session;
+	CONF_SECTION	*decode_session;
+
+	CONF_SECTION	*load_psk;
 } process_tls_sections_t;
 
 typedef struct {
@@ -57,9 +68,51 @@ typedef struct {
 
 #define PROCESS_INST			process_tls_t
 #define PROCESS_PACKET_TYPE		uint32_t
+#define PROCESS_CODE_DO_NOT_RESPOND	FR_PACKET_TYPE_VALUE_FAILURE
 #define PROCESS_PACKET_CODE_VALID	FR_TLS_PACKET_CODE_VALID
 
 #include <freeradius-devel/server/process.h>
+
+static int mod_instantiate(module_inst_ctx_t const *mctx)
+{
+	process_tls_t const *inst = talloc_get_type_abort_const(mctx->mi->data, process_tls_t);
+	CONF_SECTION	*server_cs = cf_item_to_section(cf_parent(mctx->mi->conf));
+
+	/*
+	 *	We have to define both load and save.
+	 */
+	if (inst->sections.load_session && !inst->sections.store_session) {
+		cf_log_err(server_cs, "Virtual server defines 'load session', but no 'store session'");
+		return -1;
+	}
+
+	if (inst->sections.store_session && !inst->sections.load_session) {
+		cf_log_err(server_cs, "Virtual server defines 'store session', but no 'load session'");
+		return -1;
+	}
+
+	/*
+	 *	If 'load' is set, then 'store' is set.  And we must also have 'clear'
+	 */
+	if (inst->sections.load_session && !inst->sections.clear_session) {
+		cf_log_err(server_cs, "Virtual server defines 'load session' and 'store session', but no 'clear session'");
+		return -1;
+	}
+
+	if (inst->sections.clear_session) {
+		if (!inst->sections.load_session) {
+			cf_log_err(server_cs, "Virtual server defines 'clear session' but no 'load session'");
+			return -1;
+		}
+
+		if (!inst->sections.store_session) {
+			cf_log_err(server_cs, "Virtual server defines 'clear session' but no 'store session'");
+			return -1;
+		}
+	}
+
+	return 0;
+}
 
 static fr_process_state_t const process_state[] = {
 	[FR_PACKET_TYPE_VALUE_LOAD_SESSION] = {
@@ -72,9 +125,10 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_FAIL] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_INVALID] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_DISALLOW] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_TIMEOUT] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_NOTFOUND] =	FR_PACKET_TYPE_VALUE_NOTFOUND,
 		},
-		.rcode = RLM_MODULE_NOOP,
+		.default_rcode = RLM_MODULE_NOOP,
 		.recv = recv_generic,
 		.resume = resume_recv_no_send,
 		.section_offset = PROCESS_CONF_OFFSET(load_session),
@@ -89,9 +143,10 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_FAIL] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_INVALID] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_DISALLOW] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_TIMEOUT] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_NOTFOUND] =	FR_PACKET_TYPE_VALUE_NOTFOUND,
 		},
-		.rcode = RLM_MODULE_NOOP,
+		.default_rcode = RLM_MODULE_NOOP,
 		.recv = recv_generic,
 		.resume = resume_recv_no_send,
 		.section_offset = PROCESS_CONF_OFFSET(store_session),
@@ -106,9 +161,10 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_FAIL] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_INVALID] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_DISALLOW] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_TIMEOUT] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_NOTFOUND] =	FR_PACKET_TYPE_VALUE_NOTFOUND,
 		},
-		.rcode = RLM_MODULE_NOOP,
+		.default_rcode = RLM_MODULE_NOOP,
 		.recv = recv_generic,
 		.resume = resume_recv_no_send,
 		.section_offset = PROCESS_CONF_OFFSET(clear_session),
@@ -123,58 +179,199 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_FAIL] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_INVALID] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_DISALLOW] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_TIMEOUT] =	FR_PACKET_TYPE_VALUE_FAILURE,
 			[RLM_MODULE_NOTFOUND] =	FR_PACKET_TYPE_VALUE_NOTFOUND,
 		},
-		.rcode = RLM_MODULE_NOOP,
+		.default_rcode = RLM_MODULE_NOOP,
 		.recv = recv_generic,
 		.resume = resume_recv_no_send,
 		.section_offset = PROCESS_CONF_OFFSET(verify_certificate),
 	},
+	[FR_PACKET_TYPE_VALUE_NEW_SESSION] = {
+		.packet_type = {
+			[RLM_MODULE_OK] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_UPDATED] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_NOOP] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+
+			[RLM_MODULE_REJECT] =  	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_FAIL] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_INVALID] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_DISALLOW] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_TIMEOUT] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_NOTFOUND] =	FR_PACKET_TYPE_VALUE_NOTFOUND,
+		},
+		.default_rcode = RLM_MODULE_NOOP,
+		.recv = recv_generic,
+		.resume = resume_recv_no_send,
+		.section_offset = PROCESS_CONF_OFFSET(new_session),
+	},
+	[FR_PACKET_TYPE_VALUE_ESTABLISH_SESSION] = {
+		.packet_type = {
+			[RLM_MODULE_OK] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_UPDATED] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_NOOP] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+
+			[RLM_MODULE_REJECT] =  	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_FAIL] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_INVALID] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_DISALLOW] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_TIMEOUT] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_NOTFOUND] =	FR_PACKET_TYPE_VALUE_NOTFOUND
+		},
+		.default_rcode = RLM_MODULE_NOOP,
+		.recv = recv_generic,
+		.resume = resume_recv_no_send,
+		.section_offset = PROCESS_CONF_OFFSET(establish_session),
+	},
+	[FR_PACKET_TYPE_VALUE_FAIL_SESSION] = {
+		.packet_type = {
+			[RLM_MODULE_OK] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_UPDATED] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_NOOP] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+
+			[RLM_MODULE_REJECT] =  	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_FAIL] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_INVALID] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_DISALLOW] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_TIMEOUT] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_NOTFOUND] =	FR_PACKET_TYPE_VALUE_NOTFOUND
+		},
+		.default_rcode = RLM_MODULE_NOOP,
+		.recv = recv_generic,
+		.resume = resume_recv_no_send,
+		.section_offset = PROCESS_CONF_OFFSET(fail_session),
+	},
+	[FR_PACKET_TYPE_VALUE_ENCODE_SESSION] = {
+		.packet_type = {
+			[RLM_MODULE_OK] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_UPDATED] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_NOOP] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+
+			[RLM_MODULE_REJECT] =  	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_FAIL] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_INVALID] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_DISALLOW] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_TIMEOUT] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_NOTFOUND] =	FR_PACKET_TYPE_VALUE_NOTFOUND
+		},
+		.default_rcode = RLM_MODULE_NOOP,
+		.recv = recv_generic,
+		.resume = resume_recv_no_send,
+		.section_offset = PROCESS_CONF_OFFSET(encode_session),
+	},
+	[FR_PACKET_TYPE_VALUE_DECODE_SESSION] = {
+		.packet_type = {
+			[RLM_MODULE_OK] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_UPDATED] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_NOOP] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+
+			[RLM_MODULE_REJECT] =  	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_FAIL] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_INVALID] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_DISALLOW] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_TIMEOUT] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_NOTFOUND] =	FR_PACKET_TYPE_VALUE_NOTFOUND
+		},
+		.default_rcode = RLM_MODULE_NOOP,
+		.recv = recv_generic,
+		.resume = resume_recv_no_send,
+		.section_offset = PROCESS_CONF_OFFSET(decode_session),
+	},
+	[FR_PACKET_TYPE_VALUE_LOAD_PSK] = {
+		.packet_type = {
+			[RLM_MODULE_OK] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_UPDATED] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+			[RLM_MODULE_NOOP] =	FR_PACKET_TYPE_VALUE_SUCCESS,
+
+			[RLM_MODULE_REJECT] =  	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_FAIL] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_INVALID] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_DISALLOW] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_TIMEOUT] =	FR_PACKET_TYPE_VALUE_FAILURE,
+			[RLM_MODULE_NOTFOUND] =	FR_PACKET_TYPE_VALUE_NOTFOUND,
+		},
+		.default_rcode = RLM_MODULE_NOOP,
+		.recv = recv_generic,
+		.resume = resume_recv_no_send,
+		.section_offset = PROCESS_CONF_OFFSET(load_psk),
+	},
 };
 
-static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t mod_process(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
 	fr_process_state_t const *state;
 
 	PROCESS_TRACE;
 
-	(void)talloc_get_type_abort_const(mctx->instance, process_tls_t);
+	(void)talloc_get_type_abort_const(mctx->mi->data, process_tls_t);
 
 	request->component = "tls";
 	request->module = NULL;
-	fr_assert(request->dict == dict_tls);
+	fr_assert(request->proto_dict == dict_tls);
+
+	/*
+	 *	Success, failure, and notfound are not TLS packets that we handle.
+	 */
+	if (!request->packet->code || (request->packet->code >= FR_PACKET_TYPE_VALUE_SUCCESS)) {
+		REDEBUG("Invalid packet code %u", request->packet->code);
+		RETURN_UNLANG_FAIL;
+	}
 
 	UPDATE_STATE(packet);
-
-	log_request_pair_list(L_DBG_LVL_1, request, NULL, &request->request_pairs, NULL);
 
 	return state->recv(p_result, mctx, request);
 }
 
 static const virtual_server_compile_t compile_list[] = {
 	{
-		.name = "store",
-		.name2 = "session",
-		.component = MOD_AUTHORIZE,
+		.section = SECTION_NAME("store", "session"),
+		.actions = &mod_actions_authorize,
 		.offset = PROCESS_CONF_OFFSET(store_session)
 	},
 	{
-		.name = "load",
-		.name2 = "session",
-		.component = MOD_AUTHORIZE,
+		.section = SECTION_NAME("load", "session"),
+		.actions = &mod_actions_authorize,
 		.offset = PROCESS_CONF_OFFSET(load_session)
 	},
 	{
-		.name = "clear",
-		.name2 = "session",
-		.component = MOD_AUTHORIZE,
+		.section = SECTION_NAME("clear", "session"),
+		.actions = &mod_actions_authorize,
 		.offset = PROCESS_CONF_OFFSET(clear_session)
 	},
 	{
-		.name = "verify",
-		.name2 = "certificate",
-		.component = MOD_AUTHORIZE,
+		.section = SECTION_NAME("verify", "certificate"),
+		.actions = &mod_actions_authorize,
 		.offset = PROCESS_CONF_OFFSET(verify_certificate)
+	},
+	{
+		.section = SECTION_NAME("new", "session"),
+		.actions = &mod_actions_authorize,
+		.offset = PROCESS_CONF_OFFSET(new_session)
+	},
+	{
+		.section = SECTION_NAME("establish", "session"),
+		.actions = &mod_actions_authorize,
+		.offset = PROCESS_CONF_OFFSET(establish_session)
+	},
+	{
+		.section = SECTION_NAME("fail", "session"),
+		.actions = &mod_actions_authorize,
+		.offset = PROCESS_CONF_OFFSET(fail_session)
+	},
+	{
+		.section = SECTION_NAME("encode", "session"),
+		.actions = &mod_actions_authorize,
+		.offset = PROCESS_CONF_OFFSET(encode_session)
+	},
+	{
+		.section = SECTION_NAME("decode", "session"),
+		.actions = &mod_actions_authorize,
+		.offset = PROCESS_CONF_OFFSET(decode_session)
+	},
+	{
+		.section = SECTION_NAME("load", "psk"),
+		.actions = &mod_actions_authorize,
+		.offset = PROCESS_CONF_OFFSET(load_psk)
 	},
 	COMPILE_TERMINATOR
 };
@@ -182,10 +379,16 @@ static const virtual_server_compile_t compile_list[] = {
 
 extern fr_process_module_t process_tls;
 fr_process_module_t process_tls = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "process_tls",
-	.inst_size	= sizeof(process_tls_t),
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "tls",
+		MODULE_INST(process_tls_t),
+		MODULE_RCTX(process_rctx_t),
+
+		.instantiate	= mod_instantiate,
+	},
 	.process	= mod_process,
 	.compile_list	= compile_list,
 	.dict		= &dict_tls,
+	.packet_type	= &attr_packet_type
 };

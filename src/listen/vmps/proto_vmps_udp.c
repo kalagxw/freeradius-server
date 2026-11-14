@@ -23,15 +23,11 @@
  * @copyright 2018 Alan DeKok (aland@deployingradius.com)
  */
 #include <netdb.h>
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/protocol.h>
 #include <freeradius-devel/util/udp.h>
 #include <freeradius-devel/util/trie.h>
-#include <freeradius-devel/io/base.h>
 #include <freeradius-devel/io/application.h>
 #include <freeradius-devel/io/listen.h>
 #include <freeradius-devel/io/schedule.h>
-#include <freeradius-devel/util/debug.h>
 
 #include <freeradius-devel/protocol/vmps/vmps.h>
 
@@ -71,41 +67,43 @@ typedef struct {
 	fr_ipaddr_t			*allow;			//!< allowed networks for dynamic clients
 	fr_ipaddr_t			*deny;			//!< denied networks for dynamic clients
 
-	RADCLIENT_LIST			*clients;		//!< local clients
+	fr_client_list_t			*clients;		//!< local clients
 } proto_vmps_udp_t;
 
 
-static const CONF_PARSER networks_config[] = {
-	{ FR_CONF_OFFSET("allow", FR_TYPE_COMBO_IP_PREFIX | FR_TYPE_MULTI, proto_vmps_udp_t, allow) },
-	{ FR_CONF_OFFSET("deny", FR_TYPE_COMBO_IP_PREFIX | FR_TYPE_MULTI, proto_vmps_udp_t, deny) },
+static const conf_parser_t networks_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("allow", FR_TYPE_COMBO_IP_PREFIX , CONF_FLAG_MULTI, proto_vmps_udp_t, allow) },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("deny", FR_TYPE_COMBO_IP_PREFIX , CONF_FLAG_MULTI, proto_vmps_udp_t, deny) },
 
 	CONF_PARSER_TERMINATOR
 };
 
 
-static const CONF_PARSER udp_listen_config[] = {
-	{ FR_CONF_OFFSET("ipaddr", FR_TYPE_COMBO_IP_ADDR, proto_vmps_udp_t, ipaddr) },
-	{ FR_CONF_OFFSET("ipv4addr", FR_TYPE_IPV4_ADDR, proto_vmps_udp_t, ipaddr) },
-	{ FR_CONF_OFFSET("ipv6addr", FR_TYPE_IPV6_ADDR, proto_vmps_udp_t, ipaddr) },
+static const conf_parser_t udp_listen_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("ipaddr", FR_TYPE_COMBO_IP_ADDR, 0, proto_vmps_udp_t, ipaddr) },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("ipv4addr", FR_TYPE_IPV4_ADDR, 0, proto_vmps_udp_t, ipaddr) },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("ipv6addr", FR_TYPE_IPV6_ADDR, 0, proto_vmps_udp_t, ipaddr) },
 
-	{ FR_CONF_OFFSET("interface", FR_TYPE_STRING, proto_vmps_udp_t, interface) },
-	{ FR_CONF_OFFSET("port_name", FR_TYPE_STRING, proto_vmps_udp_t, port_name) },
+	{ FR_CONF_OFFSET("interface", proto_vmps_udp_t, interface) },
+	{ FR_CONF_OFFSET("port_name", proto_vmps_udp_t, port_name) },
 
-	{ FR_CONF_OFFSET("port", FR_TYPE_UINT16, proto_vmps_udp_t, port) },
-	{ FR_CONF_OFFSET_IS_SET("recv_buff", FR_TYPE_UINT32, proto_vmps_udp_t, recv_buff) },
+	{ FR_CONF_OFFSET("port", proto_vmps_udp_t, port) },
+	{ FR_CONF_OFFSET_IS_SET("recv_buff", FR_TYPE_UINT32, 0, proto_vmps_udp_t, recv_buff) },
 
-	{ FR_CONF_OFFSET("dynamic_clients", FR_TYPE_BOOL, proto_vmps_udp_t, dynamic_clients) } ,
-	{ FR_CONF_POINTER("networks", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) networks_config },
+	{ FR_CONF_OFFSET("dynamic_clients", proto_vmps_udp_t, dynamic_clients) } ,
+	{ FR_CONF_POINTER("networks", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) networks_config },
 
-	{ FR_CONF_OFFSET("max_packet_size", FR_TYPE_UINT32, proto_vmps_udp_t, max_packet_size), .dflt = "1024" } ,
+	{ FR_CONF_OFFSET("max_packet_size", proto_vmps_udp_t, max_packet_size), .dflt = "1024" } ,
 
 	CONF_PARSER_TERMINATOR
 };
 
 
-static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer, size_t buffer_len, size_t *leftover, UNUSED uint32_t *priority, UNUSED bool *is_dup)
+static ssize_t mod_read(fr_listen_instance_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer,
+			size_t buffer_len, size_t *leftover)
 {
-	proto_vmps_udp_t const		*inst = talloc_get_type_abort_const(li->app_io_instance, proto_vmps_udp_t);
+	proto_vmps_udp_t const          *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_vmps_udp_t);
 	proto_vmps_udp_thread_t		*thread = talloc_get_type_abort(li->thread_instance, proto_vmps_udp_thread_t);
 	fr_io_address_t			*address, **address_p;
 
@@ -197,8 +195,8 @@ static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time
 }
 
 
-static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, UNUSED fr_time_t request_time,
-			 uint8_t *buffer, size_t buffer_len, UNUSED size_t written)
+static ssize_t mod_write(fr_listen_instance_t *li, void *packet_ctx, UNUSED fr_time_t request_time, uint8_t *buffer,
+			 size_t buffer_len, UNUSED size_t written)
 {
 	proto_vmps_udp_thread_t		*thread = talloc_get_type_abort(li->thread_instance, proto_vmps_udp_thread_t);
 	fr_io_track_t			*track = talloc_get_type_abort(packet_ctx, fr_io_track_t);
@@ -260,7 +258,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, UNUSED fr_time_t req
 }
 
 
-static int mod_connection_set(fr_listen_t *li, fr_io_address_t *connection)
+static int mod_connection_set(fr_listen_instance_t *li, fr_io_address_t *connection)
 {
 	proto_vmps_udp_thread_t		*thread = talloc_get_type_abort(li->thread_instance, proto_vmps_udp_thread_t);
 
@@ -269,7 +267,7 @@ static int mod_connection_set(fr_listen_t *li, fr_io_address_t *connection)
 }
 
 
-static void mod_network_get(void *instance, int *ipproto, bool *dynamic_clients, fr_trie_t const **trie)
+static void mod_network_get(int *ipproto, bool *dynamic_clients, fr_trie_t const **trie, void *instance)
 {
 	proto_vmps_udp_t *inst = talloc_get_type_abort(instance, proto_vmps_udp_t);
 
@@ -282,17 +280,19 @@ static void mod_network_get(void *instance, int *ipproto, bool *dynamic_clients,
 /** Open a UDP listener for VMPS
  *
  */
-static int mod_open(fr_listen_t *li)
+static int mod_open(fr_listen_instance_t *li)
 {
-	proto_vmps_udp_t const		*inst = talloc_get_type_abort_const(li->app_io_instance, proto_vmps_udp_t);
+	proto_vmps_udp_t const          *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_vmps_udp_t);
 	proto_vmps_udp_thread_t		*thread = talloc_get_type_abort(li->thread_instance, proto_vmps_udp_thread_t);
 
 	int				sockfd;
+	fr_ipaddr_t			ipaddr = inst->ipaddr;
 	uint16_t			port = inst->port;
 
 	li->fd = sockfd = fr_socket_server_udp(&inst->ipaddr, &port, inst->port_name, true);
 	if (sockfd < 0) {
-		PERROR("Failed opening UDP socket");
+		cf_log_err(li->listen->cs, "Failed opening UDP socket - %s", fr_strerror());
 	error:
 		return -1;
 	}
@@ -307,14 +307,16 @@ static int mod_open(fr_listen_t *li)
 		int on = 1;
 
 		if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
-			ERROR("Failed to set socket 'reuseport': %s", fr_syserror(errno));
+			cf_log_err(li->listen->cs, "Failed to set socket 'reuseport' - %s", fr_syserror(errno));
+			close(sockfd);
 			return -1;
 		}
 	}
 
-	if (fr_socket_bind(sockfd, &inst->ipaddr, &port, inst->interface) < 0) {
+	if (fr_socket_bind(sockfd, inst->interface, &ipaddr, &port) < 0) {
 		close(sockfd);
-		PERROR("Failed binding socket");
+		cf_log_err(li->listen->cs, "Failed binding to socket - %s", fr_strerror());
+		cf_log_err(li->listen->cs, DOC_ROOT_REF(troubleshooting/network/bind));
 		goto error;
 	}
 
@@ -333,9 +335,10 @@ static int mod_open(fr_listen_t *li)
 /** Set the file descriptor for this socket.
  *
  */
-static int mod_fd_set(fr_listen_t *li, int fd)
+static int mod_fd_set(fr_listen_instance_t *li, int fd)
 {
-	proto_vmps_udp_t const		*inst = talloc_get_type_abort_const(li->app_io_instance, proto_vmps_udp_t);
+	proto_vmps_udp_t const          *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_vmps_udp_t);
 	proto_vmps_udp_thread_t		*thread = talloc_get_type_abort(li->thread_instance, proto_vmps_udp_thread_t);
 
 	thread->sockfd = fd;
@@ -348,7 +351,7 @@ static int mod_fd_set(fr_listen_t *li, int fd)
 	return 0;
 }
 
-static void *mod_track_create(UNUSED void const *instance, UNUSED void *thread_instance, UNUSED RADCLIENT *client,
+static void *mod_track_create(UNUSED void const *instance, UNUSED void *thread_instance, UNUSED fr_client_t *client,
 			      fr_io_track_t *track, uint8_t const *buffer, size_t buffer_len)
 {
 	proto_vmps_track_t  *t;
@@ -371,7 +374,7 @@ static void *mod_track_create(UNUSED void const *instance, UNUSED void *thread_i
 	return t;
 }
 
-static int mod_track_compare(UNUSED void const *instance, UNUSED void *thread_instance, UNUSED RADCLIENT *client,
+static int mod_track_compare(UNUSED void const *instance, UNUSED void *thread_instance, UNUSED fr_client_t *client,
 			     void const *one, void const *two)
 {
 	proto_vmps_track_t const *a = talloc_get_type_abort_const(one, proto_vmps_track_t);
@@ -385,25 +388,26 @@ static int mod_track_compare(UNUSED void const *instance, UNUSED void *thread_in
 	if (ret != 0) return ret;
 
 	/*
-	 *	Then ordered by opcode, which is usally the same.
+	 *	Then ordered by opcode, which is usually the same.
 	 */
 	return (a->opcode < b->opcode) - (a->opcode > b->opcode);
 }
 
-static int mod_bootstrap(void *instance, CONF_SECTION *cs)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	proto_vmps_udp_t	*inst = talloc_get_type_abort(instance, proto_vmps_udp_t);
+	proto_vmps_udp_t	*inst = talloc_get_type_abort(mctx->mi->data, proto_vmps_udp_t);
+	CONF_SECTION		*conf = mctx->mi->conf;
 	size_t			num;
 	CONF_ITEM		*ci;
 	CONF_SECTION		*server_cs;
 
-	inst->cs = cs;
+	inst->cs = conf;
 
 	/*
 	 *	Complain if no "ipaddr" is set.
 	 */
 	if (inst->ipaddr.af == AF_UNSPEC) {
-		cf_log_err(cs, "No 'ipaddr' was specified in the 'udp' section");
+		cf_log_err(conf, "No 'ipaddr' was specified in the 'udp' section");
 		return -1;
 	}
 
@@ -419,17 +423,17 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 		struct servent *s;
 
 		if (!inst->port_name) {
-			cf_log_err(cs, "No 'port' was specified in the 'udp' section");
+			cf_log_err(conf, "No 'port' was specified in the 'udp' section");
 			return -1;
 		}
 
 		s = getservbyname(inst->port_name, "udp");
 		if (!s) {
-			cf_log_err(cs, "Unknown value for 'port_name = %s", inst->port_name);
+			cf_log_err(conf, "Unknown value for 'port_name = %s", inst->port_name);
 			return -1;
 		}
 
-		inst->port = ntohl(s->s_port);
+		inst->port = ntohs(s->s_port);
 	}
 
 	/*
@@ -443,18 +447,18 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	num = talloc_array_length(inst->allow);
 	if (!num) {
 		if (inst->dynamic_clients) {
-			cf_log_err(cs, "The 'allow' subsection MUST contain at least one 'network' entry when 'dynamic_clients = true'.");
+			cf_log_err(conf, "The 'allow' subsection MUST contain at least one 'network' entry when 'dynamic_clients = true'.");
 			return -1;
 		}
 	} else {
 		inst->trie = fr_master_io_network(inst, inst->ipaddr.af, inst->allow, inst->deny);
 		if (!inst->trie) {
-			cf_log_perr(cs, "Failed creating list of networks");
+			cf_log_perr(conf, "Failed creating list of networks");
 			return -1;
 		}
 	}
 
-	ci = cf_parent(inst->cs); /* listen { ... } */
+	ci = cf_section_to_item(mctx->mi->parent->conf); /* listen { ... } */
 	fr_assert(ci != NULL);
 	ci = cf_parent(ci);
 	fr_assert(ci != NULL);
@@ -470,7 +474,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	if (cf_section_find_next(server_cs, NULL, "client", CF_IDENT_ANY)) {
 		inst->clients = client_list_parse_section(server_cs, IPPROTO_UDP, false);
 		if (!inst->clients) {
-			cf_log_err(cs, "Failed creating local clients");
+			cf_log_err(conf, "Failed creating local clients");
 			return -1;
 		}
 	}
@@ -481,10 +485,10 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 // @todo - allow for "wildcard" clients, which allow anything
 // and then rely on "networks" to filter source IPs...
 // which means we probably want to filter on "networks" even if there are no dynamic clients
-static RADCLIENT *mod_client_find(fr_listen_t *li, fr_ipaddr_t const *ipaddr, int ipproto)
+static fr_client_t *mod_client_find(fr_listen_instance_t *li, fr_ipaddr_t const *ipaddr, int ipproto)
 {
-	proto_vmps_udp_t const	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_vmps_udp_t);
-	RADCLIENT		*client;
+	proto_vmps_udp_t const	*inst = talloc_get_type_abort_const(li->listen->app_io_instance, proto_vmps_udp_t);
+	fr_client_t		*client;
 
 	/*
 	 *	Prefer local clients.
@@ -497,7 +501,7 @@ static RADCLIENT *mod_client_find(fr_listen_t *li, fr_ipaddr_t const *ipaddr, in
 	return client_find(NULL, ipaddr, ipproto);
 }
 
-static char const *mod_name(fr_listen_t *li)
+static char const *mod_name(fr_listen_instance_t *li)
 {
 	proto_vmps_udp_thread_t		*thread = talloc_get_type_abort(li->thread_instance, proto_vmps_udp_thread_t);
 
@@ -505,13 +509,14 @@ static char const *mod_name(fr_listen_t *li)
 }
 
 fr_app_io_t proto_vmps_udp = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "vmps_udp",
-	.config			= udp_listen_config,
-	.inst_size		= sizeof(proto_vmps_udp_t),
-	.thread_inst_size	= sizeof(proto_vmps_udp_thread_t),
-	.bootstrap		= mod_bootstrap,
-
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "vmps_udp",
+		.config			= udp_listen_config,
+		.inst_size		= sizeof(proto_vmps_udp_t),
+		.thread_inst_size	= sizeof(proto_vmps_udp_thread_t),
+		.instantiate		= mod_instantiate,
+	},
 	.default_message_size	= 4096,
 	.track_duplicates	= true,
 

@@ -25,7 +25,7 @@
  *
  * The following macros must be defined before this header is included:
  *
- * - PROCESS_INST			the type fo structure that holds instance data for the process module.
+ * - PROCESS_INST			the type of structure that holds instance data for the process module.
  * - PROCESS_PACKET_TYPE		an enum, or generic type (uint32) that can hold
  *					all valid packet types.
  * - PROCESS_PACKET_CODE_VALID		the name of a macro or function which accepts one argument
@@ -34,31 +34,20 @@
  * The following macros may (optionally) be defined before this header is included:
  *
  * - PROCESS_CODE_MAX			the highest valid protocol packet code + 1.
- * - PROCESS_DO_NOT_RESPOND		The packet code that's used to indicate that no response
+ * - PROCESS_CODE_DO_NOT_RESPOND	The packet code that's used to indicate that no response
  *					should be sent.
  * - PROCESS_STATE_EXTRA_FIELDS		extra fields to add to the fr_process_state_t structure.
  *
  * @copyright 2021 The FreeRADIUS server project
- * @copyright 2021 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2021 Network RADIUS SAS (legal@networkradius.com)
  */
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #include <freeradius-devel/server/virtual_servers.h>
 #include <freeradius-devel/server/pair.h>
-
-/** Common public symbol definition for all process modules
- */
-typedef struct fr_process_module_s {
-	DL_MODULE_COMMON;				//!< Common fields for all loadable modules.
-	FR_MODULE_COMMON;				//!< bootstrap, instantiate
-
-	module_method_t			process;	//!< Process packets
-	virtual_server_compile_t const	*compile_list;	//!< list of processing sections
-	fr_dict_t const			**dict;		//!< pointer to local fr_dict_t *
-} fr_process_module_t;
+#include <freeradius-devel/server/process_types.h>
 
 /** Trace each state function as it's entered
  */
@@ -71,9 +60,24 @@ typedef struct fr_process_module_s {
 /** Convenience macro for providing CONF_SECTION offsets in section compilation arrays
  *
  */
-#ifdef PROCESS_INST
-#  define PROCESS_CONF_OFFSET(_x)	offsetof(PROCESS_INST, sections._x)
+#ifndef PROCESS_INST
+#  error PROCESS_INST must be defined to the C type of the process instance e.g. process_bfd_t
 #endif
+
+#if defined(PROCESS_RCTX) && defined(PROCESS_RCTX_EXTRA_FIELDS)
+#  error Only one of PROCESS_RCTX (the type of the rctx struct) OR PROCESS_RCTX_EXTRA_FIELDS (extra fields for the common rctx struct) can be defined.
+#endif
+
+#ifndef PROCESS_RCTX
+#  define PROCESS_RCTX	process_rctx_t
+#endif
+
+#ifndef PROCESS_RCTX_RESULT
+#  define PROCESS_RCTX_RESULT result
+#endif
+
+#define PROCESS_CONF_OFFSET(_x)	offsetof(PROCESS_INST, sections._x)
+#define RESULT_UNUSED		UNUSED
 
 #if defined(PROCESS_INST) && defined(PROCESS_PACKET_TYPE) && defined(PROCESS_PACKET_CODE_VALID)
 typedef PROCESS_PACKET_TYPE fr_process_rcode_t[RLM_MODULE_NUMCODES];
@@ -82,6 +86,9 @@ typedef PROCESS_PACKET_TYPE fr_process_rcode_t[RLM_MODULE_NUMCODES];
 #  define PROCESS_STATE_EXTRA_FIELDS
 #endif
 
+#ifndef PROCESS_RCTX_EXTRA_FIELDS
+#  define PROCESS_RCTX_EXTRA_FIELDS
+#endif
 /*
  *	Process state machine tables for rcode to packet.
  */
@@ -90,43 +97,145 @@ typedef struct {
 	PROCESS_PACKET_TYPE	default_reply;	//!< if not otherwise set
 	size_t			section_offset;	//!< Where to look in the process instance for
 						///< a pointer to the section we should execute.
-	rlm_rcode_t		rcode;		//!< Default rcode
-	module_method_t		recv;		//!< Method to call when receiving this type of packet.
-	unlang_module_resume_t	resume;		//!< Function to call after running a recv section.
-	unlang_module_resume_t	send;		//!< Method to call when sending this type of packet.
+	rlm_rcode_t		default_rcode;	//!< Default rcode that's set in the frame we used to
+						///< evaluate child sections.
+	rlm_rcode_t		result_rcode;	//!< Result rcode we return if the virtual server is
+						///< being called using the `call` keyword.
+	module_method_t		resume;		//!< Function to call after running a recv section.
+
+	/*
+	 *	Each state has only one "recv" or "send".
+	 */
+	union {
+		module_method_t		recv;		//!< Method to call when receiving this type of packet.
+		module_method_t		send;		//!< Method to call when sending this type of packet.
+	};
 	PROCESS_STATE_EXTRA_FIELDS
 } fr_process_state_t;
+
+typedef struct {
+	unlang_result_t		result;		//!< Result of the last section executed.
+	PROCESS_RCTX_EXTRA_FIELDS
+} process_rctx_t;
+
+/*
+ *	C doesn't technically support forward declaration of static variables.  Until such time as we
+ *	rearrange all of the process code, disabling the warnings will have to do.
+ *
+ *	A real fix is to provide a header file which contains only the macro definitions for the process state
+ *	machine.  The process files can include that, then define the function prototypes.  Then define their
+ *	own process_state[] state machine, then define the functions.
+ */
+#ifdef __clang__
+DIAG_OFF(tentative-definition-compat)
+DIAG_OFF(tentative-definition-incomplete-type)
+#endif
+
+/*
+ *	Some protocols have the same packet codes for requests and replies.
+ */
+#ifndef PROCESS_SEND_RECV
+#define process_state_packet process_state
+#define process_state_reply process_state
+static fr_process_state_t const process_state[];
+#else
+static fr_process_state_t const process_state_packet[];
+static fr_process_state_t const process_state_reply[];
+#endif
 
 /*
  *	Process state machine functions
  */
 #define UPDATE_STATE_CS(_x) \
 do { \
-	state = &process_state[request->_x->code]; \
+	state = &process_state_ ## _x[request->_x->code]; \
 	memcpy(&cs, (CONF_SECTION * const *) (((uint8_t const *) &inst->sections) + state->section_offset), sizeof(cs)); \
 } while (0)
 
-#define UPDATE_STATE(_x) state = &process_state[request->_x->code]
+#define UPDATE_STATE(_x) state = &process_state_ ## _x [request->_x->code]
 
-static fr_process_state_t const process_state[];
+#define PROCESS_ARGS unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request
 
-#define RECV(_x) static inline unlang_action_t recv_ ## _x(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
-#define SEND(_x) static inline unlang_action_t send_ ## _x(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request, void *rctx)
-#define RESUME(_x) static inline unlang_action_t resume_ ## _x(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request, void *rctx)
-#define SEND_NO_RCTX(_x) static inline unlang_action_t send_ ## _x(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request, UNUSED void *rctx)
-#define RESUME_NO_RCTX(_x) static inline unlang_action_t resume_ ## _x(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request, UNUSED void *rctx)
-#define RESUME_NO_MCTX(_x) static inline unlang_action_t resume_ ## _x(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request, UNUSED void *rctx)
+#define RECV(_x) static inline unlang_action_t recv_ ## _x(PROCESS_ARGS)
+#define SEND(_x) static inline unlang_action_t send_ ## _x(PROCESS_ARGS)
+#define SEND_NO_RESULT(_x) static inline unlang_action_t send_ ## _x(UNUSED PROCESS_ARGS)
+#define RESUME(_x) static inline unlang_action_t resume_ ## _x(PROCESS_ARGS)
+#define RESUME_FLAG(_x, _p_result_flag, _mctx_flag) static inline unlang_action_t resume_ ## _x(_p_result_flag unlang_result_t *p_result, _mctx_flag module_ctx_t const *mctx, request_t *request)
 
+/** Returns the current rcode then resets it for the next module call
+ *
+ */
+static inline CC_HINT(always_inline) unlang_result_t *process_result_reset(unlang_result_t *p_result, fr_process_state_t const *state)
+{
+	*p_result = UNLANG_RESULT_RCODE(state->default_rcode);
+	return p_result;
+}
 
-#define CALL_RECV(_x) recv_ ## _x(p_result, mctx, request);
-#define CALL_SEND(_x) send_ ## _x(p_result, mctx, request, rctx)
-#define CALL_RESUME(_x) resume_ ## _x(p_result, mctx, request, rctx)
+#define RESULT_RCODE 	(((PROCESS_RCTX *)mctx->rctx)->result.rcode)
+#define RESULT_P	process_result_reset(&(((PROCESS_RCTX *)mctx->rctx)->result), state)
+
+/** Call a module method with a new rctx
+ *
+ * @note This should be used to add a rctxs when calling the initial recv section.
+ *
+ * @param[out] p_result		Pointer to the result code.
+ * @param[in] mctx		Module context.
+ * @param[in] request		Request.
+ * @param[in] method		Method to call.
+ * @param[in] rctx		Resume context to use to override the one in the mctx.
+ * @return			Result of the method call.
+ */
+static inline CC_HINT(always_inline)
+unlang_action_t process_with_rctx(unlang_result_t *p_result, module_ctx_t const *mctx,
+				  request_t *request, module_method_t method, void *rctx)
+{
+	module_ctx_t our_mctx = *mctx;
+	our_mctx.rctx = rctx;
+
+	return method(p_result, &our_mctx, request);
+}
+
+/** Call a named recv function directly
+ */
+#define CALL_RECV(_x) recv_ ## _x(p_result, mctx, request)
+
+/** Call a named recv function directly with a new rctx
+ */
+#define CALL_RECV_RCTX(_x, _rctx) process_with_rctx(p_result, mctx, request, recv_ ## _x, _rctx)
+
+/** Call a named send function directly
+ */
+#define CALL_SEND(_x) send_ ## _x(p_result, mctx, request)
+
+/** Call a named resume function directly
+ */
+#define CALL_RESUME(_x) resume_ ## _x(p_result, mctx, request)
+
+/** Call the send function for the current state
+ */
+#define CALL_SEND_STATE(_state) state->send(p_result, mctx, request)
+
+/** Set the current reply code, and call the send function for that state
+ */
+#define CALL_SEND_TYPE(_x) call_send_type(process_state_reply[(request->reply->code = _x)].send, p_result, mctx, request)
+
+static inline unlang_action_t call_send_type(module_method_t send, \
+					     unlang_result_t *p_result, module_ctx_t const *mctx,
+					     request_t *request)
+{
+	/*
+	 *	Stupid hack to stop this being honoured
+	 *	by send_generic.
+	 */
+	pair_delete_reply(attr_packet_type);
+	return send(p_result, mctx, request);
+}
 
 RECV(generic)
 {
 	CONF_SECTION			*cs;
 	fr_process_state_t const	*state;
-	PROCESS_INST const		*inst = mctx->instance;
+	PROCESS_INST			*inst = mctx->mi->data;
 
 	PROCESS_TRACE;
 
@@ -141,22 +250,18 @@ RECV(generic)
 		} else {
 			REDEBUG("Invalid packet type (%u)", request->packet->code);
 		}
-		RETURN_MODULE_FAIL;
+		RETURN_UNLANG_FAIL;
 	}
 
-
-	if (cs) RDEBUG("Running '%s %s' from file %s", cf_section_name1(cs), cf_section_name2(cs), cf_filename(cs));
-	return unlang_module_yield_to_section(p_result, request,
-					      cs, state->rcode, state->resume,
-					      NULL, NULL);
+	return unlang_module_yield_to_section(RESULT_P, request,
+					      cs, state->default_rcode, state->resume,
+					      NULL, FR_SIGNAL_NONE, mctx->rctx);
 }
 
 RESUME(recv_generic)
 {
-	rlm_rcode_t			rcode = *p_result;
-	CONF_SECTION			*cs;
+	rlm_rcode_t			rcode = RESULT_RCODE;
 	fr_process_state_t const	*state;
-	PROCESS_INST const   		*inst = mctx->instance;
 
 	PROCESS_TRACE;
 
@@ -170,19 +275,16 @@ RESUME(recv_generic)
 	if (!request->reply->code) request->reply->code = PROCESS_CODE_DO_NOT_RESPOND;
 
 #endif
-	fr_assert(request->reply->code != 0);
+	fr_assert(PROCESS_PACKET_CODE_VALID(request->reply->code));
 
-	UPDATE_STATE_CS(reply);
-
+	UPDATE_STATE(reply);
 	fr_assert(state->send != NULL);
-	return unlang_module_yield_to_section(p_result, request,
-					      cs, state->rcode, state->send,
-					      NULL, rctx);
+	return state->send(p_result, mctx, request);
 }
 
-RESUME_NO_MCTX(recv_no_send)
+RESUME_FLAG(recv_no_send,UNUSED,)
 {
-	rlm_rcode_t			rcode = *p_result;
+	rlm_rcode_t			rcode = RESULT_RCODE;
 	fr_process_state_t const	*state;
 
 	PROCESS_TRACE;
@@ -202,12 +304,12 @@ RESUME_NO_MCTX(recv_no_send)
 	return UNLANG_ACTION_CALCULATE_RESULT;
 }
 
-SEND(generic)
+SEND_NO_RESULT(generic)
 {
 	fr_pair_t 			*vp;
 	CONF_SECTION			*cs;
 	fr_process_state_t const	*state;
-	PROCESS_INST const   		*inst = mctx->instance;
+	PROCESS_INST   			*inst = mctx->mi->data;
 
 	PROCESS_TRACE;
 
@@ -244,32 +346,41 @@ SEND(generic)
 		    (vp->vp_uint32 != PROCESS_CODE_MAX) &&
 #endif
 		    PROCESS_PACKET_CODE_VALID(vp->vp_uint32) &&
-		    process_state[vp->vp_uint32].send) {
+		    process_state_reply[vp->vp_uint32].send) {
 			request->reply->code = vp->vp_uint32;
 			UPDATE_STATE_CS(reply);
 			break;
 		}
 
-		RWDEBUG("Ignoring invalid packet-type &reply.%pP", vp);
+		RWDEBUG("Ignoring invalid packet-type reply.%pP", vp);
 		goto update_packet_type;
 
 	default:
 		MEM(0);
 	}
 
-	if (cs) RDEBUG("Running '%s %s' from file %s", cf_section_name1(cs), cf_section_name2(cs), cf_filename(cs));
+	if (!cs) {
+		char const *name;
 
-	return unlang_module_yield_to_section(p_result, request,
-					      cs, state->rcode, state->resume,
-					      NULL, rctx);
+		name = fr_dict_enum_name_by_value(attr_packet_type, fr_box_uint32(request->reply->code));
+		if (name) {
+			RWDEBUG("No 'send %s { ... } section was found.", name);
+		} else {
+			RWDEBUG("No 'send %u { ... } section was found.", request->reply->code);
+		}
+	}
+
+	return unlang_module_yield_to_section(RESULT_P, request,
+					      cs, state->default_rcode, state->resume,
+					      NULL, FR_SIGNAL_NONE, mctx->rctx);
 }
 
 RESUME(send_generic)
 {
-	rlm_rcode_t			rcode = *p_result;
+	rlm_rcode_t			rcode = RESULT_RCODE;
 	CONF_SECTION			*cs;
 	fr_process_state_t const	*state;
-	PROCESS_INST const   		*inst = mctx->instance;
+	PROCESS_INST 	  		*inst = mctx->mi->data;
 
 	PROCESS_TRACE;
 
@@ -288,7 +399,7 @@ RESUME(send_generic)
 	fr_assert(rcode < RLM_MODULE_NUMCODES);
 	switch (state->packet_type[rcode]) {
 	case 0:			/* don't change the reply */
-		fr_assert(request->reply->code != 0);
+		p_result->rcode = state->result_rcode;
 		break;
 
 	default:
@@ -314,10 +425,11 @@ RESUME(send_generic)
 
 			RWDEBUG("Failed running 'send %s', changing reply to %s", old, cf_section_name2(cs));
 
-			return unlang_module_yield_to_section(p_result, request,
-							      cs, state->rcode, state->send,
-							      NULL, rctx);
+			return unlang_module_yield_to_section(RESULT_P, request,
+							      cs, state->default_rcode, state->send,
+							      NULL, FR_SIGNAL_NONE, mctx->rctx);
 		}
+		p_result->rcode = state->result_rcode;
 
 		fr_assert(!state->packet_type[rcode] || (state->packet_type[rcode] == request->reply->code));
 		break;
@@ -330,12 +442,14 @@ RESUME(send_generic)
 		if (cs) {
 			RDEBUG("The 'send %s' section returned %s - not sending a response",
 			       cf_section_name2(cs),
-			       fr_table_str_by_value(rcode_table, rcode, "???"));
+			       fr_table_str_by_value(rcode_table, rcode, "<INVALID>"));
 		}
 		request->reply->code = PROCESS_CODE_DO_NOT_RESPOND;
+		p_result->rcode = state->result_rcode;
 		break;
 #endif
 	}
+
 
 	request->reply->timestamp = fr_time();
 
@@ -345,12 +459,97 @@ RESUME(send_generic)
 	 */
 	if (request->reply->code == PROCESS_CODE_DO_NOT_RESPOND) {
 		RDEBUG("Not sending reply to client");
+		p_result->rcode = RLM_MODULE_HANDLED;
 		return UNLANG_ACTION_CALCULATE_RESULT;
 	}
 #endif
 
 	return UNLANG_ACTION_CALCULATE_RESULT;
 }
+
+#ifdef PROCESS_CODE_DYNAMIC_CLIENT
+RESUME_FLAG(new_client_done,,UNUSED)
+{
+	p_result->rcode = RLM_MODULE_OK;
+
+	request->reply->timestamp = fr_time();
+
+	return UNLANG_ACTION_CALCULATE_RESULT;
+}
+
+RESUME(new_client)
+{
+	rlm_rcode_t			rcode = RESULT_RCODE;
+	CONF_SECTION			*cs;
+	PROCESS_INST const		*inst = mctx->mi->data;
+	fr_process_state_t const	*state;
+
+	UPDATE_STATE(reply);
+
+	switch (rcode) {
+	case RLM_MODULE_OK:
+	case RLM_MODULE_UPDATED:
+		RDEBUG("new client was successful.");
+		cs = inst->sections.add_client;
+		request->reply->code = PROCESS_CODE_DYNAMIC_CLIENT;
+		break;
+
+	default:
+		RDEBUG("new client was denied.");
+		cs = inst->sections.deny_client;
+		request->reply->code = PROCESS_CODE_DO_NOT_RESPOND;
+		break;
+	}
+
+	request->component = NULL;
+	request->module = NULL;
+
+	if (!cs) {
+		p_result->rcode = RLM_MODULE_OK;
+		request->reply->timestamp = fr_time();
+		return UNLANG_ACTION_CALCULATE_RESULT;
+	}
+
+	return unlang_module_yield_to_section(RESULT_P, request,
+					      cs, RLM_MODULE_FAIL, resume_new_client_done,
+					      NULL, FR_SIGNAL_NONE, mctx->rctx);
+}
+
+static inline unlang_action_t new_client(UNUSED unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
+{
+	CONF_SECTION			*cs;
+	PROCESS_INST const		*inst = mctx->mi->data;
+	fr_process_state_t const	*state;
+
+	UPDATE_STATE(packet);
+
+	PROCESS_TRACE;
+	fr_assert(inst->sections.new_client != NULL);
+	cs = inst->sections.new_client;
+
+	return unlang_module_yield_to_section(RESULT_P, request,
+					      cs, RLM_MODULE_FAIL, resume_new_client,
+					      NULL, FR_SIGNAL_NONE, mctx->rctx);
+}
+
+#define DYNAMIC_CLIENT_SECTIONS \
+	{ \
+		.section = SECTION_NAME("new", "client"), \
+		.actions = &mod_actions_authorize, \
+		.offset = PROCESS_CONF_OFFSET(new_client), \
+	}, \
+	{ \
+		.section = SECTION_NAME("add", "client"), \
+		.actions = &mod_actions_authorize, \
+		.offset = PROCESS_CONF_OFFSET(add_client), \
+	}, \
+	{ \
+		.section = SECTION_NAME("deny", "client"), \
+		.actions = &mod_actions_authorize, \
+		.offset = PROCESS_CONF_OFFSET(deny_client), \
+	}
+
+#endif	/* PROCESS_DYNAMIC_CLIENT */
 
 #endif	/* defined(PROCESS_INST) && defined(PROCESS_PACKET_TYPE) && defined(PROCESS_PACKET_CODE_VALID) */
 

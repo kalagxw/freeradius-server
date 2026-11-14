@@ -1,0 +1,93 @@
+#
+#  Test static IP allocation using redis_ippool
+#
+
+control.IP-Pool.Name := 'test_static'
+
+#
+#  Add a dynamic IP addresses
+#
+%redis_ippool.subnet.add(control.IP-Pool.Name, '192.168.0.1/32')
+
+#
+#  Add a static IP assigned to the calling station in the request
+#
+%redis_ippool.address.assign(control.IP-Pool.Name, '192.168.0.10/32', 'aa:bb:cc:dd:ee:ff', '192.168.0.0')
+
+#
+#  Check allocation
+#
+redis_ippool {
+	invalid = 1
+}
+if (!updated) {
+	test_fail
+}
+
+if (!(reply.Framed-IP-Address == 192.168.0.10)) {
+	test_fail
+}
+
+#
+#  Check the expiry attribute is present and correct - although the allocation is static
+#  we report the expiry as if it were dynamic e.g. to drive DHCP renewals
+#
+if (!(reply.Session-Timeout == 30)) {
+	test_fail
+}
+
+#
+#  Check that renewal does not mess with static IP
+#
+Framed-IP-Address := reply.Framed-IP-Address
+
+redis_ippool.renew {
+	invalid = 1
+}
+
+#
+#  Verify no expiry has been set on device
+#
+if (%redis('TTL', "{%{control.IP-Pool.Name}}:device:%{Calling-Station-Id}") != '-1') {
+	test_fail
+}
+
+#
+#  And that the expected expiry is now set
+#
+if (!(reply.Session-Timeout == 60)) {
+	test_fail
+}
+
+#
+#  Check that releasing does not mess with static IP
+#
+redis_ippool.release {
+	invalid = 1
+}
+if (!(updated)) {
+	test_fail
+}
+
+#
+#  Verify the association with the device remains
+#
+if (%redis('EXISTS', "{%{control.IP-Pool.Name}}:device:%{Calling-Station-ID}") == '0') {
+	test_fail
+}
+
+#
+#  Verify the hash information is retained
+#
+if (%redis('EXISTS', "{%{control.IP-Pool.Name}}:ip:%{reply.Framed-IP-Address}") == '0') {
+	test_fail
+}
+
+# Check the ZSCORE
+if (%redis('ZSCORE', "{%{control.IP-Pool.Name}}:pool", "%{reply.Framed-IP-Address}") <= %l) {
+	test_fail
+}
+
+reply := {}
+
+test_pass

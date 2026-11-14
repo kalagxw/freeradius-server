@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -71,7 +71,9 @@
 RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
+#include <freeradius-devel/unlang/action.h>
 #include <freeradius-devel/unlang/function.h>
+#include <freeradius-devel/server/pair.h>
 #include "tls.h"
 #include "attrs.h"
 
@@ -110,11 +112,9 @@ size_t eap_tls_status_table_len = NUM_ELEMENTS(eap_tls_status_table);
  *	- -1 on failure.
  */
 int eap_tls_compose(request_t *request, eap_session_t *eap_session, eap_tls_status_t status, uint8_t flags,
-		    fr_tls_record_t *record, size_t record_len, size_t frag_len)
+		    fr_dbuff_t *record, size_t record_len, size_t frag_len)
 {
 	eap_round_t		*eap_round = eap_session->this_round;
-	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
-	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
 	uint8_t			*p;
 	size_t			len = 1;	/* Flags */
 
@@ -186,7 +186,12 @@ int eap_tls_compose(request_t *request, eap_session_t *eap_session, eap_tls_stat
 		p += sizeof(net_record_len);
 	}
 
-	if (record) tls_session->record_to_buff(record, p, frag_len);
+	/*
+	 *	Limit the dbuff call to "frag_len".  If we ask for
+	 *	more, then the dbuff code will try to extend the
+	 *	buffer, and we don't want that.
+	 */
+	if (record) (void) fr_dbuff_out_memcpy(p, record, frag_len);
 
 	switch (status) {
 	case EAP_TLS_ACK_SEND:
@@ -252,17 +257,30 @@ int eap_tls_start(request_t *request, eap_session_t *eap_session)
  * We add the MPPE keys here.  These are used by the NAS.  The supplicant
  * will derive the same keys separately.
  *
+ * If we're using session tickets, then we call `store session` or
+ * `encode session` to save the session ticket.  This is done by the
+ * application (EAP) instead TLS, because the user isn't authenticated
+ * until the inner-tunnel data says so.
+ *
+ * @note The caller MUST set the caller's own unlang result before calling
+ *	 eap_tls_success().  A pushed child returns to the caller's caller
+ *	 with that result already in place.  The result is normally
+ *	 RLM_MODULE_OK, even if we fail to persist the session data.
+ *
  * @param[in] request			The current subrequest.
  * @param[in] eap_session		that completed successfully.
- * @param[in] prf_label			PRF label struct
+ * @param[in] prf_label			PRF label struct, or NULL to skip key generation.
  * @return
- *	- 0 on success.
- *	- -1 on failure.
+ *	- UNLANG_ACTION_PUSHED_CHILD	- cache sections are running.
+ *	- UNLANG_ACTION_CALCULATE_RESULT - there was nothing more to do.
+ *	- UNLANG_ACTION_FAIL		- the success packet or the keys could not be created.
  */
-int eap_tls_success(request_t *request, eap_session_t *eap_session, eap_tls_prf_label_t *prf_label)
+unlang_action_t eap_tls_success(request_t *request, eap_session_t *eap_session, eap_tls_prf_label_t *prf_label)
 {
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
 	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
+	uint8_t			*session_id;
+	fr_pair_t		*vp;
 
 	fr_assert(request->parent);	/* must be a subrequest */
 
@@ -272,36 +290,34 @@ int eap_tls_success(request_t *request, eap_session_t *eap_session, eap_tls_prf_
 	 *	Build the success packet
 	 */
 	if (eap_tls_compose(request, eap_session, EAP_TLS_ESTABLISHED,
-			    eap_tls_session->base_flags, NULL, 0, 0) < 0) return -1;
+			    eap_tls_session->base_flags, NULL, 0, 0) < 0) return UNLANG_ACTION_FAIL;
 
-	if (!prf_label) return 0;
+	/*
+	 *	EAP-FAST does it's own thing here.  <sigh>
+	 */
+	if (!prf_label) return fr_tls_ticket_issue(request, tls_session);
 
 	/*
 	 *	Automatically generate MPPE keying material.
 	 */
-	if (eap_crypto_mppe_keys(request->parent, tls_session->ssl, prf_label) < 0) return -1;
+	if (eap_crypto_mppe_keys(request->parent, tls_session->ssl, prf_label) < 0) return UNLANG_ACTION_FAIL;
 
 	/*
 	 *	Add the EAP session ID to the request
 	 */
-	{
-		uint8_t		*session_id;
-		fr_pair_t	*vp;
-
-		MEM(pair_append_reply(&vp, attr_eap_session_id) >= 0);
-		if (eap_crypto_tls_session_id(vp, request, tls_session->ssl, prf_label,
-					      &session_id, eap_session->type) < 0) {
-			pair_delete_reply(vp);
-			return -1;
-		}
-		fr_pair_value_memdup_buffer_shallow(vp, session_id, false);
-
-		RINDENT();
-		RDEBUG2("&reply.%pP", vp);
-		REXDENT();
+	MEM(pair_append_reply(&vp, attr_eap_session_id) >= 0);
+	if (eap_crypto_tls_session_id(vp, request, tls_session->ssl, prf_label,
+				      &session_id, eap_session->type) < 0) {
+		pair_delete_reply(vp);
+		return UNLANG_ACTION_FAIL;
 	}
+	fr_pair_value_memdup_buffer_shallow(vp, session_id, false);
 
-	return 0;
+	RINDENT();
+	RDEBUG2("reply.%pP", vp);
+	REXDENT();
+
+	return fr_tls_ticket_issue(request, tls_session);
 }
 
 /** Send an EAP-TLS failure
@@ -311,13 +327,16 @@ int eap_tls_success(request_t *request, eap_session_t *eap_session, eap_tls_prf_
  *
  * In addition to sending the failure, will destroy any cached session data.
  *
+ * The caller MUST set the caller's own p_result->rcode before calling this function.
+ *
  * @param[in] request		The current subrequest.
  * @param[in] eap_session	that failed.
  * @return
- *	- 0 on success.
- *	- -1 on failure (to compose a valid packet).
+ *	- UNLANG_ACTION_PUSHED_CHILD	- cache sections are running.
+ *	- UNLANG_ACTION_CALCULATE_RESULT - there was no cache work to do.
+ *	- UNLANG_ACTION_FAIL		- the frame could not be pushed.
  */
-int eap_tls_fail(request_t *request, eap_session_t *eap_session)
+unlang_action_t eap_tls_fail(request_t *request, eap_session_t *eap_session)
 {
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
 	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
@@ -326,14 +345,17 @@ int eap_tls_fail(request_t *request, eap_session_t *eap_session)
 
 	eap_session->finished = true;
 
-	/*
-	 *	Destroy any cached session data
-	 */
-	fr_tls_cache_deny(tls_session);
-
 	if (eap_tls_compose(request, eap_session, EAP_TLS_FAIL,
-			    eap_tls_session->base_flags, NULL, 0, 0) < 0) return -1;
-	return 0;
+			    eap_tls_session->base_flags, NULL, 0, 0) < 0) {
+		REDEBUG("Failed composing EAP-Failure");
+	}
+
+	/*
+	 *	Authentication failed.  Run "fail session", cancel
+	 *	any queued "store session", and then run "clear
+	 *	session".
+	 */
+	return fr_tls_session_fail_session(request, tls_session, true);
 }
 
 /** Frames the OpenSSL data that needs to be sent to the client in an EAP-Request
@@ -387,14 +409,14 @@ int eap_tls_request(request_t *request, eap_session_t *eap_session)
 	 *	TLS record length.
 	 */
 	if (eap_tls_session->record_out_started  == false) {
-		eap_tls_session->record_out_total_len = tls_session->dirty_out.used;
+		eap_tls_session->record_out_total_len = fr_dbuff_remaining(tls_session->dirty_out);
 	}
 
 	/*
 	 *	If the data we're sending is greater than the MTU
 	 *	then we need to fragment it.
 	 */
-	if ((tls_session->dirty_out.used +
+	if ((fr_dbuff_remaining(tls_session->dirty_out) +
 	    (length_included ? TLS_HEADER_LENGTH_FIELD_LEN : 0)) > tls_session->mtu) {
 		if (eap_tls_session->record_out_started == false) length_included = true;
 
@@ -411,10 +433,10 @@ int eap_tls_request(request_t *request, eap_session_t *eap_session)
 			RDEBUG2("Complete TLS record (%zu bytes) larger than MTU (%zu bytes), will fragment",
 				eap_tls_session->record_out_total_len, frag_len);	/* frag_len is correct here */
 			RDEBUG2("Sending first TLS record fragment (%zu bytes), %zu bytes remaining",
-				frag_len, tls_session->dirty_out.used - frag_len);
+				frag_len, fr_dbuff_remaining(tls_session->dirty_out) - frag_len);
 		} else {
 			RDEBUG2("Sending additional TLS record fragment (%zu bytes), %zu bytes remaining",
-				frag_len, tls_session->dirty_out.used - frag_len);
+				frag_len, fr_dbuff_remaining(tls_session->dirty_out) - frag_len);
 		}
 		eap_tls_session->record_out_started  = true;	/* Start a new series of fragments */
 	/*
@@ -422,7 +444,7 @@ int eap_tls_request(request_t *request, eap_session_t *eap_session)
 	 *	than the MTU or this is the final fragment.
 	 */
 	} else {
-		frag_len = tls_session->dirty_out.used;	/* Remaining data to drain */
+		frag_len = fr_dbuff_remaining(tls_session->dirty_out);	/* Remaining data to drain */
 
 		if (eap_tls_session->record_out_started  == false) {
 			RDEBUG2("Sending complete TLS record (%zu bytes)", frag_len);
@@ -439,7 +461,7 @@ int eap_tls_request(request_t *request, eap_session_t *eap_session)
 	if (length_included) flags = SET_LENGTH_INCLUDED(flags);
 
 	return eap_tls_compose(request, eap_session, EAP_TLS_RECORD_SEND, flags,
-			       &tls_session->dirty_out, eap_tls_session->record_out_total_len, frag_len);
+			       tls_session->dirty_out, eap_tls_session->record_out_total_len, frag_len);
 }
 
 /** ACK a fragment of the TLS record from the peer
@@ -482,7 +504,7 @@ static int eap_tls_ack(request_t *request, eap_session_t *eap_session)
 static eap_tls_status_t eap_tls_session_status(request_t *request, eap_session_t *eap_session)
 {
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
-	fr_tls_session_t		*tls_session = eap_tls_session->tls_session;
+	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
 
 	if (tls_session == NULL){
 		REDEBUG("Unexpected ACK received:  No ongoing SSL tls_session");
@@ -493,7 +515,8 @@ static eap_tls_status_t eap_tls_session_status(request_t *request, eap_session_t
 		return EAP_TLS_RECORD_SEND;
 	}
 
-	if ((tls_session->info.content_type == SSL3_RT_HANDSHAKE) && (tls_session->info.origin == 0)) {
+	if ((tls_session->info.content_type == SSL3_RT_HANDSHAKE) &&
+	    (tls_session->info.origin == TLS_INFO_ORIGIN_RECORD_RECEIVED)) {
 		REDEBUG("Unexpected ACK received:  We sent no previous messages");
 		return EAP_TLS_INVALID;
 	}
@@ -504,7 +527,7 @@ static eap_tls_status_t eap_tls_session_status(request_t *request, eap_session_t
 		return EAP_TLS_FAIL;
 
 	case SSL3_RT_HANDSHAKE:
-		if (SSL_is_init_finished(tls_session->ssl) && (tls_session->dirty_out.used == 0)) {
+		if (fr_tls_session_is_init_finished(tls_session) && (fr_dbuff_remaining(tls_session->dirty_out) == 0)) {
 			RDEBUG2("Peer ACKed our handshake fragment.  handshake is finished");
 
 			/*
@@ -529,6 +552,14 @@ static eap_tls_status_t eap_tls_session_status(request_t *request, eap_session_t
 		 *	to the default section below.
 		 */
 	default:
+		/*
+		 *	If the last message was from us, then the session is established or we're still
+		 *	sending the session ticket.
+		 */
+		if (tls_session->info.origin == TLS_INFO_ORIGIN_RECORD_SENT) {
+			if (fr_dbuff_remaining(tls_session->dirty_out) == 0) return EAP_TLS_ESTABLISHED;
+			return EAP_TLS_RECORD_SEND;
+		}
 		REDEBUG("Invalid ACK received: %d", tls_session->info.content_type);
 		return EAP_TLS_INVALID;
 	}
@@ -536,7 +567,7 @@ static eap_tls_status_t eap_tls_session_status(request_t *request, eap_session_t
 
 /** Check that this EAP-TLS packet is correct and the progression of EAP-TLS packets is sane
  *
- * @note In the received packet, No data will be present incase of ACK or NAK
+ * @note In the received packet, No data will be present in case of ACK or NAK
  *	in this case the packet->data pointer will be NULL.
  *
  * @param[in] request		the current subrequest.
@@ -640,6 +671,14 @@ static eap_tls_status_t eap_tls_verify(request_t *request, eap_session_t *eap_se
 	frag_len = this_round->response->length - header_len;
 
 	/*
+	 *	This fragment has no data, but the header says that there is more data!
+	 */
+	if (!frag_len && TLS_MORE_FRAGMENTS(eap_tls_data->flags)) {
+		REDEBUG("Peer sent EAP-TLS with zero-length fragment and 'more' bit set - if there is no data, there should not be more!");
+		return EAP_TLS_INVALID;
+	}
+
+	/*
 	 *	The L bit (length included) is set to indicate the
 	 *	presence of the four octet TLS Message Length field,
 	 *	and MUST be set for the first fragment of a fragmented
@@ -655,6 +694,11 @@ static eap_tls_status_t eap_tls_verify(request_t *request, eap_session_t *eap_se
 	if (TLS_LENGTH_INCLUDED(eap_tls_data->flags)) {
 		size_t total_len;
 
+		if (eap_tls_data->data[0] || eap_tls_data->data[1]) {
+			REDEBUG("TLS record length is > 65536");
+			return EAP_TLS_INVALID;
+		}
+
 		total_len = eap_tls_data->data[2] * 256 | eap_tls_data->data[3];
 		if (frag_len > total_len) {
 			REDEBUG("TLS fragment length (%zu bytes) greater than TLS record length (%zu bytes)",
@@ -662,9 +706,9 @@ static eap_tls_status_t eap_tls_verify(request_t *request, eap_session_t *eap_se
 			return EAP_TLS_INVALID;
 		}
 
-		if (total_len > FR_TLS_MAX_RECORD_SIZE) {
+		if (total_len > SSL3_RT_MAX_PLAIN_LENGTH) {
 			REDEBUG("Reassembled TLS record will be %zu bytes, "
-				"greater than our maximum record size (" STRINGIFY(FR_TLS_MAX_RECORD_SIZE) " bytes)",
+				"greater than our maximum record size (" STRINGIFY(SSL3_RT_MAX_PLAIN_LENGTH) " bytes)",
 				total_len);
 			return EAP_TLS_INVALID;
 		}
@@ -791,43 +835,41 @@ ignore_length:
 /** Process the result from the last TLS handshake round
  *
  * @return
- *	- eap_tls_session->state = EAP_TLS_FAIL if the message is invalid.
- *	- eap_tls_session->state = EAP_TLS_HANDLED if we need to send an
+ *	- eap_tls_session->state == EAP_TLS_FAIL if the message is invalid.
+ *	- eap_tls_session->state == EAP_TLS_HANDLED if we need to send an
  *	  additional request to the peer.
- *	- eap_tls_session->state = EAP_TLS_ESTABLISHED if the handshake
+ *	- eap_tls_session->state == EAP_TLS_ESTABLISHED if the handshake
  *	  completed successfully, and there's no more data to send.
  */
-static unlang_action_t eap_tls_handshake_resume(UNUSED rlm_rcode_t *p_result, UNUSED int *priority,
-						request_t *request, void *uctx)
+static unlang_action_t eap_tls_handshake_resume(request_t *request, void *uctx)
 {
 	eap_session_t		*eap_session = talloc_get_type_abort(uctx, eap_session_t);
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
 	fr_tls_session_t	*tls_session = talloc_get_type_abort(eap_tls_session->tls_session, fr_tls_session_t);
+	unlang_action_t		ret = UNLANG_ACTION_CALCULATE_RESULT;
 
 	switch (tls_session->result) {
 	case FR_TLS_RESULT_IN_PROGRESS:
 	default:
 		fr_assert(0);	/* Shouldn't have been called */
-		goto finish;
+		goto fail;
 
 	case FR_TLS_RESULT_ERROR:
 		REDEBUG("TLS receive handshake failed during operation");
-		fr_tls_cache_deny(tls_session);
-		eap_tls_session->state = EAP_TLS_FAIL;
-		goto finish;
+		goto fail;
 
 	case FR_TLS_RESULT_SUCCESS:
 		break;
 	}
 
-#ifdef TLS1_3_VERSION
 	/*
-	 *	https://tools.ietf.org/html/draft-ietf-emu-eap-tls13#section-2.5
+	 *	RFC 9190 Section 2.5
 	 *
 	 *	We need to signal the other end that TLS negotiation
 	 *	is done.  We can't send a zero-length application data
 	 *	message, so we send application data which is one byte
-	 *	of zero.
+	 *	of zero.  This also pushes out any stateless session
+	 *	tickets to the peer.
 	 *
 	 *	Note this is only done for when there is no application
 	 *	data to be sent. So this is done always for EAP-TLS but
@@ -844,47 +886,71 @@ static unlang_action_t eap_tls_handshake_resume(UNUSED rlm_rcode_t *p_result, UN
 	 *		  the client cert
 	 */
 	if ((tls_session->info.version == TLS1_3_VERSION) &&
-	    (tls_session->client_cert_ok || eap_tls_session->authentication_success || SSL_session_reused(tls_session->ssl))) {
+	    (tls_session->peer_cert_ok || eap_tls_session->authentication_success || SSL_session_reused(tls_session->ssl))) {
 		if ((eap_session->type == FR_EAP_METHOD_TLS) || SSL_session_reused(tls_session->ssl)) {
 			eap_tls_session->authentication_success = true;
 
-			RDEBUG("(TLS) EAP Sending final Commitment Message.");
-			tls_session->record_from_buff(&tls_session->clean_in, "\0", 1);
-		}
+			/*
+			 *	Ensure only a single instance of the application data is added.
+			 *	Some handshakes result in multiple passes through this path.
+			 */
+			if (!tls_session->sent_commitment) {
+				RDEBUG2("(TLS) EAP Sending final Commitment Message.");
+				(void) fr_dbuff_in_bytes(&tls_session->clean_in, (uint8_t) 0x00);
+				tls_session->sent_commitment = true;
+			}
 
-		/*
-		 *	Always returns UNLANG_ACTION_CALCULATE_RESULT
-		 */
-		(void) fr_tls_session_async_handshake_push(request, tls_session);
-		if (tls_session->result != FR_TLS_RESULT_SUCCESS) {
+			/*
+			 *	Write out the application data if the session is ready for it.
+			 */
+			if (SSL_is_init_finished(tls_session->ssl)) fr_tls_session_send(request, tls_session);
+		} else {
+
+			/*
+			 *	Returns UNLANG_ACTION_PUSHED_CHILD unless something has failed
+			 */
+			ret = fr_tls_session_async_handshake_push(request, tls_session);
+			if (ret != UNLANG_ACTION_FAIL) return ret;
+
 			REDEBUG("TLS receive handshake failed during operation");
-			fr_tls_cache_deny(tls_session);
-			eap_tls_session->state = EAP_TLS_FAIL;
-			return UNLANG_ACTION_CALCULATE_RESULT;
+			goto fail;
 		}
 	}
-#endif
 
 	/*
 	 *	FIXME: return success/fail.
 	 *
 	 *	TLS proper can decide what to do, then.
 	 */
-	if (tls_session->dirty_out.used > 0) {
-		eap_tls_request(request, eap_session);
+	if (fr_dbuff_remaining(tls_session->dirty_out) > 0) {
+		/*
+		 *	If the handshake is finished and we have application data
+		 *	then move to phase2.
+		 *	This happens when a client sends application data in the
+		 *	same packet as the handshake finished record, but OpenSSL
+		 *	has decided to send a NewSessionTicket.
+		 *	The client isn't expecting a ticket at this point.
+		 */
+		if (tls_session->seen_application_data && fr_dbuff_used(&tls_session->clean_out) > 0) goto phase2;
+
+		if (eap_tls_request(request, eap_session) < 0) {
+			REDEBUG("TLS failed composing a response");
+			goto fail;
+		}
 		eap_tls_session->state = EAP_TLS_HANDLED;
-		goto finish;
+		return UNLANG_ACTION_CALCULATE_RESULT;
 	}
 
 	/*
-	 *	If there is no data to send i.e dirty_out.used <=0 and
+	 *	If there is no data to send, and
 	 *	if the SSL handshake is finished, then return
 	 *	EAP_TLS_ESTABLISHED.
 	 *
 	 *	For EAP-TLS this translates to an EAP-Success, for others
 	 *	this begins phase2.
 	 */
-	if (eap_tls_session->phase2 || SSL_is_init_finished(tls_session->ssl)) {
+	if (eap_tls_session->phase2 || fr_tls_session_is_init_finished(tls_session)) {
+	phase2:
 		eap_tls_session->phase2 = true;
 
 		/*
@@ -893,16 +959,25 @@ static unlang_action_t eap_tls_handshake_resume(UNUSED rlm_rcode_t *p_result, UN
 		 */
 		tls_session->info.content_type = SSL3_RT_APPLICATION_DATA;
 		eap_tls_session->state = EAP_TLS_ESTABLISHED;
-		goto finish;
+		return UNLANG_ACTION_CALCULATE_RESULT;
 	}
 
 	/*
 	 *	Who knows what happened...
 	 */
 	REDEBUG("TLS failed during operation");
+fail:
 	eap_tls_session->state = EAP_TLS_FAIL;
 
-finish:
+	/*
+	 *	Record that the handshake failed, and let the caller deal
+	 *	with it.
+	 *
+	 *	Every caller reaches eap_tls_fail(), which runs
+	 *	"fail session" and discards the session.  Doing either of
+	 *	those here as well would run the policy twice for one
+	 *	failure.
+	 */
 	return UNLANG_ACTION_CALCULATE_RESULT;
 }
 
@@ -917,6 +992,7 @@ static inline CC_HINT(always_inline) unlang_action_t eap_tls_handshake_push(requ
 {
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
 	fr_tls_session_t	*tls_session = talloc_get_type_abort(eap_tls_session->tls_session, fr_tls_session_t);
+	unlang_action_t		ua;
 
 	/*
 	 *	Will run after the handshake round completes
@@ -924,11 +1000,16 @@ static inline CC_HINT(always_inline) unlang_action_t eap_tls_handshake_push(requ
 	if (unlang_function_push(request,
 				 NULL,
 				 eap_tls_handshake_resume,
-				 NULL, UNLANG_SUB_FRAME, eap_session) < 0) return UNLANG_ACTION_FAIL;
+				 NULL,
+				 FR_SIGNAL_NONE, UNLANG_SUB_FRAME,
+				 eap_session) < 0) return UNLANG_ACTION_FAIL;
 
-	if (fr_tls_session_async_handshake_push(request, tls_session) < 0) return UNLANG_ACTION_FAIL;
+	if (!fr_cond_assert((ua = fr_tls_session_async_handshake_push(request, tls_session)) == UNLANG_ACTION_PUSHED_CHILD)) {
+		unlang_interpet_frame_discard(request);	/* Pop the resume function */
+		return UNLANG_ACTION_FAIL;
+	}
 
-	return UNLANG_ACTION_PUSHED_CHILD;
+	return ua;
 }
 
 /** Process an EAP TLS request
@@ -936,7 +1017,7 @@ static inline CC_HINT(always_inline) unlang_action_t eap_tls_handshake_push(requ
  * Here we implement a basic state machine.  The state machine is implicit and
  * is driven by the state of the TLS session and the flags sent.
  * INCOMING DATA:
- *   1. EAP-TLS should get the compelete TLS data from the peer.
+ *   1. EAP-TLS should get the complete TLS data from the peer.
  *   2. Store that data in a data structure with any other required info
  *   3. Hand this data structure to the TLS module.
  *   4. TLS module will perform its operations on the data and hands back to EAP-TLS
@@ -948,11 +1029,13 @@ static inline CC_HINT(always_inline) unlang_action_t eap_tls_handshake_push(requ
  * session object SHOULD be maintained even after the session is completed, for session
  * resumption.
  *
+ * Note that we never return FAIL to the interpreter.  Instead, we
+ * send the EAP failure back to the supplicant.
+ *
  * @param request	the request
  * @param eap_session	to continue.
  * @return
- *	- EAP_TLS_ESTABLISHED
- *	- EAP_TLS_HANDLED
+ *	- UNLANG_ACTION_CALCULATE_RESULT
  */
 unlang_action_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 {
@@ -1020,10 +1103,11 @@ unlang_action_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 		/*
 		 *	Update the dirty_in buffer (data for reading by OpenSSL)
 		 *
-		 *	This buffer will contain partial data when M bit is set, and should
-		 * 	should only be reinitialized when M bit is not set.
+		 *	OpenSSL reads this, and writes clean data out.
+		 *	The dirty_in buffer may contain partial TLS
+		 *	records on exit.
 		 */
-		if ((tls_session->record_from_buff)(&tls_session->dirty_in, data, data_len) != data_len) {
+		if (fr_dbuff_in_memcpy_partial(tls_session->dirty_in, data, data_len) != data_len) {
 			REDEBUG("Exceeded maximum record size");
 			eap_tls_session->state = EAP_TLS_FAIL;
 			goto done;
@@ -1033,8 +1117,11 @@ unlang_action_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 		 *	ACK fragments until we get a complete TLS record.
 		 */
 		if (eap_tls_session->state != EAP_TLS_RECORD_RECV_COMPLETE) {
-			eap_tls_ack(request, eap_session);
-			eap_tls_session->state = EAP_TLS_HANDLED;
+			if (eap_tls_ack(request, eap_session) < 0) {
+				eap_tls_session->state = EAP_TLS_FAIL;
+			} else {
+				eap_tls_session->state = EAP_TLS_HANDLED;
+			}
 			goto done;
 		}
 
@@ -1043,7 +1130,7 @@ unlang_action_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 		 *	process it as application data, otherwise continue
 		 *	the handshake.
 		 */
-		if (eap_tls_session->phase2 || SSL_is_init_finished(tls_session->ssl)) {
+		if (eap_tls_session->phase2 || fr_tls_session_is_init_finished(tls_session)) {
 			int ret;
 
 			eap_tls_session->phase2 = true;
@@ -1077,15 +1164,18 @@ unlang_action_t eap_tls_process(request_t *request, eap_session_t *eap_session)
 		 *	Return a "yes we're done" if there's no more data to send,
 		 *	and we've just managed to finish the SSL session initialization.
 		 */
-		if (!eap_tls_session->phase2 && (tls_session->dirty_out.used == 0) &&
-		    SSL_is_init_finished(tls_session->ssl)) {
+		if (!eap_tls_session->phase2 && (fr_dbuff_remaining(tls_session->dirty_out) == 0) &&
+		    fr_tls_session_is_init_finished(tls_session)) {
 			eap_tls_session->phase2 = true;
 			eap_tls_session->state = EAP_TLS_ESTABLISHED;
 			goto done;
 		}
 
-		eap_tls_request(request, eap_session);
-		eap_tls_session->state = EAP_TLS_HANDLED;
+		if (eap_tls_request(request, eap_session) < 0) {
+			eap_tls_session->state = EAP_TLS_FAIL;
+		} else {
+			eap_tls_session->state = EAP_TLS_HANDLED;
+		}
 		goto done;
 
 	/*
@@ -1128,6 +1218,8 @@ eap_tls_session_t *eap_tls_session_init(request_t *request, eap_session_t *eap_s
 	eap_tls_session_t	*eap_tls_session;
 	fr_tls_session_t	*tls_session;
 	fr_tls_conf_t		*conf = fr_tls_ctx_conf(ssl_ctx);
+	fr_pair_t		*vp;
+	fr_pair_t		*tls_max, *tls_min;
 
 	fr_assert(request->parent);	/* must be a subrequest */
 
@@ -1150,6 +1242,30 @@ eap_tls_session_t *eap_tls_session_init(request_t *request, eap_session_t *eap_s
 	eap_tls_session->include_length = true;
 
 	/*
+	 *	We use default fragment size, unless the Framed-MTU
+	 *	tells us it's too big.  Note that we do NOT account
+	 *	for the EAP-TLS headers if conf->fragment_size is
+	 *	large, because that config item looks to be confusing.
+	 *
+	 *	i.e. it should REALLY be called MTU, and the code here
+	 *	should figure out what that means for TLS fragment size.
+	 *	asking the administrator to know the internal details
+	 *	of EAP-TLS in order to calculate fragment sizes is
+	 *	just too much.
+	 */
+	vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_framed_mtu);
+
+	/*
+	 *	TLS 1.3 introduces the concept of early data (also known as zero
+	 *	round trip data or 0-RTT data). Early data allows a client to send
+	 *	data to a server in the first round trip of a connection, without
+	 *	waiting for the TLS handshake to complete if the client has spoken
+	 *	to the same server recently. This doesn't work for EAP, so we
+	 *	disable early data.
+	 */
+	SSL_CTX_set_max_early_data(ssl_ctx, 0);
+
+	/*
 	 *	Every new session is started only from EAP-TLS-START.
 	 *	Before Sending our initial EAP-TLS start open a new
 	 *	SSL session.
@@ -1160,6 +1276,44 @@ eap_tls_session_t *eap_tls_session_init(request_t *request, eap_session_t *eap_s
 	eap_tls_session->tls_session = tls_session = fr_tls_session_alloc_server(eap_tls_session, ssl_ctx,
 										 request, client_cert);
 	if (unlikely(!tls_session)) return NULL;
+
+	/*
+	 *	EAP-TTLS cannot reliably use stateless session tickets with TLS 1.3.
+	 *
+	 *	See src/lib/tls/session.c for explanations.
+	 */
+	switch (eap_session->type) {
+	case FR_EAP_METHOD_TTLS:
+		tls_session->disallow_stateless_tickets = true;
+		break;
+
+	default:
+		break;
+	}
+
+	/*
+	 *	Set our MTU, and enforce dynamic MTU
+	 *
+	 *	Account for the EAP header (4), and the EAP-TLS header
+	 *	(6), as per Section 4.2 of RFC 2716.  What's left is
+	 *	the maximum amount of data we read from a TLS buffer.
+	 */
+	tls_session->mtu = conf->fragment_size - 10;
+	if (vp && (vp->vp_uint32 > 100) && (vp->vp_uint32 < tls_session->mtu)) {
+		RDEBUG2("Setting fragment_len from %pP", vp);
+		tls_session->mtu = vp->vp_uint32;
+	}
+
+	/*
+	 *	Track EAP-TLS inside of a tunneled method.  The outer TLS session encrypts each inner packet,
+	 *	which adds a record header, plus the IV, MAC or tag, and padding.  The inner MTU therefore
+	 *	needs to be smaller than the outer one, so that the inner TLS fragments fit within the outer
+	 *	TLS fragments.
+	 */
+	if (eap_session_in_tunnel(eap_session->request) && (tls_session->mtu > (EAP_TLS_NESTED_OVERHEAD + 100))) {
+		tls_session->mtu -= EAP_TLS_NESTED_OVERHEAD;
+		RDEBUG2("Nested inside another EAP method, lowering fragment_len to %zu", tls_session->mtu);
+	}
 
 	/*
 	 *	Add the EAP-Identity value to the TLS session so
@@ -1192,78 +1346,118 @@ eap_tls_session_t *eap_tls_session_init(request_t *request, eap_session_t *eap_s
 	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_CONF, (void *)conf);
 	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_IDENTITY, (void *)&(eap_session->identity));
 
+	tls_max = fr_pair_find_by_da(&request->control_pairs, NULL, attr_tls_max_version);
+	tls_min = fr_pair_find_by_da(&request->control_pairs, NULL, attr_tls_min_version);
+	if (tls_max && tls_min && (tls_min->vp_float32 > tls_max->vp_float32)) {
+		RERROR("Can't set TLS min version greater than max version");
+		goto skip_tls_version;
+	}
+
+#define SET_TLS_VERSION(_type) \
+	if (tls_ ## _type) { \
+		int tls_version = 0; \
+		if (tls_ ## _type->vp_float32 >= (float) 1.3) { \
+			tls_version = TLS1_3_VERSION; \
+		} else if (tls_ ## _type->vp_float32 >= (float) 1.2) { \
+			tls_version = TLS1_2_VERSION; \
+		} else if (tls_ ## _type->vp_float32 >= (float) 1.1) { \
+			tls_version = TLS1_1_VERSION; \
+		} \
+		if (tls_version) { \
+			if (SSL_set_ ## _type ## _proto_version(tls_session->ssl, tls_version) != 1) {\
+				RERROR("Failed to set %pP", tls_ ## _type); \
+			} else { \
+				RDEBUG2("Setting TLS " #_type " version to %0.1f", (double) tls_ ## _type->vp_float32); \
+			} \
+		} else { \
+			RWARN("Invalid value %pP", tls_ ## _type); \
+		} \
+	}
+
+	SET_TLS_VERSION(max)
+	SET_TLS_VERSION(min)
+skip_tls_version:
+
 	return eap_tls_session;
 }
 
-/** Parse TLS configuration
+/** Apply the limits that EAP puts on a parsed `tls { ... }` section
  *
- * If the option given by 'attr' is set, we find the config section of that name and use
- * that for the TLS configuration. If not, we fall back to compatibility mode and read
- * the TLS options from the 'tls' section.
+ * The submodule's own rules parse the section, through the
+ * `FR_CONF_SUBSECTION_ALLOC` row that names `fr_tls_server_config`.
  *
- * @param cs to derive the configuration from.
- * @param attr identifier for common TLS configuration.
- * @return
- *	- NULL on error.
- *	- A new fr_tls_conf_t on success.
+ * @param[in] cs		the submodule's section.
+ * @param[in,out] tls_conf	parsed from the `tls { ... }` subsection.
+ * @param[in] delayed_tickets	Does this EAP type need delayed session tickets.
  */
-fr_tls_conf_t *eap_tls_conf_parse(CONF_SECTION *cs, char const *attr)
+void eap_tls_conf_check(CONF_SECTION *cs, fr_tls_conf_t *tls_conf, bool delayed_tickets)
 {
-	char const 		*tls_conf_name;
-	CONF_PAIR		*cp;
-	CONF_SECTION		*parent;
-	CONF_SECTION		*tls_cs;
-	fr_tls_conf_t		*tls_conf;
-
-	parent = cf_item_to_section(cf_parent(cs));
-
-	cp = cf_pair_find(cs, attr);
-	if (cp) {
-		tls_conf_name = cf_pair_value(cp);
-
-		tls_cs = cf_section_find(parent, TLS_CONFIG_SECTION, tls_conf_name);
-		if (!tls_cs) {
-			ERROR("Cannot find tls config \"%s\"", tls_conf_name);
-			return NULL;
-		}
-	} else {
-		/*
-		 *	If we can't find the section given by the 'attr', we
-		 *	fall-back to looking for the "tls" section, as in
-		 *	previous versions.
-		 *
-		 *	We don't fall back if the 'attr' is specified, but we can't
-		 *	find the section - that is just a config error.
-		 */
-		INFO("TLS section \"%s\" missing, trying to use legacy configuration", attr);
-		tls_cs = cf_section_find(parent, "tls", NULL);
+	/*
+	 *	There isn't any point to having EAP sessions cache
+	 *	lifetimes which are very low.  Arguably, the minimum
+	 *	lifetime should be a few hours.  We only limit it here
+	 *	to 15min, because anything lower is pretty much
+	 *	ridiculous.
+	 *
+	 *	If the administrator also sets it too low, then we
+	 *	raise it.
+	 */
+	if (!tls_conf->cache.min_lifetime_is_set ||
+	    fr_time_delta_lt(tls_conf->cache.min_lifetime, fr_time_delta_from_sec(15 * 60))) {
+		tls_conf->cache.min_lifetime = fr_time_delta_from_sec(15 * 60);
+		cf_log_warn_by_child(cs, "tls", "Raising EAP session.min_lifetime to %pV",
+				     fr_box_time_delta(tls_conf->cache.min_lifetime));
 	}
 
-	if (!tls_cs) return NULL;
-
-	tls_conf = fr_tls_conf_parse_server(tls_cs);
-	if (!tls_conf) return NULL;
-
 	/*
-	 *	The EAP RFC's say 1020, but we're less picky.
+	 *	Most EAP methods send the ticket after the authentication has succeeded, not in the TLS handshake.
 	 */
-	FR_INTEGER_BOUND_CHECK("fragment_size", tls_conf->fragment_size, >=, 100);
-	/*
-	 *	The maximum size for a RADIUS packet is 4096, but we're
-	 *	not just a RADIUS server.
-	 *
-	 *	Maximum size for a TLS record is 16K, so little point in
-	 *	setting it higher than that.
-	 */
-	FR_INTEGER_BOUND_CHECK("fragment_size", tls_conf->fragment_size, <=, FR_TLS_MAX_RECORD_SIZE);
-
-	/*
-	 *	Account for the EAP header (4), and the EAP-TLS header
-	 *	(6), as per Section 4.2 of RFC 2716.  What's left is
-	 *	the maximum amount of data we read from a TLS buffer.
-	 */
-	tls_conf->fragment_size -= 10;
-
-	return tls_conf;
+	tls_conf->delayed_tickets = delayed_tickets;
 }
 
+/** Check that the TLS configuration does not need stateless session tickets
+ *
+ * EAP-TTLS does not use stateless session tickets with TLS 1.3.  TTLS sessions set
+ * `disallow_stateless_tickets`, and the ticket code creates no stateless ticket.
+ *
+ * - `session.mode = "stateless"` needs stateless tickets, so with TLS 1.3 allowed the method
+ *   cannot work as configured.  That is an error.
+ * - `session.mode = "auto"` allows stateless tickets, but does not need them.  That is a warning.
+ *
+ * @param[in] cs		the submodule's section.
+ * @param[in] tls_conf		parsed from the `tls { ... }` subsection.
+ *	- 0 on success.
+ *	- -1 if the configuration requires stateless session tickets.
+ */
+int eap_tls_check_stateless(CONF_SECTION *cs, fr_tls_conf_t const *tls_conf)
+{
+	/*
+	 *	No TLS 1.3 means no stateless tickets, which TLS 1.2 and earlier do not use.
+	 */
+	if ((tls_conf->tls_max_version > 0) && (tls_conf->tls_max_version < (float)1.3)) return 0;
+
+	if (!(tls_conf->cache.mode & FR_TLS_TICKET_STATELESS)) return 0;
+
+	if (tls_conf->cache.mode == FR_TLS_TICKET_AUTO) {
+		cf_log_warn_by_child(cs, "tls", "Stateless session tickets do not work with this EAP method, "
+				     "and are not used with TLS 1.3");
+		return 0;
+	}
+
+	cf_log_err_by_child(cs, "tls", "session.mode = \"stateless\" does not work with this EAP method, "
+			    "which does not use stateless session tickets with TLS 1.3.");
+
+	/*
+	 *	`auto` is rewritten to `stateless` when there is no stateful cache.  The administrator
+	 *	still asked for `auto`.
+	 */
+	if (tls_conf->cache.mode_is_auto) {
+		cf_log_warn_by_child(cs, "tls", "Add a 'store session { ... }' section to save stateful tickets, or");
+		cf_log_warn_by_child(cs, "tls", "use session.mode = \"disabled\",");
+	} else {
+		cf_log_warn_by_child(cs, "tls", "Use session.mode = \"auto\" or \"disabled\",");
+	}
+	cf_log_warn_by_child(cs, "tls", "or set tls_max_version = 1.2");
+
+	return -1;
+}

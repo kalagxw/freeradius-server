@@ -25,8 +25,6 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/io/channel.h>
-#include <freeradius-devel/io/control.h>
-#include <freeradius-devel/util/log.h>
 #include <freeradius-devel/util/debug.h>
 
 #ifdef HAVE_STDATOMIC_H
@@ -44,12 +42,7 @@ RCSID("$Id$")
 #define MPRINT(...)
 #endif
 
-/*
- *	We disable this until we fix all of the signaling issues...
- */
-#define ENABLE_SKIPS (0)
-
-typedef enum {
+typedef enum : uint8_t {
 	TO_RESPONDER = 0,
 	TO_REQUESTOR = 1
 } fr_channel_direction_t;
@@ -79,26 +72,23 @@ size_t channel_direction_len = NUM_ELEMENTS(channel_direction);
  */
 #define ATOMIC_QUEUE_SIZE (1024)
 
-typedef enum fr_channel_signal_t {
-	FR_CHANNEL_SIGNAL_ERROR			= FR_CHANNEL_ERROR,
-	FR_CHANNEL_SIGNAL_DATA_TO_RESPONDER	= FR_CHANNEL_DATA_READY_RESPONDER,
-	FR_CHANNEL_SIGNAL_DATA_TO_REQUESTOR	= FR_CHANNEL_DATA_READY_REQUESTOR,
-	FR_CHANNEL_SIGNAL_OPEN			= FR_CHANNEL_OPEN,
-	FR_CHANNEL_SIGNAL_CLOSE			= FR_CHANNEL_CLOSE,
-
-	/*
-	 *	The preceding MUST be in the same order as fr_channel_event_t
-	 */
-
-	FR_CHANNEL_SIGNAL_DATA_DONE_RESPONDER,
-	FR_CHANNEL_SIGNAL_RESPONDER_SLEEPING,
-} fr_channel_signal_t;
-
+/** The payload of every channel control message
+ *
+ *  Which event it is comes from the control message, not from the payload.
+ */
 typedef struct {
-	fr_channel_signal_t	signal;		//!< the signal to send
-	uint64_t		ack;		//!< or the endpoint..
+	uint64_t		ack;		//!< the sender's ack sequence, for data done.
 	fr_channel_t		*ch;		//!< the channel
+	fr_message_set_t	*reply_ms;	//!< the reply message set, for open only.
 } fr_channel_control_t;
+
+/** The callbacks one control plane's owner registered for channel events
+ */
+typedef struct {
+	fr_control_t		*control;	//!< the control plane these were registered on
+	fr_channel_callbacks_t	cb;		//!< what the owner does with each event
+	void			*uctx;		//!< passed to each callback
+} fr_channel_hooks_t;
 
 /** One end of a channel
  *
@@ -109,17 +99,12 @@ typedef struct {
 typedef struct {
 	fr_channel_direction_t	direction;	//!< Use for debug messages.
 
-	fr_control_t		*control;	//!< The control plane, consisting of an atomic queue and kqueue.
-
-	fr_ring_buffer_t	*rb;		//!< Ring buffer for control-plane messages.
+	fr_control_t		*control;	//!< The control plane we signal this end through.
 
 	void			*uctx;		//!< Worker context.
 
 	fr_channel_recv_callback_t recv;	//!< callback for receiving messages
 	void			*recv_uctx;	//!< context for receiving messages
-
-	bool			must_signal;	//!< we need to signal the other end
-
 
 	uint64_t		sequence;	//!< Sequence number for this channel.
 	uint64_t		ack;		//!< Sequence number of the other end.
@@ -142,8 +127,8 @@ typedef struct fr_channel_s fr_channel_t;
  * and an atomic queue in each direction to allow for bidirectional communication.
  */
 struct fr_channel_s {
-	fr_time_t		cpu_time;	//!< Total time used by the responder for this channel.
-	fr_time_t		processing_time; //!< Time spent by the responder processing requests.
+	fr_time_delta_t		cpu_time;	//!< Total time used by the responder for this channel.
+	fr_time_delta_t		processing_time; //!< Time spent by the responder processing requests.
 
 	bool			same_thread;	//!< are both ends in the same thread?
 
@@ -151,13 +136,12 @@ struct fr_channel_s {
 };
 
 fr_table_num_sorted_t const channel_signals[] = {
-	{ L("error"),			FR_CHANNEL_ERROR			},
-	{ L("data-to-responder"),		FR_CHANNEL_SIGNAL_DATA_TO_RESPONDER	},
-	{ L("data-to-requestor"),		FR_CHANNEL_DATA_READY_REQUESTOR		},
-	{ L("open"),			FR_CHANNEL_OPEN				},
-	{ L("close"),			FR_CHANNEL_CLOSE			},
-	{ L("data-done-responder"),	FR_CHANNEL_SIGNAL_DATA_DONE_RESPONDER	},
-	{ L("responder-sleeping"),		FR_CHANNEL_SIGNAL_RESPONDER_SLEEPING	},
+	{ L("close"),			FR_CHANNEL_CONTROL_CLOSE		},
+	{ L("close-ack"),		FR_CHANNEL_CONTROL_CLOSE_ACK		},
+	{ L("data-done-responder"),	FR_CHANNEL_CONTROL_DATA_DONE_RESPONDER	},
+	{ L("data-to-requestor"),	FR_CHANNEL_CONTROL_DATA_TO_REQUESTOR	},
+	{ L("data-to-responder"),	FR_CHANNEL_CONTROL_DATA_TO_RESPONDER	},
+	{ L("open"),			FR_CHANNEL_CONTROL_OPEN			},
 };
 size_t channel_signals_len = NUM_ELEMENTS(channel_signals);
 
@@ -197,13 +181,13 @@ fr_channel_t *fr_channel_create(TALLOC_CTX *ctx, fr_control_t *requestor, fr_con
 	ch->end[TO_RESPONDER].direction = TO_RESPONDER;
 	ch->end[TO_REQUESTOR].direction = TO_REQUESTOR;
 
-	ch->end[TO_RESPONDER].aq = fr_atomic_queue_alloc(ch, ATOMIC_QUEUE_SIZE);
+	ch->end[TO_RESPONDER].aq = fr_atomic_queue_talloc(ch, ATOMIC_QUEUE_SIZE, sizeof(uintptr_t));
 	if (!ch->end[TO_RESPONDER].aq) {
 		talloc_free(ch);
 		goto nomem;
 	}
 
-	ch->end[TO_REQUESTOR].aq = fr_atomic_queue_alloc(ch, ATOMIC_QUEUE_SIZE);
+	ch->end[TO_REQUESTOR].aq = fr_atomic_queue_talloc(ch, ATOMIC_QUEUE_SIZE, sizeof(uintptr_t));
 	if (!ch->end[TO_REQUESTOR].aq) {
 		talloc_free(ch);
 		goto nomem;
@@ -211,24 +195,6 @@ fr_channel_t *fr_channel_create(TALLOC_CTX *ctx, fr_control_t *requestor, fr_con
 
 	ch->end[TO_RESPONDER].control = responder;
 	ch->end[TO_REQUESTOR].control = requestor;
-
-	/*
-	 *	Create the ring buffer for the requestor to send
-	 *	control-plane messages to the responder, and vice-versa.
-	 */
-	ch->end[TO_RESPONDER].rb = fr_ring_buffer_create(ch, FR_CONTROL_MAX_MESSAGES * FR_CONTROL_MAX_SIZE);
-	if (!ch->end[TO_RESPONDER].rb) {
-	rb_nomem:
-		fr_strerror_const_push("Failed allocating ring buffer");
-		talloc_free(ch);
-		return NULL;
-	}
-
-	ch->end[TO_REQUESTOR].rb = fr_ring_buffer_create(ch, FR_CONTROL_MAX_MESSAGES * FR_CONTROL_MAX_SIZE);
-	if (!ch->end[TO_REQUESTOR].rb) {
-		talloc_free(ch);
-		goto rb_nomem;
-	}
 
 	/*
 	 *	Initialize all of the timers to now.
@@ -264,32 +230,31 @@ fr_channel_t *fr_channel_create(TALLOC_CTX *ctx, fr_control_t *requestor, fr_con
  * @param[in] ch	the channel.
  * @param[in] when	the data was ready.  Typically taken from the message.
  * @param[in] end	of the channel that the message was written to.
- * @param[in] which	end of the channel (0/1).
+ * @param[in] ev	the event to send.
  * @return
  *	- <0 on error
  *	- 0 on success
  */
-static int fr_channel_data_ready(fr_channel_t *ch, fr_time_t when, fr_channel_end_t *end, fr_channel_signal_t which)
+static int fr_channel_data_ready(fr_channel_t *ch, fr_time_t when, fr_channel_end_t *end, fr_channel_control_event_t ev)
 {
 	fr_channel_control_t cc;
 
 	end->stats.last_sent_signal = when;
 	end->stats.signals++;
-	end->must_signal = false;
 
-	cc.signal = which;
 	cc.ack = end->ack;
 	cc.ch = ch;
+	cc.reply_ms = NULL;
 
 	MPRINT("Signalling %s, with %s\n",
 	       fr_table_str_by_value(channel_direction, end->direction, "<INVALID>"),
-	       fr_table_str_by_value(channel_signals, which, "<INVALID>"));
+	       fr_table_str_by_value(channel_signals, ev, "<INVALID>"));
 
-	return fr_control_message_send(end->control, end->rb, FR_CONTROL_ID_CHANNEL, &cc, sizeof(cc));
+	return fr_control_message_send(end->control, FR_CONTROL_EVENTSET_CHANNEL, ev, &cc, sizeof(cc));
 }
 
 #define IALPHA (8)
-#define RTT(_old, _new) ((_new + ((IALPHA - 1) * _old)) / IALPHA)
+#define RTT(_old, _new) fr_time_delta_wrap((fr_time_delta_unwrap(_new) + (fr_time_delta_unwrap(_old) * (IALPHA - 1))) / IALPHA)
 
 /** Send a request message into the channel
  *
@@ -306,7 +271,8 @@ static int fr_channel_data_ready(fr_channel_t *ch, fr_time_t when, fr_channel_en
 int fr_channel_send_request(fr_channel_t *ch, fr_channel_data_t *cd)
 {
 	uint64_t sequence;
-	fr_time_t when, message_interval;
+	fr_time_t when;
+	fr_time_delta_t message_interval;
 	fr_channel_end_t *requestor;
 
 	if (!fr_cond_assert_msg(atomic_load(&ch->end[TO_RESPONDER].active), "Channel not active")) return -1;
@@ -315,7 +281,7 @@ int fr_channel_send_request(fr_channel_t *ch, fr_channel_data_t *cd)
 	 *	Same thread?  Just call the "recv" function directly.
 	 */
 	if (ch->same_thread) {
-		ch->end[TO_REQUESTOR].recv(ch->end[TO_REQUESTOR].recv_uctx, ch, cd);
+		ch->end[TO_REQUESTOR].recv(ch, cd, ch->end[TO_REQUESTOR].recv_uctx);
 		return 0;
 	}
 
@@ -330,7 +296,7 @@ int fr_channel_send_request(fr_channel_t *ch, fr_channel_data_t *cd)
 	 *	Push the message onto the queue for the other end.  If
 	 *	the push fails, the caller should try another queue.
 	 */
-	if (!fr_atomic_queue_push(requestor->aq, cd)) {
+	if (!fr_atomic_queue_spsc_push(requestor->aq, &cd)) {
 		fr_strerror_printf("Failed pushing to atomic queue - full.  Queue contains %zu items",
 				   fr_atomic_queue_size(requestor->aq));
 		while (fr_channel_recv_reply(ch));
@@ -338,17 +304,17 @@ int fr_channel_send_request(fr_channel_t *ch, fr_channel_data_t *cd)
 	}
 
 	requestor->sequence = sequence;
-	message_interval = when - requestor->stats.last_write;
+	message_interval = fr_time_sub(when, requestor->stats.last_write);
 
-	if (!requestor->stats.message_interval) {
+	if (!fr_time_delta_ispos(requestor->stats.message_interval)) {
 		requestor->stats.message_interval = message_interval;
 	} else {
 		requestor->stats.message_interval = RTT(requestor->stats.message_interval, message_interval);
 	}
 
-	fr_assert_msg(requestor->stats.last_write <= when,
+	fr_assert_msg(fr_time_lteq(requestor->stats.last_write, when),
 		      "Channel data timestamp (%" PRId64") older than last channel data sent (%" PRId64 ")",
-		      when, requestor->stats.last_write);
+		      fr_time_unwrap(when), fr_time_unwrap(requestor->stats.last_write));
 	requestor->stats.last_write = when;
 
 	requestor->stats.outstanding++;
@@ -356,34 +322,15 @@ int fr_channel_send_request(fr_channel_t *ch, fr_channel_data_t *cd)
 
 	MPRINT("REQUESTOR requests %"PRIu64", num_outstanding %"PRIu64"\n", requestor->stats.packets, requestor->stats.outstanding);
 
-#if ENABLE_SKIPS
 	/*
-	 *	We just sent the first packet.  There can't possibly be a reply, so don't bother looking.
+	 *	The message is in the queue.  If the responder is
+	 *	awake it will find it before it next bsleeps, so
+	 *	the signal is only needed if it is already asleep.
 	 */
-	if (requestor->stats.outstanding == 1) {
-
-		/*
-		 *	There is at least one old packet which is
-		 *	outstanding, look for a reply.
-		 */
-	} else if (requestor->stats.outstanding > 1) {
-		bool has_reply;
-
-		has_reply = fr_channel_recv_reply(ch);
-
-		if (has_reply) while (fr_channel_recv_reply(ch));
-
-		/*
-		 *	There's no reply yet, so we still have packets outstanding.
-		 *	Or, there is a reply, and there are more packets outstanding.
-		 *	Skip the signal.
-		 */
-		if (!requestor->must_signal && (!has_reply || (has_reply && (requestor->stats.outstanding > 1)))) {
-			MPRINT("REQUESTOR SKIPS signal\n");
-			return 0;
-		}
+	if (!fr_control_is_sleeping(requestor->control)) {
+		MPRINT("REQUESTOR SKIPS signal\n");
+		return 0;
 	}
-#endif
 
 	/*
 	 *	Tell the other end that there is new data ready.
@@ -393,7 +340,7 @@ int fr_channel_send_request(fr_channel_t *ch, fr_channel_data_t *cd)
 	 *	will pick up the message.
 	 */
 	MPRINT("REQUESTOR SIGNALS\n");
-	(void) fr_channel_data_ready(ch, when, requestor, FR_CHANNEL_SIGNAL_DATA_TO_RESPONDER);
+	(void) fr_channel_data_ready(ch, when, requestor, FR_CHANNEL_CONTROL_DATA_TO_RESPONDER);
 	return 0;
 }
 
@@ -418,7 +365,7 @@ bool fr_channel_recv_reply(fr_channel_t *ch)
 	/*
 	 *	It's OK for the queue to be empty.
 	 */
-	if (!fr_atomic_queue_pop(aq, (void **) &cd)) return false;
+	if (!fr_atomic_queue_spsc_pop(aq, &cd)) return false;
 
 	/*
 	 *	We want an exponential moving average for round trip
@@ -434,7 +381,7 @@ bool fr_channel_recv_reply(fr_channel_t *ch)
 	 *	NAKs have zero processing time, so we ignore them for
 	 *	the purpose of RTT.
 	 */
-	if (cd->reply.processing_time) {
+	if (fr_time_delta_ispos(cd->reply.processing_time)) {
 		ch->processing_time = RTT(ch->processing_time, cd->reply.processing_time);
 	}
 	ch->cpu_time = cd->reply.cpu_time;
@@ -452,10 +399,10 @@ bool fr_channel_recv_reply(fr_channel_t *ch)
 	requestor->ack = cd->live.sequence;
 	requestor->their_view_of_my_sequence = cd->live.ack;
 
-	fr_assert(requestor->stats.last_read_other <= cd->m.when);
+	fr_assert(fr_time_lteq(requestor->stats.last_read_other, cd->m.when));
 	requestor->stats.last_read_other = cd->m.when;
 
-	ch->end[TO_RESPONDER].recv(ch->end[TO_RESPONDER].recv_uctx, ch, cd);
+	ch->end[TO_RESPONDER].recv(ch, cd, ch->end[TO_RESPONDER].recv_uctx);
 
 	return true;
 }
@@ -480,7 +427,7 @@ bool fr_channel_recv_request(fr_channel_t *ch)
 	/*
 	 *	It's OK for the queue to be empty.
 	 */
-	if (!fr_atomic_queue_pop(aq, (void **) &cd)) return false;
+	if (!fr_atomic_queue_spsc_pop(aq, &cd)) return false;
 
 	fr_assert(cd->live.sequence > responder->ack);
 	fr_assert(cd->live.sequence >= responder->sequence); /* must have more requests than replies */
@@ -489,10 +436,10 @@ bool fr_channel_recv_request(fr_channel_t *ch)
 	responder->ack = cd->live.sequence;
 	responder->their_view_of_my_sequence = cd->live.ack;
 
-	fr_assert(responder->stats.last_read_other <= cd->m.when);
+	fr_assert(fr_time_lteq(responder->stats.last_read_other, cd->m.when));
 	responder->stats.last_read_other = cd->m.when;
 
-	ch->end[TO_REQUESTOR].recv(ch->end[TO_REQUESTOR].recv_uctx, ch, cd);
+	ch->end[TO_REQUESTOR].recv(ch, cd, ch->end[TO_REQUESTOR].recv_uctx);
 
 	return true;
 }
@@ -510,7 +457,8 @@ bool fr_channel_recv_request(fr_channel_t *ch)
 int fr_channel_send_reply(fr_channel_t *ch, fr_channel_data_t *cd)
 {
 	uint64_t		sequence;
-	fr_time_t		when, message_interval;
+	fr_time_t		when;
+	fr_time_delta_t		message_interval;
 	fr_channel_end_t	*responder;
 
 	if (!fr_cond_assert_msg(atomic_load(&ch->end[TO_REQUESTOR].active), "Channel not active")) return -1;
@@ -519,7 +467,7 @@ int fr_channel_send_reply(fr_channel_t *ch, fr_channel_data_t *cd)
 	 *	Same thread?  Just call the "recv" function directly.
 	 */
 	if (ch->same_thread) {
-		ch->end[TO_RESPONDER].recv(ch->end[TO_RESPONDER].recv_uctx, ch, cd);
+		ch->end[TO_RESPONDER].recv(ch, cd, ch->end[TO_RESPONDER].recv_uctx);
 		return 0;
 	}
 
@@ -531,7 +479,7 @@ int fr_channel_send_reply(fr_channel_t *ch, fr_channel_data_t *cd)
 	cd->live.sequence = sequence;
 	cd->live.ack = responder->ack;
 
-	if (!fr_atomic_queue_push(responder->aq, cd)) {
+	if (!fr_atomic_queue_spsc_push(responder->aq, &cd)) {
 		fr_strerror_printf("Failed pushing to atomic queue - full.  Queue contains %zu items",
 				   fr_atomic_queue_size(responder->aq));
 		while (fr_channel_recv_request(ch));
@@ -545,12 +493,16 @@ int fr_channel_send_reply(fr_channel_t *ch, fr_channel_data_t *cd)
 	MPRINT("\tRESPONDER replies %"PRIu64", num_outstanding %"PRIu64"\n", responder->stats.packets, responder->stats.outstanding);
 
 	responder->sequence = sequence;
-	message_interval = when - responder->stats.last_write;
-	responder->stats.message_interval = RTT(responder->stats.message_interval, message_interval);
+	message_interval = fr_time_sub(when, responder->stats.last_write);
+	if (!fr_time_delta_ispos(responder->stats.message_interval)) {
+		responder->stats.message_interval = message_interval;
+	} else {
+		responder->stats.message_interval = RTT(responder->stats.message_interval, message_interval);
+	}
 
-	fr_assert_msg(responder->stats.last_write <= when,
+	fr_assert_msg(fr_time_lteq(responder->stats.last_write, when),
 		      "Channel data timestamp (%" PRId64") older than last channel data sent (%" PRId64 ")",
-		      when, responder->stats.last_write);
+		      fr_time_unwrap(when), fr_time_unwrap(responder->stats.last_write));
 	responder->stats.last_write = when;
 
 	/*
@@ -561,11 +513,22 @@ int fr_channel_send_reply(fr_channel_t *ch, fr_channel_data_t *cd)
 	while (fr_channel_recv_request(ch));
 
 	/*
-	 *	No packets outstanding, we HAVE to signal the requestor
-	 *	thread.
+	 *	The reply is in the queue.  If the requestor is awake
+	 *	it will find it before it next blocks, so the signal is
+	 *	only needed if it is already asleep.  The mirror of the
+	 *	check in fr_channel_send_request().
+	 */
+	if (!fr_control_is_sleeping(responder->control)) {
+		MPRINT("\tRESPONDER SKIPS signal\n");
+		return 0;
+	}
+
+	/*
+	 *	No packets outstanding.  Tell the requestor how far we
+	 *	got, so it can re-signal us if it has sent more.
 	 */
 	if (responder->stats.outstanding == 0) {
-		(void) fr_channel_data_ready(ch, when, responder, FR_CHANNEL_SIGNAL_DATA_DONE_RESPONDER);
+		(void) fr_channel_data_ready(ch, when, responder, FR_CHANNEL_CONTROL_DATA_DONE_RESPONDER);
 		return 0;
 	}
 
@@ -605,7 +568,7 @@ int fr_channel_send_reply(fr_channel_t *ch, fr_channel_data_t *cd)
 #endif
 
 	MPRINT("\tRESPONDER SIGNALS num_outstanding %"PRIu64"\n", responder->stats.outstanding);
-	(void) fr_channel_data_ready(ch, when, responder, FR_CHANNEL_SIGNAL_DATA_TO_REQUESTOR);
+	(void) fr_channel_data_ready(ch, when, responder, FR_CHANNEL_CONTROL_DATA_TO_REQUESTOR);
 	return 0;
 }
 
@@ -631,142 +594,219 @@ int fr_channel_null_reply(fr_channel_t *ch)
 
 
 
-/** Signal a channel that the responder is sleeping
+/** Unpack the payload of a channel control message
+ */
+static inline void channel_message_unpack(fr_channel_control_t *cc, void const *data, NDEBUG_UNUSED size_t data_size)
+{
+	fr_assert(data_size == sizeof(*cc));
+	memcpy(cc, data, sizeof(*cc));
+}
+
+/** Drain the requests queued for the responder
  *
- * This function should be called from the responders idle loop.
- * i.e. only when it has nothing else to do.
+ * Runs on the responder's thread, so a signal which finds nothing is
+ * counted in the responder's own stats.  Each end's stats are only
+ * ever written by that end's thread.
+ */
+static inline void channel_drain_requests(fr_channel_t *ch)
+{
+	if (!fr_channel_recv_request(ch)) {
+		ch->end[TO_REQUESTOR].stats.spurious++;
+		return;
+	}
+	while (fr_channel_recv_request(ch));
+}
+
+/** Drain the replies queued for the requestor
  *
- * @param[in] ch	the channel to signal we're no longer listening on.
+ * Runs on the requestor's thread, see channel_drain_requests().
+ */
+static inline void channel_drain_replies(fr_channel_t *ch)
+{
+	if (!fr_channel_recv_reply(ch)) {
+		ch->end[TO_RESPONDER].stats.spurious++;
+		return;
+	}
+	while (fr_channel_recv_reply(ch));
+}
+
+/** The requestor has queued requests for the responder
+ *
+ * Must arrive on the responder's control plane.
+ */
+static void channel_data_to_responder(void const *data, size_t data_size, UNUSED fr_time_t now, void *uctx)
+{
+	fr_channel_hooks_t	*hooks = talloc_get_type_abort(uctx, fr_channel_hooks_t);
+	fr_channel_control_t	cc;
+
+	channel_message_unpack(&cc, data, data_size);
+	MPRINT("channel got data_to_responder\n");
+
+	if (!fr_cond_assert(hooks->control == cc.ch->end[TO_RESPONDER].control)) return;
+	channel_drain_requests(cc.ch);
+}
+
+/** The responder has queued replies for the requestor
+ *
+ * Must arrive on the requestor's control plane.
+ */
+static void channel_data_to_requestor(void const *data, size_t data_size, UNUSED fr_time_t now, void *uctx)
+{
+	fr_channel_hooks_t	*hooks = talloc_get_type_abort(uctx, fr_channel_hooks_t);
+	fr_channel_control_t	cc;
+
+	channel_message_unpack(&cc, data, data_size);
+	MPRINT("channel got data_to_requestor\n");
+
+	if (!fr_cond_assert(hooks->control == cc.ch->end[TO_REQUESTOR].control)) return;
+	channel_drain_replies(cc.ch);
+}
+
+/** The responder has serviced its requests, and says how many it has seen
+ *
+ * Only sent by the responder.  Replies may be waiting, so drain them.
+ * First compare their ACK to the last sequence we sent, and if they
+ * have not seen our latest, signal the responder to wake up.
+ */
+static void channel_data_done_responder(void const *data, size_t data_size, fr_time_t now, void *uctx)
+{
+	fr_channel_hooks_t	*hooks = talloc_get_type_abort(uctx, fr_channel_hooks_t);
+	fr_channel_control_t	cc;
+	fr_channel_t		*ch;
+	fr_channel_end_t	*requestor;
+
+	channel_message_unpack(&cc, data, data_size);
+	ch = cc.ch;
+	MPRINT("channel got data_done_responder\n");
+
+	if (!fr_cond_assert(hooks->control == ch->end[TO_REQUESTOR].control)) return;
+
+	requestor = &ch->end[TO_RESPONDER];
+
+	/*
+	 *	We have told this end to close, so there is nothing left to
+	 *	wake it for: fr_channel_send_request() refuses on an inactive
+	 *	end, so no more data can be queued.  Signalling it anyway
+	 *	writes into the control plane which the responder may have
+	 *	already freed (this has been observed and caused a crash-on-exit).
+	 *
+	 *	Servicing the message is still correct: it was in flight
+	 *	before the close, and we must keep servicing to receive the
+	 *	ack at all.  The load is relaxed because only this thread
+	 *	clears "active" for this end.
+	 */
+	if (unlikely(!atomic_load_explicit(&requestor->active, memory_order_relaxed))) goto drain;
+
+	/*
+	 *	Their ack covers everything we have sent.  Anything
+	 *	sent later signals for itself.
+	 */
+	fr_assert(cc.ack <= requestor->sequence);
+	if (cc.ack == requestor->sequence) {
+		MPRINT("REQUESTOR SKIPS signal AFTER data_done_responder num_outstanding %"PRIu64"\n",
+		       requestor->stats.outstanding);
+		goto drain;
+	}
+
+	/*
+	 *	They have not seen our latest.  Each of those sends
+	 *	already signalled, or was pushed while the responder was
+	 *	awake and so will be found by its final drain.  Signal
+	 *	again only if it has since blocked: cheap insurance
+	 *	against a dropped wakeup, free when it is running.
+	 */
+	if (!fr_control_is_sleeping(requestor->control)) goto drain;
+
+	requestor->stats.resignals++;
+
+	MPRINT("REQUESTOR SIGNALS AFTER data_done_responder\n");
+	if (fr_channel_data_ready(ch, now, requestor, FR_CHANNEL_CONTROL_DATA_TO_RESPONDER) < 0) return;
+
+drain:
+	channel_drain_replies(ch);
+}
+
+/** A requestor has opened a channel to us
+ */
+static void channel_open(void const *data, size_t data_size, fr_time_t now, void *uctx)
+{
+	fr_channel_hooks_t	*hooks = talloc_get_type_abort(uctx, fr_channel_hooks_t);
+	fr_channel_control_t	cc;
+
+	channel_message_unpack(&cc, data, data_size);
+	MPRINT("channel got open\n");
+
+	if (!fr_cond_assert(hooks->cb.open)) return;
+	hooks->cb.open(cc.ch, cc.reply_ms, now, hooks->uctx);
+}
+
+/** The requestor is closing a channel to us
+ */
+static void channel_close(void const *data, size_t data_size, fr_time_t now, void *uctx)
+{
+	fr_channel_hooks_t	*hooks = talloc_get_type_abort(uctx, fr_channel_hooks_t);
+	fr_channel_control_t	cc;
+
+	channel_message_unpack(&cc, data, data_size);
+	MPRINT("channel got close\n");
+
+	if (!fr_cond_assert(hooks->cb.close)) return;
+	hooks->cb.close(cc.ch, now, hooks->uctx);
+}
+
+/** The responder has finished closing a channel we asked it to close
+ */
+static void channel_close_ack(void const *data, size_t data_size, fr_time_t now, void *uctx)
+{
+	fr_channel_hooks_t	*hooks = talloc_get_type_abort(uctx, fr_channel_hooks_t);
+	fr_channel_control_t	cc;
+
+	channel_message_unpack(&cc, data, data_size);
+	MPRINT("channel got close_ack\n");
+
+	if (!fr_cond_assert(hooks->cb.closed)) return;
+	hooks->cb.closed(cc.ch, now, hooks->uctx);
+}
+
+/** Register the owner's channel callbacks on its control plane
+ *
+ * Call before fr_control_open().  Every channel event gets its
+ * own entry in the FR_CONTROL_EVENTSET_CHANNEL event set, so the control
+ * plane dispatches straight to the handler for that event.
+ *
+ * @param[in] c		the control plane channels will signal.
+ * @param[in] callbacks	what the owner does with each event.  Copied.
+ * @param[in] uctx	passed to each callback.
  * @return
  *	- <0 on error
  *	- 0 on success
  */
-int fr_channel_responder_sleeping(fr_channel_t *ch)
+int fr_channel_callbacks_add(fr_control_t *c, fr_channel_callbacks_t const *callbacks, void *uctx)
 {
-	fr_channel_end_t *responder;
-	fr_channel_control_t cc;
+	fr_channel_hooks_t *hooks;
 
-	responder = &(ch->end[TO_REQUESTOR]);
+	MEM(hooks = talloc_zero(c, fr_channel_hooks_t));
+	hooks->control = c;
+	hooks->cb = *callbacks;
+	hooks->uctx = uctx;
 
-	/*
-	 *	We don't have any outstanding requests to process for
-	 *	this channel, don't signal the network thread that
-	 *	we're sleeping.  It already knows.
-	 */
-	if (responder->stats.outstanding == 0) return 0;
-
-	responder->stats.signals++;
-
-	cc.signal = FR_CHANNEL_SIGNAL_RESPONDER_SLEEPING;
-	cc.ack = responder->ack;
-	cc.ch = ch;
-
-	MPRINT("\tRESPONDER SLEEPING num_outstanding %"PRIu64", packets in %"PRIu64", packets out %"PRIu64"\n", responder->stats.outstanding,
-	       ch->end[TO_RESPONDER].stats.packets, responder->stats.packets);
-	return fr_control_message_send(responder->control, responder->rb, FR_CONTROL_ID_CHANNEL, &cc, sizeof(cc));
-}
-
-
-/** Service a control-plane message
- *
- * @param[in] when		The current time.
- * @param[out] p_channel	The channel which should be serviced.
- * @param[in] data		The control message.
- * @param[in] data_size		The size of the control message.
- * @return
- *	- FR_CHANNEL_ERROR on error
- *	- FR_CHANNEL_NOOP, on do nothing
- *	- FR_CHANNEL_DATA_READY on data ready
- *	- FR_CHANNEL_OPEN when a channel has been opened and sent to us
- *	- FR_CHANNEL_CLOSE when a channel should be closed
- */
-fr_channel_event_t fr_channel_service_message(fr_time_t when, fr_channel_t **p_channel, void const *data, size_t data_size)
-{
-	int rcode;
-#if ENABLE_SKIPS
-	uint64_t ack;
-#endif
-	fr_channel_control_t cc;
-	fr_channel_signal_t cs;
-	fr_channel_event_t ce = FR_CHANNEL_ERROR;
-	fr_channel_end_t *requestor;
-	fr_channel_t *ch;
-
-	fr_assert(data_size == sizeof(cc));
-	memcpy(&cc, data, data_size);
-
-	cs = cc.signal;
-#if ENABLE_SKIPS
-	ack = cc.ack;
-#endif
-	*p_channel = ch = cc.ch;
-
-	switch (cs) {
-	/*
-	 *	These all have the same numbers as the channel
-	 *	events, and have no extra processing.  We just
-	 *	return them as-is.
-	 */
-	case FR_CHANNEL_SIGNAL_ERROR:
-	case FR_CHANNEL_SIGNAL_DATA_TO_RESPONDER:
-	case FR_CHANNEL_SIGNAL_DATA_TO_REQUESTOR:
-	case FR_CHANNEL_SIGNAL_OPEN:
-	case FR_CHANNEL_SIGNAL_CLOSE:
-		MPRINT("channel got %d\n", cs);
-		return (fr_channel_event_t) cs;
-
-	/*
-	 *	Only sent by the responder.  Both of these
-	 *	situations are largely the same, except for
-	 *	return codes.
-	 */
-	case FR_CHANNEL_SIGNAL_DATA_DONE_RESPONDER:
-		MPRINT("channel got data_done_responder\n");
-		ce = FR_CHANNEL_DATA_READY_REQUESTOR;
-		ch->end[TO_RESPONDER].must_signal = true;
-		break;
-
-	case FR_CHANNEL_SIGNAL_RESPONDER_SLEEPING:
-		MPRINT("channel got responder_sleeping\n");
-		ce = FR_CHANNEL_NOOP;
-		ch->end[TO_RESPONDER].must_signal = true;
-		break;
+	if ((fr_control_callback_add(c, FR_CONTROL_EVENTSET_CHANNEL, FR_CHANNEL_CONTROL_DATA_TO_RESPONDER,
+				     channel_data_to_responder, hooks) < 0) ||
+	    (fr_control_callback_add(c, FR_CONTROL_EVENTSET_CHANNEL, FR_CHANNEL_CONTROL_DATA_TO_REQUESTOR,
+				     channel_data_to_requestor, hooks) < 0) ||
+	    (fr_control_callback_add(c, FR_CONTROL_EVENTSET_CHANNEL, FR_CHANNEL_CONTROL_DATA_DONE_RESPONDER,
+				     channel_data_done_responder, hooks) < 0) ||
+	    (fr_control_callback_add(c, FR_CONTROL_EVENTSET_CHANNEL, FR_CHANNEL_CONTROL_OPEN,
+				     channel_open, hooks) < 0) ||
+	    (fr_control_callback_add(c, FR_CONTROL_EVENTSET_CHANNEL, FR_CHANNEL_CONTROL_CLOSE,
+				     channel_close, hooks) < 0) ||
+	    (fr_control_callback_add(c, FR_CONTROL_EVENTSET_CHANNEL, FR_CHANNEL_CONTROL_CLOSE_ACK,
+				     channel_close_ack, hooks) < 0)) {
+		talloc_free(hooks);
+		return -1;
 	}
 
-	/*
-	 *	Compare their ACK to the last sequence we
-	 *	sent.  If it's different, we signal the responder
-	 *	to wake up.
-	 */
-	requestor = &ch->end[TO_RESPONDER];
-#if ENABLE_SKIPS
-	if (!requestor->must_signal && (ack == requestor->sequence)) {
-		MPRINT("REQUESTOR SKIPS signal AFTER CE %d num_outstanding %"PRIu64"\n", cs, requestor->stats.outstanding);
-		MPRINT("REQUESTOR has ack %"PRIu64", my seq %"PRIu64" my_view %"PRIu64"\n", ack, requestor->sequence, requestor->their_view_of_my_sequence);
-		return ce;
-	}
-
-	/*
-	 *	The responder is sleeping or done.  There are more
-	 *	packets available, so we signal it to wake up again.
-	 */
-	fr_assert(ack <= requestor->sequence);
-#endif
-
-	/*
-	 *	We're signaling it again...
-	 */
-	requestor->stats.resignals++;
-
-	/*
-	 *	The responder hasn't seen our last few packets.  Signal
-	 *	that there is data ready.
-	 */
-	MPRINT("REQUESTOR SIGNALS AFTER CE %d\n", cs);
-	rcode = fr_channel_data_ready(ch, when, requestor, FR_CHANNEL_SIGNAL_DATA_TO_RESPONDER);
-	if (rcode < 0) return FR_CHANNEL_ERROR;
-
-	return ce;
+	return 0;
 }
 
 
@@ -828,18 +868,42 @@ int fr_channel_signal_responder_close(fr_channel_t *ch)
 	active = atomic_load(&ch->end[TO_RESPONDER].active);
 	if (!active) return 0;					/* Already signalled to close */
 
-	(void) talloc_get_type_abort(ch, fr_channel_t);
-
-	cc.signal = FR_CHANNEL_SIGNAL_CLOSE;
-	cc.ack = TO_RESPONDER;
-	cc.ch = ch;
-
-	ret = fr_control_message_send(ch->end[TO_RESPONDER].control,
-				      ch->end[TO_RESPONDER].rb, FR_CONTROL_ID_CHANNEL, &cc, sizeof(cc));
-
 	atomic_store(&ch->end[TO_RESPONDER].active, false);	/* Prevent further requests */
 
+	(void) talloc_get_type_abort(ch, fr_channel_t);
+
+	cc.ack = 0;
+	cc.ch = ch;
+	cc.reply_ms = NULL;
+
+	ret = fr_control_message_send(ch->end[TO_RESPONDER].control, FR_CONTROL_EVENTSET_CHANNEL,
+				      FR_CHANNEL_CONTROL_CLOSE, &cc, sizeof(cc));
+
 	return ret;
+}
+
+/** Discard any requests the requestor queued but we never received
+ *
+ * The messages belong to the requestor's message set, and it cannot reclaim them
+ * until they are marked done.  A responder that closes with requests still in
+ * the queue would strand them there, and with them the memory they were
+ * allocated from.
+ *
+ * @param[in] ch	to discard the queued requests of.
+ * @return the number of requests discarded.
+ */
+unsigned int fr_channel_responder_discard(fr_channel_t *ch)
+{
+	fr_channel_data_t	*cd;
+	fr_atomic_queue_t	*aq = ch->end[TO_RESPONDER].aq;
+	unsigned int		num = 0;
+
+	while (fr_atomic_queue_spsc_pop(aq, &cd)) {
+		fr_message_done(&cd->m);
+		num++;
+	}
+
+	return num;
 }
 
 /** Acknowledge that the channel is closing
@@ -859,18 +923,16 @@ int fr_channel_responder_ack_close(fr_channel_t *ch)
 	active = atomic_load(&ch->end[TO_REQUESTOR].active);
 	if (!active) return 0;					/* Already signalled to close */
 
-	(void) talloc_get_type_abort(ch, fr_channel_t);
-
 	atomic_store(&ch->end[TO_REQUESTOR].active, false);	/* Prevent further responses */
 
-	cc.signal = FR_CHANNEL_SIGNAL_CLOSE;
-	cc.ack = TO_REQUESTOR;
+	(void) talloc_get_type_abort(ch, fr_channel_t);
+
+	cc.ack = 0;
 	cc.ch = ch;
+	cc.reply_ms = NULL;
 
-	ret = fr_control_message_send(ch->end[TO_REQUESTOR].control,
-				      ch->end[TO_REQUESTOR].rb, FR_CONTROL_ID_CHANNEL, &cc, sizeof(cc));
-
-	atomic_store(&ch->end[TO_REQUESTOR].active, false);	/* Prevent further requests */
+	ret = fr_control_message_send(ch->end[TO_REQUESTOR].control, FR_CONTROL_EVENTSET_CHANNEL,
+				      FR_CHANNEL_CONTROL_CLOSE_ACK, &cc, sizeof(cc));
 
 	return ret;
 }
@@ -925,7 +987,7 @@ void *fr_channel_requestor_uctx_get(fr_channel_t *ch)
 }
 
 
-int fr_channel_set_recv_reply(fr_channel_t *ch, void *uctx, fr_channel_recv_callback_t recv_reply)
+int fr_channel_set_recv_reply(fr_channel_t *ch, fr_channel_recv_callback_t recv_reply, void *uctx)
 {
 	ch->end[TO_RESPONDER].recv = recv_reply;
 	ch->end[TO_RESPONDER].recv_uctx = uctx;
@@ -933,7 +995,7 @@ int fr_channel_set_recv_reply(fr_channel_t *ch, void *uctx, fr_channel_recv_call
 	return 0;
 }
 
-int fr_channel_set_recv_request(fr_channel_t *ch, void *uctx, fr_channel_recv_callback_t recv_request)
+int fr_channel_set_recv_request(fr_channel_t *ch, fr_channel_recv_callback_t recv_request, void *uctx)
 {
 	ch->end[TO_REQUESTOR].recv = recv_request;
 	ch->end[TO_REQUESTOR].recv_uctx = uctx;
@@ -943,19 +1005,21 @@ int fr_channel_set_recv_request(fr_channel_t *ch, void *uctx, fr_channel_recv_ca
 /** Send a channel to a responder
  *
  * @param[in] ch	The channel.
+ * @param[in] reply_ms	The message set the responder allocates replies from.
  * @return
  *	- <0 on error
  *	- 0 on success
  */
-int fr_channel_signal_open(fr_channel_t *ch)
+int fr_channel_signal_open(fr_channel_t *ch, fr_message_set_t *reply_ms)
 {
 	fr_channel_control_t cc;
 
-	cc.signal = FR_CHANNEL_SIGNAL_OPEN;
 	cc.ack = 0;
 	cc.ch = ch;
+	cc.reply_ms = reply_ms;
 
-	return fr_control_message_send(ch->end[TO_RESPONDER].control, ch->end[TO_RESPONDER].rb, FR_CONTROL_ID_CHANNEL, &cc, sizeof(cc));
+	return fr_control_message_send(ch->end[TO_RESPONDER].control, FR_CONTROL_EVENTSET_CHANNEL,
+				       FR_CHANNEL_CONTROL_OPEN, &cc, sizeof(cc));
 }
 
 void fr_channel_stats_log(fr_channel_t const *ch, fr_log_t const *log, char const *file, int line)
@@ -963,20 +1027,40 @@ void fr_channel_stats_log(fr_channel_t const *ch, fr_log_t const *log, char cons
 	fr_log(log, L_INFO, file, line, "requestor\n");
 	fr_log(log, L_INFO, file, line, "\tsignals sent = %" PRIu64 "\n", ch->end[TO_RESPONDER].stats.signals);
 	fr_log(log, L_INFO, file, line, "\tsignals re-sent = %" PRIu64 "\n", ch->end[TO_RESPONDER].stats.resignals);
+	fr_log(log, L_INFO, file, line, "\tsignals received empty = %" PRIu64 "\n",
+	       ch->end[TO_RESPONDER].stats.spurious);
 	fr_log(log, L_INFO, file, line, "\tkevents checked = %" PRIu64 "\n", ch->end[TO_RESPONDER].stats.kevents);
 	fr_log(log, L_INFO, file, line, "\toutstanding = %" PRIu64 "\n", ch->end[TO_RESPONDER].stats.outstanding);
 	fr_log(log, L_INFO, file, line, "\tpackets processed = %" PRIu64 "\n", ch->end[TO_RESPONDER].stats.packets);
-	fr_log(log, L_INFO, file, line, "\tmessage interval (RTT) = %" PRIu64 "\n", ch->end[TO_RESPONDER].stats.message_interval);
-	fr_log(log, L_INFO, file, line, "\tlast write = %" PRIu64 "\n", ch->end[TO_RESPONDER].stats.last_read_other);
-	fr_log(log, L_INFO, file, line, "\tlast read other end = %" PRIu64 "\n", ch->end[TO_RESPONDER].stats.last_read_other);
-	fr_log(log, L_INFO, file, line, "\tlast signal other = %" PRIu64 "\n", ch->end[TO_RESPONDER].stats.last_sent_signal);
+	fr_log(log, L_INFO, file, line, "\tmessage interval (RTT) = %" PRId64 "\n", fr_time_delta_unwrap(ch->end[TO_RESPONDER].stats.message_interval));
+	fr_log(log, L_INFO, file, line, "\tlast write = %" PRId64 "\n", fr_time_unwrap(ch->end[TO_RESPONDER].stats.last_write));
+	fr_log(log, L_INFO, file, line, "\tlast read other end = %" PRId64 "\n", fr_time_unwrap(ch->end[TO_RESPONDER].stats.last_read_other));
+	fr_log(log, L_INFO, file, line, "\tlast signal other = %" PRId64 "\n", fr_time_unwrap(ch->end[TO_RESPONDER].stats.last_sent_signal));
 
 	fr_log(log, L_INFO, file, line, "responder\n");
 	fr_log(log, L_INFO, file, line, "\tsignals sent = %" PRIu64"\n", ch->end[TO_REQUESTOR].stats.signals);
+	fr_log(log, L_INFO, file, line, "\tsignals received empty = %" PRIu64 "\n",
+	       ch->end[TO_REQUESTOR].stats.spurious);
 	fr_log(log, L_INFO, file, line, "\tkevents checked = %" PRIu64 "\n", ch->end[TO_REQUESTOR].stats.kevents);
 	fr_log(log, L_INFO, file, line, "\tpackets processed = %" PRIu64 "\n", ch->end[TO_REQUESTOR].stats.packets);
-	fr_log(log, L_INFO, file, line, "\tmessage interval (RTT) = %" PRIu64 "\n", ch->end[TO_REQUESTOR].stats.message_interval);
-	fr_log(log, L_INFO, file, line, "\tlast write = %" PRIu64 "\n", ch->end[TO_REQUESTOR].stats.last_read_other);
-	fr_log(log, L_INFO, file, line, "\tlast read other end = %" PRIu64 "\n", ch->end[TO_REQUESTOR].stats.last_read_other);
-	fr_log(log, L_INFO, file, line, "\tlast signal other = %" PRIu64 "\n", ch->end[TO_REQUESTOR].stats.last_sent_signal);
+	fr_log(log, L_INFO, file, line, "\tmessage interval (RTT) = %" PRId64 "\n", fr_time_delta_unwrap(ch->end[TO_REQUESTOR].stats.message_interval));
+	fr_log(log, L_INFO, file, line, "\tlast write = %" PRId64 "\n", fr_time_unwrap(ch->end[TO_REQUESTOR].stats.last_write));
+	fr_log(log, L_INFO, file, line, "\tlast read other end = %" PRId64 "\n", fr_time_unwrap(ch->end[TO_REQUESTOR].stats.last_read_other));
+	fr_log(log, L_INFO, file, line, "\tlast signal other = %" PRId64 "\n", fr_time_unwrap(ch->end[TO_REQUESTOR].stats.last_sent_signal));
+}
+
+/** Statistics for the requestor's end of a channel
+ *
+ * Signals the requestor sent, and signals it received which found nothing.
+ */
+fr_channel_stats_t const *fr_channel_requestor_stats(fr_channel_t const *ch)
+{
+	return &ch->end[TO_RESPONDER].stats;
+}
+
+/** Statistics for the responder's end of a channel
+ */
+fr_channel_stats_t const *fr_channel_responder_stats(fr_channel_t const *ch)
+{
+	return &ch->end[TO_REQUESTOR].stats;
 }

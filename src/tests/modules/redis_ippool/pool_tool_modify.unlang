@@ -1,40 +1,31 @@
 #
-#  Run the "redis" xlat
+#  Test modification of address using rlm_redis_ippool_tool
 #
-$INCLUDE cluster_reset.inc
 
-update control {
-	&IP-Pool.Name := 'test_update'
-}
+control.IP-Pool.Name := 'test_tool_modify'
 
 #
 #  Add IP addresses
 #
-update request {
-	&Tmp-String-0 := `./build/bin/local/rlm_redis_ippool_tool -a 192.168.0.1/32 $ENV{REDIS_IPPOOL_TEST_SERVER}:30001 %{control.IP-Pool.Name} 192.168.0.0`
-}
+%exec('./build/bin/local/rlm_redis_ippool_tool', '-D', './share/dictionary', '-a', '192.168.0.1/32', '$ENV{REDIS_IPPOOL_TEST_SERVER}:$ENV{REDIS_IPPOOL_CLUSTER_PORT_1}', %{control.IP-Pool.Name}, '192.168.0.0')
 
 #
 #  Verify the range was set OK
 #
-if ("%{redis:HGET {%{control.IP-Pool.Name}%}:ip:192.168.0.1 range}" == '192.168.0.0') {
-	test_pass
-} else {
+if !(%redis('HGET', "{%{control.IP-Pool.Name}}:ip:192.168.0.1", 'range') == '192.168.0.0') {
 	test_fail
 }
 
 #
 #  Modify the range
 #
-update request {
-	&Tmp-String-0 := `./build/bin/local/rlm_redis_ippool_tool -m 192.168.0.1/32 $ENV{REDIS_IPPOOL_TEST_SERVER}:30001 %{control.IP-Pool.Name} 10.0.0.0`
-}
+%exec('./build/bin/local/rlm_redis_ippool_tool', '-D', './share/dictionary', '-m', '192.168.0.1/32', '$ENV{REDIS_IPPOOL_TEST_SERVER}:$ENV{REDIS_IPPOOL_CLUSTER_PORT_1}', %{control.IP-Pool.Name}, '10.0.0.0')
 
 #
 #  Check it was updated
 #
-if ("%{redis:HGET {%{control.IP-Pool.Name}%}:ip:192.168.0.1 range}" == '10.0.0.0') {
-	test_pass
-} else {
+if !(%redis('HGET', "{%{control.IP-Pool.Name}}:ip:192.168.0.1", 'range') == '10.0.0.0') {
 	test_fail
 }
+
+test_pass

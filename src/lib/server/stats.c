@@ -23,21 +23,10 @@
 
 RCSID("$Id$")
 
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/server/client.h>
 
 #include <freeradius-devel/util/misc.h>
-#include <freeradius-devel/util/time.h>
 #include <freeradius-devel/radius/defs.h>
-
-
-#ifdef WITH_STATS
-
-#define EMA_SCALE (100)
-#define F_EMA_SCALE (1000000)
-
-static fr_time_t start_time;
-static fr_time_t hup_time;
 
 #define FR_STATS_INIT { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 	\
 				 { 0, 0, 0, 0, 0, 0, 0, 0 }}
@@ -47,7 +36,7 @@ fr_stats_t radius_acct_stats = FR_STATS_INIT;
 
 void request_stats_final(request_t *request)
 {
-	if (request->master_state == REQUEST_COUNTED) return;
+	if (request->counted) return;
 
 #if 0
 	if (!request->listener) return;
@@ -65,10 +54,10 @@ void request_stats_final(request_t *request)
 		return;
 
 #undef INC_AUTH
-#define INC_AUTH(_x) radius_auth_stats._x++;request->client->auth._x++;
+#define INC_AUTH(_x) do { radius_auth_stats._x++;request->client->auth._x++; } while (0)
 
 #undef INC_ACCT
-#define INC_ACCT(_x) radius_acct_stats._x++;request->client->acct._x++
+#define INC_ACCT(_x) do { radius_acct_stats._x++;request->client->acct._x++; } while (0)
 
 	/*
 	 *	Update the statistics.
@@ -143,64 +132,7 @@ void request_stats_final(request_t *request)
 		break;
 	}
 
-	request->master_state = REQUEST_COUNTED;
-}
-
-void radius_stats_init(int flag)
-{
-	if (!flag) {
-		start_time = fr_time();
-		hup_time = start_time; /* it's just nicer this way */
-	} else {
-		hup_time = fr_time();
-	}
-}
-
-void radius_stats_ema(fr_stats_ema_t *ema, fr_time_t start, fr_time_t end)
-{
-	uint64_t	tdiff;
-#ifdef WITH_STATS_DEBUG
-	static int	n = 0;
-#endif
-	if (ema->window == 0) return;
-
-	fr_assert(start <= end);
-
-	/*
-	 *	Initialize it.
-	 */
-	if (ema->f1 == 0) {
-		if (ema->window > 10000) ema->window = 10000;
-
-		ema->f1 =  (2 * F_EMA_SCALE) / (ema->window + 1);
-		ema->f10 = (2 * F_EMA_SCALE) / ((10 * ema->window) + 1);
-	}
-
-	tdiff = fr_time_delta_to_usec(start);
-	tdiff -= fr_time_delta_to_usec(end);
-	tdiff *= EMA_SCALE;
-
-	if (ema->ema1 == 0) {
-		ema->ema1 = tdiff;
-		ema->ema10 = tdiff;
-	} else {
-		int diff;
-
-		diff = ema->f1 * (tdiff - ema->ema1);
-		ema->ema1 += (diff / 1000000);
-
-		diff = ema->f10 * (tdiff - ema->ema10);
-		ema->ema10 += (diff / 1000000);
-	}
-
-
-#ifdef WITH_STATS_DEBUG
-	DEBUG("time %d %d.%06d\t%d.%06d\t%d.%06d\n",
-	      n, tdiff / PREC, (tdiff / EMA_SCALE) % USEC,
-	      ema->ema1 / PREC, (ema->ema1 / EMA_SCALE) % USEC,
-	      ema->ema10 / PREC, (ema->ema10 / EMA_SCALE) % USEC);
-	n++;
-#endif
+	request->counted = true;
 }
 
 /** Sort latency times into bins
@@ -214,19 +146,19 @@ void radius_stats_ema(fr_stats_ema_t *ema, fr_time_t start, fr_time_t end)
  */
 void fr_stats_bins(fr_stats_t *stats, fr_time_t start, fr_time_t end)
 {
-	fr_time_t	diff;
+	fr_time_delta_t	diff;
 	uint32_t	delay;
 
-	if (end < start) return;	/* bad data */
-	diff = end - start;
+	if (fr_time_lt(end, start)) return;	/* bad data */
+	diff = fr_time_sub(end, start);
 
-	if (diff >= fr_time_delta_from_sec(10)) {
+	if (fr_time_delta_gteq(diff, fr_time_delta_from_sec(10))) {
 		stats->elapsed[7]++;
 	} else {
 		int i;
 		uint32_t cmp;
 
-		delay = fr_time_delta_to_usec(diff);
+		delay = (uint32_t) fr_time_delta_to_usec(diff);	/* diff is less than 10s */
 
 		cmp = 10;
 		for (i = 0; i < 7; i++) {
@@ -238,5 +170,3 @@ void fr_stats_bins(fr_stats_t *stats, fr_time_t start, fr_time_t end)
 		}
 	}
 }
-
-#endif /* WITH_STATS */

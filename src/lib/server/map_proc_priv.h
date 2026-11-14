@@ -26,8 +26,8 @@
 #include <freeradius-devel/server/cf_util.h> /* Need CONF_* definitions */
 #include <freeradius-devel/server/map_proc.h>
 #include <freeradius-devel/server/modpriv.h>
-#include <freeradius-devel/server/map_proc.h>
 #include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/value.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,13 +37,14 @@ extern "C" {
  */
 struct map_proc {
 	fr_rb_node_t		node;			//!< Entry in the map processor tree.
-	void			*mod_inst;		//!< Module instance.
+	void const		*mod_inst;		//!< Module instance.
 	char			name[FR_MAX_STRING_LEN];	//!< Name of the map function.
-	int			length;			//!< Length of name.
+	size_t			length;			//!< Length of name.
 
 	map_proc_func_t		evaluate;		//!< Module's map processor function.
 	map_proc_instantiate_t	instantiate;		//!< Callback to create new instance struct.
 	size_t			inst_size;		//!< Size of map_proc instance data to allocate.
+	fr_value_box_safe_for_t literals_safe_for;	//!< Safe for values to be set for literals in the map source.
 };
 
 /** Map processor instance
@@ -51,7 +52,7 @@ struct map_proc {
 struct map_proc_inst {
 	map_proc_t const	*proc;			//!< Map processor.
 	tmpl_t const		*src;			//!< Evaluated to provide source value for map processor.
-	fr_map_list_t const	*maps;			//!< Head of the map list.
+	map_list_t const	*maps;			//!< Head of the map list.
 	void			*data;			//!< Instance data created by #map_proc_instantiate
 };
 

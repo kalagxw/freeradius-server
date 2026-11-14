@@ -17,12 +17,21 @@
 #include <freeradius-devel/io/atomic_queue.h>
 #include <freeradius-devel/server/base.h>
 #include <freeradius-devel/server/map.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/server/trunk.h>
 #include <freeradius-devel/util/dlist.h>
 #include <freeradius-devel/util/retry.h>
 #include <freeradius-devel/unlang/module.h>
 #include <freeradius-devel/radius/radius.h>
+#include <freeradius-devel/radius/bio.h>
+
+#include <freeradius-devel/bio/fd.h>
+
+#ifdef WITH_TLS
+#include <freeradius-devel/tls/base.h>
+#include <freeradius-devel/tls/connection.h>
+#include <freeradius-devel/bio/tls.h>
+#endif
 
 /*
  * $Id$
@@ -34,68 +43,61 @@
  */
 
 typedef struct rlm_radius_s rlm_radius_t;
-typedef struct rlm_radius_io_s rlm_radius_io_t;
 
-/** Per-thread instance data
- *
- * Contains buffers and connection handles specific to the thread.
- */
-typedef struct {
-	rlm_radius_t const	*inst;			//!< Instance of the module.
-	void			*io_thread;		//!< thread context for the IO submodule
-} rlm_radius_thread_t;
+typedef enum : uint8_t {
+	RLM_RADIUS_MODE_INVALID = 0,
+	RLM_RADIUS_MODE_PROXY,				//!< we proxy to one home server
+	RLM_RADIUS_MODE_CLIENT,				//!< we are a client to one home server
+	RLM_RADIUS_MODE_REPLICATE,			//!< to a particular destination
+	RLM_RADIUS_MODE_UNCONNECTED_REPLICATE,		//!< %radius.sendto.ipaddr(), but we don't look for a reply
+	RLM_RADIUS_MODE_XLAT_PROXY,			//!< %radius.sendto.ipaddr(), but we do look for a reply.
+} rlm_radius_mode_t;
 
 /*
  *	Define a structure for our module configuration.
  */
 struct rlm_radius_s {
-	char const		*name;			//!< Module instance name.
+	fr_bio_fd_config_t	fd_config;		//!< for now MUST be at the start!
 
-	dl_module_inst_t	*io_submodule;		//!< As provided by the transport_parse
-	rlm_radius_io_t const	*io;			//!< Easy access to the IO handle
-	void			*io_instance;		//!< Easy access to the IO instance
-	CONF_SECTION		*io_conf;		//!< Easy access to the IO config section
+	char const		*name;
 
 	fr_time_delta_t		response_window;
 	fr_time_delta_t		zombie_period;
 	fr_time_delta_t		revive_interval;
 
-	bool			replicate;		//!< Ignore responses.
-	bool			synchronous;		//!< Retransmit when receiving a duplicate request.
-	bool			originate;  		//!< Originating packets, instead of proxying existing ones.
-							///< Controls whether Proxy-State is added to the outbound
-							///< request.
+	fr_time_delta_t		home_server_lifetime;	//!< for XLAT_PROXY
+
+	char const		*secret;		//!< Shared secret.
+
+#ifdef WITH_TLS
+	fr_tls_conf_t		*tls_conf;		//!< Parsed "tls" section.  If set, we use RADIUS/TLS, or RADIUS/DTLS for UDP.
+#endif
+
+	uint32_t		max_packet_size;	//!< Maximum packet size.
+	uint16_t		max_send_coalesce;	//!< Maximum number of packets to coalesce into one mmsg call.
+
+	fr_radius_ctx_t		common_ctx;
+
+	rlm_radius_mode_t	mode;			//!< proxy, client, etc.
 
 	uint32_t		max_attributes;   	//!< Maximum number of attributes to decode in response.
 
-	uint32_t		proxy_state;  		//!< Unique ID (mostly) of this module.
+	fr_radius_require_ma_t	require_message_authenticator;	//!< Require Message-Authenticator in responses.
+	bool			*received_message_authenticator;	//!< Received Message-Authenticator in responses.
+	bool			track_load_balance;	//!< do we track load-balance state
+
 	uint32_t		*types;			//!< array of allowed packet types
 	uint32_t		status_check;  		//!< code of status-check type
-	fr_map_list_t		status_check_map;	//!< attributes for the status-server checks
-	uint32_t		num_answers_to_alive;		//!< How many status check responses we need to
+	map_list_t		status_check_map;	//!< attributes for the status-server checks
+	uint32_t		num_answers_to_alive;	//!< How many status check responses we need to
 							///< mark the connection as alive.
 
 	bool			allowed[FR_RADIUS_CODE_MAX];
+
+	fr_retry_config_t	timeout_retry;
 	fr_retry_config_t      	retry[FR_RADIUS_CODE_MAX];
 
-	fr_trunk_conf_t		trunk_conf;		//!< trunk configuration
-};
+	trunk_conf_t		trunk_conf;		//!< trunk configuration
 
-/** Enqueue a request_t to an IO submodule
- *
- */
-typedef unlang_action_t (*rlm_radius_io_enqueue_t)(rlm_rcode_t *p_result, void **rctx, void *instance, void *thread, request_t *request);
-
-/** Public structure describing an I/O path for an outgoing socket.
- *
- * This structure is exported by client I/O modules e.g. rlm_radius_udp.
- */
-struct rlm_radius_io_s {
-	DL_MODULE_COMMON;				//!< Common fields to all loadable modules.
-	FR_MODULE_COMMON;
-	FR_MODULE_THREADED_COMMON;
-
-	rlm_radius_io_enqueue_t		enqueue;	//!< Enqueue a request_t with an IO submodule.
-	unlang_module_signal_t	signal;		//!< Send a signal to an IO module.
-	unlang_module_resume_t	resume;		//!< Resume a request, and get rcode.
+	fr_pair_list_t		*trigger_args;		//!< Pairs passed to trigger requests.
 };

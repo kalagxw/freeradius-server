@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -19,10 +19,6 @@
  * @file rlm_unix.c
  * @brief Unixy things
  *
- * authentication: Unix user authentication
- * accounting:     Functions to write radwtmp file.
- * Also contains handler for "Unix-Group".
- *
  * @copyright 2000,2006 The FreeRADIUS server project
  * @copyright 2000 Jeff Carneal (jeff@apex.net)
  * @copyright 2000 Alan Curry (pacman@world.std.com)
@@ -30,37 +26,21 @@
 RCSID("$Id$")
 USES_APPLE_DEPRECATED_API
 
-#define LOG_PREFIX "rlm_unix (%s) - "
-#define LOG_PREFIX_ARGS inst->name
+#define LOG_PREFIX mctx->mi->name
 
 #include <freeradius-devel/radius/radius.h>
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
-#include <freeradius-devel/server/sysutmp.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/util/skip.h>
 #include <freeradius-devel/util/perm.h>
+#include <freeradius-devel/unlang/xlat_func.h>
 
-#include <grp.h>
-#include <pwd.h>
-#include <sys/stat.h>
 
 #include "config.h"
 
 #ifdef HAVE_SHADOW_H
 #  include <shadow.h>
 #endif
-
-static char trans[64] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-#define ENC(c) trans[c]
-
-typedef struct {
-	char const *name;	//!< Instance name.
-	char const *radwtmp;
-} rlm_unix_t;
-
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("radwtmp", FR_TYPE_FILE_OUTPUT, rlm_unix_t, radwtmp) },
-	CONF_PARSER_TERMINATOR
-};
 
 static fr_dict_t const *dict_freeradius;
 static fr_dict_t const *dict_radius;
@@ -69,7 +49,7 @@ extern fr_dict_autoload_t rlm_unix_dict[];
 fr_dict_autoload_t rlm_unix_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_auth_type;
@@ -82,6 +62,7 @@ static fr_dict_attr_t const *attr_nas_ip_address;
 static fr_dict_attr_t const *attr_nas_port;
 static fr_dict_attr_t const *attr_acct_status_type;
 static fr_dict_attr_t const *attr_acct_delay_time;
+static fr_dict_attr_t const *attr_expr_bool_enum;
 
 extern fr_dict_attr_autoload_t rlm_unix_dict_attr[];
 fr_dict_attr_autoload_t rlm_unix_dict_attr[] = {
@@ -95,49 +76,52 @@ fr_dict_attr_autoload_t rlm_unix_dict_attr[] = {
 	{ .out = &attr_nas_port, .name = "NAS-Port", .type = FR_TYPE_UINT32, .dict = &dict_radius },
 	{ .out = &attr_acct_status_type, .name = "Acct-Status-Type", .type = FR_TYPE_UINT32, .dict = &dict_radius },
 	{ .out = &attr_acct_delay_time, .name = "Acct-Delay-Time", .type = FR_TYPE_UINT32, .dict = &dict_radius },
-	{ NULL }
+	{ .out = &attr_expr_bool_enum, .name = "Expr-Bool-Enum", .type = FR_TYPE_BOOL, .dict = &dict_freeradius },
+	DICT_AUTOLOAD_TERMINATOR
 };
 
-/*
- *	The Unix-Group = handler.
+/** Check if the user is in the given group
+ *
  */
-static int groupcmp(UNUSED void *instance, request_t *request, UNUSED fr_pair_list_t *request_list,
-		    fr_pair_t const *check)
+static bool CC_HINT(nonnull) unix_check_group(request_t *request, char const *name)
 {
+	bool		rcode = false;
 	struct passwd	*pwd;
 	struct group	*grp;
-	char		**member;
-	int		retval = -1;
 	fr_pair_t	*username;
 
 	/*
 	 *	No user name, can't compare.
 	 */
-	username = fr_pair_find_by_da(&request->request_pairs, attr_user_name, 0);
-	if (!username) return -1;
+	username = fr_pair_find_by_da(&request->request_pairs, NULL, attr_user_name);
+	if (!username) return false;
 
 	if (fr_perm_getpwnam(request, &pwd, username->vp_strvalue) < 0) {
 		RPEDEBUG("Failed resolving user name");
-		return -1;
+		return false;
 	}
 
-	if (fr_perm_getgrnam(request, &grp, check->vp_strvalue) < 0) {
+	if (fr_perm_getgrnam(request, &grp, name) < 0) {
 		RPEDEBUG("Failed resolving group name");
 		talloc_free(pwd);
-		return -1;
+		return false;
 	}
 
 	/*
-	 *	The users default group isn't the one we're looking for,
-	 *	look through the list of group members.
+	 *	The users default group may be the one we're looking
+	 *	for, in which case we use that.
+	 *
+	 *	Otherwise, we go through the list of groups to see if the group name matches.
 	 */
 	if (pwd->pw_gid == grp->gr_gid) {
-		retval = 0;
+		rcode = true;
 
 	} else {
-		for (member = grp->gr_mem; *member && retval; member++) {
+		char **member;
+
+		for (member = grp->gr_mem; *member; member++) {
 			if (strcmp(*member, pwd->pw_name) == 0) {
-				retval = 0;
+				rcode = true;
 				break;
 			}
 		}
@@ -147,35 +131,68 @@ static int groupcmp(UNUSED void *instance, request_t *request, UNUSED fr_pair_li
 	talloc_free(grp);
 	talloc_free(pwd);
 
-	return retval;
+	return rcode;
+}
+
+
+/** Check if the user is a member of a particular unix group
+ *
+@verbatim
+%unix.group(<name>)
+@endverbatim
+ *
+ * @ingroup xlat_functions
+ */
+static xlat_action_t unix_group_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
+				     UNUSED xlat_ctx_t const *xctx,
+				     request_t *request, fr_value_box_list_t *in)
+{
+	fr_value_box_t		*arg = fr_value_box_list_head(in);
+	char const		*p = arg->vb_strvalue;
+	fr_value_box_t		*vb;
+
+	fr_skip_whitespace(p);
+
+	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_BOOL, attr_expr_bool_enum));
+	vb->vb_bool = unix_check_group(request, p);
+	fr_dcursor_append(out, vb);
+
+	return XLAT_ACTION_DONE;
 }
 
 
 /*
  *	Read the config
  */
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
+static int mod_bootstrap(module_inst_ctx_t const *mctx)
 {
-	rlm_unix_t		*inst = instance;
+	xlat_t			*xlat;
+	xlat_arg_parser_t	*xlat_arg;
 
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) {
-		inst->name = cf_section_name1(conf);
-
-		if (paircmp_register_by_name("Unix-Group", attr_user_name, false, groupcmp, inst) < 0) {
-			PERROR("Failed registering Unix-Group");
-			return -1;
-		}
-	} else {
-		char *unix_group = talloc_asprintf(inst, "%s-Unix-Group", inst->name);
-
-		if (paircmp_register_by_name(unix_group, attr_user_name, false, groupcmp, inst) < 0) {
-			PERROR("Failed registering %s", unix_group);
-			talloc_free(unix_group);
-			return -1;
-		}
-		talloc_free(unix_group);
+	/*
+	 *	Define the new %unix.group(name) xlat.  The register
+	 *	function automatically adds the module instance name
+	 *	as a prefix.
+	 */
+	xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, "group", unix_group_xlat, FR_TYPE_BOOL);
+	if (!xlat) {
+		PERROR("Failed registering group expansion");
+		return -1;
 	}
+
+	/*
+	 *	The xlat escape function needs access to inst - so
+	 *	argument parser details need to be defined here
+	 */
+	xlat_arg = talloc_zero_array(xlat, xlat_arg_parser_t, 2);
+	xlat_arg[0] = (xlat_arg_parser_t) {
+		.type = FR_TYPE_STRING,
+		.required = true,
+		.concat = true
+	};
+	xlat_arg[1] = (xlat_arg_parser_t)XLAT_ARG_PARSER_TERMINATOR;
+
+	xlat_func_args_set(xlat, xlat_arg);
 
 	return 0;
 }
@@ -185,7 +202,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *conf)
  *	Pull the users password from where-ever, and add it to
  *	the given vp list.
  */
-static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_authorize(unlang_result_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
 {
 	char const	*name;
 	char const	*encrypted_pass;
@@ -203,18 +220,17 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNU
 	 *	We can only authenticate user requests which HAVE
 	 *	a User-Name attribute.
 	 */
-	username = fr_pair_find_by_da(&request->request_pairs, attr_user_name, 0);
-	if (!username) RETURN_MODULE_NOOP;
+	username = fr_pair_find_by_da(&request->request_pairs, NULL, attr_user_name);
+	if (!username) RETURN_UNLANG_NOOP;
 
 	name = username->vp_strvalue;
 	encrypted_pass = NULL;
 
 	if ((pwd = getpwnam(name)) == NULL) {
-		RETURN_MODULE_NOTFOUND;
+		RETURN_UNLANG_NOTFOUND;
 	}
 	encrypted_pass = pwd->pw_passwd;
 
-#ifdef HAVE_GETSPNAM
 	/*
 	 *      See if there is a shadow password.
 	 *
@@ -224,21 +240,28 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNU
 	 *	prevents users from using NULL password fields as things
 	 *	stand right now.
 	 */
-	if ((!encrypted_pass) || (strlen(encrypted_pass) < 10)) {
+	if (!encrypted_pass || (strlen(encrypted_pass) < 10)) {
+#ifdef HAVE_GETSPNAM
 		if ((spwd = getspnam(name)) == NULL) {
-			RETURN_MODULE_NOTFOUND;
+			RETURN_UNLANG_NOTFOUND;
 		}
+
 		encrypted_pass = spwd->sp_pwdp;
-	}
+		if (!encrypted_pass || (strlen(encrypted_pass) < 10)) {
+			RETURN_UNLANG_NOTFOUND;
+		}
+#else
+		RETURN_UNLANG_NOTFOUND;
 #endif	/* HAVE_GETSPNAM */
+	}
 
 #ifdef DENY_SHELL
 	/*
 	 *	Users with a particular shell are denied access
 	 */
 	if (strcmp(pwd->pw_shell, DENY_SHELL) == 0) {
-		REDEBUG("Invalid shell", name);
-		RETURN_MODULE_REJECT;
+		REDEBUG("[%s]: invalid shell [%s]", name, pwd->pw_shell);
+		RETURN_UNLANG_REJECT;
 	}
 #endif
 
@@ -256,7 +279,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNU
 	endusershell();
 	if (!shell) {
 		REDEBUG("[%s]: invalid shell [%s]", name, pwd->pw_shell);
-		RETURN_MODULE_REJECT;
+		RETURN_UNLANG_REJECT;
 	}
 #endif
 
@@ -267,7 +290,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNU
 	if (spwd && spwd->sp_lstchg > 0 && spwd->sp_max >= 0 &&
 	    (fr_time_to_sec(request->packet->timestamp) / 86400) > (spwd->sp_lstchg + spwd->sp_max)) {
 		REDEBUG("[%s]: password has expired", name);
-		RETURN_MODULE_REJECT;
+		RETURN_UNLANG_REJECT;
 	}
 	/*
 	 *      Check if account has expired.
@@ -275,7 +298,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNU
 	if (spwd && spwd->sp_expire > 0 &&
 	    (fr_time_to_sec(request->packet->timestamp) / 86400) > spwd->sp_expire) {
 		REDEBUG("[%s]: account has expired", name);
-		RETURN_MODULE_REJECT;
+		RETURN_UNLANG_REJECT;
 	}
 #endif
 
@@ -286,7 +309,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNU
 	if ((pwd->pw_expire > 0) &&
 	    (fr_time_to_sec(request->packet->timestamp) > pwd->pw_expire)) {
 		REDEBUG("[%s]: password has expired", name);
-		RETURN_MODULE_REJECT;
+		RETURN_UNLANG_REJECT;
 	}
 #endif
 
@@ -295,232 +318,30 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNU
 	 *
 	 *	FIXME: Maybe add Auth-Type := Accept?
 	 */
-	if (encrypted_pass[0] == 0)
-		RETURN_MODULE_NOOP;
+	if (encrypted_pass[0] == 0) {
+		RETURN_UNLANG_NOOP;
+	}
 
 	MEM(pair_update_control(&vp, attr_crypt_password) >= 0);
-	fr_pair_value_strdup(vp, encrypted_pass);
+	fr_pair_value_strdup(vp, encrypted_pass, false);
 
-	RETURN_MODULE_UPDATED;
+	RETURN_UNLANG_UPDATED;
 }
 
-
-/*
- *	UUencode 4 bits base64. We use this to turn a 4 byte field
- *	(an IP address) into 6 bytes of ASCII. This is used for the
- *	wtmp file if we didn't find a short name in the naslist file.
- */
-static char *uue(void *in)
-{
-	int i;
-	static unsigned char res[7];
-	unsigned char *data = (unsigned char *)in;
-
-	res[0] = ENC( data[0] >> 2 );
-	res[1] = ENC( ((data[0] << 4) & 060) + ((data[1] >> 4) & 017) );
-	res[2] = ENC( ((data[1] << 2) & 074) + ((data[2] >> 6) & 03) );
-	res[3] = ENC( data[2] & 077 );
-
-	res[4] = ENC( data[3] >> 2 );
-	res[5] = ENC( (data[3] << 4) & 060 );
-	res[6] = 0;
-
-	for(i = 0; i < 6; i++) {
-		if (res[i] == ' ') res[i] = '`';
-		if (res[i] < 32 || res[i] > 127)
-			printf("uue: protocol error ?!\n");
-	}
-	return (char *)res;
-}
-
-
-/*
- *	Unix accounting - write a wtmp file.
- */
-static unlang_action_t CC_HINT(nonnull) mod_accounting(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
-{
-	rlm_unix_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_unix_t);
-	fr_pair_t		*vp;
-	FILE			*fp;
-	struct utmp		ut;
-	time_t			t;
-	char			buf[64];
-	char const		*s = NULL;
-	int			delay = 0;
-	int			status = -1;
-	int			nas_address = 0;
-	int			framed_address = 0;
-#ifdef USER_PROCESS
-	int			protocol = -1;
-#endif
-	uint32_t		nas_port = 0;
-	bool			port_seen = true;
-	RADCLIENT		*client;
-
-	/*
-	 *	No radwtmp.  Don't do anything.
-	 */
-	if (!inst->radwtmp) {
-		RDEBUG2("No radwtmp file configured.  Ignoring accounting request");
-		RETURN_MODULE_NOOP;
-	}
-
-	if (request->packet->socket.inet.src_ipaddr.af != AF_INET) {
-		RDEBUG2("IPv6 is not supported!");
-		RETURN_MODULE_NOOP;
-	}
-
-	/*
-	 *	Which type is this.
-	 */
-	if ((vp = fr_pair_find_by_da(&request->request_pairs, attr_acct_status_type, 0)) == NULL) {
-		RDEBUG2("no Accounting-Status-Type attribute in request");
-		RETURN_MODULE_NOOP;
-	}
-	status = vp->vp_uint32;
-
-	/*
-	 *	Maybe handle ALIVE, too?
-	 */
-	if (status != FR_STATUS_START &&
-	    status != FR_STATUS_STOP)
-		RETURN_MODULE_NOOP;
-
-	/*
-	 *	We're only interested in accounting messages
-	 *	with a username in it.
-	 */
-	if (fr_pair_find_by_da(&request->request_pairs, attr_user_name, 0) == NULL)
-		RETURN_MODULE_NOOP;
-
-	t = fr_time_to_sec(request->packet->timestamp);
-	memset(&ut, 0, sizeof(ut));
-
-	/*
-	 *	First, find the interesting attributes.
-	 */
-	for (vp = fr_pair_list_head(&request->request_pairs);
-	     vp;
-	     vp = fr_pair_list_next(&request->request_pairs, vp)) {
-		if (vp->da == attr_user_name) {
-			if (vp->vp_length >= sizeof(ut.ut_name)) {
-				memcpy(ut.ut_name, vp->vp_strvalue, sizeof(ut.ut_name));
-			} else {
-				strlcpy(ut.ut_name, vp->vp_strvalue, sizeof(ut.ut_name));
-			}
-
-		} else if (vp->da == attr_login_ip_host ||
-			   vp->da == attr_framed_ip_address) {
-			framed_address = vp->vp_ipv4addr;
-
-#ifdef USER_PROCESS
-		} else if (vp->da == attr_framed_protocol) {
-			protocol = vp->vp_uint32;
-#endif
-		} else if (vp->da == attr_nas_ip_address) {
-			nas_address = vp->vp_ipv4addr;
-
-		} else if (vp->da == attr_nas_port) {
-			nas_port = vp->vp_uint32;
-			port_seen = true;
-
-		} else if (vp->da == attr_acct_delay_time) {
-			delay = vp->vp_ipv4addr;
-		}
-	}
-
-	/*
-	 *	We don't store !root sessions, or sessions
-	 *	where we didn't see a NAS-Port attribute.
-	 */
-	if (strncmp(ut.ut_name, "!root", sizeof(ut.ut_name)) == 0 || !port_seen)
-		RETURN_MODULE_NOOP;
-
-	/*
-	 *	If we didn't find out the NAS address, use the
-	 *	originator's IP address.
-	 */
-	if (nas_address == 0) {
-		nas_address = request->packet->socket.inet.src_ipaddr.addr.v4.s_addr;
-	}
-
-	client = client_from_request(request);
-	if (client) s = client->shortname;
-	if (!s || s[0] == 0) s = uue(&(nas_address));
-
-#ifdef __linux__
-	/*
-	 *	Linux has a field for the client address.
-	 */
-	ut.ut_addr = framed_address;
-#endif
-	/*
-	 *	We use the tty field to store the terminal servers' port
-	 *	and address so that the tty field is unique.
-	 */
-	snprintf(buf, sizeof(buf), "%03u:%s", nas_port, s);
-	strlcpy(ut.ut_line, buf, sizeof(ut.ut_line));
-
-	/*
-	 *	We store the dynamic IP address in the hostname field.
-	 */
-#ifdef UT_HOSTSIZE
-	if (framed_address) {
-		inet_ntop(AF_INET, &framed_address, buf, sizeof(buf));
-		strlcpy(ut.ut_host, buf, sizeof(ut.ut_host));
-	}
-#endif
-#ifdef USE_UTMPX
-	ut.ut_xtime = t - delay;
-#else
-	ut.ut_time = t - delay;
-#endif
-#ifdef USER_PROCESS
-	/*
-	 *	And we can use the ID field to store
-	 *	the protocol.
-	 */
-	if (protocol == FR_PPP)
-		strcpy(ut.ut_id, "P");
-	else if (protocol == FR_SLIP)
-		strcpy(ut.ut_id, "S");
-	else
-		strcpy(ut.ut_id, "T");
-	ut.ut_type = status == FR_STATUS_STOP ? DEAD_PROCESS : USER_PROCESS;
-#endif
-	if (status == FR_STATUS_STOP)
-		ut.ut_name[0] = 0;
-
-	/*
-	 *	Write a RADIUS wtmp log file.
-	 *
-	 *	Try to open the file if we can't, we don't write the
-	 *	wtmp file. If we can try to write. If we fail,
-	 *	return RLM_MODULE_FAIL ..
-	 */
-	if ((fp = fopen(inst->radwtmp, "a")) != NULL) {
-		if ((fwrite(&ut, sizeof(ut), 1, fp)) != 1) {
-			fclose(fp);
-			RETURN_MODULE_FAIL;
-		}
-		fclose(fp);
-	} else
-		RETURN_MODULE_FAIL;
-
-	RETURN_MODULE_OK;
-}
 
 /* globally exported name */
-extern module_t rlm_unix;
-module_t rlm_unix = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "unix",
-	.type		= RLM_TYPE_THREAD_UNSAFE,
-	.inst_size	= sizeof(rlm_unix_t),
-	.config		= module_config,
-	.bootstrap	= mod_bootstrap,
-	.methods = {
-		[MOD_AUTHORIZE]		= mod_authorize,
-		[MOD_ACCOUNTING]	= mod_accounting
+extern module_rlm_t rlm_unix;
+module_rlm_t rlm_unix = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "unix",
+		.flags		= MODULE_TYPE_THREAD_UNSAFE,
+		.bootstrap	= mod_bootstrap
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("recv", "Access-Request"), .method = mod_authorize },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

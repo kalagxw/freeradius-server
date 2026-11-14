@@ -21,11 +21,12 @@
  * @file protocols/arp/arp.h
  * @brief Structures and prototypes for base RADIUS functionality.
  *
- * @copyright 2020 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2020 Network RADIUS SAS (legal@networkradius.com)
  */
 #include <freeradius-devel/util/packet.h>
 #include <freeradius-devel/util/rand.h>
 #include <freeradius-devel/util/log.h>
+#include <freeradius-devel/util/net.h>
 
 #include <freeradius-devel/protocol/arp/dictionary.h>
 #include <freeradius-devel/protocol/arp/rfc826.h>
@@ -36,13 +37,17 @@
 #define FR_ARP_PACKET_SIZE (28)
 #define ETH_TYPE_ARP (0x0806)
 
-int fr_arp_init(void);
-void fr_arp_free(void);
+int fr_arp_global_init(void);
+void fr_arp_global_free(void);
 
 ssize_t fr_arp_encode(fr_dbuff_t *dbuff, uint8_t const *original, fr_pair_list_t *vps);
-ssize_t fr_arp_decode(TALLOC_CTX *ctx, uint8_t const *packet, size_t packet_len, fr_pair_list_t *list);
+ssize_t fr_arp_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, uint8_t const *packet, size_t packet_len);
 
 int fr_arp_entry_add(int fd, char const *interface, uint8_t ipaddr[static 4], uint8_t macaddr[static 6]);
+
+#ifdef __FreeBSD__
+int fr_bsd_arp_entry_add(uint32_t ifindex, uint8_t ipaddr[static 4], uint8_t macaddr[static 6]);
+#endif
 
 /*
  *	ARP for ethernet && IPv4.
@@ -59,7 +64,7 @@ typedef struct {
 	uint8_t		tpa[4];			//!< Target protocol address.
 } fr_arp_packet_t;
 
-typedef enum {
+typedef enum : uint16_t {
 	FR_ARP_INVALID = 0,
 	FR_ARP_REQUEST = 1,
 	FR_ARP_REPLY = 2,

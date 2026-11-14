@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -22,7 +22,7 @@
  * @author Arran Cudbard-Bell
  *
  * @copyright 2015 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
- * @copyright 2015 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2015 Network RADIUS SAS (legal@networkradius.com)
  * @copyright 2015 The FreeRADIUS Server Project
  */
 #include <freeradius-devel/util/debug.h>
@@ -30,16 +30,16 @@
 
 #define	SELECTOR_INDEX_UNSET			INT32_MAX
 
-typedef enum {
+typedef enum : uint8_t {
 	JPATH_OPERAND_LITERAL = 0,		//!< Operand is a literal
 	JPATH_OPERAND_JPATH			//!< Operand is a jpath sequence
 } jpath_operand_type;
 
-typedef enum {
+typedef enum : uint8_t {
 	JPATH_SELECTOR_INVALID = 0,
 	JPATH_SELECTOR_ROOT,			//!< Jump to the root of the document.
 	JPATH_SELECTOR_CURRENT,			//!< Continue at the current node in the document.
-	JPATH_SELECTOR_WILDCARD,		//!< Wildcard, operate over all array indicies, or fields
+	JPATH_SELECTOR_WILDCARD,		//!< Wildcard, operate over all array indices, or fields
 	JPATH_SELECTOR_FIELD,			//!< A field, current JSON node must be an object.
 	JPATH_SELECTOR_INDEX,			//!< Array index, current JSON node must be an array.
 	JPATH_SELECTOR_SLICE,			//!< Array slice, current JSON node must be an array.
@@ -103,7 +103,7 @@ static char const escape_chars[] = "[],*.:()?";
  * @param arg uctx data, not used.
  * @return the number of chars written to out.
  */
-size_t fr_jpath_escape_func(UNUSED request_t *request, char *out, size_t outlen, char const *in, UNUSED void *arg)
+ssize_t fr_jpath_escape_func(UNUSED request_t *request, char *out, size_t outlen, char const *in, UNUSED void *arg)
 {
 	char const *p = in;
 	char *q = out, *end = out + outlen;
@@ -122,7 +122,7 @@ size_t fr_jpath_escape_func(UNUSED request_t *request, char *out, size_t outlen,
 	}
 	*q = '\0';
 
-	return q - end;
+	return q - out;
 }
 
 /** Recursive function for jpath_expr_evaluate
@@ -349,7 +349,7 @@ static int jpath_evaluate(TALLOC_CTX *ctx, fr_value_box_list_t *tail,
 	 *	we now attempt conversion of the leaf to
 	 *	the specified value.
 	 */
-	value = fr_value_box_alloc_null(ctx);
+	MEM(value = fr_value_box_alloc_null(ctx));
 	if (fr_json_object_to_value_box(value, value, object, dst_enumv, true) < 0) {
 		talloc_free(value);
 		return -1;
@@ -360,7 +360,7 @@ static int jpath_evaluate(TALLOC_CTX *ctx, fr_value_box_list_t *tail,
 		return -1;
 	}
 
-	fr_dlist_insert_tail(tail, value);
+	fr_value_box_list_insert_tail(tail, value);
 	return 1;
 }
 
@@ -539,7 +539,7 @@ static ssize_t jpath_expr_parse(UNUSED jpath_selector_t *selector, UNUSED char c
  * @param inlen length of in.
  * @return
  *	- > 0 on success.
- *	- <= 0 on error (* -1 to get offset error ocurred at).
+ *	- <= 0 on error (* -1 to get offset error occurred at).
  */
 static ssize_t jpath_array_parse(jpath_selector_t *selector, char const *in, size_t inlen)
 {
@@ -649,7 +649,7 @@ static ssize_t jpath_array_parse(jpath_selector_t *selector, char const *in, siz
 /** Parse a jpath field
  *
  */
-static size_t jpath_field_parse(fr_jpath_node_t *node, char const *in, size_t inlen)
+static ssize_t jpath_field_parse(fr_jpath_node_t *node, char const *in, size_t inlen)
 {
 	char buffer[128];
 
@@ -660,7 +660,7 @@ static size_t jpath_field_parse(fr_jpath_node_t *node, char const *in, size_t in
 	 *	Field name with optional selector
 	 */
 	while (p < end) {
-		int clen;
+		size_t clen;
 
 		if (buff_p == buff_end) {
 		name_too_big:
@@ -727,7 +727,7 @@ static size_t jpath_field_parse(fr_jpath_node_t *node, char const *in, size_t in
 /** parse a jpath selector
  *
  */
-static size_t jpath_selector_parse(fr_jpath_node_t *node, char const *in, size_t inlen)
+static ssize_t jpath_selector_parse(fr_jpath_node_t *node, char const *in, size_t inlen)
 {
 	ssize_t slen;
 	char const *p = in, *end = p + inlen;
@@ -808,7 +808,7 @@ static size_t jpath_selector_parse(fr_jpath_node_t *node, char const *in, size_t
  *
  * @return
  *	- > 0 on success.
- *	- <= 0 on error (* -1 to get offset error ocurred at).
+ *	- <= 0 on error (* -1 to get offset error occurred at).
  */
 ssize_t fr_jpath_parse(TALLOC_CTX *ctx, fr_jpath_node_t **head, char const *in, size_t inlen)
 {

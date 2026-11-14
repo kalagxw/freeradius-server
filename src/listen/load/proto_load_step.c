@@ -20,25 +20,42 @@
  * @brief Generic protocol load generator
  *
  * @copyright 2019 The FreeRADIUS server project.
- * @copyright 2019 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2019 Network RADIUS SAS (legal@networkradius.com)
  */
 #include <netdb.h>
 #include <fcntl.h>
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/protocol.h>
-#include <freeradius-devel/radius/radius.h>
-#include <freeradius-devel/io/base.h>
+#include <freeradius-devel/server/main_loop.h>
 #include <freeradius-devel/io/application.h>
 #include <freeradius-devel/io/listen.h>
 #include <freeradius-devel/io/schedule.h>
 #include <freeradius-devel/io/load.h>
-#include <freeradius-devel/util/debug.h>
 
 #include "proto_load.h"
 
 extern fr_app_io_t proto_load_step;
 
 typedef struct proto_load_step_s proto_load_step_t;
+
+/** What to do when the load test is complete
+ *
+ *  The test is complete when the PPS ramp has passed max_pps, all
+ *  max_requests packets (if set) have been sent, and every reply has
+ *  been received.
+ */
+typedef enum : uint8_t {
+	LOAD_STEP_ON_COMPLETE_EXIT = 0,			//!< make the server exit
+	LOAD_STEP_ON_COMPLETE_REPEAT,			//!< run the test again from start_pps
+	LOAD_STEP_ON_COMPLETE_STOP,			//!< stop generating load, leave the server running
+	LOAD_STEP_ON_COMPLETE_CONTINUE			//!< never complete, keep sending at max_pps forever
+} load_step_on_complete_t;
+
+static fr_table_num_sorted_t const load_on_complete_table[] = {
+	{ L("continue"),	LOAD_STEP_ON_COMPLETE_CONTINUE },
+	{ L("exit"),		LOAD_STEP_ON_COMPLETE_EXIT },
+	{ L("repeat"),		LOAD_STEP_ON_COMPLETE_REPEAT },
+	{ L("stop"),		LOAD_STEP_ON_COMPLETE_STOP }
+};
+static size_t load_on_complete_table_len = NUM_ELEMENTS(load_on_complete_table);
 
 typedef struct {
 	fr_event_list_t			*el;			//!< event list
@@ -56,9 +73,9 @@ typedef struct {
 	fr_stats_t			stats;			//!< statistics for this socket
 
 	int				fd;			//!< for CSV files
-	fr_event_timer_t const		*ev;			//!< for writing statistics
+	fr_timer_t			*ev;			//!< for writing statistics
 
-	fr_listen_t			*parent;		//!< master IO handler
+	fr_listen_instance_t		*parent;		//!< master IO handler
 } proto_load_step_thread_t;
 
 struct proto_load_step_s {
@@ -72,35 +89,43 @@ struct proto_load_step_s {
 	int				code;
 	uint32_t			max_attributes;		//!< Limit maximum decodable attributes
 
-	RADCLIENT			*client;		//!< static client
+	fr_client_t			*client;		//!< static client
 
 	fr_load_config_t		load;			//!< load configuration
-	bool				repeat;			//!, do we repeat the load generation
+	load_step_on_complete_t		on_complete;		//!< what to do when the load test completes
 	char const     			*csv;			//!< where to write CSV stats
+
+	fr_dict_t const			*dict;			//!< Our namespace.
 };
 
 
-static const CONF_PARSER load_listen_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_INPUT | FR_TYPE_REQUIRED | FR_TYPE_NOT_EMPTY, proto_load_step_t, filename) },
-	{ FR_CONF_OFFSET("csv", FR_TYPE_STRING, proto_load_step_t, csv) },
+static const conf_parser_t load_listen_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("filename", CONF_FLAG_FILE_READABLE | CONF_FLAG_REQUIRED | CONF_FLAG_NOT_EMPTY, proto_load_step_t, filename) },
+	{ FR_CONF_OFFSET("csv", proto_load_step_t, csv) },
 
-	{ FR_CONF_OFFSET("max_attributes", FR_TYPE_UINT32, proto_load_step_t, max_attributes), .dflt = STRINGIFY(RADIUS_MAX_ATTRIBUTES) } ,
+	{ FR_CONF_OFFSET("max_attributes", proto_load_step_t, max_attributes), .dflt = STRINGIFY(RADIUS_MAX_ATTRIBUTES) } ,
 
-	{ FR_CONF_OFFSET("start_pps", FR_TYPE_UINT32, proto_load_step_t, load.start_pps) },
-	{ FR_CONF_OFFSET("max_pps", FR_TYPE_UINT32, proto_load_step_t, load.max_pps) },
-	{ FR_CONF_OFFSET("duration", FR_TYPE_UINT32, proto_load_step_t, load.duration) },
-	{ FR_CONF_OFFSET("step", FR_TYPE_UINT32, proto_load_step_t, load.step) },
-	{ FR_CONF_OFFSET("max_backlog", FR_TYPE_UINT32, proto_load_step_t, load.milliseconds) },
-	{ FR_CONF_OFFSET("parallel", FR_TYPE_UINT32, proto_load_step_t, load.parallel) },
-	{ FR_CONF_OFFSET("repeat", FR_TYPE_BOOL, proto_load_step_t, repeat) },
+	{ FR_CONF_OFFSET("start_pps", proto_load_step_t, load.start_pps) },
+	{ FR_CONF_OFFSET("max_pps", proto_load_step_t, load.max_pps) },
+	{ FR_CONF_OFFSET("duration", proto_load_step_t, load.duration) },
+	{ FR_CONF_OFFSET("step", proto_load_step_t, load.step) },
+	{ FR_CONF_OFFSET("max_backlog", proto_load_step_t, load.milliseconds) },
+	{ FR_CONF_OFFSET("parallel", proto_load_step_t, load.parallel) },
+	{ FR_CONF_OFFSET("max_requests", proto_load_step_t, load.max_requests) },
+	{ FR_CONF_OFFSET("on_complete", proto_load_step_t, on_complete),
+	  .func = cf_table_parse_uint8,
+	  .uctx = &(cf_table_parse_ctx_t){ .table = load_on_complete_table, .len = &load_on_complete_table_len },
+	  .dflt = "exit" },
 
 	CONF_PARSER_TERMINATOR
 };
 
 
-static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer, size_t buffer_len, size_t *leftover, UNUSED uint32_t *priority, UNUSED bool *is_dup)
+static ssize_t mod_read(fr_listen_instance_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer,
+			size_t buffer_len, size_t *leftover)
 {
-	proto_load_step_t const		*inst = talloc_get_type_abort_const(li->app_io_instance, proto_load_step_t);
+	proto_load_step_t const         *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_load_step_t);
 	proto_load_step_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_load_step_thread_t);
 	fr_io_address_t			*address, **address_p;
 
@@ -111,23 +136,31 @@ static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time
 	 *	take over the load generation.
 	 */
 	if (!thread->suspended) {
-		static fr_event_update_t pause_read[] = {
+		static fr_event_update_t pause[] = {
 			FR_EVENT_SUSPEND(fr_event_io_func_t, read),
+			FR_EVENT_SUSPEND(fr_event_io_func_t, write),
 			{ 0 }
 		};
 
-		if (fr_event_filter_update(thread->el, li->fd, FR_EVENT_FILTER_IO, pause_read) < 0) {
+		if (fr_event_filter_update(thread->el, li->fd, FR_EVENT_FILTER_IO, pause) < 0) {
 			fr_assert(0);
 		}
 
 		thread->suspended = true;
+
+		/*
+		 *	If mod_read is first called by an FD read event, then
+		 *	the sent count will be zero, since the load generator
+		 *	pre-increments sent.
+		 */
+		if (fr_load_generator_stats(thread->l)->sent == 0) return 0;
 	}
 
 	*leftover = 0;		/* always for load generation */
 
 	/*
 	 *	Where the addresses should go.  This is a special case
-	 *	for proto_radius.
+	 *	for proto_load.
 	 */
 	address_p = (fr_io_address_t **) packet_ctx;
 	address = *address_p;
@@ -156,8 +189,56 @@ static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time
 }
 
 
-static ssize_t mod_write(fr_listen_t *li, UNUSED void *packet_ctx, fr_time_t request_time,
-			 UNUSED uint8_t *buffer, size_t buffer_len, UNUSED size_t written)
+/** The load test is complete - apply on_complete
+ *
+ */
+static void load_complete(proto_load_step_thread_t *thread)
+{
+	fr_load_stats_t const *stats = fr_load_generator_stats(thread->l);
+
+	INFO("Load test for %s complete - sent %d packets, received %d replies",
+	     thread->name, stats->sent, stats->received);
+
+	switch (thread->inst->on_complete) {
+	case LOAD_STEP_ON_COMPLETE_EXIT:
+		INFO("Signalling the server to exit");
+		thread->done = true;
+		main_loop_signal_raise(RADIUS_SIGNAL_SELF_TERM);
+		break;
+
+	case LOAD_STEP_ON_COMPLETE_REPEAT:
+		(void) fr_load_generator_stop(thread->l); /* ensure l->ev is gone */
+		(void) fr_load_generator_start(thread->l);
+		break;
+
+	case LOAD_STEP_ON_COMPLETE_STOP:
+		thread->done = true;
+		break;
+
+	/*
+	 *	The generator never completes when it's told to
+	 *	continue forever.
+	 */
+	case LOAD_STEP_ON_COMPLETE_CONTINUE:
+		fr_assert(0);
+		break;
+	}
+}
+
+/** The generator noticed completion itself, without a final reply.
+ *
+ */
+static void mod_load_done(void *uctx)
+{
+	fr_listen_instance_t		*li = uctx;
+	proto_load_step_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_load_step_thread_t);
+
+	load_complete(thread);
+}
+
+static ssize_t mod_write(fr_listen_instance_t *li, UNUSED void *packet_ctx, fr_time_t request_time,
+			 UNUSED uint8_t *buffer,
+			 size_t buffer_len, UNUSED size_t written)
 {
 	proto_load_step_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_load_step_thread_t);
 	fr_load_reply_t state;
@@ -170,18 +251,13 @@ static ssize_t mod_write(fr_listen_t *li, UNUSED void *packet_ctx, fr_time_t req
 	thread->stats.total_responses++;
 
 	/*
-	 *	Tell the load generatopr subsystem that we have a
-	 *	reply.  Then if the load test is done, exit the
-	 *	server.
+	 *	Tell the load generator subsystem that we have a
+	 *	reply.  If the reply completes the load test, apply
+	 *	on_complete.
 	 */
 	state = fr_load_generator_have_reply(thread->l, request_time);
 	if (state == FR_LOAD_DONE) {
-		if (!thread->inst->repeat) {
-			thread->done = true;
-		} else {
-			(void) fr_load_generator_stop(thread->l); /* ensure l->ev is gone */
-			(void) fr_load_generator_start(thread->l);
-		}
+		load_complete(thread);
 	}
 
 	return buffer_len;
@@ -191,9 +267,10 @@ static ssize_t mod_write(fr_listen_t *li, UNUSED void *packet_ctx, fr_time_t req
 /** Open a load listener
  *
  */
-static int mod_open(fr_listen_t *li)
+static int mod_open(fr_listen_instance_t *li)
 {
-	proto_load_step_t const		*inst = talloc_get_type_abort_const(li->app_io_instance, proto_load_step_t);
+	proto_load_step_t const         *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_load_step_t);
 	proto_load_step_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_load_step_thread_t);
 
 	fr_ipaddr_t			ipaddr;
@@ -203,6 +280,10 @@ static int mod_open(fr_listen_t *li)
 	 *	readable FD in order to bootstrap the process.
 	 */
 	li->fd = open(inst->filename, O_RDONLY);
+	if (li->fd < 0) {
+		cf_log_err(li->listen->cs, "Failed opening %s - %s", inst->filename, fr_syserror(errno));
+		return -1;
+	}
 
 	memset(&ipaddr, 0, sizeof(ipaddr));
 	ipaddr.af = AF_INET;
@@ -210,7 +291,7 @@ static int mod_open(fr_listen_t *li)
 
 	fr_assert((cf_parent(inst->cs) != NULL) && (cf_parent(cf_parent(inst->cs)) != NULL));	/* listen { ... } */
 
-	thread->name = talloc_typed_asprintf(thread, "load_step from filename %s", inst->filename ? inst->filename : "none");
+	thread->name = talloc_typed_asprintf(thread, "load_step from filename %s", inst->filename);
 	thread->parent = talloc_parent(li);
 
 	return 0;
@@ -222,7 +303,7 @@ static int mod_open(fr_listen_t *li)
  */
 static int mod_generate(fr_time_t now, void *uctx)
 {
-	fr_listen_t			*li = uctx;
+	fr_listen_instance_t		*li = uctx;
 	proto_load_step_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_load_step_thread_t);
 
 	thread->recv_time = now;
@@ -236,13 +317,13 @@ static int mod_generate(fr_time_t now, void *uctx)
 }
 
 
-static void write_stats(fr_event_list_t *el, fr_time_t now, void *uctx)
+static void write_stats(fr_timer_list_t *tl, fr_time_t now, void *uctx)
 {
 	proto_load_step_thread_t	*thread = uctx;
 	size_t len;
 	char buffer[1024];
 
-	(void) fr_event_timer_in(thread, el, &thread->ev, NSEC, write_stats, thread);
+	(void) fr_timer_in(thread, tl, &thread->ev, fr_time_delta_from_sec(1), false, write_stats, thread);
 
 	len = fr_load_generator_stats_sprint(thread->l, now, buffer, sizeof(buffer));
 	if (write(thread->fd, buffer, len) < 0) {
@@ -261,34 +342,21 @@ static int mod_decode(void const *instance, request_t *request, UNUSED uint8_t *
 	fr_io_address_t const  	*address = track->address;
 
 	/*
-	 *	Set the request dictionary so that we can do
-	 *	generic->protocol attribute conversions as
-	 *	the request runs through the server.
-	 */
-	request->dict = inst->parent->dict;
-
-	/*
 	 *	Hacks for now until we have a lower-level decode routine.
 	 */
 	if (inst->code) request->packet->code = inst->code;
 	request->packet->id = fr_rand() & 0xff;
 	request->reply->id = request->packet->id;
-	memset(request->packet->vector, 0, sizeof(request->packet->vector));
 
 	request->packet->data = talloc_zero_array(request->packet, uint8_t, 1);
 	request->packet->data_len = 1;
 
-	/*
-	 *	Note that we don't set a limit on max_attributes here.
-	 *	That MUST be set and checked in the underlying
-	 *	transport, via a call to fr_radius_ok().
-	 */
 	(void) fr_pair_list_copy(request->request_ctx, &request->request_pairs, &inst->pair_list);
 
 	/*
 	 *	Set the rest of the fields.
 	 */
-	request->client = UNCONST(RADCLIENT *, address->radclient);
+	request->client = UNCONST(fr_client_t *, address->radclient);
 
 	request->packet->socket = address->socket;
 	fr_socket_addr_swap(&request->reply->socket, &address->socket);
@@ -298,15 +366,41 @@ static int mod_decode(void const *instance, request_t *request, UNUSED uint8_t *
 	return 0;
 }
 
+/** Close a virtual listener
+ *
+ * The fd only exists to bootstrap the listener, so closing it mostly means
+ * removing the timer that drives the load generator.
+ *
+ * @param[in] li the listener
+ * @return
+ *	- 0 on success.
+ *	- -1 if the generator could not be stopped.  The fd is closed either way.
+ */
+static int mod_close(fr_listen_instance_t *li)
+{
+	proto_load_step_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_load_step_thread_t);
+	int				ret = 0;
+
+	if (thread->l && (fr_load_generator_stop(thread->l) < 0)) {
+		PERROR("Failed stopping load generator");
+		ret = -1;
+	}
+
+	close(li->fd);
+
+	return ret;
+}
+
 /** Set the event list for a new socket
  *
  * @param[in] li the listener
  * @param[in] el the event list
  * @param[in] nr context from the network side
  */
-static void mod_event_list_set(fr_listen_t *li, fr_event_list_t *el, void *nr)
+static void mod_event_list_set(fr_listen_instance_t *li, fr_event_list_t *el, void *nr)
 {
-	proto_load_step_t const       *inst = talloc_get_type_abort_const(li->app_io_instance, proto_load_step_t);
+	proto_load_step_t const       *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									  proto_load_step_t);
 	proto_load_step_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_load_step_thread_t);
 	size_t len;
 	char buffer[256];
@@ -316,7 +410,7 @@ static void mod_event_list_set(fr_listen_t *li, fr_event_list_t *el, void *nr)
 	thread->inst = inst;
 	thread->load = inst->load;
 
-	thread->l = fr_load_generator_create(thread, el, &thread->load, mod_generate, li);
+	thread->l = fr_load_generator_create(thread, el, &thread->load, mod_generate, mod_load_done, li);
 	if (!thread->l) return;
 
 	(void) fr_load_generator_start(thread->l);
@@ -329,7 +423,7 @@ static void mod_event_list_set(fr_listen_t *li, fr_event_list_t *el, void *nr)
 		return;
 	}
 
-	(void) fr_event_timer_in(thread, thread->el, &thread->ev, NSEC, write_stats, thread);
+	(void) fr_timer_in(thread, thread->el->tl, &thread->ev, fr_time_delta_from_sec(1), false, write_stats, thread);
 
 	len = fr_load_generator_stats_sprint(thread->l, fr_time(), buffer, sizeof(buffer));
 	if (write(thread->fd, buffer, len) < 0) {
@@ -337,70 +431,29 @@ static void mod_event_list_set(fr_listen_t *li, fr_event_list_t *el, void *nr)
 	}
 }
 
-static char const *mod_name(fr_listen_t *li)
+static char const *mod_name(fr_listen_instance_t *li)
 {
 	proto_load_step_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_load_step_thread_t);
 
 	return thread->name;
 }
 
-
-static int mod_bootstrap(void *instance, CONF_SECTION *cs)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	proto_load_step_t	*inst = talloc_get_type_abort(instance, proto_load_step_t);
-	dl_module_inst_t const	*dl_inst;
-
-	/*
-	 *	Find the dl_module_inst_t holding our instance data
-	 *	so we can find out what the parent of our instance
-	 *	was.
-	 */
-	dl_inst = dl_module_instance_by_data(instance);
-	fr_assert(dl_inst);
-
-	inst->parent = talloc_get_type_abort(dl_inst->parent->data, proto_load_t);
-
-	inst->cs = cs;
-
-	FR_INTEGER_BOUND_CHECK("start_pps", inst->load.start_pps, >=, 10);
-	FR_INTEGER_BOUND_CHECK("start_pps", inst->load.start_pps, <, 400000);
-
-	FR_INTEGER_BOUND_CHECK("step", inst->load.step, >=, 1);
-	FR_INTEGER_BOUND_CHECK("step", inst->load.step, <, 100000);
-
-	if (inst->load.max_pps > 0) FR_INTEGER_BOUND_CHECK("max_pps", inst->load.max_pps, >, inst->load.start_pps);
-	FR_INTEGER_BOUND_CHECK("max_pps", inst->load.max_pps, <, 100000);
-
-	FR_INTEGER_BOUND_CHECK("duration", inst->load.duration, >=, 1);
-	FR_INTEGER_BOUND_CHECK("duration", inst->load.duration, <, 10000);
-
-
-	FR_INTEGER_BOUND_CHECK("parallel", inst->load.parallel, >=, 1);
-	FR_INTEGER_BOUND_CHECK("parallel", inst->load.parallel, <, 1000);
-
-	FR_INTEGER_BOUND_CHECK("max_backlog", inst->load.milliseconds, >=, 1);
-	FR_INTEGER_BOUND_CHECK("max_backlog", inst->load.milliseconds, <, 100000);
-
-	return 0;
-}
-
-static RADCLIENT *mod_client_find(fr_listen_t *li, UNUSED fr_ipaddr_t const *ipaddr, UNUSED int ipproto)
-{
-	proto_load_step_t const       *inst = talloc_get_type_abort_const(li->app_io_instance, proto_load_step_t);
-
-	return inst->client;
-}
-
-
-static int mod_instantiate(void *instance, CONF_SECTION *cs)
-{
-	proto_load_step_t	*inst = talloc_get_type_abort(instance, proto_load_step_t);
-	RADCLIENT		*client;
+	proto_load_step_t	*inst = talloc_get_type_abort(mctx->mi->data, proto_load_step_t);
+	CONF_SECTION		*conf = mctx->mi->conf;
+	fr_client_t		*client;
 	fr_pair_t		*vp;
+	module_instance_t const	*mi = mctx->mi;
+
+	inst->dict = virtual_server_dict_by_child_ci(cf_section_to_item(conf));
+	if (!inst->dict) {
+		cf_log_err(conf, "Please define 'namespace' in this virtual server");
+		return -1;
+	}
 
 	fr_pair_list_init(&inst->pair_list);
-	inst->client = client = talloc_zero(inst, RADCLIENT);
-	if (!inst->client) return 0;
+	MEM(inst->client = client = talloc_zero(inst, fr_client_t));
 
 	client->ipaddr.af = AF_INET;
 	client->src_ipaddr = client->ipaddr;
@@ -416,13 +469,13 @@ static int mod_instantiate(void *instance, CONF_SECTION *cs)
 
 		fp = fopen(inst->filename, "r");
 		if (!fp) {
-			cf_log_err(cs, "Failed reading %s - %s",
+			cf_log_err(conf, "Failed opening %s - %s",
 				   inst->filename, fr_syserror(errno));
 			return -1;
 		}
 
-		if (fr_pair_list_afrom_file(inst, inst->parent->dict, &inst->pair_list, fp, &done) < 0) {
-			cf_log_perr(cs, "Failed reading %s", inst->filename);
+		if (fr_pair_list_afrom_file(inst, inst->dict, &inst->pair_list, fp, &done, true) < 0) {
+			cf_log_perr(conf, "Failed reading %s", inst->filename);
 			fclose(fp);
 			return -1;
 		}
@@ -430,25 +483,67 @@ static int mod_instantiate(void *instance, CONF_SECTION *cs)
 		fclose(fp);
 	}
 
-	vp = fr_pair_find_by_da(&inst->pair_list, inst->parent->attr_packet_type, 0);
+	inst->parent = talloc_get_type_abort(mi->parent->data, proto_load_t);
+	inst->cs = conf;
+
+	vp = fr_pair_find_by_da(&inst->pair_list, NULL, inst->parent->attr_packet_type);
 	if (vp) inst->code = vp->vp_uint32;
+
+	FR_INTEGER_BOUND_CHECK("start_pps", inst->load.start_pps, >=, 10);
+	FR_INTEGER_BOUND_CHECK("start_pps", inst->load.start_pps, <, 400000);
+
+	FR_INTEGER_BOUND_CHECK("step", inst->load.step, >=, 1);
+	FR_INTEGER_BOUND_CHECK("step", inst->load.step, <, 100000);
+
+	if (inst->load.max_pps > 0) FR_INTEGER_BOUND_CHECK("max_pps", inst->load.max_pps, >, inst->load.start_pps);
+	FR_INTEGER_BOUND_CHECK("max_pps", inst->load.max_pps, <, 400000);
+
+	FR_TIME_DELTA_BOUND_CHECK("duration", inst->load.duration, >=, fr_time_delta_from_sec(1));
+	FR_TIME_DELTA_BOUND_CHECK("duration", inst->load.duration, <, fr_time_delta_from_sec(10000));
+
+
+	FR_INTEGER_BOUND_CHECK("parallel", inst->load.parallel, >=, 1);
+	FR_INTEGER_BOUND_CHECK("parallel", inst->load.parallel, <, 1000);
+
+	FR_INTEGER_BOUND_CHECK("max_backlog", inst->load.milliseconds, >=, 1);
+	FR_INTEGER_BOUND_CHECK("max_backlog", inst->load.milliseconds, <, 100000);
+
+	/*
+	 *	"continue" means the test never completes, which
+	 *	contradicts a finite request count.
+	 */
+	if (inst->load.max_requests && (inst->on_complete == LOAD_STEP_ON_COMPLETE_CONTINUE)) {
+		cf_log_err(conf, "'max_requests' cannot be used with 'on_complete = continue'");
+		return -1;
+	}
+
+	inst->load.unlimited = (inst->on_complete == LOAD_STEP_ON_COMPLETE_CONTINUE);
 
 	return 0;
 }
 
-fr_app_io_t proto_load_step = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "load_step",
-	.config			= load_listen_config,
-	.inst_size		= sizeof(proto_load_step_t),
-	.thread_inst_size	= sizeof(proto_load_step_thread_t),
-	.bootstrap		= mod_bootstrap,
-	.instantiate		= mod_instantiate,
+static fr_client_t *mod_client_find(fr_listen_instance_t *li, UNUSED fr_ipaddr_t const *ipaddr, UNUSED int ipproto)
+{
+	proto_load_step_t const       *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									  proto_load_step_t);
 
+	return inst->client;
+}
+
+fr_app_io_t proto_load_step = {
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "load_step",
+		.config			= load_listen_config,
+		.inst_size		= sizeof(proto_load_step_t),
+		.thread_inst_size	= sizeof(proto_load_step_thread_t),
+		.instantiate		= mod_instantiate
+	},
 	.default_message_size	= 4096,
 	.track_duplicates	= false,
 
 	.open			= mod_open,
+	.close			= mod_close,
 	.read			= mod_read,
 	.write			= mod_write,
 	.event_list_set		= mod_event_list_set,

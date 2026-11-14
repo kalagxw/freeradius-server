@@ -27,8 +27,6 @@ RCSID("$Id$")
 #include <freeradius-devel/util/ext.h>
 #include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/syserror.h>
-#include <freeradius-devel/util/table.h>
-#include <freeradius-devel/util/talloc.h>
 
 /** Add a variable length extension to a talloc chunk
  *
@@ -67,6 +65,9 @@ void *fr_ext_alloc_size(fr_ext_t const *def, void **chunk_p, int ext, size_t ext
 	uint8_t			*ext_offsets;
 	uint8_t			*ext_ptr;
 	char const		*type;
+
+	fr_assert(chunk != NULL);
+	fr_assert(talloc_parent(chunk) != NULL);
 
 	ext_offsets = fr_ext_offsets(def, *chunk_p);
 	if (ext_offsets[ext]) return fr_ext_ptr(*chunk_p, ext_offsets[ext], info->has_hdr);
@@ -249,7 +250,9 @@ int fr_ext_copy_all(fr_ext_t const *def, TALLOC_CTX **chunk_dst, TALLOC_CTX cons
 	int	i;
 	uint8_t	*ext_src_offsets = fr_ext_offsets(def, chunk_src);	/* old chunk array */
 	uint8_t *ext_dst_offsets = fr_ext_offsets(def, *chunk_dst);	/* new chunk array */
-	bool	ext_new_alloc[def->max];
+	bool	ext_new_alloc[UINT8_MAX + 1];	/* Extension ids are uint8_t enums */
+
+	fr_assert(def->max <= (int)NUM_ELEMENTS(ext_new_alloc));
 
 	/*
 	 *	Do the operation in two phases.

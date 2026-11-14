@@ -34,8 +34,10 @@ RCSID("$Id$")
 
 #include <sys/stat.h>
 
-#include <ctype.h>
 #include <fcntl.h>
+
+static int pairlist_read_internal(TALLOC_CTX *ctx, fr_dict_t const *dict, char const *file, PAIR_LIST_LIST *list,
+				  bool complain, bool v3_compat, int *order);
 
 static inline void line_error_marker(char const *src_file, int src_line,
 				     char const *user_file, int user_line,
@@ -48,6 +50,7 @@ static inline void line_error_marker(char const *src_file, int src_line,
 	end = fr_sbuff_adv_to_chr(sbuff, SIZE_MAX, '\n');
 	if (!end) end = fr_sbuff_end(sbuff);
 	fr_sbuff_set(sbuff, &start);
+	fr_sbuff_marker_release(&start);
 
 	fr_log_marker(LOG_DST, L_ERR, src_file, src_line,
 		      fr_sbuff_start(sbuff), end - fr_sbuff_start(sbuff),
@@ -71,6 +74,7 @@ static inline void line_error_marker_adj(char const *src_file, int src_line,
 	end = fr_sbuff_adv_to_chr(sbuff, SIZE_MAX, '\n');
 	if (!end) end = fr_sbuff_end(sbuff);
 	fr_sbuff_set(sbuff, &start);
+	fr_sbuff_marker_release(&start);
 
 	fr_log_marker(LOG_DST, L_ERR, src_file, src_line,
 		      fr_sbuff_current(sbuff), end - fr_sbuff_current(sbuff),
@@ -84,19 +88,11 @@ static inline void line_error_marker_adj(char const *src_file, int src_line,
  */
 #define ERROR_MARKER_ADJ(_sbuff, _idx, _error) line_error_marker_adj(__FILE__, __LINE__, file, lineno, _sbuff, _idx, _error)
 
-/*
- *	Free a PAIR_LIST
- */
-void pairlist_free(PAIR_LIST_LIST *pl)
-{
-	talloc_free(pl);
-}
-
 static fr_table_num_sorted_t const check_cmp_op_table[] = {
 	{ L("!*"),	T_OP_CMP_FALSE		},
 	{ L("!="),	T_OP_NE			},
 	{ L("!~"),	T_OP_REG_NE		},
-	{ L("+="),	T_OP_ADD		},
+	{ L("+="),	T_OP_ADD_EQ		},
 	{ L(":="),	T_OP_SET		},
 	{ L("<"),	T_OP_LT			},
 	{ L("<="),	T_OP_LE			},
@@ -144,10 +140,11 @@ static fr_sbuff_parse_rules_t const rhs_term = {
  *	Caller saw a $INCLUDE at the start of a line.
  */
 static int users_include(TALLOC_CTX *ctx, fr_dict_t const *dict, fr_sbuff_t *sbuff, PAIR_LIST_LIST *list,
-			 char const *file, int lineno)
+			 char const *file, int lineno, bool v3_compat, int *order)
 {
 	size_t		len;
-	char		*newfile, *p, c;
+	char		*newfile, c;
+	char const	*p;
 	fr_sbuff_marker_t name;
 
 	fr_sbuff_advance(sbuff, 8);
@@ -183,7 +180,7 @@ static int users_include(TALLOC_CTX *ctx, fr_dict_t const *dict, fr_sbuff_t *sbu
 	 *	Otherwise the $INCLUDE name is an absolute path, use
 	 *	it as -is.
 	 */
-	c = *fr_sbuff_current(&name);
+	c = fr_sbuff_char(&name, '\0');
 	if (c != '/') {
 		p = strrchr(file, '/');
 
@@ -224,7 +221,7 @@ static int users_include(TALLOC_CTX *ctx, fr_dict_t const *dict, fr_sbuff_t *sbu
 	/*
 	 *	Read the $INCLUDEd file recursively.
 	 */
-	if (pairlist_read(ctx, dict, newfile, list, 0) != 0) {
+	if (pairlist_read_internal(ctx, dict, newfile, list, false, v3_compat, order) != 0) {
 		ERROR("%s[%d]: Could not read included file %s: %s",
 		      file, lineno, newfile, fr_syserror(errno));
 		talloc_free(newfile);
@@ -235,14 +232,19 @@ static int users_include(TALLOC_CTX *ctx, fr_dict_t const *dict, fr_sbuff_t *sbu
 	return 0;
 }
 
+int pairlist_read(TALLOC_CTX *ctx, fr_dict_t const *dict, char const *file, PAIR_LIST_LIST *list, bool v3_compat)
+{
+	int order = 0;
+
+	return pairlist_read_internal(ctx, dict, file, list, true, v3_compat, &order);
+}
 
 /*
  *	Read the users file. Return a PAIR_LIST.
  */
-int pairlist_read(TALLOC_CTX *ctx, fr_dict_t const *dict, char const *file, PAIR_LIST_LIST *list, int complain)
+static int pairlist_read_internal(TALLOC_CTX *ctx, fr_dict_t const *dict, char const *file, PAIR_LIST_LIST *list, bool complain, bool v3_compat, int *order)
 {
 	char			*q;
-	int			order = 0;
 	int			lineno		= 1;
 	map_t			*new_map, *relative_map;
 	FILE			*fp;
@@ -259,35 +261,29 @@ int pairlist_read(TALLOC_CTX *ctx, fr_dict_t const *dict, char const *file, PAIR
 	 *	more useful...
 	 */
 	if ((fp = fopen(file, "r")) == NULL) {
-		if (!complain) return -1;
-
-		ERROR("Couldn't open %s for reading: %s", file, fr_syserror(errno));
+		if (complain) ERROR("Couldn't open %s for reading: %s", file, fr_syserror(errno));
 		return -1;
 	}
 
 	fr_sbuff_init_file(&sbuff, &fctx, buffer, sizeof(buffer), fp, SIZE_MAX);
-	relative_map = NULL;
 
 	lhs_rules = (tmpl_rules_t) {
-		.dict_def = dict,
-		.request_def = REQUEST_CURRENT,
-		.prefix = TMPL_ATTR_REF_PREFIX_NO,
-		.disallow_qualifiers = true, /* for now, until more tests are made */
+		.attr = {
+			.dict_def = dict,
+			.list_def = request_attr_request,
+			.list_presence = TMPL_ATTR_LIST_ALLOW,
+		},
+		.literals_safe_for = FR_VALUE_BOX_SAFE_FOR_ANY,
 
-		/*
-		 *	Otherwise the tmpl code returns 0 when asked
-		 *	to parse unknown names.  So we say "please
-		 *	parse unknown names as unresolved attributes",
-		 *	and then do a second pass to complain that the
-		 *	thing isn't known.
-		 */
-		.allow_unresolved = true,
 	};
 	rhs_rules = (tmpl_rules_t) {
-		.dict_def = dict,
-		.request_def = REQUEST_CURRENT,
-		.prefix = TMPL_ATTR_REF_PREFIX_YES,
-		.disallow_qualifiers = true, /* for now, until rlm_files supports it */
+		.attr = {
+			.dict_def = dict,
+			.list_def = request_attr_request,
+			.list_presence = TMPL_ATTR_LIST_ALLOW,
+			.bare_word_enum = v3_compat,
+		},
+		.literals_safe_for = FR_VALUE_BOX_SAFE_FOR_ANY,
 	};
 
 	while (true) {
@@ -311,41 +307,23 @@ int pairlist_read(TALLOC_CTX *ctx, fr_dict_t const *dict, char const *file, PAIR
 		}
 
 		/*
-		 *	We're trying to read a name.  It MUST have
+		 *	We're trying to read a key value.  It MUST have
 		 *	been at the start of the line.  So whatever
 		 *	this is, it's wrong.
 		 */
 		if (leading_spaces) {
-	    		ERROR_MARKER(&sbuff, "Entry does not begin with a user name");
+	    		ERROR_MARKER(&sbuff, "Entry does not begin with a key value");
 		fail:
 			fclose(fp);
 			return -1;
 		}
 
 		/*
-		 *	$INCLUDE filename
+		 *	$INCLUDE filename.  This will do some sanity checks, and then add the new entries to
+		 *	the tail of the current list.
 		 */
 		if (fr_sbuff_is_str(&sbuff, "$INCLUDE", 8)) {
-			/*
-			 *	Temporary list for include entries to be read into
-			 */
-			PAIR_LIST_LIST tmp_list;
-
-			pairlist_list_init(&tmp_list);
-			if (users_include(ctx, dict, &sbuff, &tmp_list, file, lineno) < 0) goto fail;
-
-			/*
-			 *	The file may have read no entries, one
-			 *	entry, or it may be a linked list of
-			 *	entries.  Set the order of the entries
-			 *	then move them to the end of the main list.
-			 */
-			t = NULL;
-			while ((t = fr_dlist_next(&tmp_list.head, t))) {
-				t->order = order++;
-			}
-
-			fr_dlist_move(&list->head, &tmp_list.head);
+			if (users_include(ctx, dict, &sbuff, list, file, lineno, v3_compat, order) < 0) goto fail;
 
 			if (fr_sbuff_next_if_char(&sbuff, '\n')) {
 				lineno++;
@@ -365,23 +343,27 @@ int pairlist_read(TALLOC_CTX *ctx, fr_dict_t const *dict, char const *file, PAIR
 		 *	We MUST be either at a valid entry, OR at EOF.
 		 */
 		MEM(t = talloc_zero(ctx, PAIR_LIST));
-		fr_map_list_init(&t->check);
-		fr_map_list_init(&t->reply);
+		map_list_init(&t->check);
+		map_list_init(&t->reply);
 		t->filename = filename;
 		t->lineno = lineno;
-		t->order = order++;
+		t->order = (*order)++;
 
 		/*
 		 *	Copy the name from the entry.
 		 */
-		len = fr_sbuff_out_abstrncpy_until(t, &q, &sbuff, SIZE_MAX, &name_terms, NULL);
+		if (fr_sbuff_out_abstrncpy_until(t, &q, &len, &sbuff, SIZE_MAX, &name_terms, NULL) < 0) {
+			ERROR_MARKER(&sbuff, "Failed reading entry name");
+			talloc_free(t);
+			goto fail;
+		}
 		if (len == 0) {
 			talloc_free(t);
 			break;
 		}
 		t->name = q;
 
-		lhs_rules.list_def = PAIR_LIST_CONTROL;
+		lhs_rules.attr.list_def = request_attr_control;
 		comma = false;
 
 check_item:
@@ -408,69 +390,32 @@ check_item:
 			goto fail;
 		}
 
-		/*
-		 *	The map "succeeded", but no map was created.
-		 *	It must have hit a terminal character, OR EOF.
-		 *
-		 *	Except we've already skipped spaces, tabs,
-		 *	comments, and LFs.  So the only thing which is
-		 *	left is a comma.
-		 */
-		if (!new_map) {
-			if (fr_sbuff_is_char(&sbuff, ',')) {
-				ERROR_MARKER(&sbuff, "Unexpected extra comma reading check pair");
-
-				goto fail_entry;
-			}
-
-			/*
-			 *	Otherwise map_afrom_substr() returned
-			 *	nothing, because there's no more
-			 *	input.
-			 */
-
-		add_entry:
-			fr_dlist_insert_tail(&list->head, &t);
-			break;
-		}
 		fr_assert(new_map->lhs != NULL);
 		fr_assert(new_map->rhs != NULL);
 
-		if (!tmpl_is_attr(new_map->lhs)) {
-			ERROR("%s[%d]: Unknown attribute '%s'",
-			      file, lineno, new_map->lhs->name);
-			goto fail_entry;
+		/*
+		 *	The default rule says that the check
+		 *	items look at the control list, but
+		 *	protocol attributes should be compared in the request.
+		 */
+		if (!tmpl_attr_tail_da(new_map->lhs)->flags.internal) {
+			tmpl_attr_set_list(new_map->lhs, request_attr_request);
 		}
 
 		if (tmpl_contains_regex(new_map->rhs)) {
-			/*
-			 *	The default rules say that the check
-			 *	items look at the control list, but
-			 *	for regexes we want to look at the
-			 *	request list.
-			 */
-			tmpl_attr_set_list(new_map->lhs, PAIR_LIST_REQUEST);
-
 			if (tmpl_is_regex_uncompiled(new_map->rhs) &&
 			    (tmpl_regex_compile(new_map->rhs, false) < 0)) {
 				ERROR("%s[%d]: Failed compiling regular expression /%s/ - %s",
 				      file, lineno, new_map->rhs->name, fr_strerror());
-				return -1;
+				goto fail_entry;
 			}
 
 			goto do_insert;
 		}
 
-		if (!tmpl_is_data(new_map->rhs) && !tmpl_is_exec(new_map->rhs) &&
-		    !tmpl_contains_xlat(new_map->rhs)) {
-			ERROR("%s[%d]: Invalid RHS '%s' for check item",
-			      file, lineno, new_map->rhs->name);
-			goto fail_entry;
-		}
-
 	do_insert:
 		fr_assert(!new_map->parent);
-		fr_dlist_insert_tail(&t->check, new_map);
+		map_list_insert_tail(&t->check, new_map);
 
 		/*
 		 *	There can be spaces before any comma.
@@ -528,15 +473,22 @@ check_item:
 		 *	of elimination, we must be at EOF.
 		 */
 		if (!fr_sbuff_is_char(&sbuff, '\n')) {
-			goto add_entry;
+		add_entry:
+			fr_dlist_insert_tail(&list->head, t);
+			break;
 		}
 
 setup_reply:
 		/*
 		 *	Setup the reply items.
 		 */
-		lhs_rules.list_def = PAIR_LIST_REPLY;
+		lhs_rules.attr.list_def = request_attr_reply;
+
 		comma = false;
+
+		rhs_rules.attr.list_def = request_attr_request;
+
+		relative_map = NULL;
 
 reply_item:
 		/*
@@ -594,36 +546,9 @@ next_reply_item:
 				       &lhs_rules, &rhs_rules, &rhs_term);
 		if (!new_map) {
 			ERROR_MARKER_ADJ(&sbuff, slen, fr_strerror());
-			goto fail;
+			goto fail_entry;
 		}
 
-		/*
-		 *	The map "succeeded", but no map was created.
-		 *	Maybe we hit a terminal string, or EOF.
-		 *
-		 *	We can't have hit space/tab, as that was
-		 *	checked for at "reply_item", and again after
-		 *	map_afrom_substr(), if we actually got
-		 *	something.
-		 *
-		 *	What's left is a comment, comma, LF, or EOF.
-		 */
-		if (!new_map) {
-			(void) fr_sbuff_adv_past_blank(&sbuff, SIZE_MAX, NULL);
-			if (fr_sbuff_is_char(&sbuff, ',')) {
-				ERROR_MARKER(&sbuff, "Unexpected extra comma reading reply pair");
-				goto fail_entry;
-			}
-
-			if (fr_sbuff_is_char(&sbuff, '#')) goto reply_item_comment;
-			if (fr_sbuff_is_char(&sbuff, '\n')) goto reply_item_end;
-
-			/*
-			 *	We didn't read anything, but none of
-			 *	the terminal characters match.  It must be EOF.
-			 */
-			goto add_entry;
-		}
 		fr_assert(new_map->lhs != NULL);
 
 		if (!tmpl_is_attr(new_map->lhs)) {
@@ -633,20 +558,11 @@ next_reply_item:
 		}
 
 		/*
-		 *	RHS can be NULL if it's a structural type.
+		 *	We no longer really care what the RHS is, or what the list is on the LHS.  The caller
+		 *	takes care of checking that for us.
 		 */
-		if (new_map->rhs) {
-			if (!tmpl_is_data(new_map->rhs) && !tmpl_is_exec(new_map->rhs) &&
-			    !tmpl_contains_xlat(new_map->rhs)) {
-				ERROR("%s[%d]: Invalid RHS '%s' for reply item",
-				      file, lineno, new_map->rhs->name);
-				goto fail_entry;
-			}
-		}
 
-		fr_assert(tmpl_list(new_map->lhs) == PAIR_LIST_REPLY);
-
-		if (!new_map->parent) fr_dlist_insert_tail(&t->reply, new_map);
+		if (!new_map->parent) map_list_insert_tail(&t->reply, new_map);
 
 		(void) fr_sbuff_adv_past_blank(&sbuff, SIZE_MAX, NULL);
 
@@ -667,11 +583,10 @@ next_reply_item:
 		 *	Reading the next line will cause a complaint
 		 *	if this line ended with a comma.
 		 */
-	reply_item_comment:
 		if (fr_sbuff_next_if_char(&sbuff, '#')) {
 			(void) fr_sbuff_adv_to_chr(&sbuff, SIZE_MAX, '\n');
 		}
-	reply_item_end:
+
 		if (fr_sbuff_next_if_char(&sbuff, '\n')) {
 			lineno++;
 			goto reply_item;

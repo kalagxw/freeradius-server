@@ -1,6 +1,7 @@
 #
-#  Test the "files" module
+#  Test the "python" module
 #
+$(eval $(call TEST_PARALLEL))
 
 PYTHONPATH := $(top_builddir)/src/tests/modules/python/
 export PYTHONPATH

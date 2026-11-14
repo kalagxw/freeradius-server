@@ -1,0 +1,31 @@
+#
+# PRE: edit-list
+#
+#  A MERGE B
+#
+#	= B if there's no A
+#	= A if B exists
+#	= A' MERGE B' if A and B are lists
+#
+
+Filter-Id := "foo"
+control.Filter-Id := "bar"
+
+# merge
+request >= control
+
+if (!Filter-Id) {
+	test_fail
+}
+
+# The original value should be unchanged
+if (!(Filter-Id == "foo")) {
+	test_fail
+}
+
+#  and the new value should not be there
+if (Filter-Id == "bar") {
+	test_fail
+}
+
+success

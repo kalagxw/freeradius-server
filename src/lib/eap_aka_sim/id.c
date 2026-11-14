@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -20,7 +20,7 @@
  *
  * @copyright 2017 The FreeRADIUS server project
  */
-#include <freeradius-devel/tls/log.h>
+#include <freeradius-devel/tls/strerror.h>
 #include <freeradius-devel/util/base64.h>
 #include <freeradius-devel/util/rand.h>
 #include <openssl/evp.h>
@@ -33,15 +33,16 @@
 fr_table_num_sorted_t const fr_aka_sim_id_request_table[] = {
 	{ L("Any-Id-Req"),		AKA_SIM_ANY_ID_REQ		},
 	{ L("FullAuth-Id-Req"),		AKA_SIM_FULLAUTH_ID_REQ		},
+	{ L("Init"),			AKA_SIM_INIT_ID_REQ		},
+	{ L("Permanent-Id-Req"),	AKA_SIM_PERMANENT_ID_REQ	},
 	{ L("no"),			AKA_SIM_NO_ID_REQ		},	/* Used for config parsing */
 	{ L("none"),			AKA_SIM_NO_ID_REQ		},
-	{ L("Permanent-Id-Req"),	AKA_SIM_PERMANENT_ID_REQ	},
 };
 size_t fr_aka_sim_id_request_table_len = NUM_ELEMENTS(fr_aka_sim_id_request_table);
 
 fr_table_num_sorted_t const fr_aka_sim_id_method_table[] = {
-	{ L("AKA'"),			AKA_SIM_METHOD_HINT_AKA_PRIME	},
 	{ L("AKA"),			AKA_SIM_METHOD_HINT_AKA		},
+	{ L("AKA'"),			AKA_SIM_METHOD_HINT_AKA_PRIME	},
 	{ L("SIM"),			AKA_SIM_METHOD_HINT_SIM		},
 };
 size_t fr_aka_sim_id_method_table_len = NUM_ELEMENTS(fr_aka_sim_id_method_table);
@@ -57,7 +58,7 @@ size_t fr_aka_sim_id_user_len(char const *nai, size_t nai_len)
 {
 	char const *p;
 
-	p = (char *)memchr((uint8_t const *)nai, '@', nai_len);
+	p = memchr(nai, '@', nai_len);
 	if (!p) return nai_len;
 
 	return p - nai;
@@ -75,7 +76,7 @@ char const *fr_aka_sim_domain(char const *nai, size_t nai_len)
 {
 	char const *p;
 
-	p = (char *)memchr((uint8_t const *)nai, '@', nai_len);
+	p = memchr(nai, '@', nai_len);
 	if (!p) return NULL;
 
 	return p + 1;
@@ -100,10 +101,10 @@ ssize_t fr_aka_sim_3gpp_root_nai_domain_mcc_mnc(uint16_t *mnc, uint16_t *mcc,
 	char *q;
 	unsigned long num;
 
-	if (((p + 8) < end) || (CRYPTO_memcmp(p, "wlan.mnc", 8) != 0)) return -1;
+	if (((p + 8) > end) || (CRYPTO_memcmp(p, "wlan.mnc", 8) != 0)) return -1;
 	p += 8;
 
-	if (((p + 3) < end)) {
+	if (((p + 3) > end)) {
 		fr_strerror_const("Missing MNC component");
 		return (domain - p);
 	}
@@ -115,7 +116,7 @@ ssize_t fr_aka_sim_3gpp_root_nai_domain_mcc_mnc(uint16_t *mnc, uint16_t *mcc,
 	if (mnc) *mnc = (uint16_t)num;
 	p = q + 1;
 
-	if (((p + 3) < end) || (CRYPTO_memcmp(p, "mcc", 3) != 0)) {
+	if (((p + 3) > end) || (CRYPTO_memcmp(p, "mcc", 3) != 0)) {
 		fr_strerror_const("Missing MCC component");
 		return (domain - p);
 	}
@@ -127,7 +128,7 @@ ssize_t fr_aka_sim_3gpp_root_nai_domain_mcc_mnc(uint16_t *mnc, uint16_t *mcc,
 	if (mcc) *mcc = (uint16_t)num;
 
 	p = q + 1;
-	if (((p + 15) < end) || (CRYPTO_memcmp(p, "3gppnetwork.org", 15) != 0)) {
+	if (((p + 15) > end) || (CRYPTO_memcmp(p, "3gppnetwork.org", 15) != 0)) {
 		fr_strerror_const("Missing 3gppnetwork.org suffix");
 		return (domain - p);
 	}
@@ -294,7 +295,7 @@ bad_format:
 
 /** Determine if a given identity is a 3gpp identity, and return the EAP method hinted
  *
- * @parma[in] id	to check.
+ * @param[in] id	to check.
  * @param[in] len	Length of the id.
  * @return
  *	- FR_EAP_METHOD_INVALID		if this is not a 3gpp identity.
@@ -343,19 +344,19 @@ static char hint_byte_matrix[AKA_SIM_METHOD_HINT_MAX][AKA_SIM_ID_TYPE_MAX] = {
 	[AKA_SIM_METHOD_HINT_SIM] = {
 		[AKA_SIM_ID_TYPE_PERMANENT]	= ID_TAG_SIM_PERMANENT,
 		[AKA_SIM_ID_TYPE_PSEUDONYM]	= ID_TAG_SIM_PSEUDONYM,
-		[AKA_SIM_ID_TYPE_FASTAUTH]	= ID_TAG_SIM_PERMANENT,
+		[AKA_SIM_ID_TYPE_FASTAUTH]	= ID_TAG_SIM_FASTAUTH,
 		[AKA_SIM_ID_TYPE_UNKNOWN]	= '\0',
 	},
 	[AKA_SIM_METHOD_HINT_AKA] = {
 		[AKA_SIM_ID_TYPE_PERMANENT]	= ID_TAG_AKA_PERMANENT,
 		[AKA_SIM_ID_TYPE_PSEUDONYM]	= ID_TAG_AKA_PSEUDONYM,
-		[AKA_SIM_ID_TYPE_FASTAUTH]	= ID_TAG_AKA_PERMANENT,
+		[AKA_SIM_ID_TYPE_FASTAUTH]	= ID_TAG_AKA_FASTAUTH,
 		[AKA_SIM_ID_TYPE_UNKNOWN]	= '\0',
 	},
 	[AKA_SIM_METHOD_HINT_AKA_PRIME] = {
 		[AKA_SIM_ID_TYPE_PERMANENT]	= ID_TAG_AKA_PRIME_PERMANENT,
 		[AKA_SIM_ID_TYPE_PSEUDONYM]	= ID_TAG_AKA_PRIME_PSEUDONYM,
-		[AKA_SIM_ID_TYPE_FASTAUTH]	= ID_TAG_AKA_PRIME_PERMANENT,
+		[AKA_SIM_ID_TYPE_FASTAUTH]	= ID_TAG_AKA_PRIME_FASTAUTH,
 		[AKA_SIM_ID_TYPE_UNKNOWN]	= '\0',
 	},
 	[AKA_SIM_METHOD_HINT_UNKNOWN] = {
@@ -399,7 +400,8 @@ int fr_aka_sim_id_3gpp_pseudonym_encrypt(char out[AKA_SIM_3GPP_PSEUDONYM_LEN + 1
 {
 	uint8_t		padded[16];				/* Random (8 bytes) + Compressed (8 bytes) */
 	uint8_t		encr[16];				/* aes_ecb(padded) */
-	size_t		encr_len, len = 0;
+	size_t		encr_len;
+	int		len = 0;
 
 	char		*out_p = out;
 
@@ -469,7 +471,7 @@ int fr_aka_sim_id_3gpp_pseudonym_encrypt(char out[AKA_SIM_3GPP_PSEUDONYM_LEN + 1
 	 */
 	evp_ctx = aka_sim_crypto_cipher_ctx();
 	if (unlikely(EVP_EncryptInit_ex(evp_ctx, EVP_aes_128_ecb(), NULL, key, NULL) != 1)) {
-		fr_tls_log_strerror_printf("Failed initialising AES-128-ECB context");
+		fr_tls_strerror_printf("Failed initialising AES-128-ECB context");
 	error:
 		return -1;
 	}
@@ -485,14 +487,14 @@ int fr_aka_sim_id_3gpp_pseudonym_encrypt(char out[AKA_SIM_3GPP_PSEUDONYM_LEN + 1
 	 *	when decrypting.
 	 */
 	EVP_CIPHER_CTX_set_padding(evp_ctx, 0);
-	if (unlikely(EVP_EncryptUpdate(evp_ctx, encr, (int *)&len, padded, sizeof(padded)) != 1)) {
-		fr_tls_log_strerror_printf("Failed encrypting padded IMSI");
+	if (unlikely(EVP_EncryptUpdate(evp_ctx, encr, &len, padded, sizeof(padded)) != 1)) {
+		fr_tls_strerror_printf("Failed encrypting padded IMSI");
 		goto error;
 	}
 	encr_len = len;
 
-	if (unlikely(EVP_EncryptFinal_ex(evp_ctx, encr + len, (int *)&len) != 1)) {
-		fr_tls_log_strerror_printf("Failed finalising encrypted IMSI");
+	if (unlikely(EVP_EncryptFinal_ex(evp_ctx, encr + len, &len) != 1)) {
+		fr_tls_strerror_printf("Failed finalising encrypted IMSI");
 		goto error;
 	}
 	encr_len += len;
@@ -530,8 +532,8 @@ int fr_aka_sim_id_3gpp_pseudonym_encrypt(char out[AKA_SIM_3GPP_PSEUDONYM_LEN + 1
 		u_p += 3;
 	}
 	if ((out_p - out) != AKA_SIM_3GPP_PSEUDONYM_LEN) {
-		fr_strerror_printf("Base64 output length invalid, expected %i bytes, got %zu bytes",
-				   AKA_SIM_3GPP_PSEUDONYM_LEN, out_p - out);
+		fr_strerror_printf("Base64 output length invalid, expected %u bytes, got %zu bytes",
+				   AKA_SIM_3GPP_PSEUDONYM_LEN, (size_t) (out_p - out));
 		return -1;
 	}
 
@@ -588,7 +590,7 @@ int fr_aka_sim_id_3gpp_pseudonym_decrypt(char out[AKA_SIM_IMSI_MAX_LEN + 1],
 
 	char const	*p = encr_id, *end = p + AKA_SIM_3GPP_PSEUDONYM_LEN;
 
-	size_t		len = 0;
+	int		len = 0;
 	unsigned int	i;
 
 	for (i = 0; i < AKA_SIM_3GPP_PSEUDONYM_LEN; i++) {
@@ -612,7 +614,7 @@ int fr_aka_sim_id_3gpp_pseudonym_decrypt(char out[AKA_SIM_IMSI_MAX_LEN + 1],
 
 	evp_ctx = aka_sim_crypto_cipher_ctx();
 	if (unlikely(EVP_DecryptInit_ex(evp_ctx, EVP_aes_128_ecb(), NULL, key, NULL) != 1)) {
-		fr_tls_log_strerror_printf("Failed initialising AES-128-ECB context");
+		fr_tls_strerror_printf("Failed initialising AES-128-ECB context");
 	error:
 		return -1;
 	}
@@ -627,24 +629,24 @@ int fr_aka_sim_id_3gpp_pseudonym_decrypt(char out[AKA_SIM_IMSI_MAX_LEN + 1],
 	 *	inform OpenSSL explicitly that there's no padding.
 	 */
 	EVP_CIPHER_CTX_set_padding(evp_ctx, 0);
-	if (unlikely(EVP_DecryptUpdate(evp_ctx, decr, (int *)&len, dec, sizeof(dec)) != 1)) {
-		fr_tls_log_strerror_printf("Failed decypting IMSI");
+	if (unlikely(EVP_DecryptUpdate(evp_ctx, decr, &len, dec, sizeof(dec)) != 1)) {
+		fr_tls_strerror_printf("Failed decypting IMSI");
 		goto error;
 	}
 	decr_len = len;
 
-	if (unlikely(EVP_DecryptFinal_ex(evp_ctx, decr + len, (int *)&len) != 1)) {
-		fr_tls_log_strerror_printf("Failed finalising decypted IMSI");
+	if (unlikely(EVP_DecryptFinal_ex(evp_ctx, decr + len, &len) != 1)) {
+		fr_tls_strerror_printf("Failed finalising decypted IMSI");
 		goto error;
 	}
 	decr_len += len;
 
 	/*
 	 *	This should never happen, and probably means that
-	 *	some sort of memory corruption has occured.
+	 *	some sort of memory corruption has occurred.
 	 */
 	if (unlikely(decr_len > (AKA_SIM_IMSI_MAX_LEN + 1))) {
-		fr_strerror_printf("Decrypted data len invalid.  Expected %i bytes, got %zu bytes",
+		fr_strerror_printf("Decrypted data len invalid.  Expected %u bytes, got %zu bytes",
 				   (AKA_SIM_IMSI_MAX_LEN + 1), decr_len);
 		goto error;
 	}
@@ -669,9 +671,7 @@ int fr_aka_sim_id_3gpp_pseudonym_decrypt(char out[AKA_SIM_IMSI_MAX_LEN + 1],
 /*
  *  cc id.c -g3 -Wall -DHAVE_DLFCN_H -DTESTING_SIM_ID -DWITH_TLS -I../../../../ -I../../../ -I ../base/ -I /usr/local/opt/openssl/include/ -include ../include/build.h -L /usr/local/opt/openssl/lib/ -l ssl -l crypto -l talloc -L ../../../../../build/lib/local/.libs/ -lfreeradius-server -lfreeradius-tls -lfreeradius-util -o test_sim_id && ./test_sim_id
  */
-#include <stddef.h>
-#include <stdbool.h>
-#include <freeradius-devel/util/acutest.h>
+#include <freeradius-devel/util/test/acutest.h>
 
 void test_encrypt_decypt_key0(void)
 {

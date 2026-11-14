@@ -7,6 +7,7 @@
 
 proto dhcpv6
 proto-dictionary dhcpv6
+fuzzer-out dhcpv6
 
 #
 #  1 byte unsigned integer (uint8)
@@ -30,7 +31,7 @@ encode-pair ANI-Access-Technology-Type = 3GPP2-NB-IOT
 match 00 69 00 02 00 0d
 
 decode-pair -
-match ANI-Access-Technology-Type = 3GPP2-NB-IOT
+match ANI-Access-Technology-Type = ::3GPP2-NB-IOT
 
 #
 #  4 byte unsigned integer (uint32)
@@ -42,4 +43,4 @@ decode-pair -
 match Information-Refresh-Time = 99
 
 count
-match 18
+match 19

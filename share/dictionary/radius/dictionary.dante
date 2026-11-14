@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -14,7 +14,8 @@ VENDOR		DANTE				27262
 
 BEGIN-VENDOR	DANTE
 
-ATTRIBUTE	Default-TTL				1	integer
+ATTRIBUTE	Default-TTL				1	uint32
 
 END-VENDOR DANTE
 
+ALIAS		DANTE					Vendor-Specific.DANTE

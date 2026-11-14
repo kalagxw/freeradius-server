@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -29,24 +29,6 @@ USES_APPLE_DEPRECATED_API
 #include <freeradius-devel/util/debug.h>
 #include <sasl/sasl.h>
 
-/** Holds arguments for the bind operation
- *
- */
-typedef struct {
-	fr_ldap_connection_t	*c;			//!< to bind.
-	char const		*mechs;			//!< SASL mechanisms to run
-	char const		*identity;		//!< of the user.
-	char const		*password;		//!< of the user, may be NULL if no password is specified.
-	char const		*proxy;			//!< Proxy identity, may be NULL in which case identity is used.
-	char const		*realm;			//!< SASL realm (may be NULL).
-	LDAPControl		**serverctrls;		//!< Controls to pass to the server.
-	LDAPControl		**clientctrls;		//!< Controls to pass to the client (library).
-
-	int			msgid;			//!< Last msgid.
-	LDAPMessage		*result;		//!< Previous result.
-	char const		*rmech;			//!< Mech we're continuing with.
-} fr_ldap_sasl_ctx_t;
-
 static void _ldap_sasl_bind_io_write(fr_event_list_t *el, int fd, UNUSED int flags, void *uctx);
 
 /** Error reading from or writing to the file descriptor
@@ -54,7 +36,7 @@ static void _ldap_sasl_bind_io_write(fr_event_list_t *el, int fd, UNUSED int fla
  * @param[in] el	the event occurred in.
  * @param[in] fd	the event occurred on.
  * @param[in] flags	from kevent.
- * @param[in] fd_errno	The error that ocurred.
+ * @param[in] fd_errno	The error that occurred.
  * @param[in] uctx	Connection config and handle.
  */
 static void _ldap_sasl_bind_io_error(UNUSED fr_event_list_t *el, UNUSED int fd,
@@ -77,7 +59,7 @@ static void _ldap_sasl_bind_io_error(UNUSED fr_event_list_t *el, UNUSED int fd,
  */
 static int _sasl_interact(UNUSED LDAP *handle, UNUSED unsigned flags, void *uctx, void *sasl_callbacks)
 {
-	fr_ldap_sasl_ctx_t		*sasl_ctx = talloc_get_type_abort(uctx, fr_ldap_sasl_ctx_t);;
+	fr_ldap_sasl_ctx_t		*sasl_ctx = talloc_get_type_abort(uctx, fr_ldap_sasl_ctx_t);
 	sasl_interact_t			*cb = sasl_callbacks;
 	sasl_interact_t			*cb_p;
 
@@ -87,19 +69,39 @@ static int _sasl_interact(UNUSED LDAP *handle, UNUSED unsigned flags, void *uctx
 
 		switch (cb_p->id) {
 		case SASL_CB_AUTHNAME:
+			/*
+			 *	For mechs like -Y EXTERNAL we don't have
+			 *	any information to provide to SASL.
+			 */
+			if (!sasl_ctx->identity) {
+			null_result:
+				cb_p->result = NULL;
+				cb_p->len = 0;
+				break;
+			}
 			cb_p->result = sasl_ctx->identity;
+			cb_p->len = strlen(sasl_ctx->identity);
 			break;
 
 		case SASL_CB_PASS:
+			if (!sasl_ctx->password) goto null_result;
+
 			cb_p->result = sasl_ctx->password;
+			cb_p->len = strlen(sasl_ctx->password);
 			break;
 
 		case SASL_CB_USER:
+			if (!sasl_ctx->proxy && !sasl_ctx->identity) goto null_result;
+
 			cb_p->result = sasl_ctx->proxy ? sasl_ctx->proxy : sasl_ctx->identity;
+			cb_p->len = sasl_ctx->proxy ? strlen(sasl_ctx->proxy) : strlen(sasl_ctx->identity);
 			break;
 
 		case SASL_CB_GETREALM:
+			if (!sasl_ctx->realm) goto null_result;
+
 			cb_p->result = sasl_ctx->realm;
+			cb_p->len = strlen(sasl_ctx->realm);
 			break;
 
 		default:
@@ -124,24 +126,28 @@ static void _ldap_sasl_bind_io_read(fr_event_list_t *el, int fd, UNUSED int flag
 	fr_ldap_rcode_t		status;
 
 	/*
+	 *	Free the old result (if there is one)
+	 */
+	if (sasl_ctx->result) {
+		ldap_msgfree(sasl_ctx->result);
+		sasl_ctx->result = NULL;
+	}
+
+	/*
 	 *	If LDAP parse result indicates there was an error
 	 *	then we're done.
 	 */
-	status = fr_ldap_result(&sasl_ctx->result, NULL, c, sasl_ctx->msgid, LDAP_MSG_ALL, sasl_ctx->identity, 0);
+	status = fr_ldap_result(&sasl_ctx->result, NULL, c, sasl_ctx->msgid, LDAP_MSG_ALL,
+				sasl_ctx->identity, fr_time_delta_wrap(0));
 	switch (status) {
+	case LDAP_PROC_PENDING:
+		return;
+
 	case LDAP_PROC_SUCCESS:
 	case LDAP_PROC_CONTINUE:
 	{
 		struct berval			*srv_cred;
 		int				ret;
-
-		/*
-		 *	Free the old result (if there is one)
-		 */
-		if (sasl_ctx->result) {
-			ldap_msgfree(sasl_ctx->result);
-			sasl_ctx->result = NULL;
-		}
 
 		ret = ldap_parse_sasl_bind_result(c->handle, sasl_ctx->result, &srv_cred, 0);
 		if (ret != LDAP_SUCCESS) {
@@ -152,17 +158,27 @@ static void _ldap_sasl_bind_io_read(fr_event_list_t *el, int fd, UNUSED int flag
 			return;
 		}
 
-		DEBUG3("SASL response  : %pV", fr_box_strvalue_len(srv_cred->bv_val, srv_cred->bv_len));
-		ldap_memfree(srv_cred);
+		/*
+		 *	Observed as NULL when doing EXTERNAL
+		 *	authentication.
+		 */
+		if (srv_cred) {
+			DEBUG3("SASL response  : %pV",
+			       fr_box_strvalue_len(srv_cred->bv_val, srv_cred->bv_len));
+			ber_bvfree(srv_cred);
+		}
 
 		/*
 		 *	If we need to continue, wait until the
 		 *	socket is writable, and then call
 		 *	ldap_sasl_interactive_bind again.
+		 *
+		 *	sasl_ctx->rmech may be NULL if there's
+		 *	nothing else to do.
 		 */
-		DEBUG3("Continuing SASL mech %s...", sasl_ctx->rmech);
+		if (sasl_ctx->rmech) DEBUG3("Continuing SASL mech %s...", sasl_ctx->rmech);
 
-		ret = fr_event_fd_insert(sasl_ctx, el, fd,
+		ret = fr_event_fd_insert(sasl_ctx, NULL, el, fd,
 					 NULL,
 					 _ldap_sasl_bind_io_write,	/* Need to write more SASL stuff */
 					 _ldap_sasl_bind_io_error,
@@ -199,19 +215,13 @@ static void _ldap_sasl_bind_io_write(fr_event_list_t *el, int fd, UNUSED int fla
 			      NUM_ELEMENTS(our_clientctrls),
 			      c, sasl_ctx->serverctrls, sasl_ctx->clientctrls);
 
-	DEBUG2("Starting SASL mech(s): %s", sasl_ctx->mechs);
+	DEBUG2("%s SASL mech(s): %s", (sasl_ctx->result == NULL ? "Starting" : "Continuing"), sasl_ctx->mechs);
 
-	/*
-	 *	Set timeout to be 0.0, which is the magic
-	 *	non-blocking value.
-	 */
-	(void) ldap_set_option(c->handle, LDAP_OPT_NETWORK_TIMEOUT, &fr_time_delta_to_timeval(0));
 	ret = ldap_sasl_interactive_bind(c->handle, NULL, sasl_ctx->mechs,
 					 our_serverctrls, our_clientctrls,
 					 LDAP_SASL_AUTOMATIC,
 					 _sasl_interact, sasl_ctx, sasl_ctx->result,
 					 &sasl_ctx->rmech, &sasl_ctx->msgid);
-	fr_ldap_connection_timeout_reset(c);
 	switch (ret) {
 	/*
 	 *	If the handle was not connected, this operation
@@ -225,12 +235,11 @@ static void _ldap_sasl_bind_io_write(fr_event_list_t *el, int fd, UNUSED int fla
 		if (!fr_cond_assert(ret == LDAP_OPT_SUCCESS)) {
 		error:
 			talloc_free(sasl_ctx);
-			fr_ldap_connection_timeout_reset(c);
 			fr_ldap_state_error(c);				/* Restart the connection state machine */
 			return;
 		}
 
-		ret = fr_event_fd_insert(sasl_ctx, el, fd,
+		ret = fr_event_fd_insert(sasl_ctx, NULL, el, fd,
 					 NULL,
 					 _ldap_sasl_bind_io_write,	/* We'll be called again when the conn is open */
 					 _ldap_sasl_bind_io_error,
@@ -242,7 +251,22 @@ static void _ldap_sasl_bind_io_write(fr_event_list_t *el, int fd, UNUSED int fla
 	 *	Want to read more SASL stuff...
 	 */
 	case LDAP_SASL_BIND_IN_PROGRESS:
-		ret = fr_event_fd_insert(sasl_ctx, el, fd,
+		if (fd < 0) {
+			ret = ldap_get_option(c->handle, LDAP_OPT_DESC, &fd);
+			if ((ret != LDAP_OPT_SUCCESS) || (fd < 0)) goto error;
+		}
+		c->fd = fd;
+
+		/*
+		 *	libldap, up to at least 2.7.2, switches the socket to blocking mode
+		 *	while sending the first request after an async connect.
+		 */
+		if (fr_nonblock(fd) < 0) {
+			PERROR("Failed setting LDAP connection non-blocking");
+			goto error;
+		}
+
+		ret = fr_event_fd_insert(sasl_ctx, NULL, el, fd,
 					 _ldap_sasl_bind_io_read,
 					 NULL,
 					 _ldap_sasl_bind_io_error,
@@ -254,6 +278,8 @@ static void _ldap_sasl_bind_io_write(fr_event_list_t *el, int fd, UNUSED int fla
 	 *	We're done, woohoo!
 	 */
 	case LDAP_SUCCESS:
+		DEBUG2("SASL bind as \"%s\" to \"%s\" successful",
+		       sasl_ctx->identity ? sasl_ctx->identity : "(anonymous)", c->config->server);
 		talloc_free(sasl_ctx);
 		fr_ldap_state_next(c);
 		break;
@@ -318,10 +344,14 @@ int fr_ldap_sasl_bind_async(fr_ldap_connection_t *c,
 
 	el = c->conn->el;
 
-	if (ldap_get_option(c->handle, LDAP_OPT_DESC, &fd) == LDAP_SUCCESS) {
+	/*
+	 *	ldap_get_option can return LDAP_SUCCESS even if the fd is not yet available
+	 *	- hence the test for fd >= 0
+	 */
+	if ((ldap_get_option(c->handle, LDAP_OPT_DESC, &fd) == LDAP_SUCCESS) && (fd >= 0)){
 		int ret;
 
-		ret = fr_event_fd_insert(sasl_ctx, el, fd,
+		ret = fr_event_fd_insert(sasl_ctx, NULL, el, fd,
 					 NULL,
 					 _ldap_sasl_bind_io_write,
 					 _ldap_sasl_bind_io_error,
@@ -337,3 +367,208 @@ int fr_ldap_sasl_bind_async(fr_ldap_connection_t *c,
 	return 0;
 }
 
+/** Send a SASL LDAP auth bind
+ *
+ * Shares the same callback as SASL admin binds
+ *
+ * @param[in] sasl_ctx	containing SASL parameters / state for the bind.
+ * @param[out] msgid	where to write the LDAP message ID.
+ * @param[in] ldap_conn	on which the message should be sent.
+ */
+int fr_ldap_sasl_bind_auth_send(fr_ldap_sasl_ctx_t *sasl_ctx, int *msgid,
+				 fr_ldap_connection_t *ldap_conn)
+{
+	return ldap_sasl_interactive_bind(ldap_conn->handle, NULL, sasl_ctx->mechs,
+					  NULL, NULL, LDAP_SASL_AUTOMATIC,
+					  _sasl_interact, sasl_ctx, sasl_ctx->result,
+					  &sasl_ctx->rmech, msgid);
+}
+
+/** Yield interpreter after enqueueing sasl auth bind
+ *
+ */
+static unlang_action_t ldap_async_sasl_bind_auth_start(UNUSED unlang_result_t *p_result,
+						       UNUSED request_t *request, UNUSED void *uctx)
+{
+	return UNLANG_ACTION_YIELD;
+}
+
+/** Signal an outstanding SASL LDAP bind to cancel
+ *
+ * @param[in] request	being processed. Unused.
+ * @param[in] action	Signal to handle.
+ * @param[in] uctx	bind auth ctx.
+ */
+static void ldap_async_sasl_bind_auth_cancel(request_t *request, UNUSED fr_signal_t action, void *uctx)
+{
+	fr_ldap_bind_auth_ctx_t *bind_auth_ctx = talloc_get_type_abort(uctx, fr_ldap_bind_auth_ctx_t);
+
+	RWARN("Cancelling SASL bind auth");
+	if (bind_auth_ctx->msgid > 0) fr_rb_remove(NULL, bind_auth_ctx->thread->binds, bind_auth_ctx);
+	trunk_request_signal_cancel(bind_auth_ctx->treq);
+}
+
+/** Handle the return code from parsed LDAP results to set the module rcode
+ *
+ * @param[out] p_result	Where to write return code.
+ * @param[in] request	being processed.
+ * @param[in] uctx	bind auth ctx.
+ * @return	unlang action.
+ */
+static unlang_action_t ldap_async_sasl_bind_auth_results(unlang_result_t *p_result, request_t *request, void *uctx)
+{
+	fr_ldap_bind_auth_ctx_t	*bind_auth_ctx = talloc_get_type_abort(uctx, fr_ldap_bind_auth_ctx_t);
+	fr_ldap_sasl_ctx_t	*sasl_ctx = bind_auth_ctx->sasl_ctx;
+	fr_ldap_rcode_t		ret = bind_auth_ctx->ret;
+	fr_ldap_connection_t	*ldap_conn = NULL;
+
+	switch (bind_auth_ctx->ret) {
+	case LDAP_PROC_SUCCESS:
+		RDEBUG2("Bind as user \"%s\" was successful", sasl_ctx->identity);
+		break;
+
+	case LDAP_PROC_NOT_PERMITTED:
+		RDEBUG2("Bind as user \"%s\" not permitted", sasl_ctx->identity);
+		break;
+
+	case LDAP_PROC_REJECT:
+		RDEBUG2("Bind as user \"%s\" rejected", sasl_ctx->identity);
+		break;
+
+	case LDAP_PROC_CONTINUE:
+		if (trunk_request_requeue(bind_auth_ctx->treq) != TRUNK_ENQUEUE_OK) {
+			ret = LDAP_PROC_ERROR;
+			break;
+		}
+
+		/*
+		 *	Once the next SASL exchange has completed repeat this function to
+		 *	process the results
+		 */
+		if (unlang_function_repeat_set(request, ldap_async_sasl_bind_auth_results) < 0) {
+			/*
+			 *	Not strictly an LDAP error but if this happens we will want to reset
+			 *	the connection to get a known state.
+			 */
+			ret = LDAP_PROC_ERROR;
+			break;
+		}
+		return UNLANG_ACTION_YIELD;
+
+	default:
+		break;
+	}
+
+	if (bind_auth_ctx->treq) {
+		if (bind_auth_ctx->treq->tconn) ldap_conn = talloc_get_type_abort(bind_auth_ctx->treq->tconn->conn->h,
+									  	  fr_ldap_connection_t);
+		/*
+		 *	Will free bind_auth_ctx
+		 */
+		trunk_request_signal_complete(bind_auth_ctx->treq);
+	} else {
+		/*
+		 *	If there is no trunk request, the request failed, and we need to free the ctx
+		 */
+		talloc_free(bind_auth_ctx);
+	}
+
+	switch (ret) {
+	case LDAP_PROC_SUCCESS:
+		RETURN_UNLANG_OK;
+
+	case LDAP_PROC_NOT_PERMITTED:
+		RETURN_UNLANG_DISALLOW;
+
+	case LDAP_PROC_REJECT:
+		RETURN_UNLANG_REJECT;
+
+	case LDAP_PROC_BAD_DN:
+		RETURN_UNLANG_INVALID;
+
+	case LDAP_PROC_NO_RESULT:
+		RETURN_UNLANG_NOTFOUND;
+
+	default:
+		if (ldap_conn) {
+			RPERROR("LDAP connection returned an error - restarting the connection");
+			fr_ldap_state_error(ldap_conn);
+		}
+		return UNLANG_ACTION_FAIL;
+	}
+}
+
+/** Initiate an async SASL LDAP bind for authentication
+ *
+ * @param[out] p_result		Where to write the result of the bind.
+ * @param[in] request		this bind relates to.
+ * @param[in] thread		whose connection the bind should be performed on.
+ * @param[in] mechs		SASL mechanisms to use.
+ * @param[in] identity		Identity to bind with.
+ * @param[in] password		Password to bind with.
+ * @param[in] proxy		Identity to proxy.
+ * @param[in] realm		SASL realm if applicable.
+ * @return
+ *	- 0 on success.
+ *	- -1 on failure.
+*/
+unlang_action_t fr_ldap_sasl_bind_auth_async(unlang_result_t *p_result,
+					     request_t *request, fr_ldap_thread_t *thread, char const *mechs,
+					     char const *identity, char const *password, char const *proxy, char const *realm)
+{
+	fr_ldap_bind_auth_ctx_t *bind_auth_ctx;
+	trunk_request_t	*treq;
+	fr_ldap_thread_trunk_t	*ttrunk = fr_thread_ldap_bind_trunk_get(thread);
+	trunk_enqueue_t	ret;
+
+	if (!ttrunk) {
+		ERROR("Failed to get trunk connection for LDAP bind");
+		RETURN_UNLANG_FAIL;
+	}
+
+	treq = trunk_request_alloc(ttrunk->trunk, request);
+	if (!treq) {
+		ERROR("Failed to allocate trunk request for LDAP bind");
+		RETURN_UNLANG_FAIL;
+	}
+
+	MEM(bind_auth_ctx = talloc_zero(treq, fr_ldap_bind_auth_ctx_t));
+	*bind_auth_ctx = (fr_ldap_bind_auth_ctx_t) {
+		.treq = treq,
+		.request = request,
+		.thread = thread,
+		.ret = LDAP_PROC_NO_RESULT,
+		.type = LDAP_BIND_SASL
+	};
+
+	MEM(bind_auth_ctx->sasl_ctx = talloc(bind_auth_ctx, fr_ldap_sasl_ctx_t));
+	talloc_set_destructor(bind_auth_ctx->sasl_ctx, _sasl_ctx_free);
+	*bind_auth_ctx->sasl_ctx = (fr_ldap_sasl_ctx_t) {
+		.mechs = mechs,
+		.identity = identity,
+		.password = password,
+		.proxy = proxy,
+		.realm = realm,
+	};
+
+	ret = trunk_request_enqueue(&bind_auth_ctx->treq, ttrunk->trunk, request, bind_auth_ctx, NULL);
+
+	switch (ret) {
+	case TRUNK_ENQUEUE_OK:
+	case TRUNK_ENQUEUE_IN_BACKLOG:
+		break;
+
+	default:
+		ERROR("Failed to enqueue bind request");
+		trunk_request_free(&treq);
+		RETURN_UNLANG_FAIL;
+	}
+
+	return unlang_function_push_with_result(p_result,
+						request,
+						ldap_async_sasl_bind_auth_start,
+						ldap_async_sasl_bind_auth_results,
+						ldap_async_sasl_bind_auth_cancel,
+						FR_SIGNAL_ALLOW(FR_SIGNAL_CANCEL), UNLANG_SUB_FRAME,
+						bind_auth_ctx);
+}

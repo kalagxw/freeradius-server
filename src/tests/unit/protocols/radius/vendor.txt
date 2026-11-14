@@ -1,7 +1,7 @@
 proto radius
 proto-dictionary radius
-
-load-dictionary dictionary
+load-dictionary dictionary.test
+fuzzer-out radius
 
 encode-pair Vendor-Specific = { Starent = { VPN-Name = "foo" } }
 match 1a 0d 00 00 1f e4 00 02 00 07 66 6f 6f
@@ -10,31 +10,31 @@ encode-pair Vendor-Specific.Starent.VPN-Name = "foo"
 match 1a 0d 00 00 1f e4 00 02 00 07 66 6f 6f
 
 decode-pair -
-match Vendor-Specific.Starent.VPN-Name = "foo"
+match Vendor-Specific = { Starent = { VPN-Name = "foo" } }
 
 encode-pair Vendor-Specific.USR.Event-Id = 1234
 match 1a 0e 00 00 01 ad 00 00 bf be 00 00 04 d2
 
 decode-pair -
-match Vendor-Specific.USR.Event-Id = 1234
+match Vendor-Specific = { USR = { Event-Id = 1234 } }
 
 decode-pair 1a 15 00 00 4e 20 01 0f 6c 69 74 68 69 61 73 70 72 69 6e 67 73
-match Vendor-Specific.20000.1 = 0x6c6974686961737072696e6773
+match  Vendor-Specific = { raw.20000 = { raw.1 = 0x6c6974686961737072696e6773 } }
 
 encode-pair Vendor-Specific.3com.User-Access-Level = Visitor, Vendor-Specific.3com.Ip-Host-Addr = "155.4.12.100 00:00:00:00:00:00"
 match 1a 0c 00 00 00 2b 01 06 00 00 00 00 1a 26 00 00 00 2b 3c 20 31 35 35 2e 34 2e 31 32 2e 31 30 30 20 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30
 
 decode-pair -
-match Vendor-Specific.3com.User-Access-Level = Visitor, Vendor-Specific.3com.Ip-Host-Addr = "155.4.12.100 00:00:00:00:00:00"
+match Vendor-Specific = { 3com = { User-Access-Level = ::Visitor, Ip-Host-Addr = "155.4.12.100 00:00:00:00:00:00" } }
 
 #
-#  The VSAs could also be packet into one Vendor-Specific
+#  The VSAs could also be packed into one Vendor-Specific
 #
 decode-pair 1a 2e 00 00 00 2b 1c 02 01 06 00 00 00 00 3c 20 31 35 35 2e 34 2e 31 32 2e 31 30 30 20 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30
-match Vendor-Specific.3com.User-Access-Level = Visitor, Vendor-Specific.3com.Ip-Host-Addr = "155.4.12.100 00:00:00:00:00:00"
+match Vendor-Specific = { 3com = { User-Access-Level = ::Visitor, Ip-Host-Addr = "155.4.12.100 00:00:00:00:00:00" } }
 
 decode-pair 1a 2c 00 00 00 2b 01 06 00 00 00 00 3c 20 31 35 35 2e 34 2e 31 32 2e 31 30 30 20 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30
-match Vendor-Specific.3com.User-Access-Level = Visitor, Vendor-Specific.3com.Ip-Host-Addr = "155.4.12.100 00:00:00:00:00:00"
+match Vendor-Specific = { 3com = { User-Access-Level = ::Visitor, Ip-Host-Addr = "155.4.12.100 00:00:00:00:00:00" } }
 
 #
 #  Vendor-Specific is of type "vsa", and therefore cannot be assigned values.
@@ -45,21 +45,21 @@ match 1a 05 ab cd ef
 encode-pair raw.26 = 0x00000009abcdef
 match 1a 09 00 00 00 09 ab cd ef
 
-decode-pair -
+decode-pair 1a 09 00 00 00 09 ab cd ef
 match raw.Vendor-Specific = 0x00000009abcdef
 
 #
 #  Parse this as itself, nothing else.
 #
-attribute raw.26 = 0x00000009abcdef
+pair raw.26 = 0x00000009abcdef
 match raw.Vendor-Specific = 0x00000009abcdef
 
 # this untagged tunnel encrypted VSA is valid in both access accepts and CoA requests
 encode-pair Vendor-Specific.Unisphere.LI-Action = off
-match 1a 1a 00 00 13 0a 3a 14 8d 31 89 6e 2e 8a f5 fa 78 fb d5 90 d8 1a 15 91 c1 f1
+match 1a 1a 00 00 13 0a 3a 14 96 2a e3 cf d7 91 43 34 98 1e ae 38 b7 32 f7 8c 59 9c
 
 decode-pair -
-match Vendor-Specific.Unisphere.LI-Action = off
+match Vendor-Specific = { Unisphere = { LI-Action = ::off } }
 
 #packet coa_request
 #original null
@@ -71,7 +71,7 @@ match Vendor-Specific.Unisphere.LI-Action = off
 #  Unknown vendors get decoded as TLVs with type=1,length=1
 #
 decode-pair 1a12000080000105abcdef02076161616161
-match Vendor-Specific.32768.1 = 0xabcdef, Vendor-Specific.32768.2 = 0x6161616161
+match Vendor-Specific = { raw.32768 = { raw.1 = 0xabcdef, raw.2 = 0x6161616161 } }
 
 #
 #  This MUST be 50 octets of data
@@ -80,14 +80,14 @@ encode-pair Vendor-Specific.Microsoft.CHAP-Response = "xxxxxxxxxxxxxxxxxxxxxxxxx
 match 1a 3a 00 00 01 37 01 34 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 58
 
 decode-pair -
-match Vendor-Specific.Microsoft.CHAP-Response = 0x7878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787858
+match Vendor-Specific = { Microsoft = { CHAP-Response = 0x7878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787858 } }
 
 #
 #  And now something which *isn't* 50 octets, but instead 49.
 #  Therefore it's an "invalid attribute", as defined in RFC 6929 Section 2.8.
 #
 decode-pair 1a 39 00 00 01 37 01 33 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78
-match raw.Vendor-Specific.Microsoft.CHAP-Response = 0x78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878
+match Vendor-Specific = { Microsoft = { raw.CHAP-Response = 0x78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878 } }
 
 #
 #  And an ALIAS.  First we see how the VSA should be defined,
@@ -108,5 +108,60 @@ match 1a 0b 00 00 00 09 01 05 66 6f 6f 1a 0b 00 00 00 09 01 05 62 61 72
 encode-pair Cisco-AVPair = "foo", Cisco-AVPair = "bar"
 match 1a 0b 00 00 00 09 01 05 66 6f 6f 1a 0b 00 00 00 09 01 05 62 61 72
 
+#
+#  Unknown attributes with TLVs
+#
+encode-pair raw.26.6809.1 = 0xabcdef
+match 1a 0b 00 00 1a 99 01 05 ab cd ef
+
+decode-pair -
+match Vendor-Specific = { raw.6809 = { raw.1 = 0xabcdef } }
+
+pair raw.26.6809.1.2 = 0xabcdef
+match Vendor-Specific = { raw.6809 = { raw.1 = { raw.2 = 0xabcdef } } }
+
+#
+#  @todo - pair_legacy - We can't currently encode this, because the pair_legacy code creates "octets" for "raw.1", and not "tlv".
+#
+#encode-pair -
+#match 1a 0d 00 00 1a 99 01 07 02 05 ab cd ef
+
+encode-pair raw.26.6809.1.2 = 0xabcdef
+match 1a 0d 00 00 1a 99 01 07 02 05 ab cd ef
+
+decode-pair -
+match Vendor-Specific = { raw.6809 = { raw.1 = { raw.2 = 0xabcdef } } }
+
+encode-pair raw.26.6809.1.2.3 = 0xabcdef
+match 1a 0f 00 00 1a 99 01 09 02 07 03 05 ab cd ef
+
+decode-pair -
+match Vendor-Specific = { raw.6809 = { raw.1 = { raw.2 = { raw.3 = 0xabcdef } } } }
+
+encode-pair Aruba.MPSK-Lookup-Info = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxy"
+match 1a d8 00 00 39 e7 42 d2 ee 96 71 b2 0c 85 02 62 68 3e 7f 5c 78 6c fa f3 a9 c4 a5 ff 9a be 21 a2 d3 49 0a 21 4a 52 31 f5 d2 bc 00 94 49 bb 4b 04 e9 1b 95 45 00 04 f5 b7 38 65 58 f5 bf bc bd 25 7b b5 1d f6 6a 3b 01 b6 65 a1 33 4c 02 e6 1d e2 55 b9 88 45 30 2e 44 cb 67 69 b1 5c c1 ff ba 5c 56 95 f8 25 95 49 87 20 dd 43 5c f2 3b ae 37 e6 fa 32 01 46 2a 64 8f bb ac 3a bc 9c 64 a8 5e d6 27 da 3a d7 05 a4 0b bb 56 f8 ce 73 39 96 fa 69 8f 32 90 13 5e c2 bb 38 47 a8 31 51 b9 99 61 b1 ee 09 d7 b8 88 b8 3b 33 40 6e 5f 70 e1 0d 16 45 5c 63 91 0d 20 40 14 57 48 1a c1 c8 79 75 7b 47 23 af 25 b7 d9 92 71 a4 ee 09 4b f8 5e 83 2d 3b 8c 8a 98 b2 a7 97 44 7f
+
+decode-pair -
+match  Vendor-Specific = { Aruba = { MPSK-Lookup-Info = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxy" } }
+
+#
+#  Known vendors in the extended ID space
+#
+encode-pair raw.241.26.6527.38 = 0xabcdef
+match f1 0b 1a 00 00 19 7f 26 ab cd ef
+
+decode-pair -
+match Extended-Attribute-1 = { Vendor-Specific = { Nokia-SR = { raw.38 = 0xabcdef } } }
+
+#
+#  Known vendor, unknown attribute.  Microsoft will never add more RADIUS attributes to
+#  their dictionary, so we use that here.
+#
+encode-pair Vendor-Specific = { Microsoft = { raw.200 = 0xabcdef } }
+match 1a 0b 00 00 01 37 c8 05 ab cd ef
+
+decode-pair -
+match  Vendor-Specific = { Microsoft = { raw.200 = 0xabcdef } }
+
 count
-match 51
+match 78

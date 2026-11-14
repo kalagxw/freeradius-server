@@ -1,0 +1,26 @@
+#
+#  PRE: if
+#
+string dummy_string
+
+#
+#  This doesn't exist, so  the condition shouldn't match.
+#
+if (dummy_string == "foo") {
+	test_fail
+}
+else {
+	ok
+}
+
+#
+# Since the middle part doesn't match, "NOT" the middle part SHOULD match.
+#
+if (!(dummy_string == "foo")) {
+	ok
+}
+else {
+	test_fail
+}
+
+success

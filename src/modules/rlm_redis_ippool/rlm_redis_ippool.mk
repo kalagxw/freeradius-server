@@ -6,10 +6,12 @@ TARGETNAME=
 
 ifneq "${TARGETNAME}" ""
   TARGETNAME	:= rlm_redis_ippool
-  TARGET	:= $(TARGETNAME).a
+  TARGET	:= $(TARGETNAME)$(L)
 endif
+TGT_CATEGORY	:=
 
 SOURCES	:= $(TARGETNAME).c
 
 SRC_CFLAGS	+= -I$(top_builddir)/src/lib/redis
-TGT_PREREQS	:= libfreeradius-redis.a
+TGT_PREREQS	:= libfreeradius-redis$(L)
+LOG_ID_LIB	= 42

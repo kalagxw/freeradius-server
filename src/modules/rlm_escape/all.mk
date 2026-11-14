@@ -1,2 +1,6 @@
-TARGET		:= rlm_escape.a
-SOURCES		:= rlm_escape.c
+TARGETNAME	:= rlm_escape
+
+TARGET		:= $(TARGETNAME)$(L)
+SOURCES		:= $(TARGETNAME).c
+
+LOG_ID_LIB	= 16

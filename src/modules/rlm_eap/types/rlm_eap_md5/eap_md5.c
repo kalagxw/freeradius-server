@@ -36,8 +36,6 @@
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_eap_md5 - "
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <freeradius-devel/eap/base.h>
@@ -48,11 +46,10 @@ RCSID("$Id$")
 /*
  *	We expect only RESPONSE for which SUCCESS or FAILURE is sent back
  */
-MD5_PACKET *eap_md5_extract(eap_round_t *eap_round)
+MD5_PACKET *eap_md5_extract(request_t *request, eap_round_t *eap_round)
 {
 	md5_packet_t	*data;
 	MD5_PACKET	*packet;
-	unsigned short	name_len;
 
 	/*
 	 *	We need a response, of type EAP-MD5, with at least
@@ -66,12 +63,21 @@ MD5_PACKET *eap_md5_extract(eap_round_t *eap_round)
 	    !eap_round->response->type.data 		 ||
 	    (eap_round->response->length <= MD5_HEADER_LEN) ||
 	    (eap_round->response->type.data[0] == 0)) {
-		ERROR("corrupted data");
+		REDEBUG("corrupted data");
 		return NULL;
 	}
 
-	packet = talloc_zero(eap_round, MD5_PACKET);
-	if (!packet) return NULL;
+	/*
+	 *	Sanity check the EAP-MD5 packet sent to us
+	 *	by the client.
+	 */
+	data = (md5_packet_t *)eap_round->response->type.data;
+	if (data->value_size > (eap_round->response->length - 6)) {
+		REDEBUG("corrupted data");
+		return NULL;
+	}
+
+	MEM(packet = talloc_zero(eap_round, MD5_PACKET));
 
 	/*
 	 *	Code & id for MD5 & EAP are same
@@ -85,12 +91,6 @@ MD5_PACKET *eap_md5_extract(eap_round_t *eap_round)
 	packet->length = eap_round->response->length - (MD5_HEADER_LEN + 1);
 
 	/*
-	 *	Sanity check the EAP-MD5 packet sent to us
-	 *	by the client.
-	 */
-	data = (md5_packet_t *)eap_round->response->type.data;
-
-	/*
 	 *	Already checked the size above.
 	 */
 	packet->value_size = data->value_size;
@@ -98,28 +98,13 @@ MD5_PACKET *eap_md5_extract(eap_round_t *eap_round)
 	/*
 	 *	Allocate room for the data, and copy over the data.
 	 */
-	packet->value = talloc_array(packet, uint8_t, packet->value_size);
-	if (!packet->value) {
-		talloc_free(packet);
-		return NULL;
-	}
+	MEM(packet->value = talloc_array(packet, uint8_t, packet->value_size));
 	memcpy(packet->value, data->value_name, packet->value_size);
 
 	/*
-	 *	Name is optional and is present after Value, but we
-	 *	need to check for it, as eap_md5_compose()
+	 *	Name is optional and is present after Value.  We
+	 *	ignore it.
 	 */
-	name_len =  packet->length - (packet->value_size + 1);
-	if (name_len) {
-	  packet->name = talloc_array(packet, char, name_len + 1);
-		if (!packet->name) {
-			talloc_free(packet);
-			return NULL;
-		}
-		memcpy(packet->name, data->value_name + packet->value_size,
-		       name_len);
-		packet->name[name_len] = 0;
-	}
 
 	return packet;
 }
@@ -128,11 +113,11 @@ MD5_PACKET *eap_md5_extract(eap_round_t *eap_round)
 /*
  * verify = MD5(id+password+challenge_sent)
  */
-int eap_md5_verify(MD5_PACKET *packet, fr_pair_t* password,
+int eap_md5_verify(request_t *request, MD5_PACKET *packet, fr_pair_t *password,
 		  uint8_t *challenge)
 {
 	char	*ptr;
-	char	string[1 + FR_MAX_STRING_LEN*2];
+	char	string[1 + FR_MAX_STRING_LEN + MD5_CHALLENGE_LEN];
 	uint8_t digest[16];
 	unsigned short len;
 
@@ -140,7 +125,12 @@ int eap_md5_verify(MD5_PACKET *packet, fr_pair_t* password,
 	 *	Sanity check it.
 	 */
 	if (packet->value_size != 16) {
-		ERROR("Expected 16 bytes of response to challenge, got %d", packet->value_size);
+		REDEBUG("Expected 16 bytes of response to challenge, got %d", packet->value_size);
+		return 0;
+	}
+
+	if ((1 + password->vp_length + MD5_CHALLENGE_LEN) > sizeof(string)) {
+		REDEBUG("Password is too long (expected <= %u)", FR_MAX_STRING_LEN);
 		return 0;
 	}
 
@@ -181,7 +171,6 @@ int eap_md5_verify(MD5_PACKET *packet, fr_pair_t* password,
 int eap_md5_compose(eap_round_t *eap_round, MD5_PACKET *reply)
 {
 	uint8_t *ptr;
-	unsigned short name_len;
 
 	/*
 	 *	We really only send Challenge (EAP-Identity),
@@ -207,22 +196,13 @@ int eap_md5_compose(eap_round_t *eap_round, MD5_PACKET *reply)
 		eap_round->request->type.length = reply->value_size + 1;
 
 		/*
-		 *	Return the name, if necessary.
-		 *
-		 *	Don't see why this is *ever* necessary...
+		 *	We don't send a name.
 		 */
-		name_len = reply->length - (reply->value_size + 1);
-		if (name_len && reply->name) {
-			ptr += reply->value_size;
-			memcpy(ptr, reply->name, name_len);
-			/* Challenge length + Name length */
-			eap_round->request->type.length += name_len;
-		}
 	} else {
 		eap_round->request->type.length = 0;
 		/* TODO: In future we might add message here wrt rfc1994 */
 	}
-	eap_round->request->code = reply->code;
+	eap_round->request->code = (eap_code_t)reply->code;
 	talloc_free(reply);
 
 	return 1;

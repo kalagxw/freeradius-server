@@ -1,0 +1,22 @@
+= Client Configuration
+
+== Why doesn't PEAP or EAP-TLS work on a Windows machine?
+
+The most common problem with PEAP is that the client sends a series of
+Access-Request messages, the server sends an series of
+Access-Challenge responses, and then nothing happens.  After a little
+wait, the process starts again.
+
+If you see this happening, *stop*!
+
+The RADIUS server certificate has to have special OIDs in it,
+otherwise the Microsoft clients will silently fail. See the
+`raddb/certs/xpextensions` file in the server configuration for
+examples, as well as the Microsoft
+http://support.microsoft.com/kb/814394/en-us[KB814394] article.
+
+You *must* follow the requirements in the Microsoft article for for
+PEAP or EAP-TLS to work with a Windows machine.
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

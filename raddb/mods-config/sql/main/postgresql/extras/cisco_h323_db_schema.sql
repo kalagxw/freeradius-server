@@ -10,11 +10,11 @@
 -- which is designed for simple dialup installations of FreeRadius.
 --
 -- For this schema to work properly you MUST use
--- raddb/sql/postgresql/voip-postpaid.conf rather than
--- raddb/sql/postgresql/dialup.conf
+-- sql/postgresql/voip-postpaid.conf rather than
+-- sql/postgresql/dialup.conf
 --
 -- If you wish to do RADIUS Authentication using the same database,
--- you MUST use use raddb/sql/postgresql/schema.sql as well as this schema.
+-- you MUST use use sql/postgresql/schema.sql as well as this schema.
 --
 
 --
@@ -115,7 +115,7 @@ CREATE TABLE StopTelephony (
 	processed		BOOLEAN DEFAULT false
 );
 
--- You can have more than one record that is identical except for CiscoNASPort if you have a dial peer hungroup
+-- You can have more than one record that is identical except for CiscoNASPort if you have a dial peer huntgroup
 -- configured for multiple PRIs.
 create UNIQUE index stoptelephonycombo on stoptelephony (AcctTime, nasipaddress, CallID, CiscoNASPort);
 
@@ -125,7 +125,7 @@ create UNIQUE index stoptelephonycombo on stoptelephony (AcctTime, nasipaddress,
 -- This table should list the IP addresses, names and locations of all your gateways
 -- This can be used to make more useful reports.
 --
--- Note: This table should be removed in favour of using the "nas" table.
+-- NOTE: This table should be removed in favour of using the "nas" table.
 --
 CREATE TABLE gateways (
 	gw_ip		INET NOT NULL,
@@ -180,7 +180,7 @@ CREATE TRUSTED LANGUAGE "plpgsql" HANDLER "plpgsql_call_handler";
 -- We therefore do not bother to strip asterisks (*) from timestamps, as you NEED ntp setup
 -- unless you don't care about billing at all!
 --
---  * Example useage:
+--  * Example usage:
 --      insert into mytable values (strip_dot('.16:46:02.356 EET Wed Dec 11 2002'));
 --
 CREATE OR REPLACE FUNCTION strip_dot (VARCHAR) RETURNS TIMESTAMPTZ AS '

@@ -1,0 +1,54 @@
+= The try Statement
+
+.Syntax
+[source,unlang]
+----
+try {
+    [ statements ]
+}
+catch [ <return-codes> ] {
+    ...
+}
+catch [ <return-codes> ] {
+    ...
+}
+----
+
+The `try` statement runs a series of substatements in a block.  If the
+block returns an error such as `fail`, `reject`, `invalid`,
+`disallow`, or `timeout`, a subsequent xref:unlang/catch.adoc[catch]
+block is executed.
+
+[ statements ]:: The `unlang` commands which will be executed.  A
+`try` block cannot be empty.
+
+Every `try` block must be followed by at least one
+xref:unlang/catch.adoc[catch] block.
+
+.Example
+
+[source,unlang]
+----
+try {
+	sql
+}
+catch fail {
+	# ... run only if sql failed
+
+	ok	# over-ride the "fail" code
+}
+----
+
+[NOTE]
+====
+The `catch` block can be triggered on any rcode and not just failures.
+A `catch ok { ... }` is valid.
+====
+
+There is some overlap in functionality between `try` /
+xref:unlang/catch.adoc[catch] and
+xref:unlang/redundant.adoc[redundant].  See the
+xref:unlang/catch.adoc[catch] documentation for more details.
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

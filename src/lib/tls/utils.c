@@ -23,8 +23,8 @@
  * @copyright 2018 The FreeRADIUS server project
  */
 
-#include <openssl/ssl.h>
 #include "utils.h"
+#include <openssl/ssl.h>
 
 /** PKEY types (friendly names)
  *
@@ -62,7 +62,7 @@ char const *fr_tls_utils_x509_pkey_type(X509 *cert)
 
 /** Returns the OpenSSL keyblock size
  *
- * @copyright (c) 2002-2016, Jouni Malinen (j@w1.fi) and contributors
+ * @copyright (c) 2002-2016, Jouni Malinen ("j@w1.fi") and contributors
  * All Rights Reserved.
  *
  * These programs are licensed under the BSD license (the one with
@@ -83,25 +83,38 @@ int fr_tls_utils_keyblock_size_get(request_t *request, SSL *ssl)
 	const EVP_MD *h;
 	const SSL_CIPHER *ssl_cipher;
 	int cipher, digest;
+	int mac_key_len, enc_key_len, fixed_iv_len;
 
 	ssl_cipher = SSL_get_current_cipher(ssl);
 	if (!ssl_cipher)
 		return -1;
 	cipher = SSL_CIPHER_get_cipher_nid(ssl_cipher);
 	digest = SSL_CIPHER_get_digest_nid(ssl_cipher);
-	RDEBUG2("OpenSSL: cipher nid %d digest nid %d", cipher, digest);
+	RDEBUG3("(TLS) OpenSSL: cipher nid %d digest nid %d", cipher, digest);
 	if (cipher < 0 || digest < 0)
 		return -1;
 	c = EVP_get_cipherbynid(cipher);
-	h = EVP_get_digestbynid(digest);
-	if (!c || !h)
+	if (!c)
 		return -1;
+	enc_key_len = EVP_CIPHER_key_length(c);
+	if (EVP_CIPHER_mode(c) == EVP_CIPH_GCM_MODE ||
+	    EVP_CIPHER_mode(c) == EVP_CIPH_CCM_MODE)
+		fixed_iv_len = 4; /* only part of IV from PRF */
+	else
+		fixed_iv_len = EVP_CIPHER_iv_length(c);
+	if (digest == NID_undef) {
+		RDEBUG3("(TLS) OpenSSL: no digest in use (e.g., AEAD)");
+		mac_key_len = 0;
+	} else {
+		h = EVP_get_digestbynid(digest);
+		if (!h)
+			return -1;
+		mac_key_len = EVP_MD_size(h);
+	}
 
-	RDEBUG2("OpenSSL: keyblock size: key_len=%d MD_size=%d IV_len=%d",
-		   EVP_CIPHER_key_length(c), EVP_MD_size(h),
-		   EVP_CIPHER_iv_length(c));
-	return 2 * (EVP_CIPHER_key_length(c) + EVP_MD_size(h) +
-		    EVP_CIPHER_iv_length(c));
+	RDEBUG2("(TLS) OpenSSL: keyblock size: key_len=%d MD_size=%d IV_len=%d",
+		   mac_key_len, enc_key_len, fixed_iv_len);
+	return 2 * (mac_key_len + enc_key_len + fixed_iv_len);
 }
 
 /** Convert OpenSSL's ASN1_TIME to an epoch time
@@ -114,62 +127,58 @@ int fr_tls_utils_keyblock_size_get(request_t *request, SSL *ssl)
  */
 int fr_tls_utils_asn1time_to_epoch(time_t *out, ASN1_TIME const *asn1)
 {
-	struct		tm t;
-	char const	*p = (char const *)asn1->data, *end = p + strlen(p);
+	struct tm t;
 
-	memset(&t, 0, sizeof(t));
-
-	if (asn1->type == V_ASN1_UTCTIME) {/* two digit year */
-		if ((end - p) < 2) {
-			fr_strerror_printf("ASN1 date string too short, expected 2 additional bytes, got %zu bytes",
-					   end - p);
-			return -1;
-		}
-
-		t.tm_year = (*(p++) - '0') * 10;
-		t.tm_year += (*(p++) - '0');
-		if (t.tm_year < 70) t.tm_year += 100;
-	} else if (asn1->type == V_ASN1_GENERALIZEDTIME) {/* four digit year */
-		if ((end - p) < 4) {
-			fr_strerror_printf("ASN1 string too short, expected 4 additional bytes, got %zu bytes",
-					   end - p);
-			return -1;
-		}
-
-		t.tm_year = (*(p++) - '0') * 1000;
-		t.tm_year += (*(p++) - '0') * 100;
-		t.tm_year += (*(p++) - '0') * 10;
-		t.tm_year += (*(p++) - '0');
-		t.tm_year -= 1900;
-	}
-
-	if ((end - p) < 4) {
-		fr_strerror_printf("ASN1 string too short, expected 10 additional bytes, got %zu bytes",
-				   end - p);
+	/*
+	 *	ASN1_TIME_to_tm() would convert the current time instead.
+	 */
+	if (!asn1) {
+		fr_strerror_const("ASN1 time not present");
 		return -1;
 	}
 
-	t.tm_mon = (*(p++) - '0') * 10;
-	t.tm_mon += (*(p++) - '0') - 1; // -1 since January is 0 not 1.
-	t.tm_mday = (*(p++) - '0') * 10;
-	t.tm_mday += (*(p++) - '0');
-
-	if ((end - p) < 2) goto done;
-	t.tm_hour = (*(p++) - '0') * 10;
-	t.tm_hour += (*(p++) - '0');
-
-	if ((end - p) < 2) goto done;
-	t.tm_min = (*(p++) - '0') * 10;
-	t.tm_min += (*(p++) - '0');
-
-	if ((end - p) < 2) goto done;
-	t.tm_sec = (*(p++) - '0') * 10;
-	t.tm_sec += (*(p++) - '0');
+	if (ASN1_TIME_to_tm(asn1, &t) != 1) {
+		fr_strerror_const("Invalid ASN1 time");
+		return -1;
+	}
 
 	/* ASN1_TIME is UTC, so get the UTC time */
-done:
 	*out = timegm(&t);
 
 	return 0;
 }
 
+/** Return the static private key password we have configured
+ *
+ * @note This is used as a callback to OpenSSL's PEM_read_PrivateKey function.
+
+ * @param[out] buf	Where to write the password to.
+ * @param[in] size	The length of buf.
+ * @param[in] rwflag
+ *			- 0 if password used for decryption.
+ *			- 1 if password used for encryption.
+ * @param[in] u		The static password.
+ * @return
+ *	- 0 on error.
+ *	- >0 on success (the length of the password).
+ */
+int fr_utils_get_private_key_password(char *buf, int size, UNUSED int rwflag, void *u)
+{
+	char		*pass;
+	size_t		len;
+
+	if (!u) {
+		ERROR("Private key encrypted but no private_key_password configured");
+		return 0;
+	}
+
+ 	pass = talloc_get_type_abort(u, char);
+	len = talloc_array_length(pass);	/* Len includes \0 */
+	if (len > (size_t)size) {
+		ERROR("Password too long.  Maximum length is %i bytes", size - 1);
+		return -1;
+	}
+	memcpy(buf, pass, len);			/* Copy complete password including \0 byte */
+
+	return (int)(len - 1);
+}

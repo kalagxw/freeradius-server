@@ -29,15 +29,17 @@
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_sql_db2 - "
+#define LOG_PREFIX "sql - db2"
 
 #include <freeradius-devel/server/base.h>
 #include <freeradius-devel/util/debug.h>
 
 #include <sys/stat.h>
 
-#include <sqlcli.h>
+#include <sqlcli1.h>
+#include <sqlstate.h>
 #include "rlm_sql.h"
+#include "rlm_sql_trunk.h"
 
 typedef struct {
 	SQLHANDLE dbc_handle;
@@ -45,8 +47,10 @@ typedef struct {
 	SQLHANDLE stmt;
 } rlm_sql_db2_conn_t;
 
-static int _sql_socket_destructor(rlm_sql_db2_conn_t *conn)
+static void _sql_connection_close(UNUSED fr_event_list_t *el, void *h, UNUSED void *uctx)
 {
+	rlm_sql_db2_conn_t	*conn = talloc_get_type_abort(h, rlm_sql_db2_conn_t);
+
 	DEBUG2("Socket destructor called, closing socket");
 
 	if (conn->dbc_handle) {
@@ -56,30 +60,26 @@ static int _sql_socket_destructor(rlm_sql_db2_conn_t *conn)
 
 	if (conn->env_handle) SQLFreeHandle(SQL_HANDLE_ENV, conn->env_handle);
 
-	return RLM_SQL_OK;
+	talloc_free(h);
 }
 
-static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *config,
-				   UNUSED fr_time_delta_t timeout)
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function */
+static connection_state_t _sql_connection_init(void **h, connection_t *conn, void *uctx)
 {
-	SQLRETURN row;
-#if 0
-	uint32_t timeout_ms = FR_TIMEVAL_TO_MS(timeout);
-#endif
-	rlm_sql_db2_conn_t *conn;
+	rlm_sql_db2_conn_t	*c;
+	rlm_sql_t const		*sql = talloc_get_type_abort_const(uctx, rlm_sql_t);
+	rlm_sql_config_t const	*config = &sql->config;
+	uint32_t		timeout_ms = fr_time_delta_to_msec(config->trunk_conf.conn_conf->connection_timeout);
+	SQLRETURN		ret;
 
-	MEM(conn = handle->conn = talloc_zero(handle, rlm_sql_db2_conn_t));
-	talloc_set_destructor(conn, _sql_socket_destructor);
+	MEM(c = talloc_zero(conn, rlm_sql_db2_conn_t));
 
 	/* Allocate handles */
-	SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &(conn->env_handle));
-	SQLAllocHandle(SQL_HANDLE_DBC, conn->env_handle, &(conn->dbc_handle));
+	SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &(c->env_handle));
+	SQLAllocHandle(SQL_HANDLE_DBC, c->env_handle, &(c->dbc_handle));
 
 	/* Set the connection timeout */
-#if 0
-	/* Not suported ? */
-	SQLSetConnectAttr(conn->dbc_handle, SQL_ATTR_LOGIN_TIMEOUT, &timeout_ms, SQL_IS_UINTEGER);
-#endif
+	SQLSetConnectAttr(c->dbc_handle, SQL_ATTR_LOGIN_TIMEOUT, &timeout_ms, SQL_IS_UINTEGER);
 
 	/*
 	 *	We probably want to use SQLDriverConnect, which connects
@@ -93,63 +93,79 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 	 *
 	 *	Driver={IBM DB2 ODBC Driver};Database=testDb;Hostname=remoteHostName.com;UID=username;PWD=mypasswd;PORT=50000
 	 */
-	row = SQLConnect(conn->dbc_handle,
+	ret = SQLConnect(c->dbc_handle,
 			 UNCONST(SQLCHAR *, config->sql_server), SQL_NTS,
 			 UNCONST(SQLCHAR *, config->sql_login), SQL_NTS,
 			 UNCONST(SQLCHAR *, config->sql_password), SQL_NTS);
-	if (row != SQL_SUCCESS) {
+	if (ret != SQL_SUCCESS) {
 		ERROR("could not connect to DB2 server %s", config->sql_server);
 
-		return RLM_SQL_ERROR;
+		return CONNECTION_STATE_FAILED;
 	}
 
-	return RLM_SQL_OK;
+	*h = c;
+	return CONNECTION_STATE_CONNECTED;
 }
 
-static sql_rcode_t sql_query(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config, char const *query)
-{
-	SQLRETURN row;
-	rlm_sql_db2_conn_t *conn;
+SQL_TRUNK_CONNECTION_ALLOC
 
-	conn = handle->conn;
+SQL_QUERY_RESUME
+
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function */
+static void sql_trunk_request_mux(UNUSED fr_event_list_t *el, trunk_connection_t *tconn,
+				  connection_t *conn, UNUSED void *uctx)
+{
+	rlm_sql_db2_conn_t	*sql_conn = talloc_get_type_abort(conn->h, rlm_sql_db2_conn_t);
+	trunk_request_t		*treq;
+	request_t		*request;
+	fr_sql_query_t		*query_ctx;
+	SQLRETURN		ret;
+	SQLCHAR			*db2_query;
+
+	if (trunk_connection_pop_request(&treq, tconn) != 0) return;
+	if (!treq) return;
+
+	query_ctx = talloc_get_type_abort(treq->preq, fr_sql_query_t);
+	request = query_ctx->request;
+	query_ctx->tconn = tconn;
+
+	ROPTIONAL(RDEBUG2, DEBUG2, "Executing query: %pV", query_ctx->query);
 
 	/* allocate handle for statement */
-	SQLAllocHandle(SQL_HANDLE_STMT, conn->dbc_handle, &(conn->stmt));
+	SQLAllocHandle(SQL_HANDLE_STMT, sql_conn->dbc_handle, &(sql_conn->stmt));
 
 	/* execute query */
-	{
-		SQLCHAR *db2_query;
-		memcpy(&db2_query, &query, sizeof(query));
+	memcpy(&db2_query, &query_ctx->query->vb_strvalue, sizeof(db2_query));
 
-		row = SQLExecDirect(conn->stmt, db2_query, SQL_NTS);
-		if(row != SQL_SUCCESS) {
-			/* XXX Check if row means we should return RLM_SQL_RECONNECT */
-			ERROR("Could not execute statement \"%s\"", query);
-			return RLM_SQL_ERROR;
+	ret = SQLExecDirect(sql_conn->stmt, db2_query, query_ctx->query->vb_length);
+	if (ret != SQL_SUCCESS) {
+		SQLCHAR		state[6];
+		SQLSMALLINT	len;
+
+		SQLGetDiagField(SQL_HANDLE_STMT, sql_conn->stmt, 1, SQL_DIAG_SQLSTATE, state, sizeof(state), &len);
+
+		if (strncmp((char *)state, SQL_CONSTR_INDEX_UNIQUE, 5) == 0) {
+			query_ctx->rcode = RLM_SQL_ALT_QUERY;
+			goto finish;
 		}
+
+		/* XXX Check if ret means we should return RLM_SQL_RECONNECT */
+		ERROR("Could not execute statement %pV", query_ctx->query);
+		query_ctx->rcode = RLM_SQL_ERROR;
+		trunk_request_signal_fail(treq);
+		return;
 	}
 
-	return RLM_SQL_OK;
+	query_ctx->rcode = RLM_SQL_OK;
+finish:
+	query_ctx->status = SQL_QUERY_RETURNED;
+	trunk_request_signal_reapable(treq);
+	if (request) unlang_interpret_mark_runnable(request);
 }
 
-static sql_rcode_t sql_select_query(rlm_sql_handle_t *handle, rlm_sql_config_t *config, char const *query)
+static sql_rcode_t sql_fields(char const **out[], fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	return sql_query(handle, config, query);
-}
-
-static int sql_num_fields(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
-{
-	SQLSMALLINT c;
-	rlm_sql_db2_conn_t *conn;
-
-	conn = handle->conn;
-	SQLNumResultCols(conn->stmt, &c);
-	return c;
-}
-
-static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
-{
-	rlm_sql_db2_conn_t *conn = handle->conn;
+	rlm_sql_db2_conn_t *conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_db2_conn_t);
 
 	SQLSMALLINT	fields, len, i;
 
@@ -159,12 +175,12 @@ static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, UNUS
 	SQLNumResultCols(conn->stmt, &fields);
 	if (fields == 0) return RLM_SQL_ERROR;
 
-	MEM(names = talloc_array(handle, char const *, fields));
+	MEM(names = talloc_array(query_ctx, char const *, fields));
 
 	for (i = 0; i < fields; i++) {
 		char *p;
 
-		switch (SQLColAttribute(conn->stmt, i, SQL_DESC_BASE_COLUMN_NAME,
+		switch (SQLColAttribute(conn->stmt, i + 1, SQL_DESC_BASE_COLUMN_NAME,
 					field, sizeof(field), &len, NULL)) {
 		case SQL_INVALID_HANDLE:
 		case SQL_ERROR:
@@ -185,24 +201,26 @@ static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, UNUS
 	return RLM_SQL_OK;
 }
 
-static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, rlm_sql_config_t *config)
+static unlang_action_t sql_fetch_row(unlang_result_t *p_Result, UNUSED request_t *request, void *uctx)
 {
-	int			c, i;
+	fr_sql_query_t		*query_ctx = talloc_get_type_abort(uctx, fr_sql_query_t);
+	int			i;
 	SQLINTEGER		len, slen;
+	SQLSMALLINT		c;
 	rlm_sql_row_t		row;
-	rlm_sql_db2_conn_t	*conn;
+	rlm_sql_db2_conn_t	*conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_db2_conn_t);
 
-	*out = NULL;
+	TALLOC_FREE(query_ctx->row);
 
-	TALLOC_FREE(handle->row);
-
-	conn = handle->conn;
-	c = sql_num_fields(handle, config);
+	SQLNumResultCols(conn->stmt, &c);
 
 	/* advance cursor */
-	if (SQLFetch(conn->stmt) == SQL_NO_DATA_FOUND) return RLM_SQL_NO_MORE_ROWS;
+	if (SQLFetch(conn->stmt) == SQL_NO_DATA_FOUND) {
+		query_ctx->rcode = RLM_SQL_NO_MORE_ROWS;
+		RETURN_UNLANG_OK;
+	}
 
-	MEM(row = (rlm_sql_row_t)talloc_zero_array(handle, char *, c + 1));
+	MEM(row = (rlm_sql_row_t)talloc_zero_array(query_ctx, char *, c + 1));
 	for (i = 0; i < c; i++) {
 		/* get column length */
 		SQLColAttribute(conn->stmt, i + 1, SQL_DESC_DISPLAY_SIZE, NULL, 0, NULL, &len);
@@ -214,41 +232,40 @@ static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, r
 		if (slen == SQL_NULL_DATA) row[i][0] = '\0';
 	}
 
-	*out = handle->row = row;
+	query_ctx->row = row;
 
-	return RLM_SQL_OK;
+	query_ctx->rcode = RLM_SQL_OK;
+	RETURN_UNLANG_OK;
 }
 
-static sql_rcode_t sql_free_result(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+static sql_rcode_t sql_free_result(fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_db2_conn_t *conn;
+	rlm_sql_db2_conn_t	*conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_db2_conn_t);
 
-	conn = handle->conn;
-	TALLOC_FREE(handle->row);
+	TALLOC_FREE(query_ctx->row);
 	SQLFreeHandle(SQL_HANDLE_STMT, conn->stmt);
 
 	return RLM_SQL_OK;
 }
 
-/** Retrieves any errors associated with the connection handle
+/** Retrieves any errors associated with the query context
  *
  * @note Caller will free any memory allocated in ctx.
  *
  * @param ctx to allocate temporary error buffers in.
  * @param out Array of sql_log_entrys to fill.
  * @param outlen Length of out array.
- * @param handle rlm_sql connection handle.
- * @param config rlm_sql config.
+ * @param query_ctx Query context to retrieve error for.
  * @return number of errors written to the #sql_log_entry_t array.
  */
 static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], NDEBUG_UNUSED size_t outlen,
-			rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+			fr_sql_query_t *query_ctx)
 {
 	char			state[6];
 	char			errbuff[1024];
 	SQLINTEGER		err;
 	SQLSMALLINT		rl;
-	rlm_sql_db2_conn_t	*conn = handle->conn;
+	rlm_sql_db2_conn_t	*conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_db2_conn_t);
 
 	fr_assert(conn);
 	fr_assert(outlen > 0);
@@ -264,40 +281,51 @@ static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], NDEBUG_UNUSED si
 	return 1;
 }
 
-static sql_rcode_t sql_finish_query(UNUSED rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+static sql_rcode_t sql_finish_query(UNUSED fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
 	return RLM_SQL_OK;
 }
 
-static sql_rcode_t sql_finish_select_query(rlm_sql_handle_t *handle, rlm_sql_config_t *config)
-{
-	return sql_finish_query(handle, config);
-}
-
-static int sql_affected_rows(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+static int sql_affected_rows(fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
 	SQLINTEGER c;
-	rlm_sql_db2_conn_t *conn = handle->conn;
+	rlm_sql_db2_conn_t	*conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_db2_conn_t);
 
 	SQLRowCount(conn->stmt, &c);
 
 	return c;
 }
 
+static void sql_request_fail(request_t *request, void *preq, UNUSED void *rctx,
+			     UNUSED trunk_request_state_t state, UNUSED void *uctx)
+{
+	fr_sql_query_t		*query_ctx = talloc_get_type_abort(preq, fr_sql_query_t);
+
+	query_ctx->treq = NULL;
+	if (query_ctx->rcode == RLM_SQL_OK) query_ctx->rcode = RLM_SQL_ERROR;
+	if (request) unlang_interpret_mark_runnable(request);
+}
+
 /* Exported to rlm_sql */
 extern rlm_sql_driver_t rlm_sql_db2;
 rlm_sql_driver_t rlm_sql_db2 = {
-	.name				= "rlm_sql_db2",
-	.magic				= RLM_MODULE_INIT,
-	.sql_socket_init		= sql_socket_init,
-	.sql_query			= sql_query,
-	.sql_select_query		= sql_select_query,
-	.sql_num_fields			= sql_num_fields,
+	.common = {
+		.magic				= MODULE_MAGIC_INIT,
+		.name				= "sql_db2",
+	},
+	.flags				= RLM_SQL_RCODE_FLAGS_ALT_QUERY,
+	.sql_query_resume		= sql_query_resume,
+	.sql_select_query_resume	= sql_query_resume,
 	.sql_affected_rows		= sql_affected_rows,
 	.sql_fields			= sql_fields,
 	.sql_fetch_row			= sql_fetch_row,
 	.sql_free_result		= sql_free_result,
 	.sql_error			= sql_error,
 	.sql_finish_query		= sql_finish_query,
-	.sql_finish_select_query	= sql_finish_select_query
+	.sql_finish_select_query	= sql_finish_query,
+	.trunk_io_funcs = {
+		.connection_alloc	= sql_trunk_connection_alloc,
+		.request_mux		= sql_trunk_request_mux,
+		.request_fail		= sql_request_fail,
+	}
 };

@@ -1,0 +1,19 @@
+# -*- text -*-
+# Copyright (C) 2024 The FreeRADIUS Server project and contributors
+# This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
+# Version $Id$
+#
+#	The FreeRADIUS dictionary for DNS
+#
+# Version:	$Id$
+#
+
+BEGIN PROTOCOL	DNS		11	format=2,pool=1MB
+
+$INCLUDE dictionary.freeradius.internal
+$INCLUDE dictionary.rfc1034
+$INCLUDE dictionary.rfc2782
+$INCLUDE dictionary.rfc4408
+$INCLUDE dictionary.rfc8659
+
+END-PROTOCOL	DNS

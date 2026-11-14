@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -14,23 +14,23 @@ VENDOR		Foundry				1991
 
 BEGIN-VENDOR	Foundry
 
-ATTRIBUTE	Privilege-Level				1	integer
+ATTRIBUTE	Privilege-Level				1	uint32
 ATTRIBUTE	Command-String				2	string
-ATTRIBUTE	Command-Exception-Flag			3	integer
-ATTRIBUTE	INM-Privilege				4	integer
+ATTRIBUTE	Command-Exception-Flag			3	uint32
+ATTRIBUTE	INM-Privilege				4	uint32
 ATTRIBUTE	Access-List				5	string
-ATTRIBUTE	MAC-Authent-needs-802dot1x		6	integer
-ATTRIBUTE	802dot1x-Valid-Lookup			7	integer
-ATTRIBUTE	MAC-Based-Vlan-QoS			8	integer
+ATTRIBUTE	MAC-Authent-needs-802dot1x		6	uint32
+ATTRIBUTE	802dot1x-Valid-Lookup			7	uint32
+ATTRIBUTE	MAC-Based-Vlan-QoS			8	uint32
 ATTRIBUTE	INM-Role-Aor-List			9	string
 ATTRIBUTE	SI-Context-Role				10	string
 # COA-Command appears to stomp on SI-Context-Role (different departments)
 # https://www.brocade.com/content/html/en/fastiron-os/08-0-60/fastiron-08060-securityguide/GUID-A3193D90-3FF4-4B04-8C6D-084743FDE91C.html
-ATTRIBUTE	COA-Command				10	string
+ALIAS		COA-Command				.SI-Context-Role
 ATTRIBUTE	SI-Role-Template			11	string
 # Voice-Phone-Config appears to stomp on SI-Role-Template (different departments)
 # http://docs.ruckuswireless.com/fastiron/08.0.60/fastiron-08060-securityguide/GUID-7E649B6D-A80B-40FD-A19A-478ED22C3E2A.html
-ATTRIBUTE	Voice-Phone-Config			11	string
+ALIAS		Voice-Phone-Config			.SI-Role-Template
 
 VALUE	INM-Privilege			AAA_pri_0		0
 VALUE	INM-Privilege			AAA_pri_1		1
@@ -59,3 +59,4 @@ VALUE	MAC-Based-Vlan-QoS		QoS_priority_6		6
 VALUE	MAC-Based-Vlan-QoS		QoS_priority_7		7
 
 END-VENDOR	Foundry
+ALIAS		Foundry					Vendor-Specific.Foundry

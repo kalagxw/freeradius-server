@@ -1,16 +1,12 @@
-#
-# PRE: update
-#
-
-update request {
-        &Tmp-String-1 := "hello"
-}
+string test_string
+octets result_octets
+test_string := "hello"
 
 #
 #  SHA1 HMAC with missing key should fail
 #
-update {
-	&request.Tmp-Octets-1 := "%(hmacsha1:%{Tmp-String-1} )" # ERROR
+result_octets := %hmac.sha1(%{test_string}, ) # ERROR
+if result_octets {
+	test_fail
 }
-
-test_fail
+success

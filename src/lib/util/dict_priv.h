@@ -32,6 +32,7 @@ extern "C" {
 #include <freeradius-devel/util/dict_ext_priv.h>
 #include <freeradius-devel/util/dl.h>
 #include <freeradius-devel/util/hash.h>
+#include <freeradius-devel/util/value.h>
 
 #define DICT_POOL_SIZE		(1024 * 1024 * 2)
 #define DICT_FIXUP_POOL_SIZE	(1024)
@@ -61,6 +62,31 @@ typedef struct {
 	char const	        *dependent;		//!< File holding the reference.
 } fr_dict_dependent_t;
 
+/** One load or $INCLUDE of a dictionary file
+ *
+ */
+typedef struct {
+	fr_dlist_t		entry;			//!< Entry in the file's list of sources.
+
+	char const		*src_file;		//!< File which did the $INCLUDE.  NULL for a
+							///< top-level load.
+	int			src_line;		//!< Line of the $INCLUDE in src_file.
+} fr_dict_filename_src_t;
+
+/** Entry in the table of files associated with this dictionary
+ *
+ * Mainly used for debugging.
+ */
+typedef struct {
+	uint16_t		id;			//!< Ordinal of this file within the dictionary.
+							///< fr_dict_attr_t stores the id instead of a
+							///< pointer, which keeps the attribute struct
+							///< within one cache line. Id 0 is reserved for
+							///< "no location recorded".
+	char			*filename;		//!< Name of the file the dictionary was loaded from.
+	fr_dlist_head_t		sources;		//!< Each load or $INCLUDE of the file.
+} fr_dict_filename_t;
+
 /** Vendors and attribute names
  *
  * It's very likely that the same vendors will operate in multiple
@@ -69,9 +95,18 @@ typedef struct {
  *
  * There would also be conflicts for DHCP(v6)/RADIUS attributes etc...
  */
-struct fr_dict {
+struct fr_dict_s {
 	fr_dict_gctx_t	        *gctx;			//!< Global dictionary context this dictionary
 							///< was allocated in.
+
+	char const		*dir;			//!< where this protocol is located
+
+	fr_hash_table_t 	*filenames;		//!< Files that this dictionary was loaded from,
+							///< keyed by filename.
+
+	fr_dict_filename_t	**filename_by_id;	//!< Files indexed by id - 1, for resolving
+							///< attribute definition locations.
+
 	bool			read_only;		//!< If true, disallow modifications.
 
 	bool			in_protocol_by_name;	//!< Whether the dictionary has been inserted into the
@@ -79,7 +114,11 @@ struct fr_dict {
 	bool			in_protocol_by_num;	//!< Whether the dictionary has been inserted into the
 							//!< protocol_by_num table.
 
-	bool			autoloaded;		//!< manual vs autoload
+	bool			string_based;		//!< TACACS, etc.
+
+	bool			loading;		//!< from fr_dict_protocol_afrom_file();
+
+	bool			loaded;			//!< from fr_dict_protocol_afrom_file();
 
 	fr_hash_table_t		*vendors_by_name;	//!< Lookup vendor by name.
 	fr_hash_table_t		*vendors_by_num;	//!< Lookup vendor by PEN.
@@ -88,31 +127,39 @@ struct fr_dict {
 
 	TALLOC_CTX		*pool;			//!< Talloc memory pool to reduce allocs.
 							///< in the dictionary.
+	size_t			pool_size;		//!< Size of the talloc pool in bytes.  talloc has no
+							///< function that returns the size of a pool, so
+							///< dict_alloc() records the size.
 
 	fr_hash_table_t		*autoref;		//!< other dictionaries that we loaded via references
 
-	fr_table_num_ordered_t const *subtype_table;	//!< table of subtypes for this protocol
-	size_t			subtype_table_len;	//!< length of table of subtypes for this protocol
+	fr_dict_t const		*next;			//!< for attribute overloading
 
-	unsigned int		vsa_parent;		//!< varies with different protocols
-	int			default_type_size;	//!< for TLVs and VSAs
-	int			default_type_length;	//!< for TLVs and VSAs
-
-	dl_t			*dl;			//!< for validation
-
-	fr_dict_protocol_t const *proto;		//!< protocol-specific validation functions
-
-	fr_dict_attr_valid_func_t attr_valid;		//!< validation function for new attributes
+	unsigned int		vsa_parent;		//!< varies with different protocols.
 
 	fr_dict_attr_t		**fixups;		//!< Attributes that need fixing up.
 
 	fr_rb_tree_t		*dependents;		//!< Which files are using this dictionary.
+
+	dl_t			*dl;			//!< for validation
+
+	fr_dict_protocol_t const *proto;		//!< protocol-specific validation functions
 };
 
 struct fr_dict_gctx_s {
+	bool			free_at_exit;		//!< This gctx will be freed on exit.
+
+	bool			perm_check;		//!< Whether we should check dictionary
+							///< file permissions as they're loaded.
+
 	bool			read_only;
+
 	char			*dict_dir_default;	//!< The default location for loading dictionaries if one
 							///< wasn't provided.
+
+	size_t			pool_size_min;		//!< Smallest pool, in bytes, that dict_alloc() creates.
+							///< dict_alloc() uses pool_size_min in place of any
+							///< smaller pool= on a PROTOCOL line.
 
 	dl_loader_t		*dict_loader;		//!< for protocol validation
 
@@ -130,12 +177,28 @@ struct fr_dict_gctx_s {
 	 * protocol.
 	 */
 	fr_dict_t		*internal;
+
+	fr_dict_attr_t const	*attr_protocol_encapsulation;
 };
 
-extern fr_dict_gctx_t *dict_gctx;
+typedef enum : uint8_t {
+	FR_DICT_PROTO_RADIUS = 1,
+	FR_DICT_PROTO_DHCPv4 = 2,
+	FR_DICT_PROTO_DHCPv6 = 3,
+	FR_DICT_PROTO_ETHERNET = 4,
+	FR_DICT_PROTO_TACACS = 5,
+	FR_DICT_PROTO_VMPS = 6,
+	FR_DICT_PROTO_SNMP = 7,
+	FR_DICT_PROTO_ARP = 8,
+	FR_DICT_PROTO_TFTP = 9,
+	FR_DICT_PROTO_TLS = 10,
+	FR_DICT_PROTO_DNS = 11,
+	FR_DICT_PROTO_LDAP = 12,
+	FR_DICT_PROTO_BFD = 13,
+	FR_DICT_PROTO_CRL = 14,
+} fr_dict_protocol_id_t;
 
-extern fr_table_num_ordered_t const	date_precision_table[];
-extern size_t				date_precision_table_len;
+extern fr_dict_gctx_t *dict_gctx;
 
 bool			dict_has_dependents(fr_dict_t *dict);
 
@@ -143,11 +206,9 @@ int			dict_dependent_add(fr_dict_t *dict, char const *dependent);
 
 int			dict_dependent_remove(fr_dict_t *dict, char const *dependent);
 
-fr_dict_t		*dict_alloc(TALLOC_CTX *ctx);
+fr_dict_t		*dict_alloc(TALLOC_CTX *ctx, size_t pool_size);
 
 int			dict_dlopen(fr_dict_t *dict, char const *name);
-
-fr_dict_attr_t 		*dict_attr_alloc_null(TALLOC_CTX *ctx);
 
 /** Optional arguments for initialising/allocating attributes
  *
@@ -158,19 +219,83 @@ typedef struct {
 	fr_dict_attr_t const		*ref;		//!< This attribute is a reference to another attribute.
 } dict_attr_args_t;
 
-int			dict_attr_init(fr_dict_attr_t **da_p,
-				       fr_dict_attr_t const *parent,
-				       char const *name, int attr,
-				       fr_type_t type, dict_attr_args_t const *args);
+/** Partial initialisation functions
+ *
+ * These functions are used to initialise attributes in stages, i.e. when parsing a dictionary.
+ *
+ * The finalise function must be called to complete the initialisation.
+ *
+ * All functions must be called to fully initialise a dictionary attribute, except
+ * #dict_attr_parent_init this is not necessary for root attributes.
+ *
+ * @{
+ */
+fr_dict_attr_t 		*dict_attr_alloc_null(TALLOC_CTX *ctx, fr_dict_protocol_t const *dict);
 
-fr_dict_attr_t		*dict_attr_alloc(TALLOC_CTX *ctx,
-					 fr_dict_attr_t const *parent,
-					 char const *name, int attr,
-					 fr_type_t type, dict_attr_args_t const *args);
+int			dict_attr_type_init(fr_dict_attr_t **da_p, fr_type_t type);
 
-fr_dict_attr_t		*dict_attr_acopy(TALLOC_CTX *ctx, fr_dict_attr_t const *in, char const *new_name);
+int			dict_attr_parent_init(fr_dict_attr_t **da_p, fr_dict_attr_t const *parent);
+
+int			dict_attr_num_init(fr_dict_attr_t *da, unsigned int num);
+
+int			dict_attr_num_init_name_only(fr_dict_attr_t *da);
+
+void			dict_attr_location_init(fr_dict_t *dict, fr_dict_attr_t *da, char const *filename, int line);
+fr_dict_filename_t	*dict_filename_intern(fr_dict_t *dict, char const *filename);
+
+int			dict_attr_finalise(fr_dict_attr_t **da_p, char const *name);
+/** @} */
+
+/** Full initialisation functions
+ *
+ * These functions either initialise, or allocate and then initialise a
+ * complete dictionary attribute.
+ *
+ * The output of these functions can be added into a dictionary immediately
+ * @{
+ */
+#define 		dict_attr_init(_da_p, _parent, _name, _attr, _type, _args) \
+				       _dict_attr_init(__FILE__, __LINE__, _da_p, _parent, _name, _attr, _type, _args)
+
+int			_dict_attr_init(char const *filename, int line,
+					fr_dict_attr_t **da_p, fr_dict_attr_t const *parent,
+				        char const *name, unsigned int attr,
+				        fr_type_t type, dict_attr_args_t const *args) CC_HINT(nonnull(1));
+
+#define 		dict_attr_init_name_only(_da_p, _parent, _name, _type, _args) \
+					    _dict_attr_init_name_only(__FILE__, __LINE__, _da_p, _parent, _name,  _type, _args)
+
+int			_dict_attr_init_name_only(char const *filename, int line,
+					     fr_dict_attr_t **da_p, fr_dict_attr_t const *parent,
+					     char const *name,
+					     fr_type_t type, dict_attr_args_t const *args) CC_HINT(nonnull(1));
+
+#define			dict_attr_alloc_root(_ctx, _dict, _name, _attr, _args) \
+					     _dict_attr_alloc_root(__FILE__, __LINE__, _ctx, _dict, _name, _attr, _args)
+fr_dict_attr_t		*_dict_attr_alloc_root(char const *filename, int line,
+					       TALLOC_CTX *ctx,
+					       fr_dict_t const *dict,
+					       char const *name, int attr,
+					       dict_attr_args_t const *args) CC_HINT(nonnull(4,5));
+
+#define			dict_attr_alloc(_ctx, _parent, _name, _attr, _type, _args) \
+				_dict_attr_alloc(__FILE__, __LINE__, _ctx, _parent, _name, _attr, _type, (_args))
+fr_dict_attr_t		*_dict_attr_alloc(char const *filename, int line,
+					  TALLOC_CTX *ctx,
+					  fr_dict_attr_t const *parent,
+					  char const *name, int attr,
+					  fr_type_t type, dict_attr_args_t const *args) CC_HINT(nonnull(4));
+/** @} */
+
+fr_dict_attr_t		*dict_attr_acopy(TALLOC_CTX *ctx, fr_dict_attr_t const *parent, fr_dict_attr_t const *in, char const *new_name);
 
 int			dict_attr_acopy_children(fr_dict_t *dict, fr_dict_attr_t *dst, fr_dict_attr_t const *src);
+
+int			dict_attr_acopy_enumv(fr_dict_attr_t *dst, fr_dict_attr_t const *src);
+
+int			dict_attr_acopy_aliases(fr_dict_attr_t *dst, fr_dict_attr_t const *src);
+
+int 			dict_attr_alias_add(fr_dict_attr_t const *parent, char const *alias, fr_dict_attr_t const *ref, bool from_public);
 
 int			dict_attr_child_add(fr_dict_attr_t *parent, fr_dict_attr_t *child);
 
@@ -180,19 +305,15 @@ int			dict_vendor_add(fr_dict_t *dict, char const *name, unsigned int num);
 
 int			dict_attr_add_to_namespace(fr_dict_attr_t const *parent, fr_dict_attr_t *da) CC_HINT(nonnull);
 
-bool			dict_attr_flags_valid(fr_dict_t *dict, fr_dict_attr_t const *parent,
-					      UNUSED char const *name, int *attr, fr_type_t type,
-					      fr_dict_attr_flags_t *flags) CC_HINT(nonnull(1,2,6));
+bool			dict_attr_flags_valid(fr_dict_attr_t *da) CC_HINT(nonnull(1));
 
-bool			dict_attr_fields_valid(fr_dict_t *dict, fr_dict_attr_t const *parent,
-					       char const *name, int *attr, fr_type_t type,
-					       fr_dict_attr_flags_t *flags);
+bool			dict_attr_valid(fr_dict_attr_t *da);
 
 fr_dict_attr_t		*dict_attr_by_name(fr_dict_attr_err_t *err, fr_dict_attr_t const *parent, char const *name);
 
 fr_dict_attr_t		*dict_attr_child_by_num(fr_dict_attr_t const *parent, unsigned int attr);
 
-ssize_t			dict_by_protocol_substr(fr_dict_attr_err_t *err,
+fr_slen_t		dict_by_protocol_substr(fr_dict_attr_err_t *err,
 						fr_dict_t **out, fr_sbuff_t *name, fr_dict_t const *dict_def);
 
 fr_dict_t		*dict_by_protocol_name(char const *name);
@@ -205,6 +326,8 @@ bool			dict_attr_can_have_children(fr_dict_attr_t const *da);
 
 int			dict_attr_enum_add_name(fr_dict_attr_t *da, char const *name, fr_value_box_t const *value,
 					   bool coerce, bool replace, fr_dict_attr_t const *child_struct);
+
+int			fr_dict_afrom_file(fr_dict_t **out, char const *dir, char const *filename) CC_HINT(nonnull(1,3));
 
 #ifdef __cplusplus
 }

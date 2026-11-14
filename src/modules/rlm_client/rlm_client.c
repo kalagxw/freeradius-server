@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -26,9 +26,8 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
-#include <freeradius-devel/server/map_proc.h>
-#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/unlang/xlat_func.h>
 
 /** Client field
  *
@@ -56,7 +55,7 @@ static int _map_proc_client_get_vp(TALLOC_CTX *ctx, fr_pair_list_t *out, request
 	 *	FIXME: allow multiple entries.
 	 */
 	if (tmpl_is_attr(map->lhs)) {
-		da = tmpl_da(map->lhs);
+		da = tmpl_attr_tail_da(map->lhs);
 	} else {
 		char *attr;
 
@@ -67,7 +66,7 @@ static int _map_proc_client_get_vp(TALLOC_CTX *ctx, fr_pair_list_t *out, request
 			return -1;
 		}
 
-		da = fr_dict_attr_by_name(NULL, fr_dict_root(request->dict), attr);
+		da = fr_dict_attr_by_name(NULL, fr_dict_root(request->local_dict), attr);
 		if (!da) {
 			RWDEBUG("No such attribute '%s'", attr);
 			talloc_free(attr);
@@ -83,17 +82,16 @@ static int _map_proc_client_get_vp(TALLOC_CTX *ctx, fr_pair_list_t *out, request
 		char const *value = cf_pair_value(cp);
 
 		MEM(vp = fr_pair_afrom_da(ctx, da));
-		if (fr_pair_value_from_str(vp, value, talloc_array_length(value) - 1, '\0', false) < 0) {
+		if (fr_pair_value_from_str(vp, value, talloc_strlen(value), NULL, false) < 0) {
 			RWDEBUG("Failed parsing value \"%pV\" for attribute %s: %s", fr_box_strvalue(value),
-				tmpl_da(map->lhs)->name, fr_strerror());
+				tmpl_attr_tail_da(map->lhs)->name, fr_strerror());
 			talloc_free(vp);
 			goto error;
 		}
 
-		vp->op = map->op;
 		fr_pair_append(&head, vp);
 
-		if (map->op != T_OP_ADD) break;	/* Create multiple attribute for multiple CONF_PAIRs */
+		if (map->op != T_OP_ADD_EQ) break;	/* Create multiple attribute for multiple CONF_PAIRs */
 	}
 
 	fr_pair_list_append(out, &head);
@@ -103,37 +101,40 @@ static int _map_proc_client_get_vp(TALLOC_CTX *ctx, fr_pair_list_t *out, request
 
 /** Map multiple attributes from a client into the request
  *
- * @param[in] mod_inst		NULL.
- * @param[in] proc_inst		NULL.
+ * @param[out] p_result		Result of applying the map:
+ *				- #RLM_MODULE_NOOP no rows were returned.
+ *				- #RLM_MODULE_UPDATED if one or more #fr_pair_t were added to the #request_t.
+ *				- #RLM_MODULE_FAIL if an error occurred.
+ * @param[in] mpctx		NULL
  * @param[in] request		The current request.
  * @param[in] client_override	If NULL, use the current client, else use the client matching
  *				the ip given.
  * @param[in] maps		Head of the map list.
- * @return
- *	- #RLM_MODULE_NOOP no rows were returned.
- *	- #RLM_MODULE_UPDATED if one or more #fr_pair_t were added to the #request_t.
- *	- #RLM_MODULE_FAIL if an error occurred.
+ * @return UNLANG_ACTION_CALCULATE_RESULT
  */
-static rlm_rcode_t map_proc_client(UNUSED void *mod_inst, UNUSED void *proc_inst, request_t *request,
-				   fr_value_box_list_t *client_override, fr_map_list_t const *maps)
+static unlang_action_t map_proc_client(unlang_result_t *p_result, UNUSED map_ctx_t const *mpctx,
+				       request_t *request, fr_value_box_list_t *client_override, map_list_t const *maps)
 {
 	rlm_rcode_t		rcode = RLM_MODULE_OK;
 	map_t const		*map = NULL;
-	RADCLIENT		*client;
+	fr_client_t		*client;
 	client_get_vp_ctx_t	uctx;
 
-	if (!fr_dlist_empty(client_override)) {
+	if (!fr_value_box_list_empty(client_override)) {
 		fr_ipaddr_t	ip;
 		char const	*client_str;
-		fr_value_box_t	*client_override_head = fr_dlist_head(client_override);
+		fr_value_box_t	*client_override_head = fr_value_box_list_head(client_override);
 
 		/*
 		 *	Concat don't asprint, as this becomes a noop
 		 *	in the vast majority of cases.
 		 */
-		if (fr_value_box_list_concat(request, client_override_head, client_override, FR_TYPE_STRING, true) < 0) {
+		if (fr_value_box_list_concat_in_place(request,
+						      client_override_head, client_override, FR_TYPE_STRING,
+						      FR_VALUE_BOX_LIST_FREE, true,
+						      SIZE_MAX) < 0) {
 			REDEBUG("Failed concatenating input data");
-			return RLM_MODULE_FAIL;
+			RETURN_UNLANG_FAIL;
 		}
 		client_str = client_override_head->vb_strvalue;
 
@@ -168,13 +169,13 @@ static rlm_rcode_t map_proc_client(UNUSED void *mod_inst, UNUSED void *proc_inst
 		client = client_from_request(request);
 		if (!client) {
 			REDEBUG("No client associated with this request");
-			return RLM_MODULE_FAIL;
+			RETURN_UNLANG_FAIL;
 		}
 	}
 	uctx.cs = client->cs;
 
 	RINDENT();
-	while ((map = fr_dlist_next(maps, map))) {
+	while ((map = map_list_next(maps, map))) {
 		char	*field = NULL;
 
 		if (tmpl_aexpand(request, &field, request, map->rhs, NULL, NULL) < 0) {
@@ -208,7 +209,7 @@ static rlm_rcode_t map_proc_client(UNUSED void *mod_inst, UNUSED void *proc_inst
 	REXDENT();
 
 finish:
-	return rcode;
+	RETURN_UNLANG_RCODE(rcode);
 }
 
 static xlat_arg_parser_t const xlat_client_args[] = {
@@ -221,24 +222,24 @@ static xlat_arg_parser_t const xlat_client_args[] = {
  *
  * Example:
 @verbatim
-%(client:foo [<ipaddr>])
+%request.client(foo, [<ipaddr>])
 @endverbatim
  *
  * @ingroup xlat_functions
  */
-static xlat_action_t xlat_client(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-				 UNUSED void const *xlat_inst, UNUSED void *xlat_thread_inst,
-				 fr_value_box_list_t *in)
+static xlat_action_t xlat_client(TALLOC_CTX *ctx, fr_dcursor_t *out,
+				 UNUSED xlat_ctx_t const *xctx,
+				 request_t *request, fr_value_box_list_t *in)
 {
 	char const	*value = NULL;
 	fr_ipaddr_t	ip;
 	CONF_PAIR	*cp;
-	RADCLIENT	*client = NULL;
-	fr_value_box_t	*field = fr_dlist_head(in);
-	fr_value_box_t	*client_ip = fr_dlist_next(in, field);
+	fr_client_t	*client = NULL;
+	fr_value_box_t	*field = fr_value_box_list_head(in);
+	fr_value_box_t	*client_ip = fr_value_box_list_next(in, field);
 	fr_value_box_t	*vb;
 
-	if (!fr_box_is_null(client_ip)) {
+	if (client_ip) {
 		if (fr_inet_pton(&ip, client_ip->vb_strvalue, -1, AF_UNSPEC, false, true) < 0) {
 			RDEBUG("Invalid client IP address \"%s\"", client_ip->vb_strvalue);
 			return XLAT_ACTION_FAIL;
@@ -283,13 +284,13 @@ static xlat_action_t xlat_client(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *
 /*
  *	Find the client definition.
  */
-static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_authorize(unlang_result_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
 {
 	size_t		length;
 	char const	*value;
 	CONF_PAIR	*cp;
 	char		buffer[2048];
-	RADCLIENT	*client;
+	fr_client_t	*client;
 
 	/*
 	 *	Ensure we're only being called from the main thread,
@@ -298,31 +299,31 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNU
 	if ((request->packet->socket.inet.src_port != 0) || (!fr_pair_list_empty(&request->request_pairs)) ||
 	    (request->parent != NULL)) {
 		REDEBUG("Improper configuration");
-		RETURN_MODULE_NOOP;
+		RETURN_UNLANG_NOOP;
 	}
 
 	client = client_from_request(request);
 	if (!client || !client->cs) {
 		REDEBUG("Unknown client definition");
-		RETURN_MODULE_NOOP;
+		RETURN_UNLANG_NOOP;
 	}
 
 	cp = cf_pair_find(client->cs, "directory");
 	if (!cp) {
 		REDEBUG("No directory configuration in the client");
-		RETURN_MODULE_NOOP;
+		RETURN_UNLANG_NOOP;
 	}
 
 	value = cf_pair_value(cp);
 	if (!value) {
 		REDEBUG("No value given for the directory entry in the client");
-		RETURN_MODULE_NOOP;
+		RETURN_UNLANG_NOOP;
 	}
 
 	length = strlen(value);
 	if (length > (sizeof(buffer) - 256)) {
 		REDEBUG("Directory name too long");
-		RETURN_MODULE_NOOP;
+		RETURN_UNLANG_NOOP;
 	}
 
 	memcpy(buffer, value, length + 1);
@@ -331,10 +332,10 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNU
 	/*
 	 *	Read the buffer and generate the client.
 	 */
-	if (!client->server) RETURN_MODULE_FAIL;
+	if (!client->server) RETURN_UNLANG_FAIL;
 
 	client = client_read(buffer, client->server_cs, true);
-	if (!client) RETURN_MODULE_FAIL;
+	if (!client) RETURN_UNLANG_FAIL;
 
 	/*
 	 *	Replace the client.  This is more than a bit of a
@@ -342,46 +343,51 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNU
 	 */
 	request->client = client;
 
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
-/*
- *	Do any per-module initialization that is separate to each
- *	configured instance of the module.  e.g. set up connections
- *	to external databases, read configuration files, set up
- *	dictionary entries, etc.
- *
- *	If configuration information is given in the config section
- *	that must be referenced in later calls, store a handle to it
- *	in *instance otherwise put a null pointer there.
- */
-static int mod_bootstrap(void *instance, UNUSED CONF_SECTION *conf)
+static int mod_load(void)
 {
 	xlat_t	*xlat;
-	xlat = xlat_register(instance, "client", xlat_client, false);
-	xlat_func_args(xlat, xlat_client_args);
-	map_proc_register(instance, "client", map_proc_client, NULL, 0);
+
+	if (unlikely((xlat = xlat_func_register(NULL, "client", xlat_client, FR_TYPE_STRING)) == NULL)) return -1;
+	xlat_func_args_set(xlat, xlat_client_args);
+
+	if (unlikely((xlat = xlat_func_register(NULL, "request.client", xlat_client, FR_TYPE_STRING)) == NULL)) return -1;
+	xlat_func_args_set(xlat, xlat_client_args);
+
+	map_proc_register(NULL, NULL, "client", map_proc_client, NULL, 0, FR_VALUE_BOX_SAFE_FOR_ANY);
 
 	return 0;
 }
 
+static void mod_unload(void)
+{
+	xlat_func_unregister("client");
+	map_proc_unregister("client");
+}
 
 /*
  *	The module name should be the only globally exported symbol.
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern module_t rlm_client;
-module_t rlm_client = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "dynamic_clients",
-	.type		= RLM_TYPE_THREAD_SAFE,		/* type */
-	.bootstrap	= mod_bootstrap,
-	.methods = {
-		[MOD_AUTHORIZE]		= mod_authorize
+extern module_rlm_t rlm_client;
+module_rlm_t rlm_client = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "dynamic_clients",
+		.onload		= mod_load,
+		.unload		= mod_unload
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME(CF_IDENT_ANY, CF_IDENT_ANY), .method = mod_authorize },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

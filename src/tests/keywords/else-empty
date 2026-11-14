@@ -1,8 +1,8 @@
 #
-#  PRE: update if-empty-allow
+#  PRE: if-empty-allow
 #
 
-if (&User-Name == 'bob') {
+if (User-Name == 'bob') {
 	ok
 }
 else {

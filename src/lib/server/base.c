@@ -26,33 +26,25 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/module_rlm.h>
 
 /** Initialize src/lib/server/
  *
  *  This is just so that the callers don't need to call a million functions.
  *
- *  @param cs The root configuration section.
+ *  @param[in] cs 	 The root configuration section.
+ *  @param[in] conf_dir	 The path to the main configuration directory.
+ *  @param[in] dict	 the main dictionary, usually the internal dictionary.
  *  @return
  *	- 0 on success.
  *	- -1 on failure.
  */
-int server_init(CONF_SECTION *cs)
+int server_init(CONF_SECTION *cs, char const *conf_dir, fr_dict_t *dict)
 {
 	/*
-	 *	Load dictionary attributes used
-	 *	for requests.
+	 *	Initialize the dictionary attributes needed by the tmpl code.
 	 */
-	if (request_global_init() < 0) return -1;
-
-	/*
-	 *	Initialise the trigger rate limiting tree
-	 */
-	if (trigger_exec_init(cs) < 0) return -1;
-
-	/*
-	 *	Instantiate "permanent" paircmps
-	 */
-	if (paircmp_init() < 0) return -1;
+	if (tmpl_global_init() < 0) return -1;
 
 	/*
 	 *	Set up dictionaries and attributes for password comparisons
@@ -72,7 +64,45 @@ int server_init(CONF_SECTION *cs)
 	 *
 	 *	After this step, all dynamic attributes, xlats, etc. are defined.
 	 */
-	if (modules_bootstrap(cs) < 0) return -1;
+	if (modules_rlm_bootstrap(cs) < 0) return -1;
+
+	/*
+	 *	Now all the modules and virtual servers have been bootstrapped,
+	 *	we have all the dictionaries we're going to use in the server.
+	 *
+	 *	We can now register xlats for any protocol encoders/decoders.
+	 *
+	 *	Note: These xlats get freed automatically, so no explicit cleanup
+	 *	is required.
+	 */
+	if (xlat_protocols_register() < 0) return -1;
+
+	/*
+	 *	Load in the custom dictionary.  We do this after the listeners
+	 *	have loaded their relevant dictionaries, and after the modules
+	 *	have created any attributes they need to, so that we can define
+	 *	additional protocol attributes, and add
+	 */
+	switch (fr_dict_read(dict, conf_dir, FR_DICTIONARY_FILE)) {
+	case -1:
+		PERROR("Failed reading site-local dictionary");
+		return -1;
+	case 0:
+		DEBUG2("Including dictionary file \"%s/%s\"", conf_dir, FR_DICTIONARY_FILE);
+		break;
+
+	default:
+		break;
+	}
+
+	/*
+	 *	Initialise the trigger rate limiting tree.
+	 *
+	 *	This must be done after the modules have been bootstrapped, so that
+	 *	any xlat functions/dictionary attributes have been registered and
+	 *	before the modules actually want to use triggers or open connections.
+	 */
+	if (trigger_init(cs) < 0) return -1;
 
 	/*
 	 *	And then load the virtual servers.
@@ -82,12 +112,20 @@ int server_init(CONF_SECTION *cs)
 	/*
 	 *	Instantiate the modules
 	 */
-	if (modules_instantiate() < 0) return -1;
+	if (modules_rlm_instantiate() < 0) return -1;
 
 	/*
 	 *	Call xlat instantiation functions (after the xlats have been compiled)
 	 */
 	if (xlat_instantiate() < 0) return -1;
+
+	/*
+	 *	load the 'Net.' packet attributes.
+	 */
+	if (packet_global_init() < 0) return -1;
+
+	fr_suid_up = rad_suid_up;
+	fr_suid_down = rad_suid_down;
 
 	return 0;
 }
@@ -98,50 +136,11 @@ int server_init(CONF_SECTION *cs)
  */
 void server_free(void)
 {
-
 	/*
 	 *	Free xlat instance data, and call any detach methods
 	 */
 	xlat_instances_free();
 
-	/*
-	 *	Detach modules, connection pools, registered xlats / paircmps / maps.
-	 */
-	modules_free();
-
-	/*
-	 *	The only paircmps remaining are the ones registered by the server core.
-	 */
-	paircmp_free();
-
-	/*
-	 *	The only xlats remaining are the ones registered by the server core.
-	 */
-	xlat_free();
-
-	/*
-	 *	Free password dictionaries
-	 */
-	password_free();
-
-	/*
-	 *	The only maps remaining are the ones registered by the server core.
-	 */
-	map_proc_free();
-
-	/*
-	 *	Free information associated with the virtual servers.
-	 */
-	virtual_servers_free();
-
-	/*
-	 *	Now we're sure no more triggers can fire, free the
-	 * 	trigger tree.
-	 */
-	trigger_exec_free();
-
-	/*
-	 *	Free the internal dictionaries the request uses
-	 */
-	request_global_free();
+	fr_suid_up = fr_suid_noop;
+	fr_suid_down = fr_suid_noop;
 }

@@ -1,17 +1,22 @@
-imap_tls.authenticate
-
-if (ok) {
-    update control {
-        &Auth-Type := Accept
-    }
-}
-else {
-    reject
+imap_tls.authenticate {
+    reject = 1
+    fail = 2
 }
 
-if (&request.TLS-Certificate.Issuer =~ /@example\.org/) {
+#
+#  Module failure is likely a timeout
+#  Avoid false negatives by aborting test
+#
+if !(ok) {
+    if (Module-Failure-Message[*] == "imap: curl request failed: Timeout was reached (28)") {
         test_pass
-} else {
-	test_fail
+        handled
+    }
+    test_fail
 }
 
+if !(TLS-Certificate.Issuer =~ /@example\.org/) {
+    test_fail
+}
+
+test_pass

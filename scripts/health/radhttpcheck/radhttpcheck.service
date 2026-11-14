@@ -1,0 +1,17 @@
+[Unit]
+Description=radhttpcheck health probe translator
+After=network-online.target
+Documentation=https://github.com/FreeRADIUS/freeradius-server/blob/master/scripts/health/radhttpcheck/README.md
+
+[Service]
+Type=exec
+WorkingDirectory=/usr/local/radhttpcheck
+ExecStart=/usr/local/radhttpcheck/radhttpcheck.py
+Restart=always
+RestartSec=5
+
+# Allow binding to low ports like 80
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

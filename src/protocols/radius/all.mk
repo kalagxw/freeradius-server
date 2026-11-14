@@ -1,18 +1,1 @@
-#
-# Makefile
-#
-# Version:      $Id$
-#
-TARGET		:= libfreeradius-radius.a
-
-SOURCES		:= base.c \
-		   decode.c \
-		   encode.c \
-		   list.c \
-		   packet.c \
-		   tcp.c \
-		   abinary.c
-
-SRC_CFLAGS	:= -D_LIBRADIUS -DNO_ASSERT -I$(top_builddir)/src
-
-TGT_PREREQS	:= libfreeradius-util.a
+SUBMAKEFILES := libfreeradius-radius.mk libfreeradius-radius-bio.mk tests/all.mk

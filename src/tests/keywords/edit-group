@@ -1,0 +1,51 @@
+#
+#  PRE: edit
+#
+string test_string1
+string test_string2
+string test_string3
+
+#
+#  ALl of these edits are grouped.  So if one of them fails, all of
+#  them are rolled back.
+#
+transaction {
+	test_string1 := "foo"
+	test_string2 -= "bar" # fails, no existing test_string2
+	test_string3 := "bar"
+}
+
+if (test_string1) {
+	test_fail
+}
+
+if (test_string2) {
+	test_fail
+}
+
+if (test_string3) {
+	test_fail
+}
+
+#
+#  All of these succeed individually, so all of them should succeed.
+#
+transaction {
+	test_string1 := "foo"
+	test_string2 := "yup"
+	test_string3 := "bar"
+}
+
+if (!(test_string1 == "foo")) {
+	test_fail
+}
+
+if (!(test_string2 == "yup")) {
+	test_fail
+}
+
+if (!(test_string3 == "bar")) {
+	test_fail
+}
+
+success

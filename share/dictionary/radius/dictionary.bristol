@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -17,10 +17,11 @@ VENDOR		Bristol				4363
 #
 BEGIN-VENDOR	Bristol
 
-ATTRIBUTE	NN-Data-Rate				1	integer
-ATTRIBUTE	NN-Data-Rate-Ceiling			2	integer
+ATTRIBUTE	NN-Data-Rate				1	uint32
+ATTRIBUTE	NN-Data-Rate-Ceiling			2	uint32
 ATTRIBUTE	NN-Homenode				3	ipaddr
 ATTRIBUTE	NN-Homeservice				4	ipaddr
 ATTRIBUTE	NN-Homeservice-Name			5	string
 
 END-VENDOR	Bristol
+ALIAS		Bristol					Vendor-Specific.Bristol

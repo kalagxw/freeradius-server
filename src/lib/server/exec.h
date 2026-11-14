@@ -18,8 +18,8 @@
 /**
  * $Id$
  *
- * @file lib/server/exfile.h
- * @brief API for managing concurrent file access.
+ * @file lib/server/exec.h
+ * @brief Asynchronous exec
  *
  * @copyright 2014 The FreeRADIUS server project
  */
@@ -28,8 +28,6 @@ RCSIDH(exec_h, "$Id$")
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#include <unistd.h>
 
 #define EXEC_TIMEOUT		10	//!< Default wait time for exec calls (in seconds).
 
@@ -40,11 +38,18 @@ extern "C" {
 #include <freeradius-devel/server/request.h>
 #include <freeradius-devel/util/pair.h>
 #include <freeradius-devel/util/talloc.h>
+#include <freeradius-devel/util/timer.h>
 #include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef enum : uint8_t {
+	FR_EXEC_FAIL_NONE = 0,
+	FR_EXEC_FAIL_TOO_MUCH_DATA,
+	FR_EXEC_FAIL_TIMEOUT,
+} fr_exec_fail_t;
 
 typedef struct {
 	fr_sbuff_t			stdout_buff;	//!< Expandable buffer to store process output.
@@ -65,13 +70,13 @@ typedef struct {
 
 	int				stderr_fd;	//!< for producing error messages.
 
-	fr_event_timer_t const		*ev;		//!< for timing out the child
+	fr_timer_t			*ev;		//!< for timing out the child
 	fr_event_pid_t const   		*ev_pid;	//!< for cleaning up the process
-	bool				failed;		//!< due to exec timeout or buffer overflow
+	fr_exec_fail_t 			failed;		//!< what kind of failure
 
 	int				status;		//!< return code of the program
 
-	fr_pair_list_t			*vps;		//!< input VPs.  These are inserted into
+	fr_pair_list_t			*env_pairs;	//!< input VPs.  These are inserted into
 							///< the environment of the child as
 							///< environmental variables.
 
@@ -79,18 +84,53 @@ typedef struct {
 
 } fr_exec_state_t;
 
-void	fr_exec_cleanup(fr_exec_state_t *exec, int signal);
+/** @name Low level interface
+ *
+ * These functions are used both by fr_exec_oneshot function, and any code which
+ * needs a lower level interface for execing external programs.
+ *
+ * In the case of fr_exec_fork_wait, the caller is responsible for installing
+ * I/O handlers, cleaning up file descriptors returned, and reaping the process.
+ *
+ * @{
+ */
+ssize_t	fr_exec_value_box_list_to_argv(TALLOC_CTX *ctx,
+				       char ***argv_p, fr_value_box_list_t const *in);
 
-int	fr_exec_fork_nowait(request_t *request, fr_value_box_list_t *vb_list, fr_pair_list_t *env_pairs);
+#define FR_EXEC_SAFE_FOR ((fr_value_box_safe_for_t) fr_exec_value_box_list_to_argv)
 
-int	fr_exec_fork_wait(pid_t *pid_p, int *stdin_fd, int *stdout_fd, int *stderr_fd,
-			  request_t *request, fr_value_box_list_t *vb_list, fr_pair_list_t *env_pairs);
+char	**fr_exec_pair_to_env(request_t *request, fr_pair_list_t *env_pairs, bool env_escape);
 
-int	fr_exec_start(TALLOC_CTX *ctx, fr_exec_state_t *exec, request_t *request,
-		      fr_value_box_list_t *vb_list, fr_pair_list_t *env_pairs,
-		      bool need_stdin,
-		      bool store_stdout, TALLOC_CTX *stdout_ctx,
-		      fr_time_delta_t timeout);
+int	fr_exec_fork_nowait(fr_event_list_t *el,
+			    char **argv_in, char **env_in,
+			    bool env_inherit, bool debug);
+
+int 	fr_exec_fork_wait(pid_t *pid_p,
+			  int *stdin_fd, int *stdout_fd, int *stderr_fd,
+			  char **argv_in, char **env_usr,
+			  bool env_inherit, bool debug);
+/** @} */
+
+/** @name High level interface
+ *
+ * These functions allow easy processing of oneshot exec calls.
+ *
+ * @{
+ */
+int	fr_exec_oneshot_nowait(request_t *request,
+			       fr_value_box_list_t *args, fr_pair_list_t *env_pairs,
+			       bool env_escape, bool env_inherit);
+
+void	fr_exec_oneshot_cleanup(fr_exec_state_t *exec, int signal);
+
+int	fr_exec_oneshot(TALLOC_CTX *ctx, fr_exec_state_t *exec, request_t *request,
+		        fr_value_box_list_t *args,
+		        fr_pair_list_t *env_pairs, bool env_escape, bool env_inherit,
+		        bool need_stdin,
+		        bool store_stdout, TALLOC_CTX *stdout_ctx,
+		        fr_time_delta_t timeout);
+/** @} */
+
 #ifdef __cplusplus
 }
 #endif

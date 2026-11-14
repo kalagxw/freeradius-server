@@ -17,12 +17,31 @@ RCSID("$Id$")
 
 #define ind(mm,x)  ((mm)[(x >> 2) &(RANDSIZ-1)])
 #define rngstep(mix, a, b, mm, m, m2, r, x) \
-{ \
+do { \
 	x = *m;  \
 	a = ((a^(mix)) + *(m2++)) & 0xffffffff; \
 	*(m++) = y = (ind(mm, x) + a + b) & 0xffffffff; \
 	*(r++) = b = (ind(mm, y >> RANDSIZL) + x) & 0xffffffff; \
-}
+} while (0)
+
+#ifdef ISAAC_PLUS
+/*
+ *	https://eprint.iacr.org/2006/438.pdf
+ *
+ *	- replace shift by rotate
+ *	- replace "a+b" with "a^b"
+ *	- change "x+s" to "x+(s^a)"
+ */
+#define rotr(x, n) (((x) << n) | ((x) >> (32 - n)))
+#define ind(mm,x)  ((mm)[rotr(x, 2) & (RANDSIZ-1)])
+#define rngstep(mix, a, b, mm, m, m2, r, x) \
+do { \
+	x = *m;  \
+	a = ((a^(mix)) + *(m2++)) & 0xffffffff; \
+	*(m++) = y = (ind(mm, x) + (a ^ b)) & 0xffffffff; \
+	*(r++) = b = ((ind(mm, y >> RANDSIZL) ^ a) + x) & 0xffffffff; \
+} while (0)
+#endif
 
 void fr_isaac(fr_randctx *ctx)
 {
@@ -51,7 +70,7 @@ void fr_isaac(fr_randctx *ctx)
 
 
 #define mix(a,b,c,d,e,f,g,h) \
-{ \
+do { \
 	a ^= b << 11; d += a; b += c; \
 	b ^= c >> 2;  e += b; c += d; \
 	c ^= d << 8;  f += c; d += e; \
@@ -60,10 +79,10 @@ void fr_isaac(fr_randctx *ctx)
 	f ^= g >> 4;  a += f; g += h; \
 	g ^= h << 8;  b += g; h += a; \
 	h ^= a >> 9;  c += h; a += b; \
-}
+} while (0)
 
-/* if (flag==1), then use the contents of randrsl[] to initialize mm[]. */
-void fr_rand_init(fr_randctx *ctx, int flag)
+/* use the contents of randrsl[] to initialize mm[]. */
+void fr_isaac_init(fr_randctx *ctx)
 {
 	int		i;
 	uint32_t	a, b, c, d, e, f, g, h;
@@ -72,35 +91,36 @@ void fr_rand_init(fr_randctx *ctx, int flag)
 	ctx->randa = ctx->randb = ctx->randc = 0;
 	m = ctx->randmem;
 	r = ctx->randrsl;
-	a = b = c = d = e = f = g = h = 0x9e3779b9;  /* the golden ratio */
 
-	/* scramble it */
-	for (i = 0; i < 4; ++i) mix(a, b, c, d, e, f, g, h);
+	/*
+	 *	The golden ratio 0x9e3779b9 in each of a to h, scrambled by
+	 *	four rounds of mix().  The values are precomputed because
+	 *	mix() on constants is all known-value overflow.
+	 */
+	a = 0x1367df5a;
+	b = 0x95d90059;
+	c = 0xc3163e4b;
+	d = 0x0f421ad8;
+	e = 0xd92a4a78;
+	f = 0xa51a3c49;
+	g = 0xc4efea1b;
+	h = 0x30609119;
 
-	if (flag) {
-		/* initialize using the contents of r[] as the seed */
-		for (i = 0; i < RANDSIZ; i += 8) {
-			a += r[i    ]; b += r[i + 1]; c +=r [i + 2]; d += r[i + 3];
-			e += r[i + 4]; f += r[i + 5]; g +=r [i + 6]; h += r[i + 7];
-			mix(a, b, c, d, e, f, g, h);
-			m[i    ] = a; m[i + 1] = b; m[i + 2] = c; m[i + 3] = d;
-			m[i + 4] = e; m[i + 5] = f; m[i + 6] = g; m[i + 7] = h;
-		}
-		/* do a second pass to make all of the seed affect all of m */
-		for (i = 0; i < RANDSIZ; i += 8) {
-			a += m[i    ]; b += m[i + 1]; c += m[i + 2]; d += m[i + 3];
-			e += m[i + 4]; f += m[i + 5]; g += m[i + 6]; h += m[i + 7];
-			mix(a, b, c, d, e, f, g, h);
-			m[i    ] = a; m[i + 1] = b; m[i + 2] = c; m[i + 3] = d;
-			m[i + 4] = e; m[i + 5] = f; m[i + 6] = g; m[i + 7] = h;
-		}
-	} else {
-		for (i = 0; i < RANDSIZ; i += 8) {
-			/* fill in mm[] with messy stuff */
-			mix(a, b, c, d, e, f, g, h);
-			m[i    ] = a; m[i + 1] = b; m[i + 2] = c; m[i + 3] = d;
-			m[i + 4] = e; m[i + 5] = f; m[i + 6] = g; m[i + 7] = h;
-		}
+	/* initialize using the contents of r[] as the seed */
+	for (i = 0; i < RANDSIZ; i += 8) {
+		a += r[i    ]; b += r[i + 1]; c +=r [i + 2]; d += r[i + 3];
+		e += r[i + 4]; f += r[i + 5]; g +=r [i + 6]; h += r[i + 7];
+		mix(a, b, c, d, e, f, g, h);
+		m[i    ] = a; m[i + 1] = b; m[i + 2] = c; m[i + 3] = d;
+		m[i + 4] = e; m[i + 5] = f; m[i + 6] = g; m[i + 7] = h;
+	}
+	/* do a second pass to make all of the seed affect all of m */
+	for (i = 0; i < RANDSIZ; i += 8) {
+		a += m[i    ]; b += m[i + 1]; c += m[i + 2]; d += m[i + 3];
+		e += m[i + 4]; f += m[i + 5]; g += m[i + 6]; h += m[i + 7];
+		mix(a, b, c, d, e, f, g, h);
+		m[i    ] = a; m[i + 1] = b; m[i + 2] = c; m[i + 3] = d;
+		m[i + 4] = e; m[i + 5] = f; m[i + 6] = g; m[i + 7] = h;
 	}
 
 	fr_isaac(ctx);       /* fill in the first set of results */
@@ -123,7 +143,7 @@ int main()
 
 	for (i = 0; i < 256; ++i) ctx.randrsl[i] = (uint32_t)0;
 
-	fr_rand_init(&ctx, 1);
+	fr_isaac_init(&ctx);
 	for (i = 0; i < 2; ++i) {
 		fr_isaac(&ctx);
 		for (j = 0; j < 256; ++j) {

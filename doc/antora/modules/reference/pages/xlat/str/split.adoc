@@ -1,0 +1,30 @@
+= %str.split(<ref>, <delim>)
+
+Split an string into multiple new strings based on a delimiter.
+
+This expansion is the inverse of
+xref:xlat/str/concat.adoc[str.concat].
+
+.Return: _the list of strings_.
+
+.Example
+
+[source,unlang]
+----
+string name
+
+User-Name := "bob.toba@domain.com"
+
+name := %str.split(User-Name, '@')
+
+reply.Reply-Message := "Welcome %{name}"
+----
+
+.Output
+
+----
+Welcome bob.toba
+----
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

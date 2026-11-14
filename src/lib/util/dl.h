@@ -35,7 +35,6 @@ RCSIDH(dl_h, "$Id$")
 #include <freeradius-devel/util/talloc.h>
 #include <freeradius-devel/util/version.h>
 
-#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -115,6 +114,8 @@ int			dl_free(dl_t const *dl);
 
 char const		*dl_search_path(dl_loader_t *dl_loader) CC_HINT(nonnull);
 
+int                     dl_search_global_path_set(char const *lib_dir) CC_HINT(nonnull);
+
 int			dl_search_path_set(dl_loader_t *dl_loader, char const *lib_dir) CC_HINT(nonnull);
 
 int			dl_search_path_prepend(dl_loader_t *dl_loader, char const *lib_dir) CC_HINT(nonnull);
@@ -125,7 +126,9 @@ void			*dl_loader_uctx(dl_loader_t *dl_loader) CC_HINT(nonnull);
 
 dl_loader_t		*dl_loader_init(TALLOC_CTX *ctx, void *uctx, bool uctx_free, bool defer_symbol_init);
 
-void			dl_loader_debug(dl_loader_t *dl);
+bool			dl_loader_set_static(dl_loader_t *dl_loader, bool do_static) CC_HINT(nonnull);
+
+void			dl_loader_debug(FILE *fp, dl_loader_t *dl) CC_HINT(nonnull);
 #ifdef __cplusplus
 }
 #endif

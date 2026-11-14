@@ -45,7 +45,7 @@ Class = 0x69616D616E6F706171756576616C756569616D616E6F706171756576616C7565
 ==== CHAP Access-Request - unlang
 ```
 User-Name = "testuser"
-Chap-Password = %(chap_password:supersecret)
+Chap-Password = %chap.password(supersecret)
 Service-Type = Framed-User
 NAS-IP-Address = 127.0.0.1
 Tunnel-Password = "supersecret"
@@ -111,7 +111,7 @@ The home server should be configured to respond to all packets from the `NAS + P
 response (`Access-Accept` / `Accounting-Response`).
 
 Packet loss should be introduced on the home server.  There are various facilities in IP tables to do this,
-or `%{rand:}` and `&control.Response-Packet-Type = none` may be used on the home server to randomly prevent
+or `%rand()` and `&control.Response-Packet-Type = none` may be used on the home server to randomly prevent
 replies to requests.
 
 If delay needs to be added at a network level, a script is available https://gist.github.com/arr2036/6598137[here].
@@ -142,7 +142,7 @@ incoming RADIUS packets.
 
 Platforms:: MacOS, Linux, FreeBSD
 
-Rationale:: As there are no ACKs required this tests mesures the rate at which rlm_radius + transport can send
+Rationale:: As there are no ACKs required this tests measures the rate at which rlm_radius + transport can send
 packets. On Linux and FreeBSD we'd expect an exceptionally high packet rate in this mode as we coalesce multiple
 outbound packets and send them using single system call
 (`sendmmsg` for datagrams, and aggregated buffers + `write` for streams).
@@ -168,7 +168,7 @@ When sending datagrams on macOS no native `sendmmsg` function exists, so we expe
 
 Platforms:: Any
 
-Note:: You may need to increase `max_request_time` in radius.conf for this test.
+Note:: You may need to increase `request.timeout` in radius.conf for this test.
 
 This test verifies behaviour when no status_check is configured.
 
@@ -218,7 +218,7 @@ to it.
 
 Platforms:: Any
 
-Note:: You may need to increase `max_request_time` in radius.conf for this test.
+Note:: You may need to increase `request.timeout` in radius.conf for this test.
 
 This test verifies the behaviour when a `Status-Server` packet is configured for status checks.
 
@@ -283,7 +283,7 @@ Immediate entry into zombie state is likely incorrect and will probably change.
 
 Platforms:: Any
 
-Note:: You may need to increase `max_request_time` in radius.conf for this test.
+Note:: You may need to increase `request.timeout` in radius.conf for this test.
 
 See description for previous test.
 
@@ -380,10 +380,10 @@ You will need to use different subrequest types to produce the different packet 
 ** Verify No Message-Authenticator attribute is present
 * Send a <<CoA-Request>>
 ** Verify packet is well formed.
-** Verify Message-Authenticator attribue is present.
+** Verify Message-Authenticator attribute is present.
 * Send a <<Disconnect-Request>>
 ** Verify packet is well formed.
-** Verify Message-Authenticator attribue is present.
+** Verify Message-Authenticator attribute is present.
 
 === 3.2. Outbound packet buffer overrun
 
@@ -493,4 +493,3 @@ Platforms:: Any
 * Send <<PAP Access-Request>>s at a high rate for 30 minutes.
 ** Record memory usage every 5 minutes.
 ** Ensure memory usage stabilises within 15 minutes and does not continue to increase.
-

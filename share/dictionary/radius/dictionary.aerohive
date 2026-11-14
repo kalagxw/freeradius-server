@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -25,10 +25,6 @@ BEGIN-VENDOR	Aerohive
 
 # Beginning of HiveManager Classic VSAs
 # The following ATTRIBUTE and VALUE definitions are required.
-ATTRIBUTE	AH-HM-Admin-Group-Id			1	integer
-VALUE	AH-HM-Admin-Group-Id		Read-Only-Admin		0
-VALUE	AH-HM-Admin-Group-Id		Super-Admin		1
-VALUE	AH-HM-Admin-Group-Id		Read-Write-Admin	2
 
 # The following is an example of an admin group that you can define.
 #VALUE  AH-HM-Admin-Group-Id            Admin-Group100          100
@@ -36,26 +32,32 @@ VALUE	AH-HM-Admin-Group-Id		Read-Write-Admin	2
 # End of HiveManager Classic VSAs
 # Beginning of HiveOS VSAs
 
-ATTRIBUTE	Extreme-User-Vlan			1	integer
-ATTRIBUTE	Extreme-Libsip-Patron-Info		3	octets encrypt=2
-ATTRIBUTE	Extreme-Libsip-Action			4	integer
+ATTRIBUTE	Extreme-User-Vlan			1	uint32
+ALIAS		AH-HM-Admin-Group-Id	.Extreme-User-Vlan
+
+VALUE	AH-HM-Admin-Group-Id		Read-Only-Admin		0
+VALUE	AH-HM-Admin-Group-Id		Super-Admin		1
+VALUE	AH-HM-Admin-Group-Id		Read-Write-Admin	2
+
+ATTRIBUTE	Extreme-Libsip-Patron-Info		3	octets encrypt=Tunnel-Password
+ATTRIBUTE	Extreme-Libsip-Action			4	uint32
 ATTRIBUTE	Extreme-Libsip-Additional-Message	5	octets
-ATTRIBUTE	Extreme-User-Profile-Attribute		6	integer
+ATTRIBUTE	Extreme-User-Profile-Attribute		6	uint32
 ATTRIBUTE	Extreme-Data-Usage-Limit		7	octets
 ATTRIBUTE	Extreme-AVPair				8	string
-ATTRIBUTE	Extreme-Radius-Code			9	integer
+ATTRIBUTE	Extreme-Radius-Code			9	uint32
 ATTRIBUTE	Extreme-PPSK-Request			201	octets
 ATTRIBUTE	Extreme-PPSK-PMK			202	octets
-ATTRIBUTE	Extreme-IDM-Message			203	integer
-ATTRIBUTE	Extreme-NT-Identity			204	integer
+ATTRIBUTE	Extreme-IDM-Message			203	uint32
+ATTRIBUTE	Extreme-NT-Identity			204	uint32
 ATTRIBUTE	Extreme-User-Language			205	string
-ATTRIBUTE	Extreme-Time-Zone-Offset		207	integer
-ATTRIBUTE	Extreme-Daylight-Saving-Offset		208	integer
+ATTRIBUTE	Extreme-Time-Zone-Offset		207	uint32
+ATTRIBUTE	Extreme-Daylight-Saving-Offset		208	uint32
 ATTRIBUTE	Extreme-Client-Monitor-Session		209	octets
-ATTRIBUTE	Extreme-Client-Monitor-Problem		210	integer
+ATTRIBUTE	Extreme-Client-Monitor-Problem		210	uint32
 ATTRIBUTE	Extreme-IDM-Redirect-URL		211	string
 ATTRIBUTE	Extreme-MGT-MAC-Address			212	string
-ATTRIBUTE	Extreme-Auth-Source			213	integer
+ATTRIBUTE	Extreme-Auth-Source			213	uint32
 
 #
 # Integer Translations
@@ -75,3 +77,4 @@ VALUE	Extreme-Auth-Source		Service			1
 VALUE	Extreme-Auth-Source		Non-Service		2
 
 END-VENDOR      Aerohive
+ALIAS		Aerohive				Vendor-Specific.Aerohive

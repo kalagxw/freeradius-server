@@ -35,31 +35,29 @@
  *  worker receives and processes.
  *
  *  When a packet is decoded, it is put into the "runnable" heap, and
- *  also into the "time_order" heap. The main loop fr_worker() then
- *  pulls new requests off of this heap and runs them.  The
- *  worker_check_timeouts() function also checks the tail of the
- *  "time_order" heap, and ages out requests which have been active
- *  for "too long".
+ *  also into the timeout sublist. The main loop fr_worker() then
+ *  pulls new requests off of this heap and runs them.  The main event
+ *  loop checks the head of the timeout sublist, and forcefully terminates
+ *  any requests which have been running for too long.
  *
  *  If a request is yielded, it is placed onto the yielded list in
  *  the worker "tracking" data structure.
  *
  * @copyright 2016 Alan DeKok (aland@freeradius.org)
  */
+
 RCSID("$Id$")
 
-#define LOG_PREFIX "%s - "
-#define LOG_PREFIX_ARGS worker->name
+#define LOG_PREFIX worker->name
 #define LOG_DST worker->log
 
 #include <freeradius-devel/io/channel.h>
 #include <freeradius-devel/io/listen.h>
-#include <freeradius-devel/io/message.h>
-#include <freeradius-devel/io/time_tracking.h>
 #include <freeradius-devel/io/worker.h>
-#include <freeradius-devel/unlang/call.h>
-#include <freeradius-devel/unlang/interpret.h>
-#include <freeradius-devel/util/dlist.h>
+#include <freeradius-devel/unlang/base.h>
+#include <freeradius-devel/unlang/finally.h>
+#include <freeradius-devel/util/minmax_heap.h>
+#include <freeradius-devel/util/timer.h>
 
 #include <stdalign.h>
 
@@ -70,8 +68,20 @@ static void worker_verify(fr_worker_t *worker);
 #define WORKER_VERIFY
 #endif
 
-#define CACHE_LINE_SIZE	64
-static alignas(CACHE_LINE_SIZE) atomic_uint64_t request_number = 0;
+static _Atomic(uint64_t) request_number = 0;
+
+FR_SLAB_TYPES(request, request_t)
+FR_SLAB_FUNCS(request, request_t)
+
+typedef struct {
+	fr_worker_t		*worker;	//!< the worker that owns this channel slot,
+						///< so channel callbacks can reach back without
+						///< threading `worker` through every layer.
+	fr_channel_t		*ch;
+	fr_message_set_t	*ms;		//!< messages for this channel
+
+	fr_dlist_head_t		dlist;		//!< of requests received on this channel
+} fr_worker_channel_t;
 
 /**
  *  A worker which takes packets from a master, and processes them.
@@ -87,17 +97,21 @@ struct fr_worker_s {
 	fr_log_t const		*log;		//!< log destination
 	fr_log_lvl_t		lvl;		//!< log level
 
-	fr_atomic_queue_t	*aq_control;	//!< atomic queue for control messages sent to me
-
 	fr_control_t		*control;	//!< the control plane
 
 	fr_event_list_t		*el;		//!< our event list
 
 	int			num_channels;	//!< actual number of channels
+	int			num_closing;	//!< number of channels closing
 
 	fr_heap_t      		*runnable;	//!< current runnable requests which we've spent time processing
-	fr_heap_t		*time_order;	//!< time ordered heap of requests
+
+	fr_timer_list_t		*timeout;		//!< Track when requests timeout using a dlist.
+	fr_time_delta_t		max_request_time;	//!< maximum time a request can be processed
+
 	fr_rb_tree_t		*dedup;		//!< de-dup tree
+
+	fr_rb_tree_t		*listeners;    	//!< so we can cancel requests when a listener goes away
 
 	fr_io_stats_t		stats;		//!< input / output stats
 	fr_time_elapsed_t	cpu_time;	//!< histogram of total CPU time per request
@@ -108,167 +122,230 @@ struct fr_worker_s {
 
 	fr_time_delta_t		predicted;	//!< How long we predict a request will take to execute.
 	fr_time_tracking_t	tracking;	//!< how much time the worker has spent doing things.
-
-	bool			was_sleeping;	//!< used to suppress multiple sleep signals in a row
 	bool			exiting;	//!< are we exiting?
 
-	fr_time_t		checked_timeout; //!< when we last checked the tails of the queues
+	fr_worker_channel_t	*channel;	//!< list of channels
 
-	fr_event_timer_t const	*ev_cleanup;	//!< timer for max_request_time
-
-	fr_channel_t		**channel;	//!< list of channels
+	request_slab_list_t	*slab;		//!< slab allocator for request_t
 };
 
-static void worker_request_bootstrap(fr_worker_t *worker, fr_channel_data_t *cd, fr_time_t now);
-static void worker_send_reply(fr_worker_t *worker, request_t *request, size_t size, fr_time_t now);
-static void worker_max_request_time(UNUSED fr_event_list_t *el, UNUSED fr_time_t when, void *uctx);
-static void worker_max_request_timer(fr_worker_t *worker);
+typedef struct {
+	fr_listen_instance_t const	*listener;	//!< incoming packets
+
+	fr_rb_node_t		node;		//!< in tree of listeners
+
+	/*
+	 *	To save time, we don't care about num_elements here.  Which means that we don't
+	 *	need to cache or lookup the fr_worker_listen_t when we free a request.
+	 */
+	fr_dlist_head_t		dlist;		//!< of requests associated with this listener.
+} fr_worker_listen_t;
+
+
+static fr_cmp_ret_t worker_listener_cmp(void const *one, void const *two)
+{
+	fr_worker_listen_t const *a = one, *b = two;
+
+	return CMP(a->listener, b->listener);
+}
+
+
+static inline bool is_worker_thread(fr_worker_t const *worker)
+{
+	return (pthread_equal(pthread_self(), worker->thread_id) != 0);
+}
+
+static void worker_request_bootstrap(fr_worker_channel_t *wc, fr_channel_data_t *cd, fr_time_t now);
+static void worker_send_reply(fr_worker_t *worker, request_t *request, bool do_not_respond, fr_time_t now);
 
 /** Callback which handles a message being received on the worker side.
  *
- * @param[in] ctx the worker
  * @param[in] ch the channel to drain
  * @param[in] cd the message (if any) to start with
+ * @param[in] uctx the worker channel slot the message came in on
  */
-static void worker_recv_request(void *ctx, fr_channel_t *ch, fr_channel_data_t *cd)
+static void worker_recv_request(fr_channel_t *ch, fr_channel_data_t *cd, void *uctx)
 {
-	fr_worker_t *worker = ctx;
+	fr_worker_channel_t *wc = uctx;
+	fr_worker_t *worker = wc->worker;
 
 	worker->stats.in++;
 	DEBUG3("Received request %" PRIu64 "", worker->stats.in);
 	cd->channel.ch = ch;
-	worker_request_bootstrap(worker, cd, fr_time());
+	worker_request_bootstrap(wc, cd, fr_time());
 }
 
-static void worker_exit(fr_worker_t *worker)
+static void worker_requests_cancel(fr_worker_t *worker, fr_worker_channel_t *ch)
 {
-	worker->exiting = true;
+	fr_async_t *async = NULL;
+	int cancelled = 0;
+
+	while ((async = fr_dlist_next(&ch->dlist, async)) != NULL) {
+		if (unlang_finally_entered(async->request)) continue;
+		unlang_interpret_signal(async->request, FR_SIGNAL_CANCEL);
+		async->request->rcode = RLM_MODULE_TIMEOUT;
+		cancelled++;
+	}
+
+	DEBUG("%d requests cancelled", cancelled);
+}
+
+/** The network has opened a channel to us
+ *
+ * @param[in] ch	the new channel
+ * @param[in] reply_ms	the message set for replies on this channel
+ * @param[in] now	the current time
+ * @param[in] uctx	the worker
+ */
+static void worker_channel_open(fr_channel_t *ch, fr_message_set_t *reply_ms, UNUSED fr_time_t now, void *uctx)
+{
+	int			i;
+	bool			ok;
+	fr_worker_t		*worker = uctx;
+
+	DEBUG3("Channel open");
+
+	ok = false;
+	for (i = 0; i < worker->config.max_channels; i++) {
+		fr_assert(worker->channel[i].ch != ch);
+
+		if (worker->channel[i].ch != NULL) continue;
+
+		worker->channel[i].worker = worker;
+		worker->channel[i].ch = ch;
+		fr_dlist_init(&worker->channel[i].dlist, fr_async_t, entry);
+
+		DEBUG3("Received channel %p into array entry %d", ch, i);
+
+		worker->channel[i].ms = reply_ms;
+
+		/*
+		 *	Hand the channel a pointer to the slot rather than to
+		 *	any one field of it, so a callback holding only the
+		 *	channel reaches the message set and the request list
+		 *	alike.  Neither can be set in
+		 *	fr_worker_channel_create() because the slot has not
+		 *	been claimed at that point.
+		 */
+		fr_channel_responder_uctx_add(ch, &worker->channel[i]);
+		fr_channel_set_recv_request(ch, worker_recv_request, &worker->channel[i]);
+
+		worker->num_channels++;
+		ok = true;
+		break;
+	}
+
+	fr_cond_assert(ok);
+}
+
+/** The network is closing a channel to us
+ *
+ * @param[in] ch	the channel
+ * @param[in] now	the current time
+ * @param[in] uctx	the worker
+ */
+static void worker_channel_close(fr_channel_t *ch, UNUSED fr_time_t now, void *uctx)
+{
+	int			i;
+	unsigned int		num;
+	bool			ok;
+	fr_message_set_t	*ms;
+	fr_worker_t		*worker = uctx;
+
+	DEBUG3("Channel close");
+
+	ok = false;
 
 	/*
-	 *	Don't allow the post event to run
-	 *	any more requests.  They'll be
-	 *	signalled to stop before we exit.
-	 *
-	 *	This only has an effect in single
-	 *	threaded mode.
+	 *	Locate the signalling channel in the list
+	 *	of channels.
 	 */
-	(void)fr_event_post_delete(worker->el, fr_worker_post_event, worker);
+	for (i = 0; i < worker->config.max_channels; i++) {
+		if (!worker->channel[i].ch) continue;
+
+		if (worker->channel[i].ch != ch) continue;
+
+		worker_requests_cancel(worker, &worker->channel[i]);
+
+		ms = worker->channel[i].ms;
+
+		/*
+		 *	Should be nothing left: the network is not supposed
+		 *	to enqueue anything once it has signalled the close,
+		 *	which is what the assert above claims.  Hand back
+		 *	whatever we find anyway, so the messages do not
+		 *	strand the ring buffer they came from, and complain,
+		 *	because these produce no reply and so the network
+		 *	never decrements its outstanding count for them.
+		 */
+		num = fr_channel_responder_discard(ch);
+		if (num > 0) PWARN("Discarded %u request(s) still queued at close", num);
+
+		fr_assert(ms != NULL);
+		fr_message_set_gc(ms);
+
+		fr_assert(worker->num_channels > 0);
+
+		worker->num_channels--;
+		worker->num_closing++;
+		ok = true;
+		break;
+	}
+
+	fr_cond_assert(ok);
+
+	/*
+	 *	Our last input channel closed,
+	 *	time to die.
+	 */
+	if (worker->num_channels == 0) fr_worker_shutting_down(worker);
 }
 
-/** Handle a control plane message sent to the worker via a channel
+/** Channel events the worker handles
+ */
+static fr_channel_callbacks_t const worker_channel_callbacks = {
+	.open		= worker_channel_open,
+	.close		= worker_channel_close
+};
+
+static int fr_worker_listen_cancel_self(fr_worker_t *worker, fr_listen_instance_t const *li)
+{
+	fr_worker_listen_t *wl;
+	request_t *request;
+
+	fr_rb_find((void **)&wl, worker->listeners, &(fr_worker_listen_t) { .listener = li });
+	if (!wl) return -1;
+
+	while ((request = fr_dlist_pop_head(&wl->dlist)) != NULL) {
+		RERROR("Cancelling request due to socket being closed");
+		unlang_interpret_signal(request, FR_SIGNAL_CANCEL);
+	}
+
+	(void) fr_rb_delete(worker->listeners, wl);
+	talloc_free(wl);
+
+	return 0;
+}
+
+
+/** A socket is going away, so clean up any requests which use this socket.
  *
- * @param[in] ctx	the worker
  * @param[in] data	the message
  * @param[in] data_size	size of the data
  * @param[in] now	the current time
+ * @param[in] uctx	the worker
  */
-static void worker_channel_callback(void *ctx, void const *data, size_t data_size, fr_time_t now)
+static void worker_listen_cancel_callback(void const *data, NDEBUG_UNUSED size_t data_size, UNUSED fr_time_t now, void *uctx)
 {
-	int			i;
-	bool			ok, was_sleeping;
-	fr_channel_t		*ch;
-	fr_message_set_t	*ms;
-	fr_channel_event_t	ce;
-	fr_worker_t		*worker = ctx;
+	fr_listen_instance_t const	*li;
+	fr_worker_t		*worker = uctx;
 
-	was_sleeping = worker->was_sleeping;
-	worker->was_sleeping = false;
+	fr_assert(data_size == sizeof(li));
 
-	/*
-	 *	We were woken up by a signal to do something.  We're
-	 *	not sleeping.
-	 */
-	ce = fr_channel_service_message(now, &ch, data, data_size);
-	DEBUG3("Channel %s",
-	       fr_table_str_by_value(channel_signals, ce, "<INVALID>"));
-	switch (ce) {
-	case FR_CHANNEL_ERROR:
-		return;
+	memcpy(&li, data, sizeof(li));
 
-	case FR_CHANNEL_EMPTY:
-		return;
-
-	case FR_CHANNEL_NOOP:
-		return;
-
-	case FR_CHANNEL_DATA_READY_REQUESTOR:
-		fr_assert(0 == 1);
-		break;
-
-	case FR_CHANNEL_DATA_READY_RESPONDER:
-		fr_assert(ch != NULL);
-
-		if (!fr_channel_recv_request(ch)) {
-			worker->was_sleeping = was_sleeping;
-
-		} else while (fr_channel_recv_request(ch));
-		break;
-
-	case FR_CHANNEL_OPEN:
-		fr_assert(ch != NULL);
-
-		ok = false;
-		for (i = 0; i < worker->config.max_channels; i++) {
-			fr_assert(worker->channel[i] != ch);
-
-			if (worker->channel[i] != NULL) continue;
-
-			worker->channel[i] = ch;
-			DEBUG3("Received channel %p into array entry %d", ch, i);
-
-			ms = fr_message_set_create(worker, worker->config.message_set_size,
-						   sizeof(fr_channel_data_t),
-						   worker->config.ring_buffer_size);
-			fr_assert(ms != NULL);
-			fr_channel_responder_uctx_add(ch, ms);
-
-			worker->num_channels++;
-			ok = true;
-			break;
-		}
-
-		fr_cond_assert(ok);
-		break;
-
-	case FR_CHANNEL_CLOSE:
-		fr_assert(ch != NULL);
-
-		ok = false;
-
-		/*
-		 *	Locate the signalling channel in the list
-		 *	of channels.
-		 */
-		for (i = 0; i < worker->config.max_channels; i++) {
-			if (!worker->channel[i]) continue;
-
-			if (worker->channel[i] != ch) continue;
-
-			ms = fr_channel_responder_uctx_get(ch);
-
-			fr_channel_responder_ack_close(ch);
-			fr_assert(ms != NULL);
-			fr_message_set_gc(ms);
-			talloc_free(ms);
-
-			worker->channel[i] = NULL;
-			fr_assert(worker->num_channels > 0);
-			worker->num_channels--;
-			ok = true;
-			break;
-		}
-
-		fr_cond_assert(ok);
-
-		/*
-		 *	Our last input channel closed,
-		 *	time to die.
-		 */
-		if (worker->num_channels == 0) worker_exit(worker);
-		break;
-	}
+	(void) fr_worker_listen_cancel_self(worker, li);
 }
-
 
 /** Send a NAK to the network thread
  *
@@ -285,8 +362,9 @@ static void worker_nak(fr_worker_t *worker, fr_channel_data_t *cd, fr_time_t now
 	size_t			size;
 	fr_channel_data_t	*reply;
 	fr_channel_t		*ch;
+	fr_worker_channel_t	*wc;
 	fr_message_set_t	*ms;
-	fr_listen_t		*listen;
+	fr_listen_instance_t	*li;
 
 	worker->num_naks++;
 
@@ -294,7 +372,7 @@ static void worker_nak(fr_worker_t *worker, fr_channel_data_t *cd, fr_time_t now
 	 *	Cache the outbound channel.  We'll need it later.
 	 */
 	ch = cd->channel.ch;
-	listen = cd->listen;
+	li = cd->inst;
 
 	/*
 	 *	If the channel has been closed, but we haven't
@@ -308,39 +386,39 @@ static void worker_nak(fr_worker_t *worker, fr_channel_data_t *cd, fr_time_t now
 		return;
 	}
 
-	ms = fr_channel_responder_uctx_get(ch);
+	wc = fr_channel_responder_uctx_get(ch);
+	ms = wc->ms;
 	fr_assert(ms != NULL);
 
-	size = listen->app_io->default_reply_size;
-	if (!size) size = listen->app_io->default_message_size;
+	size = li->listen->app_io->default_reply_size;
+	if (!size) size = li->listen->default_message_size;
 
 	/*
 	 *	Allocate a default message size.
 	 */
-	reply = (fr_channel_data_t *) fr_message_reserve(ms, size);
-	fr_assert(reply != NULL);
+	MEM(reply = (fr_channel_data_t *) fr_message_and_data_reserve(ms, size));
 
 	/*
 	 *	Encode a NAK
 	 */
-	if (listen->app_io->nak) {
-		size = listen->app_io->nak(listen, cd->packet_ctx, cd->m.data,
+	if (li->listen->app_io->nak) {
+		size = li->listen->app_io->nak(li, cd->packet_ctx, cd->m.data,
 					   cd->m.data_size, reply->m.data, reply->m.rb_size);
 	} else {
 		size = 1;	/* rely on them to figure it the heck out */
 	}
 
-	(void) fr_message_alloc(ms, &reply->m, size);
+	(void) fr_message_and_data_commit(ms, &reply->m, size);
 
 	/*
 	 *	Fill in the NAK.
 	 */
 	reply->m.when = now;
 	reply->reply.cpu_time = worker->tracking.running_total;
-	reply->reply.processing_time = 10; /* @todo - set to something better? */
+	reply->reply.processing_time = fr_time_delta_from_msec(1); /* @todo - set to something better? */
 	reply->reply.request_time = cd->request.recv_time;
 
-	reply->listen = cd->listen;
+	reply->inst = cd->inst;
 	reply->packet_ctx = cd->packet_ctx;
 
 	/*
@@ -361,26 +439,25 @@ static void worker_nak(fr_worker_t *worker, fr_channel_data_t *cd, fr_time_t now
 /** Signal the unlang interpreter that it needs to stop running the request
  *
  * Signalling is a synchronous operation.  Whatever I/O requests the request
- * is currently performing are immediately cancelled, and all the frames are
- * popped off the unlang stack.
+ * is currently performing are signalled to be cancelled.  Depending on the
+ * specific back end, the actual cancellation may be asynchronously handled
+ * by the trunk code.
  *
  * Modules and unlang keywords explicitly register signal handlers to deal
  * with their yield points being cancelled/interrupted via this function.
  *
- * The caller should assume the request is no longer viable after calling
- * this function.
+ * Following this, the request still needs to be run through the interpreter
+ * to tidy up and potentially run a `finally` section.
  *
- * @param[in] request_p	Pointer to the request to cancel.
- *			Will be set to NULL.
+ * @param[in] request	request to cancel.  The request may still run to completion.
  */
-static void worker_stop_request(request_t **request_p)
+static void worker_stop_request(request_t *request)
 {
 	/*
 	 *	Also marks the request as done and runs
 	 *	the internal/external callbacs.
 	 */
-	unlang_interpret_signal(*request_p, FR_SIGNAL_CANCEL);
-	*request_p = NULL;
+	unlang_interpret_signal(request, FR_SIGNAL_CANCEL);
 }
 
 /** Enforce max_request_time
@@ -389,127 +466,95 @@ static void worker_stop_request(request_t **request_p)
  * thread more than max_request_time seconds ago.  In the interest of not adding a
  * timer for every packet, the requests are given a 1 second leeway.
  *
- * @param[in] el	the worker's event list
+ * @param[in] tl	the worker's timer list.
  * @param[in] when	the current time
- * @param[in] uctx	the fr_worker_t.
+ * @param[in] uctx	the request_t timing out.
  */
-static void worker_max_request_time(UNUSED fr_event_list_t *el, UNUSED fr_time_t when, void *uctx)
+static void _worker_request_timeout(UNUSED fr_timer_list_t *tl, UNUSED fr_time_t when, void *uctx)
 {
-	fr_time_t	now = fr_time();
-	request_t	*request;
-	fr_worker_t	*worker = talloc_get_type_abort(uctx, fr_worker_t);
+	request_t	*request = talloc_get_type_abort(uctx, request_t);
 
 	/*
-	 *	Look at the oldest requests, and see if they need to
-	 *	be deleted.
+	 *	Waiting too long, delete it.
 	 */
-	while ((request = fr_heap_peek_tail(worker->time_order)) != NULL) {
-		fr_time_t cleanup;
-
-		REQUEST_VERIFY(request);
-
-		cleanup = request->async->recv_time;
-		cleanup += worker->config.max_request_time;
-		if (cleanup > now) break;
-
-		/*
-		 *	Waiting too long, delete it.
-		 */
-		REDEBUG("Request has reached max_request_time - signalling it to stop");
-		worker_stop_request(&request);
-	}
+	REDEBUG("Request has reached max_request_time - signalling it to stop");
+	worker_stop_request(request);
 
 	/*
-	 *	Reset the max request timer.
+	 *	This ensures the finally section can run timeout specific policies
 	 */
-	worker_max_request_timer(worker);
+	request->rcode = RLM_MODULE_TIMEOUT;
 }
 
-/** See when we next need to service the time_order heap for "too old" packets
- *
- * Inserts a timer into the event list will will trigger when the packet that
- * was received longest ago, would be older than max_request_time.
- */
-static void worker_max_request_timer(fr_worker_t *worker)
-{
-	fr_time_t	cleanup;
-	request_t	*request;
-
-	/*
-	 *	No more requests, delete the timer.
-	 */
-	request = fr_heap_peek_tail(worker->time_order);
-	if (!request) return;
-
-	cleanup = request->async->recv_time;
-	cleanup += worker->config.max_request_time;
-
-	DEBUG2("Resetting cleanup timer to +%pV", fr_box_time_delta(worker->config.max_request_time));
-	if (fr_event_timer_at(worker, worker->el, &worker->ev_cleanup,
-			      cleanup, worker_max_request_time, worker) < 0) {
-		ERROR("Failed inserting max_request_time timer");
-	}
-}
 
 /** Start time tracking for a request, and mark it as runnable.
  *
  */
-static void worker_request_time_tracking_start(fr_worker_t *worker, request_t *request, fr_time_t now)
+static int worker_request_time_tracking_start(fr_worker_t *worker, request_t *request, fr_time_t now)
 {
 	/*
 	 *	New requests are inserted into the time order heap in
 	 *	strict time priority.  Once they are in the list, they
 	 *	are only removed when the request is done / free'd.
 	 */
-	fr_assert(!fr_heap_entry_inserted(request->time_order_id));
-	(void) fr_heap_insert(worker->time_order, request);
+	fr_assert(!fr_timer_armed(request->timeout));
+
+	if (unlikely(fr_timer_in(request, worker->timeout, &request->timeout, worker->config.max_request_time,
+				 true, _worker_request_timeout, request) < 0)) {
+		RERROR("Failed to set request timeout timer");
+		return -1;
+	}
 
 	/*
 	 *	Bootstrap the async state machine with the initial
 	 *	state of the request.
 	 */
+	RDEBUG3("Time tracking started in yielded state");
 	fr_time_tracking_start(&worker->tracking, &request->async->tracking, now);
 	fr_time_tracking_yield(&request->async->tracking, now);
 	worker->num_active++;
 
-	fr_assert(!fr_heap_entry_inserted(request->runnable_id));
-	(void) fr_heap_insert(worker->runnable, request);
+	fr_assert(!fr_heap_entry_inserted(request->runnable));
+	(void) fr_heap_insert(&worker->runnable, request);
 
-	if (!worker->ev_cleanup) worker_max_request_timer(worker);
+	return 0;
 }
 
 static void worker_request_time_tracking_end(fr_worker_t *worker, request_t *request, fr_time_t now)
 {
+	RDEBUG3("Time tracking ended");
 	fr_time_tracking_end(&worker->predicted, &request->async->tracking, now);
 	fr_assert(worker->num_active > 0);
 	worker->num_active--;
 
-	if (fr_heap_entry_inserted(request->time_order_id)) (void) fr_heap_extract(worker->time_order, request);
+	TALLOC_FREE(request->timeout);	/* Disarm the reques timer */
 }
 
 /** Send a response packet to the network side
  *
  * @param[in] worker		This worker.
  * @param[in] request		we're sending a reply for.
- * @param[in] size		The maximum size of the reply data
+ * @param[in] send_reply	whether the network side sends a reply
  * @param[in] now		The current time
  */
-static void worker_send_reply(fr_worker_t *worker, request_t *request, size_t size, fr_time_t now)
+static void worker_send_reply(fr_worker_t *worker, request_t *request, bool send_reply, fr_time_t now)
 {
 	fr_channel_data_t *reply;
 	fr_channel_t *ch;
+	fr_worker_channel_t *wc;
 	fr_message_set_t *ms;
+	size_t size = 1;
 
 	REQUEST_VERIFY(request);
 
 	/*
 	 *	If we're sending a reply, then it's no longer runnable.
 	 */
-	fr_assert(!fr_heap_entry_inserted(request->runnable_id));
+	fr_assert(!fr_heap_entry_inserted(request->runnable));
 
-	if (!size) {
-		size = request->async->listen->app_io->default_reply_size;
-		if (!size) size = request->async->listen->app_io->default_message_size;
+	if (send_reply) {
+		size = request->async->inst->listen->app_io->default_reply_size;
+		if (!size) size = request->async->inst->listen->default_message_size;
 	}
 
 	/*
@@ -529,25 +574,26 @@ static void worker_send_reply(fr_worker_t *worker, request_t *request, size_t si
 		return;
 	}
 
-	ms = fr_channel_responder_uctx_get(ch);
+	wc = fr_channel_responder_uctx_get(ch);
+	ms = wc->ms;
 	fr_assert(ms != NULL);
 
-	reply = (fr_channel_data_t *) fr_message_reserve(ms, size);
+	reply = (fr_channel_data_t *) fr_message_and_data_reserve(ms, size);
 	fr_assert(reply != NULL);
 
 	/*
 	 *	Encode it, if required.
 	 */
-	if (size) {
+	if (send_reply) {
 		ssize_t slen = 0;
-		fr_listen_t const *listen = request->async->listen;
+		fr_listen_instance_t const *li = request->async->inst;
 
-		if (listen->app->encode) {
-			slen = listen->app->encode(listen->app_instance, request,
-						   reply->m.data, reply->m.rb_size);
-		} else if (listen->app_io->encode) {
-			slen = listen->app_io->encode(listen->app_io_instance, request,
+		if (li->listen->app_io->encode) {
+			slen = li->listen->app_io->encode(li->listen->app_io_instance, request,
 						      reply->m.data, reply->m.rb_size);
+		} else if (li->listen->app->encode) {
+			slen = li->listen->app->encode(li->listen->app_instance, request,
+						   reply->m.data, reply->m.rb_size);
 		}
 		if (slen < 0) {
 			RPERROR("Failed encoding request");
@@ -561,7 +607,9 @@ static void worker_send_reply(fr_worker_t *worker, request_t *request, size_t si
 		 *	This will ALWAYS return the same message as we put in.
 		 */
 		fr_assert((size_t) slen <= reply->m.rb_size);
-		(void) fr_message_alloc(ms, &reply->m, slen);
+		(void) fr_message_and_data_commit(ms, &reply->m, slen);
+	} else {
+		(void) fr_message_and_data_commit(ms, &reply->m, 0);
 	}
 
 	/*
@@ -574,13 +622,13 @@ static void worker_send_reply(fr_worker_t *worker, request_t *request, size_t si
 	reply->reply.processing_time = request->async->tracking.running_total;
 	reply->reply.request_time = request->async->recv_time;
 
-	reply->listen = request->async->listen;
+	reply->inst = request->async->inst;
 	reply->packet_ctx = request->async->packet_ctx;
 
 	/*
 	 *	Update the various timers.
 	 */
-	fr_time_elapsed_update(&worker->cpu_time, now, now + reply->reply.processing_time);
+	fr_time_elapsed_update(&worker->cpu_time, now, fr_time_add(now, reply->reply.processing_time));
 	fr_time_elapsed_update(&worker->wall_clock, reply->reply.request_time, now);
 
 	RDEBUG("Finished request");
@@ -601,15 +649,16 @@ static void worker_send_reply(fr_worker_t *worker, request_t *request, size_t si
 
 	worker->stats.out++;
 
-	fr_assert(!fr_heap_entry_inserted(request->time_order_id));
-	fr_assert(!fr_heap_entry_inserted(request->runnable_id));
+	fr_assert(!fr_timer_armed(request->timeout));
+	fr_assert(!fr_heap_entry_inserted(request->runnable));
+
+	fr_dlist_entry_unlink(&request->listen_entry);
 
 #ifndef NDEBUG
 	request->async->el = NULL;
-	request->async->process = NULL;
 	request->async->channel = NULL;
 	request->async->packet_ctx = NULL;
-	request->async->listen = NULL;
+	request->async->inst = NULL;
 #endif
 }
 
@@ -646,36 +695,80 @@ void worker_request_init(fr_worker_t *worker, request_t *request, fr_time_t now)
 	 *	For internal requests request->packet
 	 *	and request->reply are already populated.
 	 */
-	if (!request->packet) MEM(request->packet = fr_radius_packet_alloc(request, false));
-	if (!request->reply) MEM(request->reply = fr_radius_packet_alloc(request, false));
+	if (!request->packet) MEM(request->packet = fr_packet_alloc(request, false));
+	if (!request->reply) MEM(request->reply = fr_packet_alloc(request, false));
 
 	request->packet->timestamp = now;
 	request->async = talloc_zero(request, fr_async_t);
+	request->async->request = request;
 	request->async->recv_time = now;
 	request->async->el = worker->el;
+	fr_dlist_entry_init(&request->async->entry);
 }
 
 static inline CC_HINT(always_inline)
 void worker_request_name_number(request_t *request)
 {
 	request->number = atomic_fetch_add_explicit(&request_number, 1, memory_order_seq_cst);
-	if (request->name) talloc_free(UNCONST(char *, request->name));
+	if (request->name) talloc_const_free(request->name);
 	request->name = itoa_internal(request, request->number);
 }
 
-static void worker_request_bootstrap(fr_worker_t *worker, fr_channel_data_t *cd, fr_time_t now)
+static inline CC_HINT(always_inline)
+uint64_t worker_num_requests(fr_worker_t *worker)
 {
-	bool			is_dup;
+	return fr_timer_list_num_events(worker->timeout);
+}
+
+static int _worker_request_deinit(request_t *request, UNUSED void *uctx)
+{
+	return request_slab_deinit(request);
+}
+
+static void worker_request_bootstrap(fr_worker_channel_t *wc, fr_channel_data_t *cd, fr_time_t now)
+{
+	fr_worker_t		*worker = wc->worker;
 	int			ret = -1;
 	request_t		*request;
-	TALLOC_CTX		*ctx;
-	fr_listen_t const	*listen;
+	fr_listen_instance_t	*li = cd->inst;
 
-	if (fr_heap_num_elements(worker->time_order) >= (uint32_t) worker->config.max_requests) goto nak;
+	if (worker_num_requests(worker) >= (uint64_t) worker->config.max_requests) {
+		RATE_LIMIT_GLOBAL(ERROR, "Worker at max requests");
+		goto nak;
+	}
 
-	ctx = request = request_alloc_external(NULL, NULL);
-	if (!request) goto nak;
+	/*
+	 *	Receive a message to the worker queue, and decode it
+	 *	to a request.
+	 */
+	fr_assert(li != NULL);
 
+	request = request_slab_reserve(worker->slab);
+	if (!request) {
+		RATE_LIMIT_GLOBAL(ERROR, "Worker failed allocating new request");
+		goto nak;
+	}
+	/*
+	 *	Ensures that both the deinit function runs AND
+	 *	the request is returned to the slab if something
+	 *	calls talloc_free() on it.
+	 */
+	request_slab_element_set_destructor(request, _worker_request_deinit, worker);
+
+	/*
+	 *	Have to initialise the request manually because namspace
+	 *	changes based on the listener that allocated it.
+	 */
+	if (request_init(request, REQUEST_TYPE_EXTERNAL,
+			 (&(request_init_args_t){ .namespace = li->listen->dict })) < 0) {
+		request_slab_release(request);
+		goto nak;
+	}
+
+	/*
+	 *	Do normal worker init that's shared between internal
+	 *	and external requests.
+	 */
 	worker_request_init(worker, request, now);
 	worker_request_name_number(request);
 
@@ -687,36 +780,34 @@ static void worker_request_bootstrap(fr_worker_t *worker, fr_channel_data_t *cd,
 	request->packet->timestamp = cd->request.recv_time; /* Legacy - Remove once everything looks at request->async */
 
 	/*
-	 *	Receive a message to the worker queue, and decode it
-	 *	to a request.
-	 */
-	fr_assert(cd->listen != NULL);
-
-	/*
 	 *	Update the transport-specific fields.
 	 */
 	request->async->channel = cd->channel.ch;
 
 	request->async->recv_time = cd->request.recv_time;
 
-	request->async->listen = cd->listen;
+	request->async->inst = li;
 	request->async->packet_ctx = cd->packet_ctx;
-	listen = request->async->listen;
+	request->priority = cd->priority;
 
 	/*
 	 *	Now that the "request" structure has been initialized, go decode the packet.
 	 *
 	 *	Note that this also sets the "async process" function.
 	 */
-	if (listen->app->decode) {
-		ret = listen->app->decode(listen->app_instance, request, cd->m.data, cd->m.data_size);
-	} else if (listen->app_io->decode) {
-		ret = listen->app_io->decode(listen->app_io_instance, request, cd->m.data, cd->m.data_size);
+	if (li->listen->app->decode) {
+		ret = li->listen->app->decode(li->listen->app_instance, request, cd->m.data, cd->m.data_size);
+	} else if (li->listen->app_io->decode) {
+		ret = li->listen->app_io->decode(li->listen->app_io_instance, request, cd->m.data,
+						     cd->m.data_size);
 	}
 
 	if (ret < 0) {
-		talloc_free(ctx);
-nak:
+	fail:
+		fr_assert(talloc_parent(request->stack) == request);
+		request_slab_release(request);
+
+	nak:
 		worker_nak(worker, cd, now);
 		return;
 	}
@@ -724,41 +815,24 @@ nak:
 	/*
 	 *	Set the entry point for this virtual server.
 	 */
-	if (unlang_call_push(request, cd->listen->server_cs, UNLANG_TOP_FRAME) < 0) {
+	if (unlang_call_push(NULL, request, cd->inst->listen->server_cs, UNLANG_TOP_FRAME) < 0) {
 		RERROR("Protocol failed to set 'process' function");
-		worker_nak(worker, cd, now);
-		return;
+		goto fail;
 	}
-
-	/*
-	 *	We're done with this message.
-	 */
-	is_dup = cd->request.is_dup;
-	fr_message_done(&cd->m);
 
 	/*
 	 *	Look for conflicting / duplicate packets, but only if
 	 *	requested to do so.
 	 */
-	if (request->async->listen->track_duplicates) {
+	if (request->async->inst->listen->track_duplicates) {
 		request_t *old;
 
-		old = fr_rb_find(worker->dedup, request);
+		fr_rb_find((void **)&old, worker->dedup, request);
 		if (!old) {
-			/*
-			 *	Ignore duplicate packets where we've
-			 *	already sent the reply.
-			 */
-			if (is_dup) {
-				RDEBUG("Got duplicate packet notice after we had sent a reply - ignoring");
-				fr_channel_null_reply(request->async->channel);
-				talloc_free(request);
-				return;
-			}
 			goto insert_new;
 		}
 
-		fr_assert(old->async->listen == request->async->listen);
+		fr_assert(old->async->inst == request->async->inst);
 		fr_assert(old->async->channel == request->async->channel);
 
 		/*
@@ -778,11 +852,11 @@ nak:
 		 *	@todo - fix the channel code to do queue
 		 *	depth, and not sequence / ack.
 		 */
-		if (old->async->recv_time == request->async->recv_time) {
+		if (fr_time_eq(old->async->recv_time, request->async->recv_time)) {
 			RWARN("Discarding duplicate of request (%"PRIu64")", old->number);
 
 			fr_channel_null_reply(request->async->channel);
-			talloc_free(request);
+			request_slab_release(request);
 
 			/*
 			 *	Signal there's a dup, and ignore the
@@ -797,6 +871,8 @@ nak:
 			 */
 			unlang_interpret_signal(old, FR_SIGNAL_DUP);
 			worker->stats.dup++;
+
+			fr_message_done(&cd->m);
 			return;
 		}
 
@@ -806,111 +882,101 @@ nak:
 		 */
 		RWARN("Got conflicting packet for request (%" PRIu64 "), telling old request to stop", old->number);
 
-		worker_stop_request(&old);
+		worker_stop_request(old);
 		worker->stats.dropped++;
+		(void) fr_rb_remove(NULL, worker->dedup, old); /* remove, but do NOT free it */
 
 	insert_new:
 		(void) fr_rb_insert(worker->dedup, request);
 	}
 
-	worker_request_time_tracking_start(worker, request, now);
+	if (worker_request_time_tracking_start(worker, request, now) < 0) {
+		if (request->async->inst->listen->track_duplicates) (void) fr_rb_remove(NULL, worker->dedup, request);
+		goto fail;
+	}
+
+	/*
+	 *	We're done with this message.
+	 */
+	fr_message_done(&cd->m);
+
+	{
+		fr_worker_listen_t *wl;
+
+		fr_rb_find((void **)&wl, worker->listeners, &(fr_worker_listen_t) { .listener = li });
+		if (!wl) {
+			MEM(wl = talloc_zero(worker, fr_worker_listen_t));
+			fr_dlist_init(&wl->dlist, request_t, listen_entry);
+			wl->listener = li;
+
+			(void) fr_rb_insert(worker->listeners, wl);
+		}
+
+		fr_dlist_insert_tail(&wl->dlist, request);
+	}
+
+	/*
+	 *	Track this request against the channel it came in on so
+	 *	worker_requests_cancel() has something to walk when the
+	 *	network signals CHANNEL_CLOSE.
+	 */
+	fr_dlist_insert_tail(&wc->dlist, request->async);
 }
 
 /**
  *  Track a request_t in the "runnable" heap.
+ *  Higher priorities take precedence, followed by lower sequence numbers
  */
-static int8_t worker_runnable_cmp(void const *one, void const *two)
+static fr_cmp_ret_t worker_runnable_cmp(void const *one, void const *two)
 {
 	request_t const *a = one, *b = two;
 	int ret;
 
-	ret = CMP(a->async->priority, b->async->priority);
+	/*
+	 *	Prefer higher priority packets.
+	 */
+	ret = CMP_PREFER_LARGER(a->priority, b->priority);
 	if (ret != 0) return ret;
 
-	ret = CMP(a->async->sequence, b->async->sequence);
+	/*
+	 *	Prefer packets which are further along in their processing sequence.
+	 */
+	ret = CMP_PREFER_LARGER(a->sequence, b->sequence);
 	if (ret != 0) return ret;
 
-	return CMP(a->async->recv_time, b->async->recv_time);
-}
-
-/**
- *  Track a request_t in the "time_order" heap.
- */
-static int8_t worker_time_order_cmp(void const *one, void const *two)
-{
-	request_t const *a = one, *b = two;
-
-	return CMP(a->async->recv_time, b->async->recv_time);
+	/*
+	 *	Smaller timestamp (i.e. earlier) is more important.
+	 */
+	return fr_time_cmp(a->async->recv_time, b->async->recv_time);
 }
 
 /**
  *  Track a request_t in the "dedup" tree
  */
-static int8_t worker_dedup_cmp(void const *one, void const *two)
+static fr_cmp_ret_t worker_dedup_cmp(void const *one, void const *two)
 {
 	int ret;
 	request_t const *a = one, *b = two;
 
-	ret = CMP(a->async->listen, b->async->listen);
+	ret = CMP(a->async->inst, b->async->inst);
 	if (ret) return ret;
 
 	return CMP(a->async->packet_ctx, b->async->packet_ctx);
 }
 
-/** Destroy a worker
- *
- * The input channels are signaled, and local messages are cleaned up.
- *
- * This should be called to _EXPLICITLY_ destroy a worker, when some fatal
- * error has occurred on the worker side, and we need to destroy it.
- *
- * We signal all pending requests in the backlog to stop, and tell the
- * network side that it should not send us any more requests.
- *
- * @param[in] worker the worker to destroy.
+
+/** Tidy up a worker on normal exit
  */
-void fr_worker_destroy(fr_worker_t *worker)
+void fr_worker_exit(fr_worker_t *worker)
 {
-	int i, count;
-	request_t *request;
+	fr_worker_shutting_down(worker);
 
-//	WORKER_VERIFY;
-
-	/*
-	 *	Stop any new requests running with this interpreter
-	 */
 	unlang_interpret_set_thread_default(NULL);
 
-	/*
-	 *	Destroy all of the active requests.  These are ones
-	 *	which are still waiting for timers or file descriptor
-	 *	events.
-	 */
-	count = 0;
-	while ((request = fr_heap_peek(worker->time_order)) != NULL) {
-		if (count < 10) {
-			DEBUG("Worker is exiting - telling request %s to stop", request->name);
-			count++;
-		}
-		worker_stop_request(&request);
-	}
 	fr_assert(fr_heap_num_elements(worker->runnable) == 0);
-
-	/*
-	 *	Signal the channels that we're closing.
-	 *
-	 *	The other end owns the channel, and will take care of
-	 *	popping messages in the TO_RESPONDER queue, and marking
-	 *	them FR_MESSAGE_DONE.  It will ignore the messages in
-	 *	the TO_REQUESTOR queue, as we own those.  They will be
-	 *	automatically freed when our talloc context is freed.
-	 */
-	for (i = 0; i < worker->config.max_channels; i++) {
-		if (!worker->channel[i]) continue;
-
-		fr_channel_responder_ack_close(worker->channel[i]);
-	}
-
+	fr_assert(fr_timer_list_num_events(worker->timeout) == 0);
+	fr_assert(worker->num_channels == 0);
+	DEBUG("Worker is exiting");
 	talloc_free(worker);
 }
 
@@ -929,7 +995,9 @@ static void _worker_request_internal_init(request_t *request, void *uctx)
 	 *	are always marked up as internal.
 	 */
 	fr_assert(request_is_internal(request));
-	worker_request_time_tracking_start(worker, request, now);
+	if (worker_request_time_tracking_start(worker, request, now) < 0) {
+		unlang_interpret_signal(request, FR_SIGNAL_CANCEL);
+	}
 }
 
 
@@ -945,13 +1013,13 @@ static void _worker_request_done_external(request_t *request, UNUSED rlm_rcode_t
 	 *	All external requests MUST have a listener.
 	 */
 	fr_assert(request_is_external(request));
-	fr_assert(request->async->listen != NULL);
+	fr_assert(request->async->inst != NULL);
 
 	/*
 	 *	Only real packets are in the dedup tree.  And even
 	 *	then, only some of the time.
 	 */
-	if (request->async->listen->track_duplicates) {
+	if (request->async->inst->listen->track_duplicates && fr_rb_node_inline_in_tree(&request->dedup_node)) {
 		(void) fr_rb_delete(worker->dedup, request);
 	}
 
@@ -966,12 +1034,12 @@ static void _worker_request_done_external(request_t *request, UNUSED rlm_rcode_t
 	 *	@todo - check that the stack is at frame 0, otherwise
 	 *	more things have gone wrong.
 	 */
-	fr_assert_msg(request_is_internal(request) || request_is_detached(request) || (request->log.unlang_indent == 0),
-		      "Request %s bad log indentation - expected 0 got %u", request->name, request->log.unlang_indent);
+	fr_assert_msg(request_is_internal(request) || request_is_detached(request) || (request->log.indent.unlang == 0),
+		      "Request %s bad log indentation - expected 0 got %u", request->name, request->log.indent.unlang);
 	fr_assert_msg(!unlang_interpret_is_resumable(request),
 		      "Request %s is marked as yielded at end of processing", request->name);
 	fr_assert_msg(unlang_interpret_stack_depth(request) == 0,
-		      "Request %s stack depth %u > 0", request->name, unlang_interpret_stack_depth(request));
+		      "Request %s stack depth %d > 0", request->name, unlang_interpret_stack_depth(request));
 	RDEBUG("Done request");
 
 	/*
@@ -980,19 +1048,28 @@ static void _worker_request_done_external(request_t *request, UNUSED rlm_rcode_t
 	worker_request_time_tracking_end(worker, request, now);
 
 	/*
+	 *	Remove it from the list of requests associated with this channel.
+	 */
+	if (fr_dlist_entry_in_list(&request->async->entry)) {
+		fr_worker_channel_t *wc = fr_channel_responder_uctx_get(request->async->channel);
+
+		fr_dlist_remove(&wc->dlist, request->async);
+	}
+
+	/*
 	 *	These conditions are true when the server is
 	 *	exiting and we're stopping all the requests.
 	 *
 	 *	This should never happen otherwise.
 	 */
-	if (unlikely((request->master_state == REQUEST_STOP_PROCESSING) &&
-		     !fr_channel_active(request->async->channel))) {
-		talloc_free(request);
+	if (unlikely(!fr_channel_active(request->async->channel))) {
+		fr_dlist_entry_unlink(&request->listen_entry);
+		request_slab_release(request);
 		return;
 	}
 
-	worker_send_reply(worker, request, request->master_state == REQUEST_STOP_PROCESSING ? 1 : 0, now);
-	talloc_free(request);
+	worker_send_reply(worker, request, !unlang_request_is_cancelled(request), now);
+	request_slab_release(request);
 }
 
 /** Internal request (i.e. one generated by the interpreter) is now complete
@@ -1005,8 +1082,9 @@ static void _worker_request_done_internal(request_t *request, UNUSED rlm_rcode_t
 
 	worker_request_time_tracking_end(worker, request, fr_time());
 
-	fr_assert(!fr_heap_entry_inserted(request->runnable_id));
-	fr_assert(!fr_heap_entry_inserted(request->time_order_id));
+	fr_assert(!fr_heap_entry_inserted(request->runnable));
+	fr_assert(!fr_timer_armed(request->timeout));
+	fr_assert(!fr_dlist_entry_in_list(&request->async->entry));
 }
 
 /** Detached request (i.e. one generated by the interpreter with no parent) is now complete
@@ -1014,16 +1092,14 @@ static void _worker_request_done_internal(request_t *request, UNUSED rlm_rcode_t
  * As the request has no parent, then there's nothing to free it
  * so we have to.
  */
-static void _worker_request_done_detached(request_t *request, UNUSED rlm_rcode_t rcode, void *uctx)
+static void _worker_request_done_detached(request_t *request, UNUSED rlm_rcode_t rcode, UNUSED void *uctx)
 {
-	fr_worker_t	*worker = talloc_get_type_abort(uctx, fr_worker_t);
-
 	/*
 	 *	No time tracking for detached requests
 	 *	so we don't need to call
 	 *	worker_request_time_tracking_end.
 	 */
-	fr_assert(!fr_heap_entry_inserted(request->runnable_id));
+	fr_assert(!fr_heap_entry_inserted(request->runnable));
 
 	/*
 	 *	Normally worker_request_time_tracking_end
@@ -1031,7 +1107,9 @@ static void _worker_request_done_detached(request_t *request, UNUSED rlm_rcode_t
 	 *	order heap, but we need to do that for
 	 *	detached requests.
 	 */
-	(void)fr_heap_extract(worker->time_order, request);
+	TALLOC_FREE(request->timeout);
+
+	fr_assert(!fr_dlist_entry_in_list(&request->async->entry));
 
 	/*
 	 *	Detached requests have to be freed by us
@@ -1050,59 +1128,30 @@ static void _worker_request_done_detached(request_t *request, UNUSED rlm_rcode_t
 static void _worker_request_detach(request_t *request, void *uctx)
 {
 	fr_worker_t	*worker = talloc_get_type_abort(uctx, fr_worker_t);
+	fr_time_t	now = fr_time();
 
-	RDEBUG3("Request is detached");
-	fr_assert(request_is_detached(request));
+	RDEBUG4("%s - Request detaching", __FUNCTION__);
 
-	/*
-	 *	End the time tracking...  We don't track detached requests,
-	 *	because they don't contribute for the time consumed by an
-	 *	external request.
-	 */
-	worker_request_time_tracking_end(worker, request, fr_time());
+	if (request_is_detachable(request)) {
+		/*
+		*	End the time tracking...  We don't track detached requests,
+		*	because they don't contribute for the time consumed by an
+		*	external request.
+		*/
+		if (request->async->tracking.state == FR_TIME_TRACKING_YIELDED) {
+			RDEBUG3("Forcing time tracking to running state, from yielded, for request detach");
+			fr_time_tracking_resume(&request->async->tracking, now);
+		}
+		worker_request_time_tracking_end(worker, request, now);
 
-	return;
-}
+		if (request_detach(request) < 0) RPEDEBUG("Failed detaching request");
 
-/** This is called by the interpreter when it wants to stop a request
- *
- * The idea is to get the request into the same state it would be in
- * if the interpreter had just finished with it.
- */
-static void _worker_request_stop(request_t *request, void *uctx)
-{
-	fr_worker_t	*worker = talloc_get_type_abort(uctx, fr_worker_t);
-
-	RDEBUG3("Cleaning up request execution state");
-
-	/*
-	 *	Make sure time tracking is always in a
-	 *	consistent state when we mark the request
-	 *	as done.
-	 */
-	if (request->async->tracking.state == FR_TIME_TRACKING_YIELDED) {
-		fr_time_tracking_resume(&request->async->tracking, fr_time());
+		RDEBUG3("Request is detached");
+	} else {
+		fr_assert_msg(0, "Request is not detachable");
 	}
 
-	/*
-	 *	Let everyone know the request is being
-	 *	stopped.
-	 */
-	request->master_state = REQUEST_STOP_PROCESSING;
-
-	/*
-	 *	If the request is in the runnable queue
-	 *	yank it back out, so it's not "runnable"
-	 *	when we call request done.
-	 */
-	if (fr_heap_entry_inserted(request->runnable_id)) fr_heap_extract(worker->runnable, request);
-
-	/*
-	 *	The interpreter doesn't currently fix
-	 *	this for us, so we set the indent to 0
-	 *	to avoid nasty asserts later.
-	 */
-	request->log.unlang_indent = 0;
+	return;
 }
 
 /** Request is now runnable
@@ -1112,8 +1161,8 @@ static void _worker_request_runnable(request_t *request, void *uctx)
 {
 	fr_worker_t	*worker = uctx;
 
-	RDEBUG3("Request marked as runnable");
-	fr_heap_insert(worker->runnable, request);
+	RDEBUG4("%s - Request marked as runnable", __FUNCTION__);
+	fr_heap_insert(&worker->runnable, request);
 }
 
 /** Interpreter yielded request
@@ -1121,8 +1170,8 @@ static void _worker_request_runnable(request_t *request, void *uctx)
  */
 static void _worker_request_yield(request_t *request, UNUSED void *uctx)
 {
-	RDEBUG3("Request yielded");
-	fr_time_tracking_yield(&request->async->tracking, fr_time());
+	RDEBUG4("%s - Request yielded", __FUNCTION__);
+	if (likely(!request_is_detached(request))) fr_time_tracking_yield(&request->async->tracking, fr_time());
 }
 
 /** Interpreter is starting to work on request again
@@ -1130,8 +1179,8 @@ static void _worker_request_yield(request_t *request, UNUSED void *uctx)
  */
 static void _worker_request_resume(request_t *request, UNUSED void *uctx)
 {
-	RDEBUG3("Request resuming");
-	fr_time_tracking_resume(&request->async->tracking, fr_time());
+	RDEBUG4("%s - Request resuming", __FUNCTION__);
+	if (likely(!request_is_detached(request))) fr_time_tracking_resume(&request->async->tracking, fr_time());
 }
 
 /** Check if a request is scheduled
@@ -1139,7 +1188,23 @@ static void _worker_request_resume(request_t *request, UNUSED void *uctx)
  */
 static bool _worker_request_scheduled(request_t const *request, UNUSED void *uctx)
 {
-	return fr_heap_entry_inserted(request->runnable_id);
+	return fr_heap_entry_inserted(request->runnable);
+}
+
+/** Update a request's priority
+ *
+ */
+static void _worker_request_prioritise(request_t *request, void *uctx)
+{
+	fr_worker_t *worker = talloc_get_type_abort(uctx, fr_worker_t);
+
+	RDEBUG4("%s - Request priority changed", __FUNCTION__);
+
+	/* Extract the request from the runnable queue _if_ it's in the runnable queue */
+	if (fr_heap_extract(&worker->runnable, request) < 0) return;
+
+	/* Reinsert it to re-evaluate its new priority */
+	fr_heap_insert(&worker->runnable, request);
 }
 
 /** Run a request
@@ -1162,27 +1227,19 @@ static inline CC_HINT(always_inline) void worker_run_request(fr_worker_t *worker
 	now = start;
 
 	/*
-	 *	Busy-loop running requests for 0.1ms.  another
-	 *	request.  This change means that the worker checks the
-	 *	event loop fewer times per second, instead of after
-	 *	every request.
+	 *	Busy-loop running requests for 1ms.  We still poll the
+	 *	event loop 1000 times a second, OR when there's no
+	 *	more work to do.  This allows us to make progress with
+	 *	ongoing requests, at the expense of sometimes ignoring
+	 *	new ones.
 	 */
-	while (((now - start) < (NSEC / 100000)) &&
-	       ((request = fr_heap_pop(worker->runnable)) != NULL)) {
+	while (fr_time_delta_lt(fr_time_sub(now, start), fr_time_delta_from_msec(1)) &&
+	       (fr_heap_pop((void **)&request, &worker->runnable) == 0) && request) {
 
 		REQUEST_VERIFY(request);
-		fr_assert(!fr_heap_entry_inserted(request->runnable_id));
+		fr_assert(!fr_heap_entry_inserted(request->runnable));
 
-		/*
-		 *	For real requests, if the channel is gone,
-		 *	just stop the request and free it.
-		 */
-		if (request->async->channel && !fr_channel_active(request->async->channel)) {
-			worker_stop_request(&request);
-			return;
-		}
-
-		(void)unlang_interpret(request);
+		(void)unlang_interpret(request, UNLANG_REQUEST_RESUME);
 
 		now = fr_time();
 	}
@@ -1200,8 +1257,8 @@ static inline CC_HINT(always_inline) void worker_run_request(fr_worker_t *worker
  *	- NULL on error
  *	- fr_worker_t on success
  */
-fr_worker_t *fr_worker_create(TALLOC_CTX *ctx, fr_event_list_t *el, char const *name, fr_log_t const *logger, fr_log_lvl_t lvl,
-			      fr_worker_config_t *config)
+fr_worker_t *fr_worker_alloc(TALLOC_CTX *ctx, fr_event_list_t *el, char const *name, fr_log_t const *logger, fr_log_lvl_t lvl,
+			     fr_worker_config_t *config)
 {
 	fr_worker_t *worker;
 
@@ -1222,14 +1279,19 @@ nomem:
 		if (worker->config._x > _max) worker->config._x = _max; \
        } while (0)
 
+#define CHECK_CONFIG_TIME_DELTA(_x, _min, _max) do { \
+		if (fr_time_delta_lt(worker->config._x, _min)) worker->config._x = _min; \
+		if (fr_time_delta_gt(worker->config._x, _max)) worker->config._x = _max; \
+       } while (0)
+
 	CHECK_CONFIG(max_requests,1024,(1 << 30));
 	CHECK_CONFIG(max_channels, 64, 1024);
-	CHECK_CONFIG(talloc_pool_size, 4096, 65536);
+	CHECK_CONFIG(reuse.child_pool_size, 4096, 65536);
 	CHECK_CONFIG(message_set_size, 1024, 8192);
 	CHECK_CONFIG(ring_buffer_size, (1 << 17), (1 << 20));
-	CHECK_CONFIG(max_request_time, fr_time_delta_from_sec(30), fr_time_delta_from_sec(60));
+	CHECK_CONFIG_TIME_DELTA(max_request_time, fr_time_delta_from_sec(5), fr_time_delta_from_sec(120));
 
-	worker->channel = talloc_zero_array(worker, fr_channel_t *, worker->config.max_channels);
+	worker->channel = talloc_zero_array(worker, fr_worker_channel_t, worker->config.max_channels);
 	if (!worker->channel) {
 		talloc_free(worker);
 		goto nomem;
@@ -1247,40 +1309,51 @@ nomem:
 	 */
 	memset(&worker->tracking, 0, sizeof(worker->tracking));
 
-	worker->aq_control = fr_atomic_queue_alloc(worker, 1024);
-	if (!worker->aq_control) {
-		fr_strerror_const("Failed creating atomic queue");
+	worker->control = fr_control_create(worker, el, FR_CONTROL_MAX_MESSAGES, FR_CONTROL_MAX_SIZE);
+	if (!worker->control) {
+		fr_strerror_const_push("Failed creating control plane");
 	fail:
 		talloc_free(worker);
 		return NULL;
 	}
 
-	worker->control = fr_control_create(worker, el, worker->aq_control);
-	if (!worker->control) {
-		fr_strerror_const_push("Failed creating control plane");
-		goto fail;
-	}
-
-	if (fr_control_callback_add(worker->control, FR_CONTROL_ID_CHANNEL, worker, worker_channel_callback) < 0) {
+	if (fr_channel_callbacks_add(worker->control, &worker_channel_callbacks, worker) < 0) {
 		fr_strerror_const_push("Failed adding control channel");
 		goto fail;
 	}
 
-	worker->runnable = fr_heap_talloc_alloc(worker, worker_runnable_cmp, request_t, runnable_id, 0);
+	if (fr_control_callback_add(worker->control, FR_CONTROL_EVENTSET_WORKER, FR_WORKER_CONTROL_LISTEN_DEAD,
+				    worker_listen_cancel_callback, worker) < 0) {
+		fr_strerror_const_push("Failed adding callback for listeners");
+		goto fail;
+	}
+
+	if (fr_control_open(worker->control) < 0) {
+		fr_strerror_const_push("Failed opening control plane");
+		goto fail;
+	}
+
+	worker->runnable = fr_heap_talloc_alloc(worker, worker_runnable_cmp, request_t, runnable, 0);
 	if (!worker->runnable) {
 		fr_strerror_const("Failed creating runnable heap");
 		goto fail;
 	}
 
-	worker->time_order = fr_heap_talloc_alloc(worker, worker_time_order_cmp, request_t, time_order_id, 0);
-	if (!worker->time_order) {
-		fr_strerror_const("Failed creating time_order heap");
+	worker->timeout = fr_timer_list_ordered_alloc(worker, el->tl);
+	if (!worker->timeout) {
+		fr_strerror_const("Failed creating timeouts list");
 		goto fail;
 	}
 
 	worker->dedup = fr_rb_inline_talloc_alloc(worker, request_t, dedup_node, worker_dedup_cmp, NULL);
 	if (!worker->dedup) {
 		fr_strerror_const("Failed creating de_dup tree");
+		goto fail;
+	}
+
+	worker->listeners = fr_rb_inline_talloc_alloc(worker, fr_worker_listen_t, node, worker_listener_cmp, NULL);
+	if (!worker->listeners) {
+		fr_strerror_const("Failed creating listener tree");
 		goto fail;
 	}
 
@@ -1293,25 +1366,97 @@ nomem:
 							.done_detached = _worker_request_done_detached,
 
 							.detach = _worker_request_detach,
-							.stop = _worker_request_stop,
 							.yield = _worker_request_yield,
 							.resume = _worker_request_resume,
 							.mark_runnable = _worker_request_runnable,
 
-							.scheduled = _worker_request_scheduled
+							.scheduled = _worker_request_scheduled,
+							.prioritise = _worker_request_prioritise
 					     },
 					     worker);
 	if (!worker->intp){
 		fr_strerror_const("Failed initialising interpreter");
 		goto fail;
 	}
+
+	{
+		if (!worker->config.reuse.child_pool_size) worker->config.reuse.child_pool_size = REQUEST_POOL_SIZE;
+		if (!worker->config.reuse.num_children) worker->config.reuse.num_children = REQUEST_POOL_NUM_OBJECTS;
+
+		if (!(worker->slab = request_slab_list_alloc(worker, el, &worker->config.reuse, NULL, NULL,
+							     UNCONST(void *, worker), true, false))) {
+			fr_strerror_const("Failed creating request slab list");
+			goto fail;
+		}
+	}
+
 	unlang_interpret_set_thread_default(worker->intp);
 
 	return worker;
 }
 
+/** Announce we are about to block, then drain every channel one last time
+ *
+ * See fr_control_sleeping() for the ordering this relies on.
+ *
+ * @return
+ *	- true if a channel had messages, so the caller must not block.
+ *	- false if every channel was empty.
+ */
+static inline bool worker_sleeping(fr_worker_t *worker)
+{
+	int i;
+	bool received;
 
-/** The main loop and entry point of the worker thread.
+	received = fr_control_sleeping(worker->control);
+
+	for (i = 0; i < worker->config.max_channels; i++) {
+		if (!worker->channel[i].ch) continue;
+
+		/*
+		 *	Nothing further arrives on a closed channel.
+		 */
+		if (!fr_channel_active(worker->channel[i].ch)) continue;
+
+		while (fr_channel_recv_request(worker->channel[i].ch)) received = true;
+	}
+
+	/*
+	 *	A requestor may have pushed before it could see us
+	 *	sleeping, and skipped the signal.  We found that work,
+	 *	so we are not going to block after all.
+	 */
+	if (received) fr_control_awake(worker->control);
+
+	return received;
+}
+
+/** Acknowledge channel close after requests are completed
+ *
+ * When the channel close is acknowledged, the network frees the channel
+ * which then causes issues with any requests still referencing the channel.
+ */
+static inline void worker_channel_close_ack(fr_worker_t *worker)
+{
+	if (unlikely(worker->num_closing > 0)) {
+		int i;
+		for (i = 0; i < worker->config.max_channels; i++) {
+			if (!worker->channel[i].ch) continue;
+			if (fr_channel_active(worker->channel[i].ch)) continue;
+			if (fr_dlist_num_elements(&worker->channel[i].dlist) > 0) continue;
+
+			fr_channel_responder_ack_close(worker->channel[i].ch);
+			worker->channel[i].ch = NULL;
+			worker->num_closing--;
+		}
+	}
+}
+
+/** The main loop and entry point of the stand-alone worker thread.
+ *
+ *  Where there is only one thread, the event loop runs fr_worker_pre_event() and fr_worker_post_event()
+ *  instead, And then fr_worker_post_event() takes care of calling worker_run_request() to actually run the
+ *  request.
  *
  * @param[in] worker the worker data structure to manage
  */
@@ -1319,8 +1464,8 @@ void fr_worker(fr_worker_t *worker)
 {
 	WORKER_VERIFY;
 
-	while (!worker->exiting) {
-		bool wait_for_event;
+	while (true) {
+		bool wait_for_event, announced = false;
 		int num_events;
 
 		WORKER_VERIFY;
@@ -1331,6 +1476,18 @@ void fr_worker(fr_worker_t *worker)
 		 */
 		wait_for_event = (fr_heap_num_elements(worker->runnable) == 0);
 		if (wait_for_event) {
+			worker_channel_close_ack(worker);
+
+			if (unlikely(worker->exiting && (worker_num_requests(worker) == 0))) break;
+
+			/*
+			 *	Announce that we are about to block, so the
+			 *	requestors know to signal us.  If the final
+			 *	drain turned up work, don't block.
+			 */
+			announced = true;
+			if (worker_sleeping(worker)) wait_for_event = false;
+
 			DEBUG4("Ready to process requests");
 		}
 
@@ -1338,15 +1495,25 @@ void fr_worker(fr_worker_t *worker)
 		 *	Check the event list.  If there's an error
 		 *	(e.g. exit), we stop looping and clean up.
 		 */
-		DEBUG3("Gathering events - %s", wait_for_event ? "will wait" : "Will not wait");
+		DEBUG4("Gathering events - %s", wait_for_event ? "will wait" : "Will not wait");
 		num_events = fr_event_corral(worker->el, fr_time(), wait_for_event);
+
+		/*
+		 *	Whatever woke us, we are running again.
+		 */
+		if (announced) fr_control_awake(worker->control);
+
 		if (num_events < 0) {
+			if (fr_event_loop_exiting(worker->el)) {
+				DEBUG4("Event loop exiting");
+				break;
+			}
+
 			PERROR("Failed retrieving events");
 			break;
 		}
 
-		DEBUG3("%u event(s) pending%s",
-		       num_events == -1 ? 0 : num_events, num_events == -1 ? " - event loop exiting" : "");
+		DEBUG4("%d event(s) pending", num_events);
 
 		/*
 		 *	Service outstanding events.
@@ -1367,7 +1534,7 @@ void fr_worker(fr_worker_t *worker)
  *
  *	This should be run ONLY in single-threaded mode!
  */
-int fr_worker_pre_event(UNUSED fr_time_t wake, void *uctx)
+int fr_worker_pre_event(UNUSED fr_time_t now, UNUSED fr_time_delta_t wake, void *uctx)
 {
 	fr_worker_t *worker = talloc_get_type_abort(uctx, fr_worker_t);
 	request_t *request;
@@ -1395,6 +1562,61 @@ void fr_worker_post_event(UNUSED fr_event_list_t *el, UNUSED fr_time_t now, void
 	worker_run_request(worker, fr_time());	/* Event loop time can be too old, and trigger asserts */
 }
 
+static int fr_worker_pre_close_event(UNUSED fr_time_t now, UNUSED fr_time_delta_t wake, void *uctx)
+{
+	fr_worker_t *worker = talloc_get_type_abort(uctx, fr_worker_t);
+
+	return worker->num_closing;
+}
+
+static void fr_worker_post_close_event(UNUSED fr_event_list_t *el, UNUSED fr_time_t now, void *uctx)
+{
+	fr_worker_t *worker = talloc_get_type_abort(uctx, fr_worker_t);
+
+	worker_channel_close_ack(worker);
+}
+
+/** Add events to the loop which will send close ack to the network
+ */
+int fr_worker_close_event_insert(fr_worker_t *worker)
+{
+	if (fr_event_pre_insert(worker->el, fr_worker_pre_close_event, worker) < 0) {
+		fr_strerror_const("Failed adding close pre-event to event list");
+		return -1;
+	}
+	if (fr_event_post_insert(worker->el, fr_worker_post_close_event, worker) < 0) {
+		fr_strerror_const("Failed adding close post-event to event list");
+		return -1;
+	}
+	return 0;
+}
+
+/** Tell the interpreter of the worker to cancel requests, instead of running them
+ *
+ * The single threaded scheduler calls this function before it detaches the thread data, so that the requests
+ * which the detach cancels do not go into the runnable heap of the worker.  A worker thread does the same
+ * when the last input channel closes.
+ *
+ * @param[in] worker	which is shutting down.
+ */
+void fr_worker_shutting_down(fr_worker_t *worker)
+{
+	request_t *request;
+
+	unlang_interpret_shutting_down(worker->intp);
+
+	while ((fr_heap_pop((void **)&request, &worker->runnable) == 0) && request) {
+		REQUEST_VERIFY(request);
+		fr_assert(!fr_heap_entry_inserted(request->runnable));
+
+		(void) unlang_interpret(request, UNLANG_REQUEST_RESUME);
+	}
+
+	fr_assert(fr_heap_num_elements(worker->runnable) == 0);
+
+	worker->exiting = true;
+}
+
 /** Print debug information about the worker structure
  *
  * @param[in] worker the worker
@@ -1408,9 +1630,11 @@ void fr_worker_debug(fr_worker_t *worker, FILE *fp)
 	fprintf(fp, "\tstats.in = %" PRIu64 "\n", worker->stats.in);
 
 	fprintf(fp, "\tcalculated (predicted) total CPU time = %" PRIu64 "\n",
-		worker->predicted * worker->stats.in);
-	fprintf(fp, "\tcalculated (counted) per request time = %" PRIu64 "\n",
-		worker->tracking.running_total / worker->stats.in);
+		fr_time_delta_unwrap(worker->predicted) * worker->stats.in);
+	if (worker->stats.in) {
+		fprintf(fp, "\tcalculated (counted) per request time = %" PRIu64 "\n",
+			fr_time_delta_unwrap(worker->tracking.running_total) / worker->stats.in);
+	}
 
 	fr_time_tracking_debug(&worker->tracking, fp);
 
@@ -1419,13 +1643,15 @@ void fr_worker_debug(fr_worker_t *worker, FILE *fp)
 /** Create a channel to the worker
  *
  * Called by the master (i.e. network) thread when it needs to create
- * a new channel to a particuler worker.
+ * a new channel to a particular worker.
  *
  * @param[in] worker the worker
- * @param[in] master the control plane of the master
  * @param[in] ctx the context in which the channel will be created
+ * @param[in] master the control plane of the master
+ * @param[in] reply_ms the message set the worker allocates replies from
  */
-fr_channel_t *fr_worker_channel_create(fr_worker_t *worker, TALLOC_CTX *ctx, fr_control_t *master)
+fr_channel_t *fr_worker_channel_create(fr_worker_t *worker, TALLOC_CTX *ctx, fr_control_t *master,
+				       fr_message_set_t *reply_ms)
 {
 	fr_channel_t *ch;
 	pthread_t id;
@@ -1439,17 +1665,29 @@ fr_channel_t *fr_worker_channel_create(fr_worker_t *worker, TALLOC_CTX *ctx, fr_
 	ch = fr_channel_create(ctx, master, worker->control, same);
 	if (!ch) return NULL;
 
-	fr_channel_set_recv_request(ch, worker, worker_recv_request);
 
 	/*
 	 *	Tell the worker about the channel
 	 */
-	if (fr_channel_signal_open(ch) < 0) {
+	if (fr_channel_signal_open(ch, reply_ms) < 0) {
 		talloc_free(ch);
 		return NULL;
 	}
 
 	return ch;
+}
+
+int fr_worker_listen_cancel(fr_worker_t *worker, fr_listen_instance_t const *li)
+{
+	/*
+	 *	Skip a bunch of work if we're already in the worker thread.
+	 */
+	if (is_worker_thread(worker)) {
+		return fr_worker_listen_cancel_self(worker, li);
+	}
+
+	return fr_control_message_send(worker->control, FR_CONTROL_EVENTSET_WORKER, FR_WORKER_CONTROL_LISTEN_DEAD,
+				       &li, sizeof(li));
 }
 
 #ifdef WITH_VERIFY_PTR
@@ -1462,7 +1700,6 @@ static void worker_verify(fr_worker_t *worker)
 	int i;
 
 	(void) talloc_get_type_abort(worker, fr_worker_t);
-	fr_atomic_queue_verify(worker->aq_control);
 
 	fr_assert(worker->control != NULL);
 	(void) talloc_get_type_abort(worker->control, fr_control_t);
@@ -1477,9 +1714,9 @@ static void worker_verify(fr_worker_t *worker)
 	(void) talloc_get_type_abort(worker->dedup, fr_rb_tree_t);
 
 	for (i = 0; i < worker->config.max_channels; i++) {
-		if (!worker->channel[i]) continue;
+		if (!worker->channel[i].ch) continue;
 
-		(void) talloc_get_type_abort(worker->channel[i], fr_channel_t);
+		(void) talloc_get_type_abort(worker->channel[i].ch, fr_channel_t);
 	}
 }
 #endif
@@ -1489,7 +1726,7 @@ int fr_worker_stats(fr_worker_t const *worker, int num, uint64_t *stats)
 	if (num < 0) return -1;
 	if (num == 0) return 0;
 
-	if (num >= 1) stats[0] = worker->stats.in;
+	stats[0] = worker->stats.in;
 	if (num >= 2) stats[1] = worker->stats.out;
 	if (num >= 3) stats[2] = worker->stats.dup;
 	if (num >= 4) stats[3] = worker->stats.dropped;
@@ -1501,10 +1738,15 @@ int fr_worker_stats(fr_worker_t const *worker, int num, uint64_t *stats)
 	return 6;
 }
 
+fr_worker_config_t const *fr_worker_config(fr_worker_t *worker)
+{
+	return &worker->config;
+}
+
 static int cmd_stats_worker(FILE *fp, UNUSED FILE *fp_err, void *ctx, fr_cmd_info_t const *info)
 {
 	fr_worker_t const *worker = ctx;
-	fr_time_t when;
+	fr_time_delta_t when;
 
 	if ((info->argc == 0) || (strcmp(info->argv[0], "count") == 0)) {
 		fprintf(fp, "count.in\t\t\t%" PRIu64 "\n", worker->stats.in);
@@ -1518,17 +1760,19 @@ static int cmd_stats_worker(FILE *fp, UNUSED FILE *fp_err, void *ctx, fr_cmd_inf
 
 	if ((info->argc == 0) || (strcmp(info->argv[0], "cpu") == 0)) {
 		when = worker->predicted;
-		fprintf(fp, "cpu.request_time_rtt\t\t%u.%09" PRIu64 "\n", (unsigned int) (when / NSEC), when % NSEC);
+		fprintf(fp, "cpu.request_time_rtt\t\t%.9f\n", fr_time_delta_to_sec_double(when));
 
 		when = worker->tracking.running_total;
-		if (when > 0) when /= (worker->stats.in - worker->stats.dropped);
-		fprintf(fp, "cpu.average_request_time\t%u.%09" PRIu64 "\n", (unsigned int) (when / NSEC), when % NSEC);
+		if (fr_time_delta_ispos(when) && (worker->stats.in > worker->stats.dropped)) {
+			when = fr_time_delta_div(when, fr_time_delta_wrap(worker->stats.in - worker->stats.dropped));
+		}
+		fprintf(fp, "cpu.average_request_time\t%.9f\n", fr_time_delta_to_sec_double(when));
 
 		when = worker->tracking.running_total;
-		fprintf(fp, "cpu.used\t\t\t%u.%06u\n", (unsigned int) (when / NSEC), (unsigned int) (when % NSEC) / 1000);
+		fprintf(fp, "cpu.used\t\t\t%.6f\n", fr_time_delta_to_sec_double(when));
 
 		when = worker->tracking.waiting_total;
-		fprintf(fp, "cpu.waiting\t\t\t%u.%03u\n", (unsigned int) (when / NSEC), (unsigned int) (when % NSEC) / 1000000);
+		fprintf(fp, "cpu.waiting\t\t\t%.3f\n", fr_time_delta_to_sec_double(when));
 
 		fr_time_elapsed_fprint(fp, &worker->cpu_time, "cpu.requests", 4);
 		fr_time_elapsed_fprint(fp, &worker->wall_clock, "time.requests", 4);

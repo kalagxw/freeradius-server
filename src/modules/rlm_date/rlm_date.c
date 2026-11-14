@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -25,25 +25,24 @@
  */
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
-#include <ctype.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/unlang/xlat_func.h>
 #include <time.h>
 
 typedef struct {
-	char const *xlat_name;
 	char const *fmt;
 	bool utc;
 } rlm_date_t;
 
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("format", FR_TYPE_STRING, rlm_date_t, fmt), .dflt = "%b %e %Y %H:%M:%S %Z" },
-	{ FR_CONF_OFFSET("utc", FR_TYPE_BOOL, rlm_date_t, utc), .dflt = "no" },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET("format", rlm_date_t, fmt), .dflt = "%b %e %Y %H:%M:%S %Z" },
+	{ FR_CONF_OFFSET("utc", rlm_date_t, utc), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
 DIAG_OFF(format-nonliteral)
 static xlat_action_t date_convert_string(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-				   const char *str, rlm_date_t const *inst)
+					 const char *str, rlm_date_t const *inst)
 {
 	struct tm	tminfo;
 	time_t		date = 0;
@@ -64,7 +63,7 @@ static xlat_action_t date_convert_string(TALLOC_CTX *ctx, fr_dcursor_t *out, req
 		char *p;
 
 		/*
-		 *	
+		 *
 		 */
 		MEM(my_str = talloc_strdup(ctx, str));
 		p = my_str + (tz - str);
@@ -76,7 +75,7 @@ static xlat_action_t date_convert_string(TALLOC_CTX *ctx, fr_dcursor_t *out, req
 			talloc_free(my_str);
 			return XLAT_ACTION_FAIL;
 		}
-		talloc_free(my_str);		
+		talloc_free(my_str);
 
 		/*
 		 *	The output is converted to the local time zone, so
@@ -101,14 +100,14 @@ static xlat_action_t date_convert_string(TALLOC_CTX *ctx, fr_dcursor_t *out, req
 		return XLAT_ACTION_FAIL;
 	}
 
-	vb = fr_value_box_alloc(ctx, FR_TYPE_UINT64, NULL, false);
-	vb->vb_uint64 = (uint64_t) date;
+	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_DATE, NULL));
+	vb->vb_date = fr_unix_time_from_sec(date);
 	fr_dcursor_append(out, vb);
 	return XLAT_ACTION_DONE;
 }
 
 static xlat_action_t date_encode_strftime(TALLOC_CTX *ctx, fr_dcursor_t *out, rlm_date_t const *inst,
-				    request_t *request, time_t date)
+					  request_t *request, char const *fmt, time_t date)
 {
 	struct tm	tminfo;
 	char		buff[64];
@@ -126,21 +125,15 @@ static xlat_action_t date_encode_strftime(TALLOC_CTX *ctx, fr_dcursor_t *out, rl
 		}
 	}
 
-	if (strftime(buff, sizeof(buff), inst->fmt, &tminfo) == 0) return XLAT_ACTION_FAIL;
+	if (strftime(buff, sizeof(buff), fmt, &tminfo) == 0) return XLAT_ACTION_FAIL;
 
-	vb = fr_value_box_alloc_null(ctx);
-	fr_value_box_strdup(ctx, vb, NULL, buff, false);
+	MEM(vb = fr_value_box_alloc_null(ctx));
+	MEM(fr_value_box_strdup(ctx, vb, NULL, buff, false) == 0);
 	fr_dcursor_append(out, vb);
 
 	return XLAT_ACTION_DONE;
 }
 DIAG_ON(format-nonliteral)
-
-static int mod_xlat_instantiate(void *xlat_inst, UNUSED xlat_exp_t const *exp, void *uctx)
-{
-	*((void **)xlat_inst) = talloc_get_type_abort(uctx, rlm_date_t);
-	return 0;
-}
 
 static xlat_arg_parser_t const xlat_date_convert_args[] = {
 	{ .required = true, .single = true, .type = FR_TYPE_VOID },
@@ -154,50 +147,55 @@ static xlat_arg_parser_t const xlat_date_convert_args[] = {
  *
  * When the request arrived:
 @verbatim
-%(date:request)
+%date(request)
 @endverbatim
  *
  * Now:
 @verbatim
-%(date:now}
+%date(now)
 @endverbatim
  *
  * Examples (Tmp-Integer-0 = 1506101100):
 @verbatim
 update request {
-  &Tmp-String-0 := "%(date:%{Tmp-Integer-0})" ("Fri 22 Sep 18:25:00 BST 2017")
-  &Tmp-Integer-1 := "%(date:%{Tmp-String-0})" (1506101100)
+  &Tmp-String-0 := %date(%{Tmp-Integer-0}) ("Fri 22 Sep 18:25:00 BST 2017")
+  &Tmp-Integer-1 := %date(%{Tmp-String-0}) (1506101100)
 }
 @endverbatim
  *
  * @ingroup xlat_functions
  */
-static xlat_action_t xlat_date_convert(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-				       void const *xlat_inst, UNUSED void *xlat_thread_inst,
-				       fr_value_box_list_t *in)
+static xlat_action_t xlat_date_convert(TALLOC_CTX *ctx, fr_dcursor_t *out,
+				       xlat_ctx_t const *xctx,
+				       request_t *request, fr_value_box_list_t *in)
 {
-	rlm_date_t const	*inst;
-	void			*instance;
+	rlm_date_t const	*inst = talloc_get_type_abort(xctx->mctx->mi->data, rlm_date_t);
 	struct tm 		tminfo;
-	fr_value_box_t		*arg = fr_dlist_head(in);
-
-	memcpy(&instance, xlat_inst, sizeof(instance));
-
-	inst = talloc_get_type_abort(instance, rlm_date_t);
+	fr_value_box_t		*arg = fr_value_box_list_head(in);
 
 	memset(&tminfo, 0, sizeof(tminfo));
+
+	if (!arg) goto now;
 
 	/*
 	 *	Certain strings have magical meanings.
 	 */
 	if (arg->type == FR_TYPE_STRING) {
 		if (strcmp(arg->vb_strvalue, "request") == 0) {
-			return date_encode_strftime(ctx, out, inst, request,
+			return date_encode_strftime(ctx, out, inst, request, inst->fmt,
 						    fr_time_to_sec(request->packet->timestamp));
 		}
 
 		if (strcmp(arg->vb_strvalue, "now") == 0) {
-			return date_encode_strftime(ctx, out, inst, request, fr_time_to_sec(fr_time()));
+		now:
+			return date_encode_strftime(ctx, out, inst, request, inst->fmt, fr_time_to_sec(fr_time()));
+		}
+
+		/*
+		 *	%date('+%A') == "Monday", to mirror the behavior of the `date` command.
+		 */
+		if (arg->vb_strvalue[0] == '+') {
+			return date_encode_strftime(ctx, out, inst, request, arg->vb_strvalue + 1, fr_time_to_sec(fr_time()));
 		}
 	}
 
@@ -208,13 +206,13 @@ static xlat_action_t xlat_date_convert(TALLOC_CTX *ctx, fr_dcursor_t *out, reque
 	 *	format as a string.
 	 */
 	case FR_TYPE_DATE:
-		return date_encode_strftime(ctx, out, inst, request, fr_unix_time_to_sec(arg->vb_date));
+		return date_encode_strftime(ctx, out, inst, request, inst->fmt, fr_unix_time_to_sec(arg->vb_date));
 
 	case FR_TYPE_UINT32:
-		return date_encode_strftime(ctx, out, inst, request, (time_t) arg->vb_uint32);
+		return date_encode_strftime(ctx, out, inst, request, inst->fmt, (time_t) arg->vb_uint32);
 
 	case FR_TYPE_UINT64:
-		return date_encode_strftime(ctx, out, inst, request, (time_t) arg->vb_uint64);
+		return date_encode_strftime(ctx, out, inst, request, inst->fmt, (time_t) arg->vb_uint64);
 
 	/*
 	 *	These are 'from' types, i.e. we'll convert the input string
@@ -225,35 +223,29 @@ static xlat_action_t xlat_date_convert(TALLOC_CTX *ctx, fr_dcursor_t *out, reque
 		return date_convert_string(ctx, out, request, arg->vb_strvalue, inst);
 
 	default:
-		REDEBUG("Can't convert type %s into date", fr_table_str_by_value(fr_value_box_type_table, arg->type, "<INVALID>"));
+		REDEBUG("Can't convert type %s into date", fr_type_to_str(arg->type));
 	}
 
 	return XLAT_ACTION_FAIL;
 }
 
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
+static int mod_bootstrap(module_inst_ctx_t const *mctx)
 {
-	rlm_date_t 	*inst = instance;
 	xlat_t 		*xlat;
 
-	inst->xlat_name = cf_section_name2(conf);
-	if (!inst->xlat_name) {
-		inst->xlat_name = cf_section_name1(conf);
-	}
-
-	xlat = xlat_register(inst, inst->xlat_name, xlat_date_convert, false);
-	xlat_func_args(xlat,xlat_date_convert_args);
-	xlat_async_instantiate_set(xlat, mod_xlat_instantiate, rlm_date_t *, NULL, inst);
+	xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, NULL, xlat_date_convert, FR_TYPE_VOID);
+	xlat_func_args_set(xlat, xlat_date_convert_args);
 
 	return 0;
 }
 
-extern module_t rlm_date;
-module_t rlm_date = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "date",
-	.inst_size	= sizeof(rlm_date_t),
-	.config		= module_config,
-	.bootstrap	= mod_bootstrap
+extern module_rlm_t rlm_date;
+module_rlm_t rlm_date = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "date",
+		.inst_size	= sizeof(rlm_date_t),
+		.config		= module_config,
+		.bootstrap	= mod_bootstrap
+	}
 };
-

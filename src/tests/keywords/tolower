@@ -1,25 +1,26 @@
 #
-# PRE: update if
+# PRE: if
 #
-update {
-        &Tmp-String-0           := "AbCdE"
-}
+string test_string
+string dummy_string
 
-update request {
-        &Tmp-String-0           := "%{tolower:%{Tmp-String-0}}"
-        &Tmp-String-1           := "%{tolower:AAbbCCdd}"
-        &Tmp-String-2           := "%{tolower:%{Tmp-String-9}}"
-}
+test_string	:= "AbCdE"
+test_string	:= %str.lower(test_string)
 
-if (&Tmp-String-0 != "abcde") {
+if !(test_string == "abcde") {
 	test_fail
 }
 
-if (&Tmp-String-1 != "aabbccdd") {
+test_string	:= %str.lower('AAbbCCdd')
+if !(test_string == "aabbccdd") {
 	test_fail
 }
 
-if (&Tmp-String-2 != "") {
+#
+#  Doesn't exist
+#
+test_string	:= "%str.lower(dummy_string)"
+if !(test_string == "") {
 	test_fail
 }
 

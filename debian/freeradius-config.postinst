@@ -34,10 +34,10 @@ case "$1" in
 
           # Create links for default modules
           for mod in always attr_filter cache_eap chap client \
-              delay detail detail.log dhcpv4 digest eap \
-              eap_inner echo exec expr files linelog logintime \
-              mschap ntlm_auth pap pam passwd radutmp \
-              soh sradutmp stats unix unpack utf8 ; do
+              delay detail detail.log digest eap \
+              eap_inner echo exec files linelog \
+              mschap ntlm_auth pap pam passwd \
+              stats unix unpack utf8 ; do
             if test ! -h /etc/freeradius/mods-enabled/$mod && \
                test ! -e /etc/freeradius/mods-enabled/$mod; then
               ln -s ../mods-available/$mod /etc/freeradius/mods-enabled/$mod
@@ -49,7 +49,7 @@ case "$1" in
         # install or an upgrade from before there were links; users may
         # want to remove them...
         if [ -z "$2" ] || dpkg --compare-versions "$2" lt 2.0.4+dfsg-4; then
-          for site in default inner-tunnel; do
+          for site in default inner-tunnel proxy; do
             if test ! -h /etc/freeradius/sites-enabled/$site && \
                test ! -e /etc/freeradius/sites-enabled/$site; then
               ln -s ../sites-available/$site /etc/freeradius/sites-enabled/$site

@@ -20,25 +20,22 @@
  * @file xlat_inst.c
  * @brief Create instance data for xlat function calls.
  *
+ * @copyright 2018-2021 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  * @copyright 2018 The FreeRADIUS server project
- * @copyright 2018 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
 RCSID("$Id$")
 
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/unlang/xlat_priv.h>
 #include <freeradius-devel/io/schedule.h>
-
-#include <ctype.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/unlang/xlat_priv.h>
 
 /** Holds instance data created by xlat_instantiate
  */
-static fr_rb_tree_t *xlat_inst_tree;
+static fr_heap_t *xlat_inst_tree;
 
 /** Holds thread specific instance data created by xlat_instantiate
  */
-static _Thread_local fr_rb_tree_t *xlat_thread_inst_tree;
+static _Thread_local fr_heap_t *xlat_thread_inst_tree;
 
 /** Compare two xlat instances based on node pointer
  *
@@ -46,11 +43,11 @@ static _Thread_local fr_rb_tree_t *xlat_thread_inst_tree;
  * @param[in] two	Second xlat expansion instance.
  * @return CMP(one, two)
  */
-static int8_t _xlat_inst_cmp(void const *one, void const *two)
+static fr_cmp_ret_t _xlat_inst_cmp(void const *one, void const *two)
 {
 	xlat_inst_t const *a = one, *b = two;
 
-	return CMP(a->node, b->node);
+	return CMP(a->node->call.id, b->node->call.id);
 }
 
 /** Compare two thread instances based on node pointer
@@ -59,11 +56,11 @@ static int8_t _xlat_inst_cmp(void const *one, void const *two)
  * @param[in] two	Second thread specific xlat expansion instance.
  * @return CMP(one, two)
  */
-static int8_t _xlat_thread_inst_cmp(void const *one, void const *two)
+static fr_cmp_ret_t _xlat_thread_inst_cmp(void const *one, void const *two)
 {
 	xlat_thread_inst_t const *a = one, *b = two;
 
-	return CMP(a->node, b->node);
+	return CMP(a->node->call.id, b->node->call.id);
 }
 
 /** Destructor for xlat_thread_inst_t
@@ -74,72 +71,99 @@ static int8_t _xlat_thread_inst_cmp(void const *one, void const *two)
  *	as we need to call thread_detach *before* any of the children
  *	of the talloc ctx are freed.
  */
-static int _xlat_thread_inst_detach(xlat_thread_inst_t *thread_inst)
+static int _xlat_thread_inst_detach(xlat_thread_inst_t *xt)
 {
-	fr_assert(thread_inst->node->type == XLAT_FUNC);
+	xlat_call_t const *call = &xt->node->call;
 
-	if (thread_inst->node->call.func->thread_detach) {
-		(void) thread_inst->node->call.func->thread_detach(thread_inst->data, thread_inst->node->call.func->thread_uctx);
-	}
+	fr_assert(xt->node->type == XLAT_FUNC);
+
+	DEBUG4("Cleaning up xlat thread instance (%p/%p)", xt, xt->data);
+
+	fr_assert(call->func->thread_detach);
+
+	(void) call->func->thread_detach(XLAT_THREAD_INST_CTX(call->inst->data,
+							      xt->data, xt->node, xt->mctx,
+							      xt->el,
+							      call->func->thread_uctx));
 
 	return 0;
-}
-
-/** Destructor for xlat_thread_inst_tree elements
- *
- */
-static void _xlat_thread_inst_free(void *to_free)
-{
-	xlat_thread_inst_t *thread_inst = talloc_get_type_abort(to_free, xlat_thread_inst_t);
-
-	DEBUG4("Worker cleaning up xlat thread instance (%p/%p)", thread_inst, thread_inst->data);
-
-	talloc_free(thread_inst);
 }
 
 /** Create thread instances where needed
  *
  * @param[in] ctx	to allocate thread instance data in.
- * @param[in] inst	to allocate thread-instance data for.
+ * @param[in] el	event list to register I/O handlers against.
+ * @param[in] xi	to allocate thread-instance data for.
  * @return
  *	- 0 on success.  The node/thread specific data will be inserted
  *	  into xlat_thread_inst_tree.
  *	- -1 on failure.
  */
-static xlat_thread_inst_t *xlat_thread_inst_alloc(TALLOC_CTX *ctx, xlat_inst_t *inst)
+static xlat_thread_inst_t *xlat_thread_inst_alloc(TALLOC_CTX *ctx, fr_event_list_t *el, xlat_inst_t *xi)
 {
-	xlat_thread_inst_t	*thread_inst = NULL;
+	size_t 			extra_headers = 0;
+	size_t 			extra_mem = 0;
+	xlat_call_t const	*call = &((xlat_inst_t const *)talloc_get_type_abort_const(xi, xlat_inst_t))->node->call;
+	xlat_thread_inst_t	*xt = NULL;
 
-	(void)talloc_get_type_abort(inst, xlat_inst_t);
+	/*
+	 *	Allocate extra room for the thread instance data
+	 */
+	if (call->func->thread_inst_size) {
+		extra_headers++;
+		extra_mem += call->func->thread_inst_size;
+	}
 
-	if (inst->node->call.func->thread_inst_size) {
-		MEM(thread_inst = talloc_zero_pooled_object(ctx, xlat_thread_inst_t,
-							    1, inst->node->call.func->thread_inst_size));
+	/*
+	 *	Allocate extra room for the mctx
+	 */
+	if (call->func->mctx) {
+		extra_headers++;
+		extra_mem += sizeof(*call->func->mctx);
+	}
+
+	if (extra_headers || extra_mem) {
+		MEM(xt = talloc_zero_pooled_object(ctx, xlat_thread_inst_t, extra_headers, extra_mem));
 	} else {
-		MEM(thread_inst = talloc_zero(ctx, xlat_thread_inst_t));
+		MEM(xt = talloc_zero(ctx, xlat_thread_inst_t));
 	}
 
-	thread_inst->node = inst->node;
+	xt->node = xi->node;
+	xt->el = el;
 
-	fr_assert(inst->node->type == XLAT_FUNC);
-	fr_assert(!inst->node->call.thread_inst);		/* May be missing inst, but this is OK */
+	fr_assert(xi->node->type == XLAT_FUNC);
 
-	talloc_set_destructor(thread_inst, _xlat_thread_inst_detach);
-	if (inst->node->call.func->thread_inst_size) {
-		MEM(thread_inst->data = talloc_zero_array(thread_inst, uint8_t, inst->node->call.func->thread_inst_size));
+	if (call->func->thread_detach) talloc_set_destructor(xt, _xlat_thread_inst_detach);
 
-		/*
-		 *	This is expensive, only do it if we might
-		 *	might be using it.
-		 */
-#ifndef TALLOC_GET_TYPE_ABORT_NOOP
-		talloc_set_name_const(thread_inst->data, inst->node->call.func->thread_inst_type);
-#endif
+	if (call->func->thread_inst_size) {
+		MEM(xt->data = talloc_zero_array(xt, uint8_t, call->func->thread_inst_size));
+
+		if (call->func->thread_inst_type) {
+			talloc_set_name_const(xt->data, call->func->thread_inst_type);
+		} else {
+			talloc_set_name(xt->data, "xlat_%s_thread_t", call->func->name);
+		}
 	}
 
-	DEBUG4("Worker alloced xlat thread instance (%p/%p)", thread_inst, thread_inst->data);
+	/*
+	 *	Create a module call ctx.
+	 *
+	 *	We do this now because we're operating in the
+	 *	context of a thread and can get the thread
+	 *	specific data for the module.
+	 */
+	if (call->func->mctx) {
+		module_ctx_t *mctx;
 
-	return thread_inst;
+		mctx = module_ctx_from_inst(xt, call->func->mctx);
+		mctx->thread = module_thread(mctx->mi)->data;
+
+		xt->mctx = mctx;
+	}
+
+	DEBUG4("Alloced xlat thread instance (%p/%p)", xt, xt->data);
+
+	return xt;
 }
 
 /** Destructor for xlat_inst_t
@@ -150,31 +174,34 @@ static xlat_thread_inst_t *xlat_thread_inst_alloc(TALLOC_CTX *ctx, xlat_inst_t *
  *	as we need to call thread_detach *before* any of the children
  *	of the talloc ctx are freed.
  */
-static int _xlat_inst_detach(xlat_inst_t *inst)
+static int _xlat_inst_detach(xlat_inst_t *xi)
 {
-	(void)talloc_get_type_abort_const(inst->node, xlat_exp_t);
-	fr_assert(inst->node->type == XLAT_FUNC);
+	xlat_call_t const *call;
+
+	fr_assert(xlat_inst_tree);		/* xlat_inst_init must have been called */
+
+	(void) talloc_get_type_abort_const(xi->node, xlat_exp_t);
+	fr_assert(xi->node->type == XLAT_FUNC);
+
+	call = &xi->node->call;
 
 	/*
-	 *	Remove permanent data from the instance tree.
+	 *	Remove permanent data from the instance tree
+	 *	and auto-free the tree when the last xlat is
+	 *      freed.
 	 */
-	if (!inst->node->call.ephemeral) {
-		fr_rb_delete(xlat_inst_tree, inst);
-		if (fr_rb_num_elements(xlat_inst_tree) == 0) TALLOC_FREE(xlat_inst_tree);
+	if (!call->ephemeral) {
+		if (fr_heap_entry_inserted(xi->idx)) fr_heap_extract(&xlat_inst_tree, xi);
+		if (fr_heap_num_elements(xlat_inst_tree) == 0) TALLOC_FREE(xlat_inst_tree);
 	}
 
-	if (inst->node->call.func->detach) (void) inst->node->call.func->detach(inst->data, inst->node->call.func->uctx);
+	DEBUG4("Cleaning up xlat instance (%p/%p)", xi, xi->data);
 
+	if (call->func->detach) (void) call->func->detach(XLAT_INST_CTX(xi->data,
+									xi->node,
+									call->func->mctx,
+									call->func->uctx));
 	return 0;
-}
-
-/** Destructor for xlat_inst_tree elements
- *
- */
-static void _xlat_inst_free(void *to_free)
-{
-	xlat_inst_t *inst = talloc_get_type_abort(to_free, xlat_inst_t);
-	talloc_free(inst);
 }
 
 /** Allocate instance data for an xlat expansion
@@ -183,40 +210,78 @@ static void _xlat_inst_free(void *to_free)
  */
 static xlat_inst_t *xlat_inst_alloc(xlat_exp_t *node)
 {
-	xlat_inst_t		*inst = NULL;
+	xlat_call_t const	*call = &node->call;
+	xlat_inst_t		*xi = NULL;
 
 	(void)talloc_get_type_abort(node, xlat_exp_t);
 
 	fr_assert(xlat_inst_tree);		/* xlat_inst_init must have been called */
 	fr_assert(node->type == XLAT_FUNC);
-	fr_assert(!node->call.inst);
+	fr_assert(!call->inst);
 
-	if (node->call.func->inst_size) {
-		MEM(inst = talloc_zero_pooled_object(node, xlat_inst_t, 1, node->call.func->inst_size));
+	if (call->func->inst_size) {
+		MEM(xi = talloc_zero_pooled_object(node, xlat_inst_t, 1, call->func->inst_size));
 	} else {
-		MEM(inst = talloc_zero(node, xlat_inst_t));
+		MEM(xi = talloc_zero(node, xlat_inst_t));
 	}
-
-	inst->node = node;
+	xi->node = node;
 
 	/*
 	 *	Instance data is freed when the
 	 *	node is freed.
 	 */
-	talloc_set_destructor(inst, _xlat_inst_detach);
-	if (node->call.func->inst_size) {
-		MEM(inst->data = talloc_zero_array(inst, uint8_t, node->call.func->inst_size));
-
-		/*
-		 *	This is expensive, only do it if we might
-		 *	might be using it.
-		 */
-#ifndef TALLOC_GET_TYPE_ABORT_NOOP
-		talloc_set_name_const(inst->data, node->call.func->inst_type);
-#endif
+	if (call->func->detach || !call->ephemeral) {
+		talloc_set_destructor(xi, _xlat_inst_detach);
 	}
 
-	return inst;
+	if (call->func->inst_size) {
+		MEM(xi->data = talloc_zero_array(xi, uint8_t, call->func->inst_size));
+		if (call->func->inst_type) {
+			talloc_set_name_const(xi->data, call->func->inst_type);
+		} else {
+			talloc_set_name(xi->data, "xlat_%s_t", call->func->name);
+		}
+	}
+
+	/*
+	 *	If the xlat has a call env defined, parse it.
+	 */
+	if (call->func->call_env_method) {
+		fr_assert_msg(call->func->call_env_method->inst_size,
+			      "Method environment for module %s, xlat %s declared, "
+			      "but no inst_size set", call->func->mctx->mi->name, call->func->name);
+
+		/*
+		 *	FIXME - This is wrong, we should pass in the tmpl_rule_t
+		 *	from the compiler call.  But it would be prohibitively
+		 *	memory inefficient to copy it on every xlat call, and it
+		 *	only exists for the duration of the compilation phase
+		 *	because many elements are stack allocated.  The correct
+		 *	fix is to allocate all tmpl_rules_t on the heap.
+		 *	OR just bite the bullet and duplicate the whole nested
+		 *	rules structure for every xlat node.
+		 *
+		 *	Because of this hack, outer. and parent. will not work
+		 *	within xlat call envs.
+		 */
+		xi->call_env = call_env_alloc(xi, call->func->name, call->func->call_env_method,
+					      &(tmpl_rules_t){
+							.attr = {
+									.dict_def = call->dict,
+									.list_def = request_attr_request
+							}
+					      }, call->func->mctx->mi->conf,
+					      &(call_env_ctx_t){
+							.type = CALL_ENV_CTX_TYPE_XLAT,
+							.mi = call->func->mctx->mi
+					      });
+		if (!xi->call_env) {
+			talloc_free(xi);
+			return NULL;
+		}
+	}
+
+	return xi;
 }
 
 /** Callback for creating "ephemeral" instance data for a #xlat_exp_t
@@ -224,85 +289,107 @@ static xlat_inst_t *xlat_inst_alloc(xlat_exp_t *node)
  * @note Epehemeral xlats must not be shared between requests.
  *
  * @param[in] node	to create "ephemeral" instance data for.
- * @param[in] uctx	UNUSED.
+ * @param[in] uctx	event list passed to xlat thread instantiation functions.
  * @return
  *	- 0 if instantiation functions were successful.
  *	- -1 if either instantiation function failed.
  */
-static int _xlat_instantiate_ephemeral_walker(xlat_exp_t *node, UNUSED void *uctx)
+static int _xlat_instantiate_ephemeral_walker(xlat_exp_t *node, void *uctx)
 {
-	fr_assert(!node->call.inst && !node->call.thread_inst);
-
-	node->call.inst = xlat_inst_alloc(node);
-	if (!node->call.inst) return -1;
+	fr_event_list_t		*el;
+	xlat_call_t		*call;
+	xlat_inst_t		*xi;
+	xlat_thread_inst_t	*xt;
 
 	/*
-	 *	Instantiate immediately unlike permanent XLATs
-	 *	Where it's a separate phase.
+	 *	tmpl_tokenize() instantiates ephemeral xlats.  So for
+	 *	now, just ignore ones which are already instantiated.
 	 */
-	if (node->call.func->instantiate &&
-	    (node->call.func->instantiate(node->call.inst->data, node, node->call.func->uctx) < 0)) {
-	error:
-		TALLOC_FREE(node->call.inst);
-		return -1;
+	if (node->type == XLAT_GROUP) {
+		return node->group->instantiated; /* prune on 1, continue on 0 */
 	}
 
-	/*
-	 *	Create a thread instance too.
-	 */
-	node->call.thread_inst = xlat_thread_inst_alloc(node, node->call.inst);
-	if (!node->call.thread_inst) goto error;
+	if (node->type != XLAT_FUNC) return 0; /* skip it */
 
-	if (node->call.func->thread_instantiate &&
-	    node->call.func->thread_instantiate(node->call.inst, node->call.thread_inst->data,
-	    				   node, node->call.func->thread_uctx) < 0) goto error;
+	el = talloc_get_type_abort(uctx, fr_event_list_t);
+	call = &node->call;
+
+	fr_assert(!call->inst && !call->thread_inst);
 
 	/*
 	 *	Mark this up as an ephemeral node, so the destructors
 	 *	don't search for it in the xlat_inst_tree.
 	 */
-	node->call.ephemeral = true;
+	call->ephemeral = true;
+
+	xi = call->inst = xlat_inst_alloc(node);
+	if (!xi) return -1;
+
+	/*
+	 *	Instantiate immediately unlike permanent XLATs
+	 *	Where it's a separate phase.
+	 */
+	if (call->func->instantiate) {
+	    	XLAT_VERIFY(xi->node);
+		if (call->func->instantiate(XLAT_INST_CTX(xi->data,
+							  xi->node,
+							  call->func->mctx,
+							  call->func->uctx)) < 0) {
+		error:
+			TALLOC_FREE(call->inst);
+			return -1;
+		}
+		XLAT_VERIFY(xi->node);
+	}
+
+	/*
+	 *	Create a thread instance too.
+	 */
+	xt = node->call.thread_inst = xlat_thread_inst_alloc(node, el, call->inst);
+	if (!xt) goto error;
+
+	if (call->func->thread_instantiate) {
+	    	XLAT_VERIFY(xi->node);
+		if (call->func->thread_instantiate(XLAT_THREAD_INST_CTX(xi->data,
+	    					   xt->data,
+	    					   xi->node,
+	    					   xt->mctx,
+	    					   el,
+	    					   call->func->thread_uctx)) < 0) goto error;
+	    	XLAT_VERIFY(xi->node);
+	}
+
 
 	return 0;
 }
 
 /** Create instance data for "ephemeral" xlats
  *
- * @note This must only be used for xlats created at runtime.
+ * @note This function should only be called from routines which get
+ * passed a #request_t.
  *
- * @param[in] root of xlat tree to create instance data for.
+ * @param[in] head of xlat tree to create instance data for.
+ * @param[in] el event list used to run any instantiate data
  */
-int xlat_instantiate_ephemeral(xlat_exp_t *root)
+static inline CC_HINT(always_inline) int xlat_instantiate_ephemeral(xlat_exp_head_t *head, fr_event_list_t *el)
 {
-	return xlat_eval_walk(root, _xlat_instantiate_ephemeral_walker, XLAT_FUNC, NULL);
-}
+	int ret;
 
-/** Walker callback for xlat_inst_tree
- *
- */
-static int _xlat_thread_instantiate(void *data, void *uctx)
-{
-	xlat_thread_inst_t	*thread_inst;
-	xlat_inst_t		*inst = talloc_get_type_abort(data, xlat_inst_t);
-
-	thread_inst = xlat_thread_inst_alloc(uctx, data);
-	if (!thread_inst) return -1;
-
-	DEBUG3("Instantiating xlat \"%s\" node %p, instance %p, new thread instance %p",
-	       inst->node->call.func->name, inst->node, inst, thread_inst);
-
-	if (inst->node->call.func->thread_instantiate) {
-		int ret;
-
-		ret = inst->node->call.func->thread_instantiate(inst->data, thread_inst->data,
-							   inst->node, inst->node->call.func->thread_uctx);
-		if (ret < 0) {
-			talloc_free(thread_inst);
-			return -1;
-		}
+	/*
+	 *	The caller MAY resolve it, or may not.  If the caller
+	 *	hasn't resolved it, then we can't allow any unresolved
+	 *	functions or attributes.
+	 */
+	if (head->flags.needs_resolving) {
+		if (xlat_resolve(head, &(xlat_res_rules_t){ .allow_unresolved = false }) < 0) return -1;
 	}
 
-	fr_rb_insert(xlat_thread_inst_tree, thread_inst);
+	if (head->instantiated) return 0;
+
+	ret = xlat_eval_walk(head, _xlat_instantiate_ephemeral_walker, XLAT_INVALID, el);
+	if (ret < 0) return ret;
+
+	head->instantiated = true;
 
 	return 0;
 }
@@ -316,12 +403,26 @@ static int _xlat_thread_instantiate(void *data, void *uctx)
  */
 xlat_thread_inst_t *xlat_thread_instance_find(xlat_exp_t const *node)
 {
+	xlat_call_t const *call = &node->call;
+	xlat_thread_inst_t *xt;
+
+	if (call->ephemeral) return call->thread_inst;
+
 	fr_assert(xlat_thread_inst_tree);
 	fr_assert(node->type == XLAT_FUNC);
+	fr_assert(fr_heap_num_elements(xlat_thread_inst_tree) == fr_heap_num_elements(xlat_inst_tree));
 
-	if (node->call.ephemeral) return node->call.thread_inst;
+	/*
+	 *	This works because the comparator for
+	 *      the thread heap returns the same result
+	 *	as the one for the global instance data
+	 *	heap, and both heaps contain the same
+	 *	number of elements.
+	 */
+	xt = fr_heap_peek_at(xlat_thread_inst_tree, call->inst->idx);
+	fr_assert(xt && (xt->idx == call->inst->idx));
 
-	return fr_rb_find(xlat_thread_inst_tree, &(xlat_thread_inst_t){ .node = node });
+	return xt;
 }
 
 /** Create thread specific instance tree and create thread instances
@@ -332,33 +433,49 @@ xlat_thread_inst_t *xlat_thread_instance_find(xlat_exp_t const *node)
  *
  * @param[in] ctx	to bind instance tree lifetime to.  Must not be
  *			shared between multiple threads.
+ * @param[in] el	Event list to pass to all thread instantiation functions.
  * @return
  *	- 0 on success.
  *	- -1 on failure.
  */
-int xlat_thread_instantiate(TALLOC_CTX *ctx)
+int xlat_thread_instantiate(TALLOC_CTX *ctx, fr_event_list_t *el)
 {
-	fr_rb_iter_preorder_t	iter;
-	void				*data;
+	fr_assert(xlat_inst_tree);
 
-	if (!xlat_inst_tree) return 0;
-
-	if (!xlat_thread_inst_tree) {
-		MEM(xlat_thread_inst_tree = fr_rb_inline_talloc_alloc(ctx, xlat_thread_inst_t, inst_node,
-								      _xlat_thread_inst_cmp, _xlat_thread_inst_free));
+	if (unlikely(!xlat_thread_inst_tree)) {
+		MEM(xlat_thread_inst_tree = fr_heap_talloc_alloc(ctx,
+								 _xlat_thread_inst_cmp,
+								 xlat_thread_inst_t,
+								 idx,
+								 fr_heap_num_elements(xlat_inst_tree)));
 	}
 
-	/*
-	 *	Walk the inst tree, creating thread specific instances.
-	 */
-	for (data = fr_rb_iter_init_preorder(&iter, xlat_inst_tree);
-	     data;
-	     data = fr_rb_iter_next_preorder(&iter)) {
-		if (_xlat_thread_instantiate(data, xlat_thread_inst_tree) < 0) {
-			TALLOC_FREE(xlat_thread_inst_tree);
+	fr_heap_foreach(xlat_inst_tree, xlat_inst_t, xi) {
+		int			ret;
+	     	xlat_call_t const	*call = &xi->node->call;
+	     	xlat_thread_inst_t	*xt = xlat_thread_inst_alloc(xlat_thread_inst_tree, el, xi);
+		if (unlikely(!xt)) return -1;
+
+		DEBUG3("Instantiating xlat \"%s\" node %p, instance %p, new thread instance %p",
+		       call->func->name, xt->node, xi->data, xt);
+
+		ret = fr_heap_insert(&xlat_thread_inst_tree, xt);
+		if (!fr_cond_assert(ret == 0)) {
+		error:
+			TALLOC_FREE(xlat_thread_inst_tree);	/* Reset the tree on error */
 			return -1;
 		}
-	}
+
+		if (!call->func->thread_instantiate) continue;
+
+		ret = call->func->thread_instantiate(XLAT_THREAD_INST_CTX(xi->data,
+									  xt->data,
+									  xi->node,
+									  xt->mctx,
+									  el,
+									  call->func->thread_uctx));
+		if (unlikely(ret < 0)) goto error;
+	}}
 
 	return 0;
 }
@@ -373,40 +490,87 @@ void xlat_thread_detach(void)
 	TALLOC_FREE(xlat_thread_inst_tree);
 }
 
-/** Initialise the xlat inst code
+/** Initialise the xlat instance data code
  *
  */
 static int xlat_instantiate_init(void)
 {
-	if (xlat_inst_tree) return 0;
+	if (unlikely(xlat_inst_tree != NULL)) return 0;
 
-	xlat_inst_tree = fr_rb_inline_talloc_alloc(NULL, xlat_inst_t, inst_node, _xlat_inst_cmp, _xlat_inst_free);
+	xlat_inst_tree = fr_heap_talloc_alloc(NULL, _xlat_inst_cmp, xlat_inst_t, idx, 0);
 	if (!xlat_inst_tree) return -1;
 
 	return 0;
 }
 
-/** Call instantiation functions for "permanent" xlats
+/** Call instantiation functions for all registered, "permanent" xlats
  *
- * Should be called after module instantiation is complete.
+ * Should be called after all the permanent xlats have been tokenised/bootstrapped.
  */
 int xlat_instantiate(void)
 {
-	fr_rb_iter_preorder_t	iter;
-	void				*data;
+	if (unlikely(!xlat_inst_tree)) xlat_instantiate_init();
 
-	if (!xlat_inst_tree) xlat_instantiate_init();
+	/*
+	 *	Loop over all the bootstrapped
+	 *      xlats, instantiating them.
+	 */
+	fr_heap_foreach(xlat_inst_tree, xlat_inst_t, xi) {
+	     	xlat_call_t const	*call = &xi->node->call;
 
-	for (data = fr_rb_iter_init_preorder(&iter, xlat_inst_tree);
-	     data;
-	     data = fr_rb_iter_next_preorder(&iter)) {
-		xlat_inst_t *inst = talloc_get_type_abort(data, xlat_inst_t);
+		/*
+		 *	We can't instantiate functions which
+		 *	still have children that need resolving
+		 *      as this may break redundant xlats
+		 *	if we end up needing to duplicate the
+		 *	argument nodes.
+		 */
+		fr_assert(!xi->node->flags.needs_resolving);
 
-		if (inst->node->call.func->instantiate &&
-		    (inst->node->call.func->instantiate(inst->data, inst->node, inst->node->call.func->uctx) < 0)) {
-			return -1;
-		}
+		if (!call->func->instantiate) continue;
+
+		if (call->func->instantiate(XLAT_INST_CTX(xi->data,
+		    					  xi->node,
+		    					  call->func->mctx,
+		    					  call->func->uctx)) < 0) return -1;
+	}}
+
+	return 0;
+}
+
+/** Remove a node from the list of xlat instance data
+ *
+ * @note This is primarily used during "purification", to remove xlats which are no longer used.
+ *
+ * @param[in] node	to remove instance data for.
+ */
+int xlat_instance_unregister_func(xlat_exp_t *node)
+{
+	int ret;
+
+	fr_assert(node->type == XLAT_FUNC);
+	fr_assert(!node->call.func->detach);
+	fr_assert(!node->call.func->thread_detach);
+
+	if (node->call.inst) {
+		ret = fr_heap_extract(&xlat_inst_tree, node->call.inst);
+		if (ret < 0) return ret;
+
+		talloc_set_destructor(node->call.inst, NULL);
+		TALLOC_FREE(node->call.inst);
 	}
+
+	if (node->call.thread_inst) {
+		if (!node->call.ephemeral) {
+			ret = fr_heap_extract(&xlat_thread_inst_tree, node->call.thread_inst);
+			if (ret < 0) return ret;
+		}
+
+		talloc_set_destructor(node->call.thread_inst, NULL);
+		TALLOC_FREE(node->call.thread_inst);
+	}
+
+	XLAT_VERIFY(node);
 
 	return 0;
 }
@@ -417,56 +581,140 @@ int xlat_instantiate(void)
  * not call the instantiation function.  This is to allow for a clear separation
  * between the module instantiation phase and the xlat instantiation phase.
  *
+ * @note This is very similar to #xlat_instance_register but does not walk the
+ *	 children of the node.  This is primarily used to register individual
+ *	 nodes for instantiation and when an xlat function is resolved in a
+ *	 subsequent resolution pass and needs to be registered for instantiation.
+ *
  * @param[in] node	to create "permanent" instance data for.
  * @return
  *	- 0 if instantiation functions were successful.
  *	- -1 if either instantiation function failed.
  */
-int xlat_bootstrap_func(xlat_exp_t *node)
+int xlat_instance_register_func(xlat_exp_t *node)
 {
+	static uint64_t call_id;
+	xlat_call_t *call = &node->call;
 	bool ret;
 
 	fr_assert(node->type == XLAT_FUNC);
-	fr_assert(!node->call.inst && !node->call.thread_inst);
+	fr_assert(!call->id && !call->inst && !call->thread_inst);	/* Node cannot already have instance data */
+	if (!fr_cond_assert(!call->ephemeral)) {
+		fr_strerror_printf("Cannot register ephemeral calls for %s()", node->fmt);
+		return -1;		/* Can't bootstrap ephemeral calls */
+	}
 
-	node->call.inst = xlat_inst_alloc(node);
-	if (!node->call.inst) return -1;
+	call->inst = xlat_inst_alloc(node);
+	if (unlikely(!call->inst)) return -1;
 
-	DEBUG3("Instantiating xlat \"%s\" node %p, new instance %p", node->call.func->name, node, node->call.inst);
+	DEBUG3("Instantiating xlat \"%s\" node %p, new instance %p", call->func->name, node, call->inst);
 
-	ret = fr_rb_insert(xlat_inst_tree, node->call.inst);
-	if (!fr_cond_assert(ret)) {
-		TALLOC_FREE(node->call.inst);
+	/*
+	 *	Assign a unique ID to each xlat function call.
+	 *
+	 *	This is so they're ordered in the heap by
+	 *	the order in which they were "bootstrapped".
+	 *
+	 *	This allows additional functions to be added
+	 *	in the instantiation functions of other xlats
+	 *	which is useful for the redundant xlats.
+	 */
+	node->call.id = call_id++;
+
+	ret = fr_heap_insert(&xlat_inst_tree, call->inst);
+	if (!fr_cond_assert(ret == 0)) {
+		TALLOC_FREE(call->inst);
 		return -1;
 	}
+
+	XLAT_VERIFY(node);
 
 	return 0;
 }
 
-static int _xlat_bootstrap_walker(xlat_exp_t *node, UNUSED void *uctx)
+static int _xlat_inst_walker(xlat_exp_t *node, UNUSED void *uctx)
 {
-	return xlat_bootstrap_func(node);
+	/*
+	 *	tmpl_tokenize() instantiates ephemeral xlats.  So for
+	 *	now, just ignore ones which are already instantiated.
+	 */
+	if (node->type == XLAT_GROUP) {
+		return node->group->instantiated; /* prune on 1, continue on 0 */
+	}
+
+	if (node->type != XLAT_FUNC) return 0; /* skip it */
+
+
+	return xlat_instance_register_func(node);
 }
 
 /** Create instance data for "permanent" xlats
  *
- * @note This must only be used for xlats created during startup.
+ * @note This must only be used for xlats which are read from the configuration files.
  *	 IF THIS IS CALLED FOR XLATS TOKENIZED AT RUNTIME YOU WILL LEAK LARGE AMOUNTS OF MEMORY.
- *	 USE xlat_instantiate_request() INSTEAD.
+ *	 If the caller has a #tmpl_rules_t, it should call xlat_finalize() instead.
  *
- * @param[in] root of xlat tree to create instance data for.
+ * @param[in] head	of xlat tree to create instance data for.  Will walk the entire tree
+ *		   	registering all the xlat function calls for later instantiation.
  */
-int xlat_bootstrap(xlat_exp_t *root)
+static inline CC_HINT(always_inline) int xlat_instance_register(xlat_exp_head_t *head)
 {
+	int ret;
+
 	/*
 	 *	If thread instantiate has been called, it's too late to
 	 *	bootstrap new xlats.
 	 */
-	fr_assert(!xlat_thread_inst_tree);
+	fr_assert_msg(!xlat_thread_inst_tree, "Tried to instantiate new compile time xlat at runtime.  "
+		      "xlat.runtime_el likely not set in tmpl rules when it should've been.  "
+		      "Use unlang_interpret_event_list() to get the current event list from the request");
 
-	if (!xlat_inst_tree) xlat_instantiate_init();
+	/*
+	 *	Initialise the instance tree if this is the first xlat
+	 *	being instantiated.
+	 */
+	if (unlikely(!xlat_inst_tree)) xlat_instantiate_init();
 
-	return xlat_eval_walk(root, _xlat_bootstrap_walker, XLAT_FUNC, NULL);
+	if (head->instantiated) return 0;
+
+	/*
+	 *	Walk an expression registering all the function calls
+	 *	so that we can instantiate them later.
+	 */
+	ret = xlat_eval_walk(head, _xlat_inst_walker, XLAT_INVALID, NULL);
+	if (ret < 0) return ret;
+
+	head->instantiated = true;
+	return 0;
+}
+
+/** Bootstrap static xlats, or instantiate ephemeral ones.
+ *
+ * @param[in] head		of xlat tree to create instance data for.
+ * @param[in] runtime_el	determines whether we do ephemeral or static instantiation.
+ *				If NULL, we perform static instantiation, otherwise
+ *				will perform ephemeral instantiation passing the el to
+ *				the instantiation functions.
+ */
+int xlat_finalize(xlat_exp_head_t *head, fr_event_list_t *runtime_el)
+{
+	int ret;
+
+	if (!runtime_el) {
+		ret = xlat_instance_register(head);
+	} else {
+		ret = xlat_instantiate_ephemeral(head, runtime_el);
+	}
+	if (ret < 0) return ret;
+
+	/*
+	 *	Both branches walk the tree and attach instance data to every
+	 *	function call in it, so check the result here.  Callers do not
+	 *	need to check it again themselves.
+	 */
+	XLAT_HEAD_VERIFY(head);
+
+	return ret;
 }
 
 /** Walk over all registered instance data and free them explicitly
@@ -477,5 +725,12 @@ int xlat_bootstrap(xlat_exp_t *root)
  */
 void xlat_instances_free(void)
 {
-	TALLOC_FREE(xlat_inst_tree);
+	xlat_inst_t *xi;
+
+	/*
+	 *	When we get to zero instances the heap
+	 *	is freed, so we need to check there's
+	 *	still a heap to pass to fr_heap_pop.
+	 */
+	while (xlat_inst_tree && (fr_heap_pop((void **)&xi, &xlat_inst_tree) == 0) && xi) talloc_free(xi);
 }

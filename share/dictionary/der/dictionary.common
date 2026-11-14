@@ -1,0 +1,74 @@
+# -*- text -*-
+# Copyright (C) 2025 Network RADIUS SAS (legal@networkradius.com)
+# This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
+# Version $Id$
+
+#
+#  List this at the top of the DER dictionary, so that it can be
+#  referenced from elsewhere.  While technically doing so allows
+#  people to reference it out of scope, in practice that isn't a huge
+#  issue.
+#
+DEFINE	RelativeDistinguishedName			set set_of=sequence,size=1..
+BEGIN RelativeDistinguishedName
+DEFINE	AttributeTypeAndValue				sequence sequence_of=oid_and_value
+END RelativeDistinguishedName
+
+DEFINE	GeneralName					choice
+BEGIN GeneralName
+
+ATTRIBUTE	otherName				0	sequence option
+BEGIN otherName
+DEFINE	type-id						oid
+DEFINE	value						sequence option=0
+BEGIN value
+DEFINE	userPrincipalName				utf8string
+END value
+END otherName
+
+ATTRIBUTE	rfc822Name				1	ia5string option
+ATTRIBUTE	dNSName					2	ia5string option
+
+ATTRIBUTE	directoryName				4	sequence  option
+BEGIN directoryName
+DEFINE	RDNSequence					sequence        sequence_of=set
+BEGIN RDNSequence
+DEFINE	RelativeDistinguishedName			set clone=@.RelativeDistinguishedName
+END RDNSequence
+END directoryName
+
+ATTRIBUTE	EDIPartyName				5	sequence option
+BEGIN EDIPartyName
+#
+#  These are really DirectoryString, which is CHOICE of all of the string options.
+#
+ATTRIBUTE nameAssigner					0	utf8string option
+ATTRIBUTE partyName					1	utf8string option
+END EDIPartyName
+
+ATTRIBUTE	uniformResourceIdentifier		6	ia5string option
+ATTRIBUTE	iPAddress				7	combo-ip option
+
+END GeneralName
+
+DEFINE	DirectoryName					choice
+BEGIN DirectoryName
+ATTRIBUTE	printableString				19	printablestring
+ATTRIBUTE	universalString				28	universalstring
+ATTRIBUTE	utf8String				12	utf8string
+END DirectoryName
+
+DEFINE	GeneralSubtree					sequence
+BEGIN GeneralSubtree
+DEFINE	base						sequence        clone=@.GeneralName
+ATTRIBUTE minimum					0	integer		option,optional,default=0
+ATTRIBUTE maximum					1	integer		option,optional
+END GeneralSubtree
+
+DEFINE	Name						sequence
+BEGIN Name
+DEFINE	RDNSequence					sequence        sequence_of=set
+BEGIN RDNSequence
+DEFINE	RelativeDistinguishedName			set clone=@.RelativeDistinguishedName
+END RDNSequence
+END Name

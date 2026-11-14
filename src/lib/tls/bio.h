@@ -25,10 +25,42 @@
  */
 RCSIDH(bio_h, "$Id$")
 
+#include "openssl_user_macros.h"
+
 #include <openssl/bio.h>
 #include <freeradius-devel/util/dbuff.h>
 
+/** An OpenSSL BIO whose backing store is a (possibly) talloc-extendable buffer
+ *
+ * The BIO has two dbuffs, a producer and a consumer.  They have
+ * the same start pointers, but different end pointers.  The producer
+ * writes more data to the memory buffer via fr_tls_bio_dbuff_in(),
+ * which updates its end pointer.  The end pointer is shared with the
+ * consumer, which sees that data is available, and reads it via
+ * fr_tls_bio_dbuff_out().
+ *
+ * This design allows the producer and consumer to share an underlying
+ * memory block, which reduces copies.
+ *
+ * The dbuff can shift its memory contents around.  A read shifts the
+ * data down to reclaim the space which was consumed, and a write
+ * shifts the data down in the same way.  A write may also extend the
+ * buffer, and talloc extends a buffer by moving the buffer to a new
+ * address.  Callers must therefore not cache any pointers, and
+ * instead always call the dbuff wrapper functions to get the current
+ * values.
+ */
 typedef struct fr_tls_bio_dbuff_s fr_tls_bio_dbuff_t;
+
+/** Window of datagrams which can be in a TLS BIO, but not yet written.
+ *
+ * The cap serves the same purpose as FR_TLS_MAX_ROUNDS in session.h:
+ * it stops the server from holding unbounded state.  A handshake
+ * flight is a handful of datagrams even at the smallest possible MTU.
+ * Any write which would exceed this limit fails, rather than growing
+ * the queue.
+ */
+#define FR_TLS_MAX_DATAGRAMS (256)
 
 uint8_t		*fr_tls_bio_dbuff_finalise(fr_tls_bio_dbuff_t *bd);
 
@@ -40,6 +72,8 @@ fr_dbuff_t	*fr_tls_bio_dbuff_in(fr_tls_bio_dbuff_t *bd);
 
 void		fr_tls_bio_dbuff_reset(fr_tls_bio_dbuff_t *bd);
 
+void		fr_tls_bio_dbuff_clear(fr_tls_bio_dbuff_t *bd);
+
 BIO		*fr_tls_bio_dbuff_alloc(fr_tls_bio_dbuff_t **out, TALLOC_CTX *bio_ctx, TALLOC_CTX *buff_ctx,
 					 size_t init, size_t max, bool free_buff);
 
@@ -50,6 +84,12 @@ char		*fr_tls_bio_dbuff_thread_local_finalise_bstr(void);
 void		fr_tls_bio_dbuff_thread_local_clear(void);
 
 BIO		*fr_tls_bio_dbuff_thread_local(TALLOC_CTX *ctx, size_t init, size_t max);
+
+int		fr_tls_bio_dbuff_datagram_init(fr_tls_bio_dbuff_t *bd);
+
+size_t		fr_tls_bio_dbuff_datagram_len(fr_tls_bio_dbuff_t *bd);
+
+void		fr_tls_bio_dbuff_datagram_sent(fr_tls_bio_dbuff_t *bd);
 
 int		fr_tls_bio_init(void);
 

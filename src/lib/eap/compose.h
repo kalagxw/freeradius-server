@@ -23,7 +23,6 @@
  * @copyright 2019 The FreeRADIUS server project
  */
 
-#include <stdbool.h>
 
 #include "types.h"
 
@@ -53,8 +52,6 @@ typedef struct {
 
 #include "session.h"
 #include "submodule.h"
-
-#define RAD_REQUEST_OPTION_PROXY_EAP	(1 << 16)
 
 rlm_rcode_t	eap_start(request_t *request, rlm_eap_method_t const methods[], bool ignore_unknown_types) CC_HINT(nonnull);
 rlm_rcode_t	eap_continue(eap_session_t *eap_session) CC_HINT(nonnull);

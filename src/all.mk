@@ -8,4 +8,13 @@ SUBMAKEFILES := include/all.mk \
 	process/all.mk \
 	modules/all.mk \
 	bin/all.mk \
-	tests/all.mk
+	fuzzer/all.mk \
+	stats/all.mk
+
+#
+#  The default is to just build the source code.  We skip running the
+#  test framework if it's not necessary.
+#
+ifneq "$(findstring test,$(MAKECMDGOALS))$(findstring clean,$(MAKECMDGOALS))" ""
+SUBMAKEFILES +=	tests/all.mk
+endif

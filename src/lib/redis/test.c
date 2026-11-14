@@ -1,7 +1,7 @@
 /*
  *  cc  -g3 -Wall -DHAVE_DLFCN_H -I../../../src -include freeradius-devel/build.h -L../../../build/lib/local/.libs -ltalloc -lhiredis -lfreeradius-unlang -lfreeradius-util -lfreeradius-server -o test_redis test.c redis.c io.c crc16.c
  */
-#include <freeradius-devel/util/acutest.h>
+#include <freeradius-devel/util/test/acutest.h>
 #include "base.h"
 #include "io.h"
 #include "pipeline.h"
@@ -44,8 +44,8 @@ static void test_basic_connection(void)
 	fr_redis_command_set_t		*cmds;
 	fr_redis_cluster_thread_t	*cluster_thread;
 	fr_redis_trunk_t		*rtrunk;
-	fr_connection_conf_t		conn_conf;
-	fr_trunk_conf_t			trunk_conf;
+	connection_conf_t		conn_conf;
+	trunk_conf_t			trunk_conf;
 	size_t				i;
 	redis_pipeline_stats_t		stats;
 

@@ -1,0 +1,73 @@
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    #
+    #  The condition restricts the job to trusted contributors. The
+    #  Claude Code action needs `id-token: write`. GitHub denies
+    #  `id-token: write` for events originating on fork pull requests,
+    #  regardless of what we put in the `permissions:` block. Without the
+    #  condition the workflow fails, with "Could not fetch an OIDC
+    #  token", every time a first-time fork contributor mentions
+    #  `@claude`.
+    #
+    #  Maintainers can still trigger Claude on a fork pull request by
+    #  replying in the thread with the maintainer's own `@claude` mention.
+    #
+    if: |
+      (
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) ||
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association) ||
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association)
+      ) &&
+      (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+      actions: read # Claude needs actions: read to read continuous integration (CI) results on pull requests
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_federation_rule_id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          anthropic_organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          anthropic_service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          anthropic_workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+
+          # `additional_permissions` is an optional setting that allows Claude
+          # to read CI results on pull requests
+          additional_permissions: |
+            actions: read
+
+          # Optional: Give a custom prompt to Claude. If you specify no prompt, Claude performs the instructions in the comment that mentioned Claude.
+          # prompt: 'Update the pull request description to include a summary of changes.'
+
+          # Optional: Add `claude_args` to customize behavior and configuration
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
+          # claude_args: '--allowed-tools Bash(gh pr:*)'
+

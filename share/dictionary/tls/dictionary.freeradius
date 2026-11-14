@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2022 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -8,22 +8,241 @@
 # Version:	$Id$
 #
 
-ATTRIBUTE	Packet-Type				1	uint32
+DEFINE		Packet-Type					uint32
 
 VALUE	Packet-Type			Load-Session		1
 VALUE	Packet-Type			Store-Session		2
 VALUE	Packet-Type			Clear-Session		3
 VALUE	Packet-Type			Verify-Certificate	4
+VALUE	Packet-Type			New-Session		5
+VALUE	Packet-Type			Establish-Session	6
+VALUE	Packet-Type			Fail-Session		7
+VALUE	Packet-Type			Encode-Session		8
+VALUE	Packet-Type			Decode-Session		9
+VALUE	Packet-Type			Load-PSK		10
 
 #
 #  We use response packet types instead of rcodes so that
 #  the virtual server can be tested in isolation.
 #
-VALUE	Packet-Type			success			10
-VALUE	Packet-Type			failure			11
-VALUE	Packet-Type			notfound		12
+VALUE	Packet-Type			success			11
+VALUE	Packet-Type			failure			12
+VALUE	Packet-Type			notfound		13
 
-ATTRIBUTE	Session-Id				10	octets
-ATTRIBUTE	Session-Data				11	octets
-ATTRIBUTE	Session-Resumed				12	bool
-ATTRIBUTE	Session-TTL				13	time_delta
+DEFINE		Session-Id					octets
+DEFINE		Session-Data					octets
+DEFINE		Session-Resumed					bool
+DEFINE		Session-TTL					time_delta
+
+DEFINE		Min-Version					float32
+DEFINE		Max-Version					float32
+
+#
+#  `Alert` carries a TLS alert.
+#
+#  Note that we're not decoding TLS here, so we don't need to define
+#  any attribute numbers.  We just want to be able to use the TLS
+#  alerts in a policy.
+#
+DEFINE		Alert						struct
+
+MEMBER		Level						uint8
+
+#
+#  The TLS RFCs define only two alert levels.
+#
+VALUE	Level				Warning			1
+VALUE	Level				Fatal			2
+
+MEMBER		Description					uint8
+
+#
+#  The alert names are taken from the IANA "TLS Alerts" registry.
+#
+VALUE	Description			Close-Notify		0
+VALUE	Description			Unexpected-Message	10
+VALUE	Description			Bad-Record-MAC		20
+VALUE	Description			Decryption-Failed	21	# reserved
+VALUE	Description			Record-Overflow		22
+VALUE	Description			Decompression-Failure	30	# reserved
+VALUE	Description			Handshake-Failure	40
+VALUE	Description			No-Certificate		41	# reserved
+VALUE	Description			Bad-Certificate		42
+VALUE	Description			Unsupported-Certificate	43
+VALUE	Description			Certificate-Revoked	44
+VALUE	Description			Certificate-Expired	45
+VALUE	Description			Certificate-Unknown	46
+VALUE	Description			Illegal-Parameter	47
+VALUE	Description			Unknown-CA		48
+VALUE	Description			Access-Denied		49
+VALUE	Description			Decode-Error		50
+VALUE	Description			Decrypt-Error		51
+VALUE	Description			Too-Many-CIDs-Requested	52
+VALUE	Description			Export-Restriction	60	# reserved
+VALUE	Description			Protocol-Version	70
+VALUE	Description			Insufficient-Security	71
+VALUE	Description			Internal-Error		80
+VALUE	Description			Inappropriate-Fallback	86
+VALUE	Description			User-Canceled		90
+VALUE	Description			No-Renegotiation	100	# reserved
+VALUE	Description			Missing-Extension	109
+VALUE	Description			Unsupported-Extension	110
+VALUE	Description			Certificate-Unobtainable	111	# reserved
+VALUE	Description			Unrecognized-Name	112
+VALUE	Description			Bad-Certificate-Status-Response	113
+VALUE	Description			Bad-Certificate-Hash-Value	114	# reserved
+VALUE	Description			Unknown-PSK-Identity	115
+VALUE	Description			Certificate-Required	116
+VALUE	Description			General-Error		117
+VALUE	Description			No-Application-Protocol	120
+VALUE	Description			ECH-Required		121
+
+#
+#  Track the many reasons why a TLS connection has failed.
+#
+#  The Error attribute contains the reason why the TLS connection failed.
+#  It is _appended_ to the `session-state` list, as a connection can fail
+#  for multiple reasons.  You can look at the Errors in order, to
+#  determine which errors happened.
+#
+#  FreeRADIUS appends `Error` to the `session-state` list, and appends
+#  rather than replaces, so a session which fails for one reason and then
+#  reports a second reason keeps both, in the order they happened.
+#
+#  The numbers carry no meaning and are not used anywhere outside of FreeRADIUS.
+#
+DEFINE		Error						uint32
+
+#
+#  We received a TLS Alert, the alert is in request.Alert.Description
+#
+VALUE	Error				Received-Alert			1
+
+#
+#  We are sending a TLS Alert, the alert is in reply.Alert.Description
+#
+VALUE	Error				Sent-Alert			2
+
+#
+#  The handshake made no progress, or was asked to run when it should not
+#  have been.
+#
+VALUE	Error				Too-Many-Rounds			3
+VALUE	Error				Handshake-Finished		4
+VALUE	Error				Session-Invalid			5
+
+#
+#  A record which FreeRADIUS refused.  Each of these marks the session
+#  invalid, so `Session-Invalid` follows on the next round.
+#
+VALUE	Error				Session-Mismatch		6
+VALUE	Error				Invalid-Version-SSLv2		7
+VALUE	Error				Invalid-Version-SSLv3		8
+VALUE	Error				Invalid-Record-Length		9
+VALUE	Error				Heartbeat-Overflow		10
+
+#
+#  Application data in the wrong place.
+#
+VALUE	Error				Application-Data-Too-Early	11
+VALUE	Error				Record-After-Handshake		12
+VALUE	Error				Record-Too-Large		13
+
+#
+#  Certificates failures.
+#
+VALUE	Error				Certificate-Verify-Failed	14
+VALUE	Error				Certificate-Attributes-Failed	15
+VALUE	Error				Certificate-Revalidation-Failed	16
+
+#
+#  Session resumption.  None of these fails a handshake.  Each one means
+#  that a full handshake runs instead of a resumed one.
+#
+VALUE	Error				Load-Session-Expired		17
+VALUE	Error				Store-Session-Expired		18
+VALUE	Error				Session-Ticket-Expired		19
+VALUE	Error				Session-Data-Decode-Failed	20
+VALUE	Error				Session-Ticket-Not-Allowed	21
+VALUE	Error				Store-Cancelled-By-Clear	22
+
+#
+#  Pre-shared keys.  Each of these returns a key of length zero, and
+#  OpenSSL then fails the handshake by itself.
+#
+#  The server records `PSK-Identity-Unknown` when the fixed `psk.identity`
+#  does not match the identity that the peer sent, and when `load psk`
+#  returns `notfound`.  `PSK-Empty` and `PSK-Too-Long` describe the
+#  `TLS-PSK-Key` that `load psk` returned.
+#
+VALUE	Error				PSK-Identity-Invalid		23
+VALUE	Error				PSK-Empty			24
+VALUE	Error				PSK-Too-Long			25
+VALUE	Error				PSK-Identity-Unknown		26
+
+#
+#  Configuration which is missing or wrong.  These are the administrator's
+#  errors rather than the peer's, and they stop a session before the
+#  handshake starts.
+#
+VALUE	Error				No-Server-Certificate		27
+VALUE	Error				No-Server-Private-Key		28
+
+#
+#  A policy section which did not reply with `success`.  The rule broken
+#  is the administrator's rather than the peer's, but `fail session` reads
+#  one field, so the reasons belong here with the rest.
+#
+#  `verify certificate` also copies any `Module-Failure-Message` from its
+#  own subrequest up into the parent request, which is where the text
+#  explaining a rejection ends up.
+#
+VALUE	Error				Verify-Certificate-Failed	29
+VALUE	Error				Load-Session-Failed		30
+VALUE	Error				Load-Session-Not-Found		31
+VALUE	Error				Load-Session-Malformed		32
+VALUE	Error				Store-Session-Failed		33
+VALUE	Error				Clear-Session-Failed		34
+VALUE	Error				Encode-Session-Failed		35
+VALUE	Error				Decode-Session-Failed		36
+VALUE	Error				Load-PSK-Failed			41
+
+#
+#  Something in connection failed, rather than the handshake.
+#
+#  Either there was an IO error, or some application-layer failure
+#  which isn't captured here.
+#
+VALUE	Error				System-Call-Failed		37
+VALUE	Error				Application-Failed		38
+
+#
+#  OpenSSL finished the handshake but handed back no session, so there is
+#  nothing to cache and nothing to resume.
+#
+VALUE	Error				Session-Missing			39
+
+#
+#  ALPN was used, and there was an unresolveable discrepancy between the two ends.
+#
+VALUE	Error				ALPN-Failed			40
+
+#
+#  We didn't see a session ticket or data after the TLS handshake.
+#
+VALUE	Error				Post-Handshake-Timeout		41
+
+#
+#  DTLS needed more data from the peer, and didn't receive it
+#
+VALUE	Error				DTLS-Handshake-Timeout		42
+
+#
+#  The peer closed the connection.
+#
+VALUE	Error				Peer-Closed-Connection		43
+
+#
+#  The name of the ALPN string which was negotiated.
+#
+DEFINE	ALPN							string

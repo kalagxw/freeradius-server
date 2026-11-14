@@ -1,0 +1,45 @@
+```
+server detail {
+	namespace = detail
+
+	listen {
+		type = Accounting-Request
+		transport = file
+
+		file {
+			filename = "${confdir}/detail-*"
+			filename.work = "${confdir}/detail.work"
+			track = no
+		}
+
+#		work {
+#			filename.work = "${confdir}/detail.work"
+#			track = no
+#		}
+
+	}
+
+recv {
+	fail
+}
+
+send success {
+	ok
+}
+
+send failure {
+```
+do nothing
+```
+}
+
+}
+```
+
+== Default Configuration
+
+```
+```
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

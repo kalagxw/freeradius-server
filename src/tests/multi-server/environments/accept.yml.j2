@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------
+# Docker Compose Test Environment:
+#
+#   load-generator (proto_load, in-process) -> FreeRADIUS (Access-Accept)
+#
+#   Same compose serves both service and profiling modes. In profiling
+#   mode the make recipe sets FREERADIUS_IMAGE=freeradius4-radenv-profiling/<image>:<sha>
+#   and RADIUSD_COMMAND to the capture script. The test template exec's
+#   RADIUSD_COMMAND, which is freeradius itself in service mode.
+# ---------------------------------------------------------------
+x-common-config: &id001
+  cap_add:
+  - NET_ADMIN
+  - SYS_PTRACE
+  environment:
+    TEST_PROJECT_NAME: ${COMPOSE_PROJECT_NAME}
+    TEST_SUBNET: {{ test_subnet | default('172.16.0.0/12') }}
+services:
+  freeradius:
+    image: ${FREERADIUS_IMAGE}
+    extends:
+      file: freeradius-common.yml
+      service: freeradius-load-generator
+    volumes:
+    # freeradius server config
+    - ${DATA_PATH}/freeradius/accept/radiusd.conf:/etc/freeradius/radiusd.conf
+    entrypoint:
+    - bash
+    - -lc
+    - |
+      # Keep the container alive. The test framework starts FreeRADIUS
+      # and runs commands via 'docker exec' so it can control timing.
+      sleep infinity
+    <<: *id001

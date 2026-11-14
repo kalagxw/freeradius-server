@@ -7,8 +7,7 @@
  * @copyright 2013 The FreeRADIUS server project
  * @copyright 2013 Network RADIUS (legal@networkradius.com)
  */
-#define LOG_PREFIX "rlm_yubikey (%s) - "
-#define LOG_PREFIX_ARGS inst->name
+#define LOG_PREFIX inst->name
 
 #include "rlm_yubikey.h"
 
@@ -79,14 +78,17 @@ int rlm_yubikey_ykclient_init(CONF_SECTION *conf, rlm_yubikey_t *inst)
 
 	status = ykclient_global_init();
 	if (status != YKCLIENT_OK) {
-yk_error:
 		ERROR("%s", ykclient_strerror(status));
 
 		return -1;
 	}
 
 	status = ykclient_init(&inst->ykc);
-	if (status != YKCLIENT_OK) goto yk_error;
+	if (status != YKCLIENT_OK) {
+		ERROR("%s", ykclient_strerror(status));
+		ykclient_global_done();
+		return -1;
+	}
 
 	servers = cf_section_find(conf, "servers", CF_IDENT_ANY);
 	if (servers) {
@@ -115,7 +117,10 @@ yk_error:
 		if (count) {
 			status = ykclient_set_url_templates(inst->ykc, count, inst->uris);
 			if (status != YKCLIENT_OK) {
-				goto yk_error;
+				ERROR("%s", ykclient_strerror(status));
+				ykclient_done(&inst->ykc);
+				ykclient_global_done();
+				return -1;
 			}
 		}
 	}
@@ -124,14 +129,15 @@ init:
 	status = ykclient_set_client_b64(inst->ykc, inst->client_id, inst->api_key);
 	if (status != YKCLIENT_OK) {
 		ERROR("%s", ykclient_strerror(status));
-
+		ykclient_done(&inst->ykc);
+		ykclient_global_done();
 		return -1;
 	}
 
-	inst->pool = module_connection_pool_init(conf, inst, mod_conn_create, NULL, inst->name, NULL, NULL);
+	inst->pool = module_rlm_connection_pool_init(conf, inst, mod_conn_create, NULL, inst->name, NULL, NULL);
 	if (!inst->pool) {
 		ykclient_done(&inst->ykc);
-
+		ykclient_global_done();
 		return -1;
 	}
 
@@ -147,14 +153,16 @@ int rlm_yubikey_ykclient_detach(rlm_yubikey_t *inst)
 	return 0;
 }
 
-unlang_action_t rlm_yubikey_validate(rlm_rcode_t *p_result, rlm_yubikey_t const *inst, request_t *request, char const *passcode)
+unlang_action_t rlm_yubikey_validate(unlang_result_t *p_result, module_ctx_t const *mctx,
+				     request_t *request, char const *passcode)
 {
+	rlm_yubikey_t const *inst = talloc_get_type_abort(mctx->mi->data, rlm_yubikey_t);
 	rlm_rcode_t rcode = RLM_MODULE_OK;
 	ykclient_rc status;
 	ykclient_handle_t *yandle;
 
 	yandle = fr_pool_connection_get(inst->pool, request);
-	if (!yandle) RETURN_MODULE_FAIL;
+	if (!yandle) RETURN_UNLANG_FAIL;
 
 	/*
 	 *	The libcurl multi-handle interface will tear down the TCP sockets for any partially completed
@@ -192,6 +200,6 @@ unlang_action_t rlm_yubikey_validate(rlm_rcode_t *p_result, rlm_yubikey_t const 
 
 	fr_pool_connection_release(inst->pool, request, yandle);
 
-	RETURN_MODULE_RCODE(rcode);
+	RETURN_UNLANG_RCODE(rcode);
 }
 #endif

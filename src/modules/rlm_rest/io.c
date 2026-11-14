@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -23,21 +23,18 @@
  */
 #include "rest.h"
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/server/module.h>
-#include <freeradius-devel/unlang/base.h>
+#include <freeradius-devel/server/module_rlm.h>
 
 /** Handle asynchronous cancellation of a request
  *
  * If we're signalled that the request has been cancelled (FR_SIGNAL_CANCEL).
  * Cleanup any pending state and release the connection handle back into the pool.
  */
-void rest_io_module_action(module_ctx_t const *mctx, request_t *request, void *rctx, fr_state_signal_t action)
+void rest_io_module_signal(module_ctx_t const *mctx, request_t *request, UNUSED fr_signal_t action)
 {
-	fr_curl_io_request_t	*randle = talloc_get_type_abort(rctx, fr_curl_io_request_t);
+	fr_curl_io_request_t	*randle = talloc_get_type_abort(mctx->rctx, fr_curl_io_request_t);
 	rlm_rest_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_rest_thread_t);
 	CURLMcode		ret;
-
-	if (action != FR_SIGNAL_CANCEL) return;
 
 	RDEBUG2("Forcefully cancelling pending REST request");
 
@@ -48,8 +45,7 @@ void rest_io_module_action(module_ctx_t const *mctx, request_t *request, void *r
 	}
 	t->mhandle->transfers--;
 
-	rest_request_cleanup(mctx->instance, randle);
-	fr_pool_connection_release(t->pool, request, randle);
+	rest_slab_release(randle);
 }
 
 /** Handle asynchronous cancellation of a request
@@ -57,14 +53,17 @@ void rest_io_module_action(module_ctx_t const *mctx, request_t *request, void *r
  * If we're signalled that the request has been cancelled (FR_SIGNAL_CANCEL).
  * Cleanup any pending state and release the connection handle back into the pool.
  */
-void rest_io_xlat_signal(request_t *request, UNUSED void *instance, void *thread, void *rctx, fr_state_signal_t action)
+void rest_io_xlat_signal(xlat_ctx_t const *xctx, request_t *request, fr_signal_t action)
 {
-	rest_xlat_thread_inst_t		*xti = talloc_get_type_abort(thread, rest_xlat_thread_inst_t);
-	rlm_rest_t			*mod_inst = xti->inst;
-	rlm_rest_thread_t		*t = xti->t;
+	rlm_rest_thread_t		*t = talloc_get_type_abort(xctx->mctx->thread, rlm_rest_thread_t);
 
-	rlm_rest_xlat_rctx_t		*our_rctx = talloc_get_type_abort(rctx, rlm_rest_xlat_rctx_t);
+	rlm_rest_xlat_rctx_t		*our_rctx = talloc_get_type_abort(xctx->rctx, rlm_rest_xlat_rctx_t);
 	fr_curl_io_request_t		*randle = talloc_get_type_abort(our_rctx->handle, fr_curl_io_request_t);
 
-	rest_io_module_action(&(module_ctx_t){ .instance = mod_inst, .thread = t }, request, randle, action);
+	rest_io_module_signal(MODULE_CTX(xctx->mctx->mi,
+			      t,
+			      xctx->mctx->env_data,
+			      randle),
+			      request,
+			      action);
 }

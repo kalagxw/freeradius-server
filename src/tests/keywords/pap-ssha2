@@ -1,27 +1,30 @@
 #
-# PRE: update if pap
+# PRE: if pap
+#
+string salt
+string result_string
+octets result_octets
+
+#
+#  @todo - When fully converted, this crashes on ubsan issues.
 #
 
 #
 #  Skip if the server wasn't built with openssl
 #
-if ('${feature.tls}' != 'yes') {
-	update reply {
-		&Packet-Type := Access-Accept
-	}
+if (!('${feature.tls}' == 'yes')) {
+	reply.Packet-Type := ::Access-Accept
 	handled
 }
 
-update {
-	&control !* ANY
-	&Tmp-String-0 := "5RNqNl8iYLbkCc7JhR8as4TtDDCX6otuuWtcja8rITUyx9zrnHSe9tTHGmKK"	# 60 byte salt
-}
+control := {}
+salt := "5RNqNl8iYLbkCc7JhR8as4TtDDCX6otuuWtcja8rITUyx9zrnHSe9tTHGmKK"	# 60 byte salt
 
 #
 #  Hex encoded SSHA2-512 password
 #
-update {
-	&control.Password.With-Header += "{ssha512}%{hex:%{sha2_512:%{User-Password}%{Tmp-String-0}}}%{hex:%{Tmp-String-0}}"
+control += {
+	Password.With-Header = "{ssha512}%hex(%hash.sha2_512(%{User-Password}%{salt}))%hex(%{salt})"
 }
 
 pap.authorize
@@ -32,29 +35,21 @@ if (reject) {
 	test_fail
 }
 
-update {
-	&control !* ANY
-}
+control := {}
 
 #
 #  Base64 encoded SSHA2-512 password
 #
-update {
-	&control.Tmp-String-1 := "%{hex:%{sha2_512:%{User-Password}%{Tmp-String-0}}}%{hex:%{Tmp-String-0}}"
-}
+result_string := "%hex(%hash.sha2_512(%{User-Password}%{salt}))%hex(%{salt})"
 
 # To Binary
-update {
-	&control.Tmp-Octets-0 := "%{bin:%{control.Tmp-String-1}}"
-}
+result_octets := "%bin(%{result_string})"
 
 # To Base64
-update {
-	&control.Tmp-String-1 := "%{base64:%{control.Tmp-Octets-0}}"
-}
+result_string := "%base64.encode(%{result_octets})"
 
-update {
-	&control.Password.With-Header += "{ssha512}%{control.Tmp-String-1}"
+control += {
+	Password.With-Header = "{ssha512}%{result_string}"
 }
 
 pap.authorize
@@ -65,29 +60,21 @@ if (reject) {
 	test_fail
 }
 
-update {
-	&control !* ANY
-}
+control := {}
 
 #
 #  Base64 of Base64 encoded SSHA2-512 password
 #
-update {
-	&control.Tmp-String-1 := "%{hex:%{sha2_512:%{User-Password}%{Tmp-String-0}}}%{hex:%{Tmp-String-0}}"
-}
+result_string := "%hex(%hash.sha2_512(%{User-Password}%{salt}))%hex(%{salt})"
 
 # To Binary
-update {
-	&control.Tmp-Octets-0 := "%{bin:%{control.Tmp-String-1}}"
-}
+result_octets := "%bin(%{result_string})"
 
 # To Base64
-update {
-	&control.Tmp-String-1 := "{ssha512}%{base64:%{control.Tmp-Octets-0}}"
-}
+result_string := "{ssha512}%base64.encode(%{result_octets})"
 
-update {
-	&control.Password.With-Header += "%{base64:%{control.Tmp-String-1}}"
+control += {
+	Password.With-Header = "%base64.encode(%{result_string})"
 }
 
 pap.authorize
@@ -98,16 +85,12 @@ if (reject) {
 	test_fail
 }
 
-update {
-	&control !* ANY
-}
+control := {}
 
 #
 #  Base64 of SHA2-384 password (in SHA2-Password)
 #
-update control {
-	&control.Password.SHA2 := "%{hex:%{sha2_384:%{User-Password}}}"
-}
+control.Password.SHA2 := %hex(%hash.sha2_384(%{User-Password}))
 
 pap.authorize
 pap.authenticate {
@@ -117,20 +100,14 @@ if (reject) {
 	test_fail
 }
 
-update {
-	&control !* ANY
-}
-
-update control {
-	&Auth-Type := Accept
+control := {
+	Auth-Type = ::Accept
 }
 
 #
 #  Base64 of SHA2-256 password (in SHA2-256-Password)
 #
-update control {
-	&control.Password.SHA2-256 := "%{hex:%{sha2_256:%{User-Password}}}"
-}
+control.Password.SHA2-256 := "%hex(%hash.sha2_256(%{User-Password}))"
 
 pap.authorize
 pap.authenticate {
@@ -140,16 +117,12 @@ if (reject) {
 	test_fail
 }
 
-update {
-	&control !* ANY
-}
+control := {}
 
 #
 #  Base64 of SHA2-224 password (in SHA2-224-Password - No hex armour)
 #
-update control {
-	&control.Password.SHA2-224 := "%{sha2_224:%{User-Password}}"
-}
+control.Password.SHA2-224 := "%hash.sha2_224(%{User-Password})"
 
 pap.authorize
 pap.authenticate {
@@ -159,13 +132,8 @@ if (reject) {
 	test_fail
 }
 
-update {
-	&control !* ANY
-}
-
-
-update control {
-	&Auth-Type := Accept
+control := {
+	Auth-Type = ::Accept
 }
 
 success

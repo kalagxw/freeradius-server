@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -14,7 +14,7 @@ VENDOR		Camiant				21274
 BEGIN-VENDOR	Camiant
 
 ATTRIBUTE	MI-role					1	string
-ATTRIBUTE	SUI-role				2	integer
+ATTRIBUTE	SUI-role				2	uint32
 ATTRIBUTE	MI-scope				3	string
 
 VALUE	SUI-role			camiantView		101
@@ -22,3 +22,4 @@ VALUE	SUI-role			camiantUser		102
 VALUE	SUI-role			camiantService		104
 
 END-VENDOR	Camiant
+ALIAS		Camiant					Vendor-Specific.Camiant

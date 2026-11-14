@@ -1,0 +1,31 @@
+#
+#  PRE: if
+#
+string foo
+string bar
+
+try {
+	foo := "hello"
+
+	fail
+
+	bar := "nope"
+}
+catch disallow {
+	test_fail
+}
+catch ok reject {
+	test_fail
+}
+
+catch fail {
+	if foo != "hello" {
+		test_fail
+	}
+
+	if bar {
+		test_fail
+	}
+}
+
+success

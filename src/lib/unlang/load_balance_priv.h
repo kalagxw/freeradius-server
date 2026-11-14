@@ -30,16 +30,19 @@ extern "C" {
 #include <freeradius-devel/server/tmpl.h>
 
 typedef struct {
-	unlang_group_t	group;
-	tmpl_t		*vpt;
+	unlang_group_t	group;		//!< our instruction
+	tmpl_t		*vpt;		//!< template to expand for keyed balancing
+	unlang_t	**children;	//!< array of child instructions.
 } unlang_load_balance_t;
 
 /** State of a redundant operation
  *
  */
 typedef struct {
-	unlang_t 		*child;
-	unlang_t		*found;
+	unlang_t 		*child;		//!< the current child we're processing
+	unlang_t		*start;		//!< the starting child
+	uint32_t		num;		//!< the current child number
+	unlang_result_t		result;		//!< for intermediate child results
 } unlang_frame_state_redundant_t;
 
 /** Cast a group structure to the load_balance keyword extension
@@ -57,6 +60,9 @@ static inline unlang_group_t *unlang_load_balance_to_group(unlang_load_balance_t
 {
 	return (unlang_group_t *)load_balance;
 }
+
+int	unlang_load_balance_persist(request_t *request) CC_HINT(nonnull);
+uint8_t	unlang_load_balance_child(request_t *request) CC_HINT(nonnull);
 
 #ifdef __cplusplus
 }

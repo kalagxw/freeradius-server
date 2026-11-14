@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -26,10 +26,9 @@ RCSID("$Id$")
 #include <freeradius-devel/io/test_point.h>
 #include <freeradius-devel/server/module.h>
 #include <freeradius-devel/tls/base.h>
-#include <freeradius-devel/tls/log.h>
-#include <freeradius-devel/util/base.h>
+#include <freeradius-devel/tls/strerror.h>
 #include <freeradius-devel/util/dbuff.h>
-#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/rand.h>
 #include <freeradius-devel/util/sha1.h>
 
 #include <freeradius-devel/eap/types.h>
@@ -57,31 +56,38 @@ RCSID("$Id$")
  * of 32 bits, and includes the Type/Length fields.
  */
 
-static ssize_t encode_tlv_hdr(fr_dbuff_t *dbuff,
-			      fr_da_stack_t *da_stack, unsigned int depth,
-			      fr_dcursor_t *cursor, void *encode_ctx);
+static ssize_t encode_tlv(fr_dbuff_t *dbuff,
+			  fr_da_stack_t *da_stack, unsigned int depth,
+			  fr_dcursor_t *cursor, void *encode_ctx);
 
-/** Evaluation function for EAP-AKA-encodability
+/** Implements the iterator for EAP-AKA
  *
- * @param item	pointer to a fr_pair_t
- * @param uctx	context
- *
- * @return true if the underlying fr_pair_t is EAP_AKA encodable, false otherwise
+ * @param[in] cursor	to iterate over.
+ * @param[in] current	The fr_pair_t cursor->current.  Will be advanced and checked to
+ *			see if it matches the specified fr_dict_t.
+ * @param[in] uctx	The fr_dict_t to search for.
+ * @return
+ *	- Next matching fr_pair_t.
+ *	- NULL if not more matching fr_pair_ts could be found.
  */
-static bool is_eap_aka_encodable(void const *item, UNUSED void const *uctx)
+static void *fr_eap_aka_sim_next_encodable(fr_dcursor_t *cursor, void *current, void *uctx)
 {
-	fr_pair_t const		*vp = item;
+	fr_pair_t	*c = current;
+	fr_dict_t	*dict = talloc_get_type_abort(uctx, fr_dict_t);
 
-	if (!vp) return false;
-	if (vp->da->flags.internal) return false;
-	/*
-	 *	Bool attribute presence is 'true' in SIM
-	 *	and absence is 'false'
-	 */
-	if ((vp->da->type == FR_TYPE_BOOL) && (vp->vp_bool == false)) return false;
-	if (!fr_dict_attr_common_parent(fr_dict_root(dict_eap_aka_sim), vp->da, true)) return false;
+	while ((c = fr_dcursor_list_next(cursor, c))) {
+		PAIR_VERIFY(c);
 
-	return true;
+		/*
+		 *	Bool attribute presence is 'true' in SIM
+		 *	and absence is 'false'
+		 */
+		if ((c->vp_type == FR_TYPE_BOOL) && (c->vp_bool == false)) continue;
+
+		if ((c->da->dict == dict) && (!c->da->flags.internal)) break;
+	}
+
+	return c;
 }
 
 /** Add an IV to a packet
@@ -153,7 +159,8 @@ static ssize_t encode_iv(fr_dbuff_t *dbuff, void *encode_ctx)
 static ssize_t encode_encrypted_value(fr_dbuff_t *dbuff,
 			     	      uint8_t const *in, size_t inlen, void *encode_ctx)
 {
-	size_t			total_len, pad_len, encr_len, len = 0;
+	size_t			total_len, pad_len, encr_len;
+	int			len = 0;
 	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 	uint8_t			*encr = NULL;
 	fr_aka_sim_ctx_t	*packet_ctx = encode_ctx;
@@ -180,8 +187,7 @@ static ssize_t encode_encrypted_value(fr_dbuff_t *dbuff,
 	if (unlikely(fr_dbuff_start(&work_dbuff) != in)) {
 		FR_DBUFF_IN_MEMCPY_RETURN(&work_dbuff, in, inlen);
 	} else {
-		FR_DBUFF_EXTEND_LOWAT_OR_RETURN(&work_dbuff, inlen);
-		fr_dbuff_advance(&work_dbuff, inlen);
+		FR_DBUFF_ADVANCE_EXTEND_RETURN(&work_dbuff, inlen);
 	}
 
 	/*
@@ -201,7 +207,7 @@ static ssize_t encode_encrypted_value(fr_dbuff_t *dbuff,
 	evp_ctx = aka_sim_crypto_cipher_ctx();
 	if (unlikely(EVP_EncryptInit_ex(evp_ctx, evp_cipher, NULL,
 					packet_ctx->k_encr, packet_ctx->iv) != 1)) {
-		fr_tls_log_strerror_printf("Failed initialising AES-128-ECB context");
+		fr_tls_strerror_printf("Failed initialising AES-128-ECB context");
 	error:
 		talloc_free(encr);
 		return PAIR_ENCODE_FATAL_ERROR;
@@ -225,14 +231,14 @@ static ssize_t encode_encrypted_value(fr_dbuff_t *dbuff,
 	 *	inform OpenSSL explicitly that there's no padding.
 	 */
 	EVP_CIPHER_CTX_set_padding(evp_ctx, 0);
-	if (unlikely(EVP_EncryptUpdate(evp_ctx, encr, (int *)&len, fr_dbuff_start(&work_dbuff), total_len) != 1)) {
-		fr_tls_log_strerror_printf("%s: Failed encrypting attribute", __FUNCTION__);
+	if (unlikely(EVP_EncryptUpdate(evp_ctx, encr, &len, fr_dbuff_start(&work_dbuff), (int)total_len) != 1)) {
+		fr_tls_strerror_printf("%s: Failed encrypting attribute", __FUNCTION__);
 		goto error;
 	}
 	encr_len = len;
 
-	if (unlikely(EVP_EncryptFinal_ex(evp_ctx, encr + encr_len, (int *)&len) != 1)) {
-		fr_tls_log_strerror_printf("%s: Failed finalising encrypted attribute", __FUNCTION__);
+	if (unlikely(EVP_EncryptFinal_ex(evp_ctx, encr + encr_len, &len) != 1)) {
+		fr_tls_strerror_printf("%s: Failed finalising encrypted attribute", __FUNCTION__);
 		goto error;
 	}
 	encr_len += len;
@@ -276,7 +282,7 @@ static ssize_t encode_value(fr_dbuff_t *dbuff,
 	fr_dict_attr_t const	*da = da_stack->da[depth];
 	fr_aka_sim_ctx_t	*packet_ctx = encode_ctx;
 
-	VP_VERIFY(vp);
+	PAIR_VERIFY(vp);
 	FR_PROTO_STACK_PRINT(da_stack, depth);
 
 	if (unlikely(da_stack->da[depth + 1] != NULL)) {
@@ -289,10 +295,10 @@ static ssize_t encode_value(fr_dbuff_t *dbuff,
 		return PAIR_ENCODE_FATAL_ERROR;
 	}
 
-	switch (da->type) {
+	switch (vp->vp_type) {
 	case FR_TYPE_STRUCTURAL:
 		fr_strerror_printf("%s: Called with structural type %s", __FUNCTION__,
-				   fr_table_str_by_value(fr_value_box_type_table, da_stack->da[depth]->type, "?Unknown?"));
+				   fr_type_to_str(da_stack->da[depth]->type));
 		return PAIR_ENCODE_FATAL_ERROR;
 
 	default:
@@ -375,7 +381,7 @@ static ssize_t encode_value(fr_dbuff_t *dbuff,
 		break;
 	}
 
-	switch (da->type) {
+	switch (vp->vp_type) {
 	/*
 	 *	In order to represent the string length properly we include a second
 	 *	16bit length field with the real string length.
@@ -487,7 +493,7 @@ done:
 	/*
 	 *	Rebuilds the TLV stack for encoding the next attribute
 	 */
-	vp = fr_dcursor_filter_next(cursor, is_eap_aka_encodable, encode_ctx);
+	vp = fr_dcursor_next(cursor);
 	fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
 
 	return fr_dbuff_set(dbuff, &work_dbuff);
@@ -520,11 +526,11 @@ static ssize_t encode_array(fr_dbuff_t *dbuff,
 	size_t			actual_len;
 	fr_dbuff_t		len_dbuff = FR_DBUFF(dbuff);
 	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
+	fr_dbuff_marker_t	value_start;
 	fr_dict_attr_t const	*da = da_stack->da[depth];
 	fr_assert(da->flags.array);
 
-	FR_DBUFF_EXTEND_LOWAT_OR_RETURN(&work_dbuff, 2);
-	fr_dbuff_advance(&work_dbuff, 2);
+	FR_DBUFF_ADVANCE_EXTEND_RETURN(&work_dbuff, 2);
 
 	if (unlikely(da->type == FR_TYPE_OCTETS)) {
 		if (!da->flags.length) {
@@ -541,19 +547,25 @@ static ssize_t encode_array(fr_dbuff_t *dbuff,
 	 *	Keep encoding as long as we have space to
 	 *	encode things.
 	 */
+	fr_dbuff_marker(&value_start, &work_dbuff);
 	while (fr_dbuff_extend_lowat(NULL, &work_dbuff, element_len) >= element_len) {
 		fr_pair_t	*vp;
 		ssize_t		slen;
 
 		slen = encode_value(&work_dbuff, da_stack, depth, cursor, encode_ctx);
-		if (slen == PAIR_ENCODE_FATAL_ERROR) return slen;
+		if (slen == PAIR_ENCODE_FATAL_ERROR) {
+			fr_dbuff_marker_release(&value_start);
+			return slen;
+		}
 		if (slen < 0) break;
 
 		vp = fr_dcursor_current(cursor);
 		if (!vp || (vp->da != da)) break;		/* Stop if we have an attribute of a different type */
 	}
 
-	actual_len = fr_dbuff_used(&work_dbuff) - 2;	/* Length of the elements we encoded */
+	actual_len = fr_dbuff_behind(&value_start);	/* Length of the elements we encoded */
+	fr_dbuff_marker_release(&value_start);
+
 	/*
 	 *	Arrays with an element size which is
 	 *	a multiple of 4 don't need an
@@ -582,7 +594,7 @@ static ssize_t encode_array(fr_dbuff_t *dbuff,
  * If it's a standard attribute, then vp->da->attr == attribute.
  * Otherwise, attribute may be something else.
  */
-static ssize_t encode_rfc_hdr(fr_dbuff_t *dbuff, fr_da_stack_t *da_stack, unsigned int depth,
+static ssize_t encode_rfc(fr_dbuff_t *dbuff, fr_da_stack_t *da_stack, unsigned int depth,
 			      fr_dcursor_t *cursor, void *encode_ctx)
 {
 	size_t			pad_len;
@@ -596,7 +608,7 @@ static ssize_t encode_rfc_hdr(fr_dbuff_t *dbuff, fr_da_stack_t *da_stack, unsign
 	switch (da_stack->da[depth]->type) {
 	case FR_TYPE_STRUCTURAL:
 		fr_strerror_printf("%s: Called with structural type %s", __FUNCTION__,
-				   fr_table_str_by_value(fr_value_box_type_table, da_stack->da[depth]->type, "?Unknown?"));
+				   fr_type_to_str(da_stack->da[depth]->type));
 		return PAIR_ENCODE_FATAL_ERROR;
 
 	default:
@@ -619,8 +631,7 @@ static ssize_t encode_rfc_hdr(fr_dbuff_t *dbuff, fr_da_stack_t *da_stack, unsign
 	 */
 	da = da_stack->da[depth];
 
-	FR_DBUFF_EXTEND_LOWAT_OR_RETURN(&work_dbuff, 2);
-	fr_dbuff_advance(&work_dbuff, 2);
+	FR_DBUFF_ADVANCE_EXTEND_RETURN(&work_dbuff, 2);
 
 	if (da->flags.array) {
 		slen = encode_array(&FR_DBUFF_MAX_BIND_CURRENT(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN - 2),
@@ -639,8 +650,8 @@ static ssize_t encode_rfc_hdr(fr_dbuff_t *dbuff, fr_da_stack_t *da_stack, unsign
 		FR_DBUFF_MEMSET_RETURN(&work_dbuff, 0, pad_len);
 	}
 
-	fr_dbuff_in_bytes(&hdr_dbuff, (uint8_t)da->attr,
-			  (uint8_t)(fr_dbuff_used(&work_dbuff) >> 2));
+	FR_DBUFF_IN_BYTES_RETURN(&hdr_dbuff, (uint8_t)da->attr,
+				 (uint8_t)(fr_dbuff_used(&work_dbuff) >> 2));
 
 	FR_PROTO_HEX_DUMP(fr_dbuff_start(&work_dbuff), fr_dbuff_used(&work_dbuff), "Done RFC attribute");
 
@@ -675,9 +686,9 @@ static inline ssize_t encode_tlv_internal(fr_dbuff_t *dbuff,
 		 *	Determine the nested type and call the appropriate encoder
 		 */
 		if (da_stack->da[depth + 1]->type == FR_TYPE_TLV) {
-			slen = encode_tlv_hdr(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
+			slen = encode_tlv(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
 		} else {
-			slen = encode_rfc_hdr(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
+			slen = encode_rfc(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
 		}
 
 		if (slen <= 0) {
@@ -706,15 +717,23 @@ static inline ssize_t encode_tlv_internal(fr_dbuff_t *dbuff,
 	 *	encrypt the contents of the TLV using AES-CBC-128
 	 *	or another encryption algorithm.
 	 */
-	if (!da->flags.extra && da->flags.subtype) {
+	if (fr_aka_sim_flag_encrypted(da)) {
 		ssize_t	value_len = fr_dbuff_used(&work_dbuff) - 2;
 
 		slen = encode_encrypted_value(&value_dbuff, fr_dbuff_current(&value_start),
 					      value_len, encode_ctx);
 		if (slen < 0) return PAIR_ENCODE_FATAL_ERROR;
 
-		FR_DBUFF_EXTEND_LOWAT_OR_RETURN(&work_dbuff, (size_t)slen - value_len);
-		fr_dbuff_advance(&work_dbuff, (size_t)slen - value_len);
+#ifdef __COVERITY__
+		/*
+		 * 	Coverity as it stands doesn't see that value_len >= 0 because
+		 * 	work_dbuff has at least the two zero bytes in it, and thus thinks
+		 * 	(size_t) slen - value_len will be some huge size_t value. This
+		 * 	check should pacify it.
+		 */
+		if (value_len < 0) return -1;
+#endif
+		FR_DBUFF_ADVANCE_EXTEND_RETURN(&work_dbuff, (size_t)slen - value_len);
 	}
 
 	FR_PROTO_HEX_DUMP(fr_dbuff_start(&work_dbuff), fr_dbuff_used(&work_dbuff), "Done TLV");
@@ -722,7 +741,7 @@ static inline ssize_t encode_tlv_internal(fr_dbuff_t *dbuff,
 	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
-static ssize_t encode_tlv_hdr(fr_dbuff_t *dbuff,
+static ssize_t encode_tlv(fr_dbuff_t *dbuff,
 			      fr_da_stack_t *da_stack, unsigned int depth,
 			      fr_dcursor_t *cursor, void *encode_ctx)
 {
@@ -731,19 +750,33 @@ static ssize_t encode_tlv_hdr(fr_dbuff_t *dbuff,
 	fr_dict_attr_t const	*da;
 	fr_dbuff_t		tl_dbuff;
 	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
+	fr_dcursor_t		*my_cursor = cursor;
+	fr_dcursor_t		child_cursor;
 
-	VP_VERIFY(fr_dcursor_current(cursor));
+	PAIR_VERIFY(fr_dcursor_current(cursor));
 	FR_PROTO_STACK_PRINT(da_stack, depth);
 
 	if (da_stack->da[depth]->type != FR_TYPE_TLV) {
 		fr_strerror_printf("%s: Expected type \"tlv\" got \"%s\"", __FUNCTION__,
-				   fr_table_str_by_value(fr_value_box_type_table, da_stack->da[depth]->type, "?Unknown?"));
+				   fr_type_to_str(da_stack->da[depth]->type));
 		return PAIR_ENCODE_FATAL_ERROR;
 	}
 
 	if (!da_stack->da[depth + 1]) {
-		fr_strerror_printf("%s: Can't encode empty TLV", __FUNCTION__);
-		return PAIR_ENCODE_FATAL_ERROR;
+		fr_pair_t *vp;
+
+		vp = fr_dcursor_current(cursor);
+		if ((vp->vp_type != FR_TYPE_TLV) || (fr_pair_list_num_elements(&vp->vp_group) == 0)) {
+			fr_strerror_printf("%s: Can't encode empty TLV", __FUNCTION__);
+			return PAIR_ENCODE_FATAL_ERROR;
+		}
+
+		fr_assert(vp->da == da_stack->da[depth]);
+
+		vp = fr_pair_dcursor_child_iter_init(&child_cursor, &vp->vp_group, cursor);
+		my_cursor = &child_cursor;
+
+		fr_proto_da_stack_build(da_stack, vp->da);
 	}
 
 	/*
@@ -751,19 +784,20 @@ static ssize_t encode_tlv_hdr(fr_dbuff_t *dbuff,
 	 *	The ASCII art in the RFCs the attributes in
 	 *	this order.
 	 */
-	if (!da_stack->da[depth]->flags.extra && da_stack->da[depth]->flags.subtype) {
+	if (fr_aka_sim_flag_encrypted(da_stack->da[depth])) {
 		len = encode_iv(&work_dbuff, encode_ctx);
 		if (len < 0) return len;
 	}
 	tl_dbuff = FR_DBUFF(&work_dbuff);
 
-	FR_DBUFF_EXTEND_LOWAT_OR_RETURN(&work_dbuff, 2);
-	fr_dbuff_advance(&work_dbuff, 2);
+	FR_DBUFF_ADVANCE_EXTEND_RETURN(&work_dbuff, 2);
 
 	da = da_stack->da[depth];
 	len = encode_tlv_internal(&FR_DBUFF_MAX_BIND_CURRENT(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN - 2),
-				  da_stack, depth, cursor, encode_ctx);
+				  da_stack, depth, my_cursor, encode_ctx);
 	if (len <= 0) return len;
+
+	if (my_cursor != cursor) fr_dcursor_next(cursor);
 
 	/*
 	 *	Round attr + len + data length out to a multiple
@@ -786,24 +820,23 @@ ssize_t fr_aka_sim_encode_pair(fr_dbuff_t *dbuff, fr_dcursor_t *cursor, void *en
 	ssize_t			slen;
 
 	fr_da_stack_t		da_stack;
-	fr_dict_attr_t const	*da = NULL;
 
 	fr_dbuff_marker(&m, &work_dbuff);
 	if (!cursor) return PAIR_ENCODE_FATAL_ERROR;
 
-	vp = fr_dcursor_filter_current(cursor, is_eap_aka_encodable, encode_ctx);
+	vp = fr_dcursor_current(cursor);
 	if (!vp) return 0;
 
-	VP_VERIFY(vp);
+	PAIR_VERIFY(vp);
 
 	if (vp->da->depth > FR_DICT_MAX_TLV_STACK) {
-		fr_strerror_printf("%s: Attribute depth %i exceeds maximum nesting depth %i",
+		fr_strerror_printf("%s: Attribute depth %u exceeds maximum nesting depth %d",
 				   __FUNCTION__, vp->da->depth, FR_DICT_MAX_TLV_STACK);
 		return PAIR_ENCODE_FATAL_ERROR;
 	}
 
 	if (vp->da->attr == FR_MAC) {
-		fr_dcursor_filter_next(cursor, is_eap_aka_encodable, encode_ctx);
+		fr_dcursor_next(cursor);
 		return 0;
 	}
 	/*
@@ -813,41 +846,19 @@ ssize_t fr_aka_sim_encode_pair(fr_dbuff_t *dbuff, fr_dcursor_t *cursor, void *en
 	 */
 
 	/*
-	 *	Fast path for the common case.
-	 */
-	if ((vp->da->parent == fr_dict_root(dict_eap_aka_sim)) && (vp->vp_type != FR_TYPE_TLV)) {
-		da_stack.da[0] = vp->da;
-		da_stack.da[1] = NULL;
-		da_stack.depth = 1;
-		FR_PROTO_STACK_PRINT(&da_stack, 0);
-		return encode_rfc_hdr(&FR_DBUFF_MAX_BIND_CURRENT(dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN + 2),
-				      &da_stack, 0, cursor, encode_ctx);
-	}
-
-	/*
 	 *	Do more work to set up the stack for the complex case.
 	 */
 	fr_proto_da_stack_build(&da_stack, vp->da);
 	FR_PROTO_STACK_PRINT(&da_stack, 0);
 
-	da = da_stack.da[0];
-
-	switch (da->type) {
-	/*
-	 *	Supported types
-	 */
-	default:
-		slen = encode_rfc_hdr(&FR_DBUFF_MAX_BIND_CURRENT(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN + 2),
-				      &da_stack, 0, cursor, encode_ctx);
-		if (slen < 0) return slen;
-		break;
-
-	case FR_TYPE_TLV:
-		slen = encode_tlv_hdr(&FR_DBUFF_MAX_BIND_CURRENT(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN + 2),
-				      &da_stack, 0, cursor, encode_ctx);
-		if (slen < 0) return slen;
-		break;
+	if (da_stack.da[0]->type == FR_TYPE_TLV) {
+		slen = encode_tlv(&FR_DBUFF_MAX_BIND_CURRENT(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN + 2),
+				  &da_stack, 0, cursor, encode_ctx);
+	} else {
+		slen = encode_rfc(&FR_DBUFF_MAX_BIND_CURRENT(&work_dbuff, SIM_MAX_ATTRIBUTE_VALUE_LEN + 2),
+				  &da_stack, 0, cursor, encode_ctx);
 	}
+	if (slen < 0) return slen;
 
 	/*
 	 *	We couldn't do it, so we didn't do anything.
@@ -882,28 +893,30 @@ ssize_t fr_aka_sim_encode(request_t *request, fr_pair_list_t *to_encode, void *e
 	 *	It might be too big for putting into an
 	 *	EAP packet.
 	 */
-	vp = fr_pair_find_by_child_num(to_encode, fr_dict_root(dict_eap_aka_sim), FR_SUBTYPE);
+	vp = fr_pair_find_by_child_num_idx(to_encode, fr_dict_root(dict_eap_aka_sim), FR_SUBTYPE, 0);
 	if (!vp) {
 		REDEBUG("Missing subtype attribute");
 		return PAIR_ENCODE_FATAL_ERROR;
 	}
-	subtype = vp->vp_uint16;
+	subtype = vp->vp_uint8;
 
 	/*
 	 *	Group attributes with similar lineages together
 	 */
 	fr_pair_list_sort(to_encode, fr_pair_cmp_by_parent_num);
-	if (fr_dcursor_init(&cursor, to_encode) == vp) fr_dcursor_next(&cursor);	/* Skip subtype if it came out first */
+	if (fr_pair_dcursor_iter_init(&cursor, to_encode, fr_eap_aka_sim_next_encodable, dict_eap_aka_sim) == vp) {
+		fr_dcursor_next(&cursor);	/* Skip subtype if it came out first */
+	}
 
 	/*
 	 *	Will we need to generate a HMAC?
 	 */
-	if (fr_pair_find_by_child_num(to_encode, fr_dict_root(dict_eap_aka_sim), FR_MAC)) do_hmac = true;
+	if (fr_pair_find_by_child_num_idx(to_encode, fr_dict_root(dict_eap_aka_sim), FR_MAC, 0)) do_hmac = true;
 
 	/*
 	 *	Fast path, we just need to encode a subtype
 	 */
-	if (!do_hmac && !fr_dcursor_filter_current(&cursor, is_eap_aka_encodable, packet_ctx)) {
+	if (!do_hmac && !fr_dcursor_current(&cursor)) {
 		MEM(buff = talloc_array(eap_packet, uint8_t, 3));
 
 		buff[0] = subtype;	/* SIM or AKA subtype */
@@ -921,7 +934,7 @@ ssize_t fr_aka_sim_encode(request_t *request, fr_pair_list_t *to_encode, void *e
 
 	fr_dbuff_init_talloc(NULL, &dbuff, &tctx, 512, 1024);
 
-	fr_dbuff_in_bytes(&dbuff, subtype, 0x00, 0x00);
+	FR_DBUFF_IN_BYTES_RETURN(&dbuff, subtype, 0x00, 0x00);
 
 	/*
 	 *	Add space in the packet for AT_MAC
@@ -941,6 +954,8 @@ ssize_t fr_aka_sim_encode(request_t *request, fr_pair_list_t *to_encode, void *e
 		if (slen < 0) {
 		error:
 			talloc_free(fr_dbuff_buff(&dbuff));
+			eap_packet->type.data = NULL;
+			eap_packet->type.length = 0;
 			return PAIR_ENCODE_FATAL_ERROR;
 		}
 		fr_assert(fr_dbuff_used(&dbuff) > 0);	/* We messed up a check somewhere in the encoder */
@@ -1009,7 +1024,8 @@ static fr_aka_sim_ctx_t *test_ctx_init(TALLOC_CTX *ctx, uint8_t const *k_encr, s
 /*
  *	Test ctx data
  */
-static int encode_test_ctx_sim(void **out, TALLOC_CTX *ctx)
+static int encode_test_ctx_sim(void **out, TALLOC_CTX *ctx, UNUSED fr_dict_t const *dict,
+			       UNUSED fr_dict_attr_t const *root_da)
 {
 	fr_aka_sim_ctx_t	*test_ctx;
 	static uint8_t		k_encr[] = { 0x00, 0x01, 0x02, 0x03, 0x04 ,0x05, 0x06, 0x07,
@@ -1025,7 +1041,8 @@ static int encode_test_ctx_sim(void **out, TALLOC_CTX *ctx)
 	return 0;
 }
 
-static int encode_test_ctx_aka(void **out, TALLOC_CTX *ctx)
+static int encode_test_ctx_aka(void **out, TALLOC_CTX *ctx, UNUSED fr_dict_t const *dict,
+			       UNUSED fr_dict_attr_t const *root_da)
 {
 	fr_aka_sim_ctx_t	*test_ctx;
 	static uint8_t		k_encr[] = { 0x00, 0x01, 0x02, 0x03, 0x04 ,0x05, 0x06, 0x07,
@@ -1041,7 +1058,8 @@ static int encode_test_ctx_aka(void **out, TALLOC_CTX *ctx)
 	return 0;
 }
 
-static int encode_test_ctx_sim_rfc4186(void **out, TALLOC_CTX *ctx)
+static int encode_test_ctx_sim_rfc4186(void **out, TALLOC_CTX *ctx, UNUSED fr_dict_t const *dict,
+				       UNUSED fr_dict_attr_t const *root_da)
 {
 	fr_aka_sim_ctx_t	*test_ctx;
 	static uint8_t		k_encr[] = { 0x53, 0x6e, 0x5e, 0xbc, 0x44 ,0x65, 0x58, 0x2a,
@@ -1061,17 +1079,20 @@ static int encode_test_ctx_sim_rfc4186(void **out, TALLOC_CTX *ctx)
 extern fr_test_point_pair_encode_t sim_tp_encode;
 fr_test_point_pair_encode_t sim_tp_encode = {
 	.test_ctx	= encode_test_ctx_sim,
-	.func		= fr_aka_sim_encode_pair
+	.func		= fr_aka_sim_encode_pair,
+	.next_encodable	= fr_eap_aka_sim_next_encodable,
 };
 
 extern fr_test_point_pair_encode_t aka_tp_encode;
 fr_test_point_pair_encode_t aka_tp_encode = {
 	.test_ctx	= encode_test_ctx_aka,
-	.func		= fr_aka_sim_encode_pair
+	.func		= fr_aka_sim_encode_pair,
+	.next_encodable	= fr_eap_aka_sim_next_encodable,
 };
 
 extern fr_test_point_pair_encode_t sim_tp_encode_rfc4186;
 fr_test_point_pair_encode_t sim_tp_encode_rfc4186 = {
 	.test_ctx	= encode_test_ctx_sim_rfc4186,
-	.func		= fr_aka_sim_encode_pair
+	.func		= fr_aka_sim_encode_pair,
+	.next_encodable	= fr_eap_aka_sim_next_encodable,
 };

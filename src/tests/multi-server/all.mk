@@ -1,0 +1,454 @@
+#
+# all.mk for multi-server tests
+#
+# Makefile arguments:
+# - TEST_MULTI_SERVER_DEBUG=<0-2>   debug level for multi-server test framework
+# - TEST_MULTI_SERVER_VERBOSE=<0-4>  verbosity level
+# - MODE=<service|profiling>        the FreeRADIUS image that the tests
+#                                   run.  Default `service`, which uses
+#                                   `freeradius4-radenv/<image>:<sha>`.
+#                                   `profiling` uses
+#                                   `freeradius4-radenv-profiling/<image>:<sha>`,
+#                                   sets `RADIUSD_COMMAND` so that the
+#                                   test template runs the server under
+#                                   valgrind/callgrind, and writes the
+#                                   results to `PROFILING_RESULT_PATH`.
+# - PROFILING_RESULT_MODE=<ci|dev>      Profiling output layout (only meaningful when
+#                                   MODE=profiling). Default `ci`.
+#                                     ci:  PROFILING_RESULT_ROOT/<branch>/<commit>/<run-index>/<suite>/<test>/<tool>
+#                                     dev: PROFILING_RESULT_ROOT/<suite>/<test>/<tool>  (flat)
+#
+# Usage:
+#   make -f src/tests/multi-server/all.mk test.multi-server                       # all suites, radenv image
+#   make -f src/tests/multi-server/all.mk test.multi-server.ci                    # CI subset, radenv image
+#   make -f src/tests/multi-server/all.mk test.multi-server.profiling             # all suites, profiling image
+#   make -f src/tests/multi-server/all.mk test.multi-server.profiling.ci          # CI subset, profiling image
+#   make -f src/tests/multi-server/all.mk test.multi-server.profiling.<tool>      # all suites, one profiler
+#   make -f src/tests/multi-server/all.mk test.multi-server.profiling.<tool>.ci   # CI subset, one profiler
+#   make -f src/tests/multi-server/all.mk test.multi-server.accept.short_ci       # single test
+#   make -f src/tests/multi-server/all.mk clean.test.multi-server                 # clean logs
+#
+# <tool> is one of PROFILING_TOOLS (valgrind, gperftools).
+#
+
+SHELL := /bin/bash
+
+#
+#  Allow for stand-alone builds from the local directory.
+#
+ifeq "$(BUILD_DIR)" ""
+top_srcdir	:= $(abspath ./)
+BUILD_DIR	:= ${top_srcdir}/build
+endif
+
+# abspath is needed because BUILD_DIR is relative ("build") when
+# included from the top-level makefile, but paths are passed to
+# external tools (config_builder.py, docker compose) which need
+# absolute paths.
+DIR    := $(abspath ${top_srcdir}/src/tests/multi-server)
+OUTPUT := $(abspath $(BUILD_DIR)/tests/multi-server)
+
+GIT_BRANCH         := $(or $(shell git -C $(top_srcdir) rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '_'),unknown-branch)
+GIT_COMMIT         := $(or $(shell git -C $(top_srcdir) rev-parse --short HEAD 2>/dev/null),unknown-commit)
+PROFILING_RESULT_ROOT  := $(abspath $(top_srcdir)/prof-results)
+#
+#  Path inside the freeradius container that receives the profiling output.
+#  The compose templates bind mount PROFILING_RESULT_PATH there and export
+#  the same path to the container as PROFILING_RESULT_DIR, which the
+#  valgrind wrapper reads.
+#
+PROFILING_RESULT_DIR   := /var/lib/prof-results
+#
+#  Profilers whose capture scripts are copied into the container and mounted
+#  at /usr/local/bin.  PROFILING_TOOL names the one a MODE=profiling run
+#  captures with; RADIUSD_COMMAND runs start_$(PROFILING_TOOL)_profiling.sh.
+#  Set PROFILING_TOOL on the command line to profile with another.
+#
+PROFILING_TOOLS        := valgrind gperftools
+PROFILING_TOOL         ?= valgrind
+PROFILING_RESULT_MODE  ?= ci
+
+#
+#  PROFILING_RUN_INDEX is the <run-index> that a MODE=profiling run uses.
+#  CI passes it in from github.run_number, because a job's runner and
+#  working directory do not persist between runs.  For a local run, make
+#  computes it once based off of the number of directories under
+#  PROFILING_RESULT_ROOT/<branch>/<commit>.
+#
+#  All results are saved under the same <run-index>.
+#
+#
+#  Fallback for local runs, where nothing sets PROFILING_RUN_INDEX.
+#
+ifeq "$(PROFILING_RUN_INDEX)" ""
+  # Path containing the run directories for this commit
+  PROFILING_RUN_BASE := $(PROFILING_RESULT_ROOT)/$(GIT_BRANCH)/$(GIT_COMMIT)
+
+  # Count existing run directories and set new index accordingly; num of directories + 1
+  PROFILING_RUN_INDEX := $(shell \
+    count=$$(find "$(PROFILING_RUN_BASE)" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l); \
+    echo $$((count + 1)) \
+  )
+endif
+
+#
+#  FreeRADIUS image selection.
+#
+#  The compose environments reference `${FREERADIUS_IMAGE}`.  The per-test
+#  recipe sets `FREERADIUS_IMAGE` to the image that `MODE` selects.  Both
+#  images are the SHA-tagged images that the `docker.<type>.<image>` rule
+#  writes, so the build does not keep intermediate `:latest` aliases in
+#  sync.
+#
+#  The SHA tag alone does not prove that the image holds the checked-out
+#  commit.  When `DOCKER_REGISTRY` is set, the `docker.mk` build rule
+#  pulls the published image and retags the pulled image as `:<sha>`.  No
+#  workflow publishes a 'radenv' or 'radenv-profiling' image, so the pull
+#  fails and `docker.mk` builds both images from the checkout.
+#
+FREERADIUS_RADENV_IMAGE            := freeradius4-radenv/ubuntu24:$(GIT_COMMIT)
+FREERADIUS_RADENV_PROFILING_IMAGE  := freeradius4-radenv-profiling/ubuntu24:$(GIT_COMMIT)
+
+#
+#  Multi-server test framework is published as a PEP 503 simple index
+#  at https://pypi.inkbridge.io/ (the root serves the package listing,
+#  no /simple/ suffix needed). pip uses it for the named package and
+#  falls back to PyPI proper for transitive deps not hosted there.
+#
+RADENV_PACKAGE                  := radenv
+RADENV_VERSION                  := 1.1.1
+RADENV_INDEX_URL                := https://pypi.inkbridge.io/
+TEST_MULTI_SERVER_FRAMEWORK_DIR := $(abspath $(BUILD_DIR)/radenv)
+
+#
+#  The stamp carries the version, so a build directory that installed an
+#  earlier version does not keep the earlier version after the pin moves.
+#
+TEST_MULTI_SERVER_FRAMEWORK_STAMP := $(TEST_MULTI_SERVER_FRAMEWORK_DIR)/.configured-$(RADENV_VERSION)
+
+#
+#  Suppress command echo unless VERBOSE is set
+#
+ifeq "$(VERBOSE)" ""
+Q := @
+else
+Q :=
+endif
+
+#
+#  Debug and verbosity settings
+#  Pass TEST_MULTI_SERVER_FLAGS to add extra arguments to the test runner
+#  e.g. make test.multi-server TEST_MULTI_SERVER_FLAGS="-x -vvv"
+#
+TEST_MULTI_SERVER_FLAGS ?=
+
+#
+#  Output directories
+#
+$(OUTPUT):
+	@mkdir -p $@
+
+#
+#  Install the multi-server test framework into a per-build virtualenv.
+#  Shared prerequisite for every test target.
+#
+$(TEST_MULTI_SERVER_FRAMEWORK_STAMP): | $(OUTPUT)
+	$(Q)set -e; \
+	mkdir -p $(TEST_MULTI_SERVER_FRAMEWORK_DIR); \
+	if [ ! -d $(TEST_MULTI_SERVER_FRAMEWORK_DIR)/.venv ]; then \
+		python3 -m venv $(TEST_MULTI_SERVER_FRAMEWORK_DIR)/.venv; \
+	fi; \
+	$(TEST_MULTI_SERVER_FRAMEWORK_DIR)/.venv/bin/pip install --quiet \
+		--extra-index-url $(RADENV_INDEX_URL) \
+		$(RADENV_PACKAGE)==$(RADENV_VERSION); \
+	rm -f $(TEST_MULTI_SERVER_FRAMEWORK_DIR)/.configured*; \
+	touch $@
+
+######################################################################
+#
+#  Macros for defining multi-server test suites.
+#
+#  Each suite is a directory under $(DIR) containing:
+#    - template.yml.j2   Test steps template
+#    - *.yml             Params files (one per test)
+#    - *.j2              Symlinks to compose/config templates to render
+#
+######################################################################
+
+#
+#  TEST_MULTI_SERVER_CONFIG_FILES lists every configuration source file
+#  under $(DIR)/configs (rendered templates and static files), and every
+#  macro file under $(DIR)/templates that a suite template imports.
+#  TEST_MULTI_SERVER_RENDER uses the list as prerequisites, so a change to
+#  any listed file re-renders every template.
+#
+TEST_MULTI_SERVER_CONFIG_FILES := $(shell find $(DIR)/configs -type f) $(wildcard $(DIR)/templates/*.j2)
+
+#
+#  TEST_MULTI_SERVER_RENDER - render a single .j2 template into the build dir.
+#
+#  Re-renders only when the .j2 source, params file, or any config file changes.
+#  The output path includes the mode.  The comment above TEST_MULTI_SERVER
+#  gives the reason.
+#
+#  ${1} = suite dir name
+#  ${2} = test name (basename of params file)
+#  ${3} = params file path
+#  ${4} = .j2 source path
+#
+define TEST_MULTI_SERVER_RENDER
+$(OUTPUT)/$(TEST_MULTI_SERVER_MODE_DIR)/${1}/${2}/$(notdir $(patsubst %.j2,%,${4})): ${4} ${3} $(TEST_MULTI_SERVER_CONFIG_FILES) | $(TEST_MULTI_SERVER_FRAMEWORK_STAMP)
+	${Q}mkdir -p $$(@D)
+	${Q}echo "RENDER ${4} -> $$@"
+	${Q}set -e; \
+	$(TEST_MULTI_SERVER_FRAMEWORK_DIR)/.venv/bin/radenv-config \
+	    "${4}" \
+	    --vars-file "${3}" \
+	    --aux-file \
+	    --include-path "$(DIR)/configs" \
+	    --include-path "$(DIR)/templates" \
+	    --output-path "$$@" \
+	    --process-volumes \
+	    --volume-src "$(DIR)/configs" \
+	    --define project="${1}-${2}-$(MODE)" \
+	    --define mode="$(MODE)" \
+	    --define profiling_result_dir="$(PROFILING_RESULT_DIR)" \
+	    --define profiling_tools="$(PROFILING_TOOLS)" \
+	    >> "$$(@D)/config_builder.log" 2>&1
+endef
+
+#
+#  Capture script that RADIUSD_COMMAND runs in profiling mode.  make copies
+#  it into each test's output dir in every mode, because the common compose
+#  file bind mounts it, and compose turns a missing bind source into an
+#  empty directory instead of an error.  A profiler without a script fails
+#  the build early with "No rule to make target .../start_<tool>_profiling.sh".
+#
+TEST_MULTI_SERVER_SCRIPT_DIR     := $(DIR)/scripts
+TEST_MULTI_SERVER_SCRIPT_NAMES   := $(foreach t,$(PROFILING_TOOLS),start_$(t)_profiling.sh)
+TEST_MULTI_SERVER_COMMON_COMPOSE := $(wildcard $(DIR)/configs/compose/*.yml.j2)
+
+#
+#  TEST_MULTI_SERVER_INSTANCE - define render + run targets for a single test.
+#
+#  Discovers all .j2 files in the suite directory, generates a render rule
+#  for each, and creates a test target that depends on all rendered outputs.
+#  Switches image / valgrind wiring based on MODE.
+#
+#  ${1} = suite dir name
+#  ${2} = test name
+#  ${3} = params file path
+#  ${4} = test output directory
+#
+define TEST_MULTI_SERVER_INSTANCE
+#
+#  The suite's own templates, plus the partial compose services that the
+#  suite's environment.yml.j2 extends.  The common file renders into the
+#  same directory, so `extends.file` resolves relative to environment.yml,
+#  and the render copies the ${DATA_PATH} sources the common file mounts.
+#
+TEST_MULTI_SERVER_JINJA_FILES.${1}.${2}  := $$(wildcard $$(DIR)/tests/${1}/*.j2) $$(TEST_MULTI_SERVER_COMMON_COMPOSE)
+TEST_MULTI_SERVER_RENDERED.${1}.${2}     := $$(addprefix ${4}/,$$(notdir $$(patsubst %.j2,%,$$(TEST_MULTI_SERVER_JINJA_FILES.${1}.${2}))))
+
+$$(foreach j,$$(TEST_MULTI_SERVER_JINJA_FILES.${1}.${2}),$$(eval $$(call TEST_MULTI_SERVER_RENDER,${1},${2},${3},$$j)))
+
+#
+#  environment.yml and freeradius-common.yml both mount
+#  ${DATA_PATH}/freeradius/common/proto-load/load-generator-packets/, and
+#  --process-volumes removes and re-copies that directory on every render.
+#  Order the two renders so a parallel make does not copy the directory
+#  from two processes at once.
+#
+${4}/freeradius-common.yml: | ${4}/environment.yml
+
+TEST_MULTI_SERVER_SCRIPTS.${1}.${2}      := $$(addprefix ${4}/scripts/,$$(TEST_MULTI_SERVER_SCRIPT_NAMES))
+
+${4}/scripts/start_%_profiling.sh: $$(TEST_MULTI_SERVER_SCRIPT_DIR)/profiling/start_%_profiling.sh
+	$${Q}mkdir -p $$(@D)
+	$${Q}cp $$< $$@
+
+.PHONY: render.test.multi-server.${1}.${2}
+render.test.multi-server.${1}.${2}: $$(TEST_MULTI_SERVER_RENDERED.${1}.${2}) $$(TEST_MULTI_SERVER_SCRIPTS.${1}.${2})
+
+.PHONY: test.multi-server.${1}.${2}
+test.multi-server.${1}.${2}: $$(TEST_MULTI_SERVER_RENDERED.${1}.${2}) $$(TEST_MULTI_SERVER_SCRIPTS.${1}.${2})
+	${Q}mkdir -p "${4}/logs" "${4}/listener"
+	${Q}echo "MULTI-SERVER-TEST test.multi-server.${1}.${2} ($(TEST_MULTI_SERVER_MODE_LABEL))"
+	${Q}if [ "$(MODE)" = "profiling" ]; then \
+		FREERADIUS_IMAGE=$(FREERADIUS_RADENV_PROFILING_IMAGE); \
+		RADIUSD_COMMAND="bash /usr/local/bin/start_$(PROFILING_TOOL)_profiling.sh"; \
+		if [ "$(PROFILING_RESULT_MODE)" = "dev" ]; then \
+			PROFILING_RESULT_PATH="$(PROFILING_RESULT_ROOT)/${1}/${2}/$(PROFILING_TOOL)"; \
+		else \
+			PROFILING_RESULT_PATH="$(PROFILING_RESULT_ROOT)/$(GIT_BRANCH)/$(GIT_COMMIT)/$(PROFILING_RUN_INDEX)/${1}/${2}/$(PROFILING_TOOL)"; \
+		fi; \
+		mkdir -p "$$$$PROFILING_RESULT_PATH"; \
+		echo "PROFILING_RESULT_PATH: $$$$PROFILING_RESULT_PATH"; \
+	else \
+		FREERADIUS_IMAGE=$(FREERADIUS_RADENV_IMAGE); \
+		PROFILING_RESULT_PATH=/tmp/prof-results-unused; \
+	fi; \
+	DATA_PATH="${4}" \
+	TOP_SRCDIR="$(top_srcdir)" \
+	FREERADIUS_IMAGE="$$$$FREERADIUS_IMAGE" \
+	RADIUSD_COMMAND="$$$$RADIUSD_COMMAND" \
+	PROFILING_RESULT_PATH="$$$$PROFILING_RESULT_PATH" \
+	$(TEST_MULTI_SERVER_FRAMEWORK_DIR)/.venv/bin/radenv $(TEST_MULTI_SERVER_FLAGS) \
+	    --project-name "${1}-${2}-$(MODE)" \
+	    --compose "${4}/environment.yml" \
+	    --test "${4}/template.yml" \
+	    --use-files \
+	    --listener-dir "${4}/listener" \
+	    --log-dir "${4}/logs" \
+	    --output "${4}/logs/result.log" \
+	    > "${4}/logs/stdout.log" 2> "${4}/logs/stderr.log" || \
+	{ \
+	    echo "FAILED: test.multi-server.${1}.${2} ($(TEST_MULTI_SERVER_MODE_LABEL))"; \
+	    for f in ${4}/logs/* ${4}/listener/*; do \
+	        [ -f "$$$$f" ] || continue; \
+	        echo ""; \
+	        echo "=== $$$$f ==="; \
+	        case "$$$$f" in \
+	            */listener/*) \
+	                echo "-- line-type counts --"; \
+	                awk '{print $$$$1}' "$$$$f" | sort | uniq -c; \
+	                echo "-- last 200 lines --"; \
+	                ;; \
+	        esac; \
+	        tail -200 "$$$$f"; \
+	    done; \
+	    exit 1; \
+	}; \
+	if [ "$(MODE)" = "profiling" ]; then \
+		if [ -s "$$$$PROFILING_RESULT_PATH/stats.txt" ]; then \
+			printf 'STATS: test.multi-server.${1}.${2} ($(TEST_MULTI_SERVER_MODE_LABEL))\n%s\n' \
+			    "$$$$(sed 's/^/    /' "$$$$PROFILING_RESULT_PATH/stats.txt")"; \
+		else \
+			echo "WARNING: test.multi-server.${1}.${2} ($(TEST_MULTI_SERVER_MODE_LABEL)) has no stats.txt, the capture script did not finish"; \
+		fi; \
+	fi
+endef
+
+#
+#  TEST_MULTI_SERVER - define all test instances for a suite.
+#
+#  Discovers *.test.yml param files in the suite directory and generates
+#  render + test targets for each.
+#
+#  The output directory path includes the mode for two reasons:
+#    1. A template may render differently per mode, because the render
+#       receives `mode` as a variable.
+#    2. A profiling run must not overwrite the logs of a service run.
+#
+#  ${1} = suite dir name (e.g. accept)
+#
+define TEST_MULTI_SERVER
+TEST_MULTI_SERVER_PARAM_FILES.${1} := $$(wildcard $$(DIR)/tests/${1}/*.test.yml)
+TEST_MULTI_SERVER_TESTS.${1}       := $$(foreach p,$$(TEST_MULTI_SERVER_PARAM_FILES.${1}),test.multi-server.${1}.$$(subst .,_,$$(patsubst %.test.yml,%,$$(notdir $$p))))
+
+$$(foreach p,$$(TEST_MULTI_SERVER_PARAM_FILES.${1}),$$(eval $$(call TEST_MULTI_SERVER_INSTANCE,${1},$$(subst .,_,$$(patsubst %.test.yml,%,$$(notdir $$p))),$$p,$(OUTPUT)/$(TEST_MULTI_SERVER_MODE_DIR)/${1}/$$(subst .,_,$$(patsubst %.test.yml,%,$$(notdir $$p))))))
+endef
+
+######################################################################
+#
+#  Discover suites and generate targets
+#
+######################################################################
+
+MODE ?= service
+
+TEST_MULTI_SERVER_MODE_DIR = $(MODE)$(if $(filter profiling,$(MODE)),/$(PROFILING_TOOL))
+
+#
+#  How the progress and failure messages name the mode.  A profiling run
+#  also names the profiler, because each profiler runs every test.
+#
+TEST_MULTI_SERVER_MODE_LABEL = MODE=$(MODE)$(if $(filter profiling,$(MODE)), PROFILING_TOOL=$(PROFILING_TOOL))
+
+#
+#  A suite is any subdirectory containing a template.yml.j2 file.
+#
+TEST_MULTI_SERVER_SUITES := $(notdir $(patsubst %/template.yml.j2,%,$(wildcard $(DIR)/tests/*/template.yml.j2)))
+
+$(foreach s,$(TEST_MULTI_SERVER_SUITES),$(eval $(call TEST_MULTI_SERVER,$s)))
+
+TEST_MULTI_SERVER_ALL_TESTS := $(foreach s,$(TEST_MULTI_SERVER_SUITES),$(TEST_MULTI_SERVER_TESTS.$(s)))
+
+######################################################################
+#
+#  Top-level targets
+#
+######################################################################
+
+#
+#  All tests
+#
+.PHONY: test.multi-server
+test.multi-server: $(TEST_MULTI_SERVER_ALL_TESTS)
+
+#
+#  CI tests only - matches *.ci.test.yml param files
+#
+TEST_MULTI_SERVER_CI_TESTS := $(filter %_ci,$(TEST_MULTI_SERVER_ALL_TESTS))
+
+.PHONY: test.multi-server.ci
+test.multi-server.ci: $(TEST_MULTI_SERVER_CI_TESTS)
+
+#
+#  Profiling pass: same suites, profiling image, one target per tool in
+#  PROFILING_TOOLS.  Forces MODE=profiling via a recursive sub-make so the
+#  per-test recipes pick up the right image / env without needing the
+#  operator to set MODE manually.
+#
+#  ${1} = profiling tool (e.g. valgrind)
+#
+define TEST_MULTI_SERVER_PROFILING
+.PHONY: test.multi-server.profiling.${1} test.multi-server.profiling.${1}.ci
+test.multi-server.profiling.${1}: freeradius-prof.image
+	$(Q)$$(MAKE) -f $(DIR)/all.mk test.multi-server MODE=profiling PROFILING_TOOL=${1} PROFILING_RUN_INDEX=$(PROFILING_RUN_INDEX)
+
+test.multi-server.profiling.${1}.ci: freeradius-prof.image
+	$(Q)$$(MAKE) -f $(DIR)/all.mk test.multi-server.ci MODE=profiling PROFILING_TOOL=${1} PROFILING_RUN_INDEX=$(PROFILING_RUN_INDEX)
+endef
+$(foreach t,$(PROFILING_TOOLS),$(eval $(call TEST_MULTI_SERVER_PROFILING,$t)))
+
+#
+#  The compose project name is <suite>-<test>-<mode>, so the tool passes
+#  run one after another rather than as parallel prerequisites.
+#
+.PHONY: test.multi-server.profiling test.multi-server.profiling.ci
+test.multi-server.profiling: freeradius-prof.image
+	$(Q)$(foreach t,$(PROFILING_TOOLS),$(MAKE) -f $(DIR)/all.mk test.multi-server.profiling.$t && ) true
+
+test.multi-server.profiling.ci: freeradius-prof.image
+	$(Q)$(foreach t,$(PROFILING_TOOLS),$(MAKE) -f $(DIR)/all.mk test.multi-server.profiling.$t.ci && ) true
+
+#
+#  Profiling image: build the standard freeradius4-radenv-profiling/<image>:<sha>
+#  via the top-level docker.radenv-profiling target. Stops short of any retag;
+#  the compose envs read the SHA-tagged image name directly out of
+#  FREERADIUS_IMAGE.
+#
+.PHONY: freeradius-prof.image
+freeradius-prof.image:
+	${Q}if [ -n "$(FORCE_IMAGE_REBUILD)" ] || [ -z "$$(docker images -q $(FREERADIUS_RADENV_PROFILING_IMAGE) 2>/dev/null)" ]; then \
+		$(MAKE) -C $(top_srcdir) docker.radenv-profiling.ubuntu24; \
+	else \
+		echo "$(FREERADIUS_RADENV_PROFILING_IMAGE) available, skipping profiling image build"; \
+	fi
+
+.PHONY: clean.test.multi-server
+clean.test.multi-server:
+	${Q}rm -rf $(OUTPUT)
+
+.PHONY: distclean.test.multi-server
+distclean.test.multi-server: clean.test.multi-server
+	${Q}rm -rf $(TEST_MULTI_SERVER_FRAMEWORK_DIR)
+
+.PHONY: clean
+clean: clean.test.multi-server
+
+.PHONY: distclean
+distclean: distclean.test.multi-server
+
+clean.test: clean.test.multi-server

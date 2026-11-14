@@ -28,8 +28,16 @@ RCSIDH(util_file_h, "$Id$")
 extern "C" {
 #endif
 
-#include <freeradius-devel/util/talloc.h>
-#include <stdbool.h>
+#include <freeradius-devel/util/sbuff.h>
+#include <freeradius-devel/util/value.h>
+
+#ifdef HAVE_DIRENT_H
+#  include <dirent.h>
+#endif
+
+#ifdef HAVE_GLOB_H
+#include <glob.h>
+#endif
 
 /** Callback for allowing additional operations on newly created directories
  *
@@ -44,6 +52,13 @@ extern "C" {
  */
 typedef int(*fr_mkdir_func_t)(int fd, char const *path, void *uctx);
 
+typedef struct {
+	uid_t		uid;
+	gid_t		gid;
+} fr_mkdir_chown_t;
+
+int		fr_mkdir_chown(int fd, char const *path, void *uctx);
+
 ssize_t		fr_mkdir(int *fd_out, char const *path, ssize_t len, mode_t mode,
 			 fr_mkdir_func_t func, void *uctx);
 
@@ -54,6 +69,50 @@ ssize_t		fr_touch(int *fd_out, char const *filename, mode_t mode, bool mkdir, mo
 int 		fr_unlink(char const *filename);
 
 char const	*fr_cwd_strip(char const *filename);
+
+int 		fr_dirfd(int *dirfd, char const **filename, char const *pathname) CC_HINT(nonnull);
+
+typedef enum : uint8_t {
+	FR_GLOBDIR_INVALID = 0,
+	FR_GLOBDIR_FILE,
+#ifdef HAVE_DIRENT_H
+	FR_GLOBDIR_DIR,
+#endif
+#ifdef HAVE_GLOB_H
+	FR_GLOBDIR_GLOB,
+#endif
+} fr_globdir_type_t;
+
+typedef struct {
+	fr_globdir_type_t	type;
+
+	char			*path;
+	char			*filename;
+
+	union {
+		DIR		*dir;
+#ifdef HAVE_GLOB_H
+		struct {
+			size_t	gl_current;
+			glob_t	glob;
+		};
+#endif
+	};
+} fr_globdir_iter_t;
+
+int		fr_globdir_iter_init(char const **filename, char const *dir, char const *pattern, fr_globdir_iter_t *iter);
+int		fr_globdir_iter_next(char const **filename, fr_globdir_iter_t *iter);
+int		fr_globdir_iter_free(fr_globdir_iter_t *iter);
+
+bool		fr_filename_ok(char const *filename, char const *end, bool allow_dir) CC_HINT(nonnull);
+bool		fr_filename_allowed_by_list(char const *filename, char const *end, char const * const *array) CC_HINT(nonnull);
+char const	*fr_filename(char const *path);
+char const	*fr_filename_common_trim(char const *path, char const *common);
+
+int		fr_filename_box_make_safe(TALLOC_CTX *ctx, fr_value_box_t *vb) CC_HINT(nonnull(2));
+
+extern const fr_sbuff_escape_rules_t fr_filename_escape;
+extern const fr_sbuff_escape_rules_t fr_filename_escape_dots;
 
 #ifdef __cplusplus
 }

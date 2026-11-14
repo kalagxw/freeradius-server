@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -19,7 +19,7 @@
  * @file lib/eap/chbind.c
  * @brief Channel binding
  *
- * @copyright 2014 Network RADIUS SARL
+ * @copyright 2014 Network RADIUS SAS
  * @copyright 2014 The FreeRADIUS server project
  */
 
@@ -27,6 +27,7 @@ RCSID("$Id$")
 
 #include <freeradius-devel/radius/defs.h>
 #include <freeradius-devel/radius/radius.h>
+#include <freeradius-devel/server/auth.h>
 
 #include <freeradius-devel/io/pair.h>
 #include "chbind.h"
@@ -36,7 +37,7 @@ static bool chbind_build_response(request_t *request, CHBIND_REQ *chbind)
 {
 	ssize_t			slen;
 	size_t			total;
-	uint8_t			*ptr, *end;
+	uint8_t			*ptr, *start, *end;
 	fr_pair_t		const *vp;
 	fr_dcursor_t		cursor;
 
@@ -57,9 +58,9 @@ static bool chbind_build_response(request_t *request, CHBIND_REQ *chbind)
 	 *	No attributes: just send a 1-byte response code.
 	 */
 	if (!total) {
-		ptr = talloc_zero_array(chbind, uint8_t, 1);
+		ptr = start = talloc_zero_array(chbind, uint8_t, 1);
 	} else {
-		ptr = talloc_zero_array(chbind, uint8_t, total + 4);
+		ptr = start = talloc_zero_array(chbind, uint8_t, total + 4);
 	}
 	if (!ptr) return false;
 	chbind->response = (chbind_packet_t *) ptr;
@@ -68,9 +69,9 @@ static bool chbind_build_response(request_t *request, CHBIND_REQ *chbind)
 	 *	Set the response code.  Default to "fail" if none was
 	 *	specified.
 	 */
-	vp = fr_pair_find_by_da(&request->control_pairs, attr_chbind_response_code, 0);
+	vp = fr_pair_find_by_da(&request->control_pairs, NULL, attr_chbind_response_code);
 	if (vp) {
-		ptr[0] = vp->vp_uint32;
+		ptr[0] = vp->vp_uint8;
 	} else {
 		ptr[0] = CHBIND_CODE_FAILURE;
 	}
@@ -89,28 +90,30 @@ static bool chbind_build_response(request_t *request, CHBIND_REQ *chbind)
 	ptr += 4;
 	end = ptr + total;
 
-	fr_dcursor_init(&cursor, &request->reply_pairs);
+	fr_pair_dcursor_init(&cursor, &request->reply_pairs);
 	while ((vp = fr_dcursor_current(&cursor)) && (ptr < end)) {
 		/*
 		 *	Skip things which shouldn't be in channel bindings.
-		 *	i.e. tagged, encrypted, or extended attributes
+		 *
+		 *	reply_pairs holds more than RADIUS attributes, and
+		 *	fr_radius_encode_pair() reads RADIUS flags from every
+		 *	attribute it is given.
 		 */
-		if (vp->da->flags.subtype) {
-		next:
+		if ((fr_dict_by_da(vp->da) != dict_radius) ||
+		    vp->da->flags.internal || (!vp->da->flags.extra && vp->da->flags.subtype) ||
+		    (vp->da == attr_message_authenticator)) {
 			fr_dcursor_next(&cursor);
 			continue;
 		}
-		if (vp->da == attr_message_authenticator) goto next;
 
 		slen = fr_radius_encode_pair(&FR_DBUFF_TMP(ptr, end), &cursor, NULL);
 		if (slen < 0) {
-			if (slen == PAIR_ENCODE_SKIPPED) goto next;
-
 			RPERROR("Failed encoding chbind response");
-
-			talloc_free(ptr);
+			chbind->response = NULL;
+			talloc_free(start);
 			return false;
 		}
+
 		ptr += slen;
 	}
 
@@ -149,7 +152,7 @@ static size_t chbind_get_data(chbind_packet_t const *packet,
 		 */
 		if ((end - ptr) < 4) return 0;
 
-		length = (ptr[0] << 8) | ptr[1];
+		length = fr_nbo_to_uint16(ptr);
 		if (length == 0) return 0;
 
 		if ((ptr + length + 3) > end) return 0;
@@ -171,12 +174,13 @@ static size_t chbind_get_data(chbind_packet_t const *packet,
 fr_radius_packet_code_t chbind_process(request_t *request, CHBIND_REQ *chbind)
 {
 	fr_radius_packet_code_t		code;
-	rlm_rcode_t	rcode;
+	unlang_result_t	result;
 	request_t	*fake = NULL;
 	uint8_t const	*attr_data;
 	size_t		data_len = 0;
 	fr_pair_t	*vp;
-	fr_radius_ctx_t packet_ctx;
+	fr_radius_ctx_t common_ctx = {};
+	fr_radius_decode_ctx_t packet_ctx = {};
 
 	/* check input parameters */
 	fr_assert((request != NULL) &&
@@ -185,34 +189,33 @@ fr_radius_packet_code_t chbind_process(request_t *request, CHBIND_REQ *chbind)
 		   (chbind->response == NULL));
 
 	/* Set-up the fake request */
-	fake = request_alloc_internal(request, &(request_init_args_t){ .parent = request });
+	fake = request_local_alloc_internal(request, &(request_init_args_t){ .parent = request });
 	MEM(fr_pair_prepend_by_da(fake->request_ctx, &vp, &fake->request_pairs, attr_freeradius_proxied_to) >= 0);
-	fr_pair_value_from_str(vp, "127.0.0.1", sizeof("127.0.0.1"), '\0', false);
+	(void) fr_pair_value_from_str(vp, "127.0.0.1", sizeof("127.0.0.1") - 1, NULL, false);
 
 	/* Add the username to the fake request */
 	if (chbind->username) {
-		vp = fr_pair_copy(fake->request_ctx, chbind->username);
+		MEM(vp = fr_pair_copy(fake->request_ctx, chbind->username));
 		fr_pair_append(&fake->request_pairs, vp);
 	}
 
 	/*
 	 *	Maybe copy the State over, too?
 	 */
-	memset(&packet_ctx, 0, sizeof(packet_ctx));
+	packet_ctx.common = &common_ctx;
 	packet_ctx.tmp_ctx = talloc_init_const("tmp");
 
 	/* Add the channel binding attributes to the fake packet */
 	data_len = chbind_get_data(chbind->request, CHBIND_NSID_RADIUS, &attr_data);
 	if (data_len) {
-		fr_dcursor_t cursor;
-
 		fr_assert(data_len <= talloc_array_length((uint8_t const *) chbind->request));
 
-		fr_dcursor_init(&cursor, &fake->request_pairs);
+		packet_ctx.end = attr_data + data_len;
+
 		while (data_len > 0) {
 			ssize_t attr_len;
 
-			attr_len = fr_radius_decode_pair(fake->request_ctx, &cursor, dict_radius,
+			attr_len = fr_radius_decode_pair(fake->request_ctx, &fake->request_pairs,
 							 attr_data, data_len, &packet_ctx);
 			if (attr_len <= 0) {
 				/*
@@ -223,7 +226,7 @@ fr_radius_packet_code_t chbind_process(request_t *request, CHBIND_REQ *chbind)
 				talloc_free(packet_ctx.tmp_ctx);
 				talloc_free(packet_ctx.tags);
 
-				return FR_RADIUS_CODE_ACCESS_ACCEPT;
+				return FR_RADIUS_CODE_ACCESS_REJECT;
 			}
 			attr_data += attr_len;
 			data_len -= attr_len;
@@ -241,8 +244,8 @@ fr_radius_packet_code_t chbind_process(request_t *request, CHBIND_REQ *chbind)
 //	fake->server_cs = virtual_server_find("channel_bindings");
 	fake->packet->code = FR_RADIUS_CODE_ACCESS_REQUEST;
 
-	rad_virtual_server(&rcode, fake);
-	switch (rcode) {
+	rad_virtual_server(&result, fake);
+	switch (result.rcode) {
 		/* If the virtual server succeeded, build a reply */
 	case RLM_MODULE_OK:
 	case RLM_MODULE_HANDLED:
@@ -275,7 +278,7 @@ chbind_packet_t *eap_chbind_vp2packet(TALLOC_CTX *ctx, fr_pair_list_t *vps)
 	chbind_packet_t		*packet;
 	fr_dcursor_t		cursor;
 
-	if (!fr_dcursor_iter_by_da_init(&cursor, vps, attr_eap_channel_binding_message)) return NULL;
+	if (!fr_pair_dcursor_by_da_init(&cursor, vps, attr_eap_channel_binding_message)) return NULL;
 
 	/*
 	 *	Compute the total length of the channel binding data.

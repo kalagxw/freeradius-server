@@ -1,0 +1,407 @@
+/*
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or (at
+ *   your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+/**
+ * $Id$
+ * @file lib/bio/base.c
+ * @brief Binary IO abstractions.
+ *
+ * @copyright 2024 Network RADIUS SAS (legal@networkradius.com)
+ */
+
+#include <freeradius-devel/bio/bio_priv.h>
+#include <freeradius-devel/bio/null.h>
+#include <freeradius-devel/util/syserror.h>
+
+/** Free this bio.
+ *
+ *  We allow talloc_free() to be called on just about anything in the
+ *  bio chain.  But we ensure that the chain is always shut down in an
+ *  orderly fashion.
+ */
+int fr_bio_destructor(fr_bio_t *bio)
+{
+	fr_bio_common_t *my = (fr_bio_common_t *) bio;
+
+	FR_BIO_DESTRUCTOR_COMMON;
+
+	return 0;
+}
+
+/** Internal bio function which just reads from the "next" bio.
+ *
+ *  It is mainly used when the current bio needs to modify the write
+ *  path, but does not need to do anything on the read path.
+ */
+ssize_t fr_bio_next_read(fr_bio_t *bio, void *packet_ctx, void *buffer, size_t size)
+{
+	fr_bio_t *next;
+
+	next = fr_bio_next(bio);
+	fr_assert(next != NULL);
+
+	return next->read(next, packet_ctx, buffer, size);
+}
+
+/** Internal bio function which just writes to the "next" bio.
+ *
+ *  It is mainly used when the current bio needs to modify the read
+ *  path, but does not need to do anything on the write path.
+ */
+ssize_t fr_bio_next_write(fr_bio_t *bio, void *packet_ctx, void const *buffer, size_t size)
+{
+	fr_bio_t *next;
+
+	next = fr_bio_next(bio);
+	fr_assert(next != NULL);
+
+	return next->write(next, packet_ctx, buffer, size);
+}
+
+ssize_t fr_bio_shutdown_read(UNUSED fr_bio_t *bio, UNUSED void *packet_ctx, UNUSED void *buffer, UNUSED size_t size)
+{
+	return fr_bio_error(SHUTDOWN);
+}
+
+ssize_t fr_bio_shutdown_write(UNUSED fr_bio_t *bio, UNUSED void *packet_ctx, UNUSED void const *buffer, UNUSED size_t size)
+{
+	return fr_bio_error(SHUTDOWN);
+}
+
+/** Tear down every bio from "first" to the end of the chain.
+ *
+ *  Running a bio's own shutdown routine twice is harmless, because the routine is cleared once it
+ *  has run.
+ */
+static int fr_bio_shutdown_chain(fr_bio_t *first)
+{
+	int rcode;
+	fr_bio_t *this;
+	fr_bio_common_t *my;
+
+	for (this = first; this != NULL; this = fr_bio_next(this)) {
+		my = (fr_bio_common_t *) this;
+
+		if (my->priv_cb.shutdown) {
+			rcode = my->priv_cb.shutdown(&my->bio);
+			if (rcode < 0) return rcode;
+			my->priv_cb.shutdown = NULL;
+		}
+
+		my->bio.read = fr_bio_shutdown_read;
+		my->bio.write = fr_bio_shutdown_write;
+		talloc_set_destructor(my, NULL);
+	}
+
+	return 0;
+}
+
+/** Finish a shutdown: tear down the whole chain, and tell the application.
+ *
+ *  Called either from fr_bio_shutdown() when nothing was buffered, or from fr_bio_eof() once the
+ *  application has drained everything which had already been received.
+ */
+static int fr_bio_shutdown_final(fr_bio_t *bio)
+{
+	int rcode;
+	fr_bio_t *head = fr_bio_head(bio);
+	fr_bio_common_t *my = (fr_bio_common_t *) head;
+
+	my->shutdown_pending = false;
+
+	rcode = fr_bio_shutdown_chain(head);
+	if (rcode < 0) return rcode;
+
+	/*
+	 *	Call the application shutdown routine to tell it that the BIO has been successfully shut
+	 *	down.  The read and write routines above are already dead, so a shutdown routine which
+	 *	calls back into us does nothing.
+	 */
+	if (my->cb.shutdown) {
+		rcode = my->cb.shutdown(head);
+		if (rcode < 0) return rcode;
+		my->cb.shutdown = NULL;
+	}
+
+	return 0;
+}
+
+/** Shut down a set of BIOs
+ *
+ *  We shut down the BIOs from the top to the bottom.  This gives the TLS BIO an opportunity to call
+ *  the SSL_shutdown() routine, which should then write to the FD BIO.  Once that write is
+ *  completed, the FD BIO can then close its socket.
+ *
+ *  Any shutdown is "stop read / write", but is not "free all resources".  A shutdown can happen
+ *  when one of the intermediary BIOs hits a fatal error.  It can't free the BIO, but it has to mark
+ *  the entire BIO chain as being unusable.
+ *
+ *  Writes stop at once.  Reads do not: a bio which still holds data which the application has not
+ *  collected keeps its read routine, and the rest of the shutdown waits until that data has been
+ *  drained.  fr_bio_shutdown_discard() is the version which does not wait.
+ *
+ *  A destructor will first shutdown the BIOs, and then free all resources.
+ */
+int fr_bio_shutdown(fr_bio_t *bio)
+{
+	fr_bio_t *head, *this, *stopped;
+	fr_bio_common_t *my;
+
+	/*
+	 *	Find the first bio in the chain.
+	 */
+	head = fr_bio_head(bio);
+	my = (fr_bio_common_t *) head;
+
+	/*
+	 *	We're in the process of shutting down, or we have already shut down.  Don't call ourselves
+	 *	recursively.
+	 */
+	if (my->shutdown_pending || (my->bio.read == fr_bio_shutdown_read)) return 0;
+
+	/*
+	 *	Writes die immediately, everywhere.  Whatever killed the transport means that no write can
+	 *	ever succeed, and the application must not be told "nothing written, try again later".
+	 *
+	 *	Reads are left alone, so that the application can still collect data which arrived before
+	 *	the transport went away.
+	 */
+	for (this = head; this != NULL; this = fr_bio_next(this)) {
+		((fr_bio_common_t *) this)->bio.write = fr_bio_shutdown_write;
+	}
+
+	my->shutdown_pending = true;
+
+	/*
+	 *	Walk back up the chain from the bio which failed.  If nothing is holding data,
+	 *	fr_bio_eof() runs the teardown itself and returns NULL.
+	 */
+	stopped = fr_bio_eof(bio);
+	if (!stopped) return 0;
+
+	/*
+	 *	Something upstream still has data for the application.  Everything downstream of it is
+	 *	finished with, so tear that down now, and leave the rest until the drain completes.
+	 */
+	return fr_bio_shutdown_chain(fr_bio_next(stopped));
+}
+
+/** Shut down the chain now, discarding anything which is still buffered.
+ *
+ *  For a caller which has decided that the buffered data is the problem, such as a verify failure,
+ *  and for a free, which cannot wait for the application to drain anything.
+ */
+int fr_bio_shutdown_discard(fr_bio_t *bio)
+{
+	fr_bio_common_t *my = (fr_bio_common_t *) fr_bio_head(bio);
+
+	if (my->bio.read == fr_bio_shutdown_read) return 0;
+
+	return fr_bio_shutdown_final(&my->bio);
+}
+
+/** Like fr_bio_shutdown(), but can be called by anyone in the chain.
+ *
+ *  fr_bio_shutdown() finds the head itself, so this is now the same function.
+ */
+int fr_bio_shutdown_intermediate(fr_bio_t *bio)
+{
+	return fr_bio_shutdown(bio);
+}
+
+char const *fr_bio_strerror(ssize_t error)
+{
+	switch (error) {
+	case fr_bio_error(NONE):
+		return "";
+
+	case fr_bio_error(IO_WOULD_BLOCK):
+		return "IO operation would block";
+
+	case fr_bio_error(IO):
+		return fr_syserror(errno);
+
+	case fr_bio_error(GENERIC):
+		return fr_strerror();
+
+	case fr_bio_error(OOM):
+		return "Out of memory";
+
+	case fr_bio_error(VERIFY):
+		return "Packet fails verification";
+
+	case fr_bio_error(BUFFER_FULL):
+		return "Output buffer is full";
+
+	case fr_bio_error(BUFFER_TOO_SMALL):
+		return "Output buffer is too small to cache the data";
+
+	case fr_bio_error(SHUTDOWN):
+		return "The IO handler is not available.  It has been shut down due to a previous error";
+
+	default:
+		return "<unknown>";
+	}
+}
+
+void fr_bio_cb_set(fr_bio_t *bio, fr_bio_cb_funcs_t const *cb)
+{
+	fr_bio_common_t *my = (fr_bio_common_t *) bio;
+
+	if (!cb) {
+		memset(&my->cb, 0, sizeof(my->cb));
+		bio->uctx = NULL;
+	} else {
+		my->cb = *cb;
+	}
+}
+
+/** Internal BIO function to run EOF callbacks.
+ *
+ *  When a BIO hits EOF, it MUST call this function.  This function will take care of changing the read()
+ *  function to return nothing.  It will also take care of walking back up the hierarchy, and calling any
+ *  BIO EOF callbacks.
+ *
+ *  Once all of the BIOs have been marked as blocked, it will call the application EOF callback.
+ */
+fr_bio_t *fr_bio_eof(fr_bio_t *bio)
+{
+	fr_bio_common_t *this = (fr_bio_common_t *) bio;
+
+	/*
+	 *	This BIO is at EOF.  So we can't call read() any more.
+	 *
+	 *	@todo - we have to fix ordering of priv.cb.eof() versus cb.eof() the application may signal
+	 *	EOF on the BIO, in which case we have to do various things in the right order, so that the
+	 *	various callbacks can be set / updated correctly.  See mem.c and pipe.c for examples.
+	 *
+	 *	What we probably want is to ensure that there is no NEXT bio, OR that the next BIO is already
+	 *	at EOF.  So the FD BIO can call "eof" when it hits EOF, and the various upstream BIOs have
+	 *	their EOF callbacks run when they hit EOF.
+	 *
+	 *	We probably want to also add "bool eof" to fr_bio_common_s.  And perhaps also read/write
+	 *	blocked.
+	 */
+	this->bio.read = fr_bio_null_read;
+
+	while (true) {
+		fr_bio_common_t *prev = (fr_bio_common_t *) fr_bio_prev(&this->bio);
+
+		/*
+		 *	There are no more BIOs. Tell the application that the entire BIO chain is at EOF.
+		 */
+		if (!prev) {
+			if (this->cb.eof) {
+				this->cb.eof(&this->bio);
+				this->cb.eof = NULL;
+			}
+
+			/*
+			 *	A shutdown was deferred so that the application could drain whatever had
+			 *	already been received.  There is nothing left to drain, so finish it.
+			 */
+			if (this->shutdown_pending) (void) fr_bio_shutdown_final(&this->bio);
+
+			return NULL;
+		}
+
+		/*
+		 *	Go to the previous BIO.  If it doesn't have an EOF handler, then keep going back up
+		 *	the chain until we're at the top.
+		 */
+		this = prev;
+		if (!this->priv_cb.eof) continue;
+
+		/*
+		 *	The EOF handler said it's an error or NOT at EOF, so we stop processing here.
+		 */
+		if (this->priv_cb.eof((fr_bio_t *) this) <= 0) return (fr_bio_t *) this;
+
+		/*
+		 *	Don't run the EOF callback multiple times, and continue the loop.
+		 */
+		this->priv_cb.eof = NULL;
+	}
+}
+
+/** Internal BIO function to tell all BIOs that it's blocked.
+ *
+ *  When a BIO blocks on write, it MUST call this function.  This function will take care of walking back up
+ *  the hierarchy, and calling any write_blocked callbacks.
+ *
+ *  Once all of the BIOs have been marked as blocked, it will call the application write_blocked callback.
+ *
+ *  However, a BIO chain which is in the process of shutting down shouldn't signal the application.
+ *
+ * @return
+ *	- 1 every BIO in the chain is blocked.
+ *	- 0 a BIO is not blocked, or the chain is shutting down.
+ *	- <0 on error.
+ */
+int fr_bio_write_blocked(fr_bio_t *bio)
+{
+	fr_bio_common_t *this = (fr_bio_common_t *) bio;
+	fr_bio_common_t *head = (fr_bio_common_t *) fr_bio_head(bio);
+	int is_blocked = 1;
+
+	/*
+	 *	We're in the process of shutting down, don't do anything.  We have to check both the flags and
+	 *	the write functions.  See fr_bio_shutdown_final(), which clears `shutdown_pending`, and then
+	 *	walks the chain from the head, resetting the write function in each BIO.
+	 *
+	 *	A shutdown routine lower in the chain therefore sees a head BIO which is already dead, but its
+	 *	own write function is not yet dead.  So we have to check for all of these cases.
+	 */
+	if (head->shutdown_pending || (head->bio.write == fr_bio_shutdown_write) ||
+	    (this->bio.write == fr_bio_shutdown_write)) {
+		return 0;
+	}
+
+	while (true) {
+		fr_bio_common_t *prev = (fr_bio_common_t *) fr_bio_prev(&this->bio);
+		int rcode;
+
+		/*
+		 *	There are no more BIOs. Tell the application that the entire BIO chain is blocked.
+		 */
+		if (!prev) {
+			if (this->cb.write_blocked) {
+				rcode = this->cb.write_blocked(&this->bio);
+				if (rcode < 0) return rcode;
+				is_blocked &= (rcode == 1);
+			}
+			break;
+		}
+
+		/*
+		 *	Go to the previous BIO.  If it doesn't have a write_blocked handler, then keep going
+		 *	back up the chain until we're at the top.
+		 */
+		this = prev;
+		if (!this->priv_cb.write_blocked) continue;
+
+		/*
+		 *	Run this BIO's write_blocked handler.  On error we bail out immediately;
+		 *	otherwise we record whether it considers itself blocked and keep walking up
+		 *	the chain so that every BIO is told that writes are blocked.
+		 */
+		rcode = this->priv_cb.write_blocked((fr_bio_t *) this);
+		if (rcode < 0) return rcode;
+		is_blocked &= (rcode == 1);
+	}
+
+	return is_blocked;
+}

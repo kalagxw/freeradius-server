@@ -1,34 +1,34 @@
 #
-#  PRE: update expr
+#  PRE: expr
 #
+uint32 result_integer
 
 #
 #  Calculations based on month and year are not consistent due to
 #  different numbers of days involved.  Check hour / day / week
 #
 
-update request {
-        &Tmp-Integer-0 := "%{expr:%(nexttime:2h) - %(nexttime:1h)}"
+result_integer := "%{%time.next('2h') - %time.next('1h')}"
+
+# We have a fudge factor of 1 second either way
+if ((result_integer < 3599) || (result_integer > 3601)) {
+	test_fail
 }
 
-if (&Tmp-Integer-0 != 3600) {
-        test_fail
+#
+#  Day
+#
+result_integer := "%{%time.next('3d') - %time.next('1d')}"
+if ((result_integer < 172799) || (result_integer > 172801)) {
+	test_fail
 }
 
-update request {
-        &Tmp-Integer-0 := "%{expr:%(nexttime:3d) - %(nexttime:1d)}"
-}
-
-if (&Tmp-Integer-0 != 172800) {
-        test_fail
-}
-
-update request {
-        &Tmp-Integer-0 := "%{expr:%(nexttime:4w) - %(nexttime:2w)}"
-}
-
-if (&Tmp-Integer-0 != 1209600) {
-        test_fail
+#
+#  Week
+#
+result_integer := "%{%time.next('4w') - %time.next('2w')}"
+if ((result_integer < 1209599) || (result_integer > 1209601)) {
+	test_fail
 }
 
 success

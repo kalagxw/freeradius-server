@@ -47,7 +47,7 @@
  */
 #define VLAN_VID_UNPACK(_vlan)		((htons((_vlan)->tag_control) & 0x0fff))
 
-/** Pack the PCP (Priority Code Point) DEI (Drop Eligable Indicator) and VID (VLAN ID)
+/** Pack the PCP (Priority Code Point) DEI (Drop Eligible Indicator) and VID (VLAN ID)
  *
  * Packs the PCP, DEI and VID into the TCI (Tag control information). Output will be a 16bit integer
  * in network byte order.
@@ -105,7 +105,7 @@ typedef struct {
 /** Protocol options for ethernet
  *
  */
-typedef enum {
+typedef enum : uint8_t {
 	PROTO_OPT_ETHERNET_SVLAN_TPID = 0,	//!< Outer VLAN tag type.
 	PROTO_OPT_ETHERNET_SVLAN_PCP,		//!< Outer VLAN priority code point.
 	PROTO_OPT_ETHERNET_SVLAN_DEI,		//!< Outer VLAN drop eligible indicator.

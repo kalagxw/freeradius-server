@@ -24,36 +24,11 @@
  */
 RCSID("$Id$")
 
-#include <freeradius-devel/server/exec.h>
-#include <freeradius-devel/server/exec_legacy.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/server/request.h>
 #include <freeradius-devel/server/util.h>
-#include <freeradius-devel/unlang/interpret.h>
-
-#include <freeradius-devel/util/dlist.h>
-#include <freeradius-devel/util/misc.h>
-#include <freeradius-devel/util/pair_legacy.h>
-#include <freeradius-devel/util/syserror.h>
-#include <freeradius-devel/util/atexit.h>
-
-#include <freeradius-devel/protocol/freeradius/freeradius.internal.h>
-
-#include <sys/file.h>
-
-#include <fcntl.h>
-#include <ctype.h>
-#include <signal.h>
-
-#ifdef HAVE_SYS_WAIT_H
-#  include <sys/wait.h>
-#endif
-#ifndef WEXITSTATUS
-#  define WEXITSTATUS(stat_val) ((unsigned)(stat_val) >> 8)
-#endif
-#ifndef WIFEXITED
-#  define WIFEXITED(stat_val) (((stat_val) & 0x7f) == 0)
-#endif
+#include <freeradius-devel/server/exec_legacy.h>
+#include <freeradius-devel/server/exec_priv.h>
 
 #define MAX_ARGV (256)
 
@@ -88,8 +63,8 @@ static void exec_pair_to_env_legacy(request_t *request, fr_pair_list_t *input_pa
 			for (p = buffer; *p != '='; p++) {
 				if (*p == '-') {
 					*p = '_';
-				} else if (isalpha((int) *p)) {
-					*p = toupper(*p);
+				} else if (isalpha((uint8_t) *p)) {
+					*p = toupper((uint8_t) *p);
 				}
 			}
 		}
@@ -99,13 +74,13 @@ static void exec_pair_to_env_legacy(request_t *request, fr_pair_list_t *input_pa
 					   shell_escape ? T_DOUBLE_QUOTED_STRING : T_BARE_WORD);
 
 		DEBUG3("export %s", buffer);
-		envp[i++] = talloc_typed_strdup(envp, buffer);
+		envp[i++] = talloc_strdup(envp, buffer);
 	}
 
 	if (request) {
 		da = fr_dict_attr_child_by_num(fr_dict_root(fr_dict_internal()), FR_EXEC_EXPORT);
 		if (da) {
-			for (vp = fr_dcursor_iter_by_da_init(&cursor, &request->control_pairs, da);
+			for (vp = fr_pair_dcursor_by_da_init(&cursor, &request->control_pairs, da);
 			     vp && (i < (envlen - 1));
 			     vp = fr_dcursor_next(&cursor)) {
 				DEBUG3("export %pV", &vp->data);
@@ -196,13 +171,12 @@ static NEVER_RETURNS void exec_child_legacy(request_t *request, char **argv, cha
 	 *	want to leave dangling FD's for the child process
 	 *	to play funky games with, so we close them.
 	 */
-	closefrom(STDERR_FILENO + 1);
+	fr_closefrom(STDERR_FILENO + 1);
 
 	/*
 	 *	Disarm the thread local destructors
 	 *
-	 *	FIXME - Leaving them enabled causes issues in child
-	 *	execd processes, but we should really track down why.
+	 *	It's not safe to free memory between fork and exec.
 	 */
 	fr_atexit_thread_local_disarm_all();
 
@@ -241,7 +215,7 @@ static NEVER_RETURNS void exec_child_legacy(request_t *request, char **argv, cha
  * @param[in] cmd		Command to execute. This is parsed into argv[]
  *				parts, then each individual argv part is
  *				xlat'ed.
- * @param[in] request		Current reuqest
+ * @param[in] request		Current request
  * @param[in] exec_wait		set to true to read from or write to child.
  * @param[in] input_pairs	list of value pairs - these will be put into
  *				the environment variables of the child.
@@ -336,6 +310,7 @@ pid_t radius_start_program_legacy(int *stdin_fd, int *stdout_fd, int *stderr_fd,
 	if (pid < 0) {
 		ERROR("Couldn't fork %s: %s", argv[0], fr_syserror(errno));
 		if (exec_wait) goto error;
+		return -1;
 	}
 
 	/*
@@ -380,18 +355,18 @@ pid_t radius_start_program_legacy(int *stdin_fd, int *stdout_fd, int *stderr_fd,
  *	- -1 on failure.
  *	- Length of output.
  */
-int radius_readfrom_program_legacy(int fd, pid_t pid, fr_time_delta_t timeout, char *answer, int left)
+ssize_t radius_readfrom_program_legacy(int fd, pid_t pid, fr_time_delta_t timeout, char *answer, size_t left)
 {
-	int done = 0;
+	size_t done = 0;
 	int status;
 	fr_time_t start;
 
-	fr_nonblock(fd);
+	(void) fr_nonblock(fd);
 
 	/*
 	 *	Minimum timeout period is one section
 	 */
-	if (timeout < NSEC) timeout = fr_time_delta_from_sec(1);
+	if (fr_time_delta_unwrap(timeout) < NSEC) timeout = fr_time_delta_from_sec(1);
 
 	/*
 	 *	Read from the pipe until we doesn't get any more or
@@ -400,19 +375,20 @@ int radius_readfrom_program_legacy(int fd, pid_t pid, fr_time_delta_t timeout, c
 	start = fr_time();
 	while (1) {
 		int		rcode;
+		ssize_t		slen;
 		fd_set		fds;
 		fr_time_delta_t	elapsed;
 
 		FD_ZERO(&fds);
 		FD_SET(fd, &fds);
 
-		elapsed = fr_time() - start;
-		if (elapsed >= timeout) goto too_long;
+		elapsed = fr_time_sub(fr_time(), start);
+		if (fr_time_delta_gteq(elapsed, timeout)) goto too_long;
 
-		rcode = select(fd + 1, &fds, NULL, NULL, &fr_time_delta_to_timeval(timeout - elapsed));
+		rcode = select(fd + 1, &fds, NULL, NULL, &fr_time_delta_to_timeval(fr_time_delta_sub(timeout, elapsed)));
 		if (rcode == 0) {
 		too_long:
-			DEBUG("Child PID %u is taking too much time: forcing failure and killing child.", pid);
+			DEBUG("Child PID %ld is taking too much time: forcing failure and killing child.", (long)pid);
 			kill(pid, SIGTERM);
 			close(fd); /* should give SIGPIPE to child, too */
 
@@ -432,26 +408,26 @@ int radius_readfrom_program_legacy(int fd, pid_t pid, fr_time_delta_t timeout, c
 		 *	Read as many bytes as possible.  The kernel
 		 *	will return the number of bytes available.
 		 */
-		status = read(fd, answer + done, left);
+		slen = read(fd, answer + done, left);
 #else
 		/*
 		 *	There's at least 1 byte ready: read it.
 		 *	This is a terrible hack for non-blocking IO.
 		 */
-		status = read(fd, answer + done, 1);
+		slen = read(fd, answer + done, 1);
 #endif
 
 		/*
 		 *	Nothing more to read: stop.
 		 */
-		if (status == 0) {
+		if (slen == 0) {
 			break;
 		}
 
 		/*
 		 *	Error: See if we have to continue.
 		 */
-		if (status < 0) {
+		if (slen < 0) {
 			/*
 			 *	We were interrupted: continue reading.
 			 */
@@ -467,9 +443,9 @@ int radius_readfrom_program_legacy(int fd, pid_t pid, fr_time_delta_t timeout, c
 			break;
 		}
 
-		done += status;
-		left -= status;
-		if (left <= 0) break;
+		done += slen;
+		left -= slen;
+		if (left == 0) break;
 	}
 
 	/* Strip trailing new lines */
@@ -482,12 +458,9 @@ int radius_readfrom_program_legacy(int fd, pid_t pid, fr_time_delta_t timeout, c
 
 /** Execute a program.
  *
- * @param[in,out] ctx to allocate new fr_pair_t (s) in.
  * @param[out] out buffer to append plaintext (non valuepair) output.
  * @param[in] outlen length of out buffer.
- * @param[out] output_pairs list of value pairs - Data on child's stdout will be parsed and
- *	added into this list of value pairs.
- * @param[in] request Current request (may be NULL).
+ * @param[in] request Current request. Must not be NULL.
  * @param[in] cmd Command to execute. This is parsed into argv[] parts, then each individual argv
  *	part is xlat'ed.
  * @param[in] input_pairs list of value pairs - these will be available in the environment of the
@@ -500,16 +473,14 @@ int radius_readfrom_program_legacy(int fd, pid_t pid, fr_time_delta_t timeout, c
  *	- exit code if exec_wait!=0.
  *	- -1 on failure.
  */
-int radius_exec_program_legacy(TALLOC_CTX *ctx, char *out, size_t outlen, fr_pair_list_t *output_pairs,
+int radius_exec_program_legacy(char *out, size_t outlen,
 			       request_t *request, char const *cmd, fr_pair_list_t *input_pairs,
 			       bool exec_wait, bool shell_escape, fr_time_delta_t timeout)
 {
 	pid_t pid;
 	int stdout_pipe;
-	char *p;
 	pid_t child_pid;
-	int comma = 0;
-	int status, ret = 0;
+	int status;
 	ssize_t len;
 	char answer[4096];
 
@@ -526,7 +497,7 @@ int radius_exec_program_legacy(TALLOC_CTX *ctx, char *out, size_t outlen, fr_pai
 		return 0;
 	}
 
-	len = radius_readfrom_program_legacy(stdout_pipe, pid, timeout, answer, sizeof(answer));
+	len = radius_readfrom_program_legacy(stdout_pipe, pid, timeout, answer, sizeof(answer) - 1);
 	if (len < 0) {
 		/*
 		 *	Failure - radius_readfrom_program_legacy will
@@ -548,51 +519,7 @@ int radius_exec_program_legacy(TALLOC_CTX *ctx, char *out, size_t outlen, fr_pai
 		goto wait;
 	}
 
-	/*
-	 *	Parse the output, if any.
-	 */
-	if (output_pairs) {
-		fr_pair_list_t vps;
-
-		fr_pair_list_init(&vps);
-		/*
-		 *	HACK: Replace '\n' with ',' so that
-		 *	fr_pair_list_afrom_str() can parse the buffer in
-		 *	one go (the proper way would be to
-		 *	fix fr_pair_list_afrom_str(), but oh well).
-		 */
-		for (p = answer; *p; p++) {
-			if (*p == '\n') {
-				*p = comma ? ' ' : ',';
-				p++;
-				comma = 0;
-			}
-			if (*p == ',') {
-				comma++;
-			}
-		}
-
-		/*
-		 *	Replace any trailing comma by a NUL.
-		 */
-		if (answer[len - 1] == ',') {
-			answer[--len] = '\0';
-		}
-
-		if (fr_pair_list_afrom_str(ctx, request->dict, answer, sizeof(answer), &vps) == T_INVALID) {
-			RPERROR("Failed parsing output from: %s", cmd);
-			if (out) strlcpy(out, answer, len);
-			ret = -1;
-		}
-
-		/*
-		 *	We want to mark the new attributes as tainted,
-		 *	but not the existing ones.
-		 */
-		fr_pair_list_tainted(&vps);
-		fr_pair_list_append(output_pairs, &vps);
-
-	} else if (out) {
+	if (out) {
 		/*
 		 *	We've not been told to extract output pairs,
 		 *	just copy the programs output to the out
@@ -612,15 +539,15 @@ wait:
 	if (child_pid == pid) {
 		if (WIFEXITED(status)) {
 			status = WEXITSTATUS(status);
-			if ((status != 0) || (ret < 0)) {
-				RERROR("Program returned code (%d) and output \"%pV\"", status,
+			if (status != 0) {
+				RERROR("Program returned code (%d) and output %pV", status,
 				       fr_box_strvalue_len(answer, len));
 			} else {
-				RDEBUG2("Program returned code (%d) and output \"%pV\"", status,
+				RDEBUG2("Program returned code (%d) and output %pV", status,
 					fr_box_strvalue_len(answer, len));
 			}
 
-			return ret < 0 ? ret : status;
+			return status;
 		}
 	}
 

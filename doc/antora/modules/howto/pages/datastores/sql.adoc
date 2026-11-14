@@ -1,0 +1,12 @@
+= Structured Query Language (SQL)
+
+== What is it?
+
+== How to connect
+
+== Why use SQL?
+
+== Setting up a SQL Datastore
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

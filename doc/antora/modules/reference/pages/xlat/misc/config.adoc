@@ -1,0 +1,27 @@
+= Server Configuration
+
+== `+%config(<key>)+`
+
+Refers to a variable in the configuration file. See the documentation
+on configuration file references.
+
+.Return: _string_
+
+.Pulling variables from the server config
+====
+[source,unlang]
+----
+"Server installed in %config('prefix')"
+"Module rlm_exec.shell_escape = %config('modules.exec.shell_escape')"
+----
+
+.Output
+
+----
+Server installed in /opt/freeradius
+Module rlm_exec.shell_escape = yes
+----
+====
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

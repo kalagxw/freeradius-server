@@ -18,6 +18,10 @@ include /usr/share/dpkg/default.mk
 
 .NOTPARALLEL:
 
+ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+  MAKEFLAGS += -j$(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+endif
+
 SHELL           = /bin/bash
 
 package         = freeradius
@@ -27,9 +31,10 @@ mandir          = /usr/share/man
 libdir          = /usr/lib/$(package)
 logdir          = /var/log/$(package)
 pkgdocdir       = /usr/share/doc/$(package)
-raddbdir        = /etc/$(package)
+confdir        = /etc/$(package)
 
-modulelist=krb5 ldap sql_mysql sql_unixodbc sql_postgresql dhcp redis rest yubikey
+modulelist=kafka krb5 ldap redis rest yubikey
+sqldriverlist=freetds mysql unixodbc postgresql
 pkgs=$(shell dh_listpackages)
 
 # This has to be exported to make some magic below work.
@@ -52,11 +57,11 @@ else
 	confflags += --build $(DEB_BUILD_GNU_TYPE) --host $(DEB_HOST_GNU_TYPE)
 endif
 
-# Add dependency on distribution specific version of openssl that fixes Heartbleed (CVE-2014-0160).
-ifeq ($(shell dpkg-vendor --derives-from Ubuntu && echo yes),yes)
-       SUBSTVARS = -Vdist:Depends="libssl1.0.0 (>= 1.0.1f-1ubuntu2) | libssl1.1"
+# Later Debian versions have the legacy OpenSSL provider in a separate package
+ifeq ($(shell apt-cache show openssl-provider-legacy &>/dev/null && echo yes),yes)
+        SUBSTVARS = -Vdist:Depends="libssl3, openssl-provider-legacy"
 else
-       SUBSTVARS = -Vdist:Depends="libssl1.0.0 (>= 1.0.1e-2+deb7u5) | libssl1.0.2 | libssl1.1"
+        SUBSTVARS = -Vdist:Depends="libssl3"
 endif
 
 # Add libsystemd-dev as a Build-Depends to debian/control if it is known to this system
@@ -90,7 +95,6 @@ endif
 
 	./configure $(confflags) \
 		--config-cache \
-		--disable-developer \
 		--disable-openssl-version-check \
 		--prefix=/usr \
 		--exec-prefix=/usr \
@@ -99,7 +103,7 @@ endif
 		--libdir=$(libdir) \
 		--datadir=/usr/share \
 		--localstatedir=/var \
-		--with-raddbdir=$(raddbdir) \
+		--with-raddbdir=$(confdir) \
 		--with-logdir=/var/log/$(package) \
 		--with-large-files \
 		--with-udpfromto \
@@ -108,7 +112,6 @@ endif
 		--with-rlm_sql_postgresql_include_dir=`pg_config --includedir` \
 		--without-rlm_eap_ikev2 \
 		--without-rlm_sql_oracle \
-		--without-rlm_sql_unixodbc \
 		--with-systemd \
 		--enable-reproducible-builds
 
@@ -183,6 +186,12 @@ install-arch: build-arch-stamp
 	  dh_install --sourcedir=$(freeradius_dir) -p freeradius-$$mod ; \
 	  rm -f $(freeradius_dir)/usr/lib/freeradius/rlm_$$mod*.so ; \
 	  rm -f $(freeradius_dir)/usr/lib/freeradius/proto_$$mod*.so ; \
+	  rm -f $(freeradius_dir)/usr/lib/freeradius/process_$$mod*.so ; \
+	done
+
+	for driver in ${sqldriverlist}; do \
+	  dh_install --sourcedir=$(freeradius_dir) -p freeradius-$$driver ; \
+	  rm -f $(freeradius_dir)/usr/lib/freeradius/rlm_sql_$$driver*.so ; \
 	done
 
 	dh_install --sourcedir=$(freeradius_dir) -p freeradius-memcached
@@ -217,11 +226,11 @@ binary-common:
 	dh_md5sums
 	dh_builddeb
 
-# Build architecture independant packages using the common target.
+# Build architecture independent packages using the common target.
 binary-indep: build-indep install-indep
 	$(MAKE) -f debian/rules DH_OPTIONS=-i binary-common
 
-# Build architecture dependant packages using the common target.
+# Build architecture dependent packages using the common target.
 binary-arch: build-arch install-arch
 	$(MAKE) -f debian/rules DH_OPTIONS=-s binary-common
 

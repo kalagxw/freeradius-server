@@ -26,20 +26,19 @@ RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #ifdef WITH_TLS
-#define LOG_PREFIX "tls - "
-
-#include <openssl/ssl.h>
-
+#define LOG_PREFIX "tls"
 #include <freeradius-devel/util/strerror.h>
 
 #include "cert.h"
 #include "utils.h"
 
+#include <openssl/ssl.h>
+
 /** Check if a certificate is currently valid
  *
  * @param[out] not_before_p	Where to write the not before time.  May be NULL.
  * @param[out] not_after_p	Where to write the not after time.  May be NULL.
- * @parma[in] cert		The Certificate to validate.
+ * @param[in] cert		The Certificate to validate.
  * @return
  *	- -1 if we can't parse the notBefore or notAfter values in the cert.
  *	- -2 if the cert has expired (not_before_p, not_after_p still populated).
@@ -70,10 +69,10 @@ int fr_tls_cert_is_valid(fr_unix_time_t *not_before_p, fr_unix_time_t *not_after
 	/*
 	 *	Check the cert hasn't expired
 	 */
-	if (fr_time_from_sec(not_after) < now) {
+	if (fr_time_lt(fr_time_from_sec(not_after), now)) {
 		fr_strerror_printf("Certificate has expired.  "
 				   "Validity period (notAfter) ends %pV, current time is %pV",
-				   fr_box_date(fr_unix_time_from_time(not_before)), fr_box_date(fr_time_to_unix_time(now)));
+				   fr_box_date(fr_unix_time_from_time(not_after)), fr_box_date(fr_time_to_unix_time(now)));
 		return -2;
 	}
 
@@ -81,7 +80,7 @@ int fr_tls_cert_is_valid(fr_unix_time_t *not_before_p, fr_unix_time_t *not_after
 	 *	Check the cert's validity period
 	 *	has started.
 	 */
-	if (fr_time_from_sec(not_before) > now) {
+	if (fr_time_gt(fr_time_from_sec(not_before), now)) {
 		fr_strerror_printf("Certificate is not yet valid.  "
 				   "Validity period (notBefore) starts %pV, current time is %pV",
 				   fr_box_date(fr_unix_time_from_time(not_before)), fr_box_date(fr_time_to_unix_time(now)));

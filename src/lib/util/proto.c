@@ -30,7 +30,7 @@ void fr_proto_print(char const *file, int line, char const *fmt, ...)
 	char		*buff;
 
 	va_start(ap, fmt);
-	buff = talloc_vasprintf(NULL, fmt, ap);
+	buff = fr_vasprintf(NULL, fmt, ap);
 	va_end(ap);
 
 	fr_log(&default_log, L_DBG, file, line, "msg: %pV", fr_box_strvalue_buffer(buff));
@@ -79,7 +79,7 @@ void fr_proto_da_stack_print(char const *file, int line, char const *func, fr_da
 		fr_log(&default_log, L_DBG, file, line,
 		       "stk: %s [%i] %s: %s, vendor: 0x%x (%u), attr: 0x%x (%u)",
 		       (i == (int)depth) ? ">" : " ", i,
-		       fr_table_str_by_value(fr_value_box_type_table, da_stack->da[i]->type, "?Unknown?"),
+		       fr_type_to_str(da_stack->da[i]->type),
 		       da_stack->da[i]->name,
 		       fr_dict_vendor_num_by_da(da_stack->da[i]), fr_dict_vendor_num_by_da(da_stack->da[i]),
 		       da_stack->da[i]->attr, da_stack->da[i]->attr);
@@ -89,23 +89,21 @@ void fr_proto_da_stack_print(char const *file, int line, char const *func, fr_da
 
 /** Implements the default iterator to encode pairs belonging to a specific dictionary that are not internal
  *
- * @param[in] list	to itterate over.
- * @param[in] to_eval	The fr_pair_t after cursor->current.  Will be checked to
+ * @param[in] cursor	to iterate over.
+ * @param[in] current	The fr_pair_t cursor->current.  Will be advanced and checked to
  *			see if it matches the specified fr_dict_t.
  * @param[in] uctx	The fr_dict_t to search for.
  * @return
  *	- Next matching fr_pair_t.
  *	- NULL if not more matching fr_pair_ts could be found.
  */
-void *fr_proto_next_encodable(fr_dlist_head_t *list, void *to_eval, void *uctx)
+void *fr_proto_next_encodable(fr_dcursor_t *cursor, void *current, void *uctx)
 {
-	fr_pair_t	*c;
+	fr_pair_t	*c = current;
 	fr_dict_t	*dict = talloc_get_type_abort(uctx, fr_dict_t);
 
-	if (!to_eval) return NULL;
-
-	for (c = to_eval; c; c = fr_dlist_next(list, c)) {
-		VP_VERIFY(c);
+	while ((c = fr_dcursor_list_next(cursor, c))) {
+		PAIR_VERIFY(c);
 		if ((c->da->dict == dict) && (!c->da->flags.internal)) break;
 	}
 
@@ -119,33 +117,19 @@ void *fr_proto_next_encodable(fr_dlist_head_t *list, void *to_eval, void *uctx)
  */
 void fr_proto_da_stack_build(fr_da_stack_t *stack, fr_dict_attr_t const *da)
 {
-	fr_dict_attr_t const **cached;
+	fr_dict_attr_t const *da_p, **da_o;
 
 	if (!da) return;
 
 	/*
-	 *	See if we have a cached da stack available
+	 *	Manually build the da_stack.
 	 */
-	cached = fr_dict_attr_da_stack(da);
-	if (cached) {
-		/*
-		 *	da->da_stack[0] is dict->root
-		 */
-		memcpy(&stack->da[0], &cached[1], sizeof(stack->da[0]) * da->depth);
+	da_p = da;
+	da_o = stack->da + (da->depth - 1);
 
-	} else {
-		fr_dict_attr_t const	*da_p, **da_o;
-
-		/*
-		 *	Unknown attributes don't have a da->da_stack.
-		 */
-		da_p = da;
-		da_o = stack->da + (da->depth - 1);
-
-		while (da_o >= stack->da) {
-			*da_o-- = da_p;
-			da_p = da_p->parent;
-		}
+	while (da_o >= stack->da) {
+		*da_o-- = da_p;
+		da_p = da_p->parent;
 	}
 
 	stack->depth = da->depth;

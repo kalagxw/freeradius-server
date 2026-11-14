@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2022 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -17,8 +17,7 @@
 #	On top of that, a number of options are really TLV's.
 #	We need to be able to understand them, too.
 #
-PROTOCOL	Ethernet	4
-BEGIN-PROTOCOL	Ethernet
+BEGIN PROTOCOL	Ethernet	4	pool=1MB
 
 $INCLUDE dictionary.ethernet
 

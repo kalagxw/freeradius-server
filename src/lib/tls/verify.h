@@ -18,12 +18,14 @@
 /**
  * $Id$
  *
- * @file lib/tls/validate.h
+ * @file lib/tls/verify.h
  * @brief Structures for session-resumption management.
  *
  * @copyright 2021 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
-RCSIDH(validate_h, "$Id$")
+RCSIDH(verify_h, "$Id$")
+
+#include "openssl_user_macros.h"
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -35,14 +37,14 @@ extern "C" {
 /** Certificate validation states
  *
  */
-typedef enum {
+typedef enum : uint8_t {
 	FR_TLS_VALIDATION_INIT = 0,			//!< OpenSSL hasn't requested certificate validation.
 	FR_TLS_VALIDATION_REQUESTED,			//!< OpenSSL requested validation.
 	FR_TLS_VALIDATION_SUCCESS,			//!< Certificate chain was validate.
 	FR_TLS_VALIDATION_FAILED			//!< Certificate validation failed.
 } fr_tls_validation_state_t;
 
-typedef enum {
+typedef enum : uint8_t {
 	FR_TLS_VERIFY_MODE_DISABLED = 0,		//!< Don't convert any pairs for verification.
 	FR_TLS_VERIFY_MODE_LEAF = 0x01,			//!< Convert the client certificate.
 	FR_TLS_VERIFY_MODE_ISSUER = 0x02,		//!< Convert the issuer of the client certificate.
@@ -62,6 +64,10 @@ typedef struct {
 							///< certificate validation.
 
 	bool				resumed;	//!< Whether we're validating a resumed session.
+
+	X509_STORE_CTX			*x509_ctx;	//!< Chain OpenSSL is verifying.  Set while the
+							///< handshake is paused in fr_tls_verify_cert_cb(),
+							///< NULL for a resumed session, which has no chain.
 } fr_tls_verify_t;
 
 #ifdef __cplusplus
@@ -76,15 +82,17 @@ extern "C" {
 
 int		fr_tls_verify_cert_cb(int ok, X509_STORE_CTX *ctx);
 
-int		fr_tls_verify_client_cert_chain(request_t *request, SSL *ssl);
+int		fr_tls_verify_cert_chain(request_t *request, SSL *ssl);
 
-bool		fr_tls_verify_client_cert_result(fr_tls_session_t *tls_session);
+bool		fr_tls_verify_cert_result(fr_tls_session_t *tls_session);
 
-void		fr_tls_verify_client_cert_reset(fr_tls_session_t *tls_session);
+void		fr_tls_verify_cert_reset(fr_tls_session_t *tls_session);
 
-void		fr_tls_verify_client_cert_request(fr_tls_session_t *tls_session, bool resumed);
+void		fr_tls_verify_cert_request(fr_tls_session_t *tls_session, X509_STORE_CTX *x509_ctx);
 
-unlang_action_t fr_tls_verify_client_cert_pending_push(request_t *request, fr_tls_session_t *tls_session);
+void		fr_tls_verify_resumed_request(fr_tls_session_t *tls_session);
+
+unlang_action_t fr_tls_verify_cert_pending_push(request_t *request, fr_tls_session_t *tls_session);
 
 #ifdef __cplusplus
 }

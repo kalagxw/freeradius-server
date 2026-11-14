@@ -1,0 +1,96 @@
+#
+#  PRE: if
+#
+ipv4prefix prefix
+string head
+
+prefix = 192.0.2/24
+
+if (%file.escape(%unsafe("../foobar")) != "_x2e_x2e_x2ffoobar") {
+	test_fail
+}
+
+if (%file.escape(%unsafe("./foobar")) != "_x2e_x2ffoobar") {
+	test_fail
+}
+
+if (%file.escape("foobar") != "foobar") {
+	test_fail
+}
+
+#
+#  / in mask
+#
+if %file.escape(prefix) != "192.0.2.0_x2f24" {
+	test_fail
+}
+
+#
+#  This file doesn't exist, and we should not succeed in deleting it.
+#
+if %file.rm("${tmp}/.nosuchfile") {
+	test_fail
+}
+
+if %file.escape("${tmp}") != "${tmp}" {
+	test_fail
+}
+
+#
+#  @todo -this fails due to API issues.  It outputs src_x2ftests_x2fkeywords_x2f_x2ffoo :(
+#
+#if %file.safe("${tmp}" + %unsafe('/foo')) != "src/tests/keywords/_x2ffoo" {
+#	test_fail
+#}
+
+#
+#  These files are inside the "limit files" sub section of the "security"
+#  configuration, so access to them must succeed.
+#
+if !%file.exists("${tmp}/filename.attrs") {
+	test_fail
+}
+
+head = %file.head("${tmp}/filename.attrs")
+if (head != "#") {
+	test_fail
+}
+
+if !%file.mkdir("${tmp}/.limit-files-test-dir") {
+	test_fail
+}
+
+if !%file.exists("${tmp}/.limit-files-test-dir") {
+	test_fail
+}
+
+if !%file.rmdir("${tmp}/.limit-files-test-dir") {
+	test_fail
+}
+
+#
+#  These files are outside of the "limit files" subsection of the "security" configuration.
+#
+if %file.mkdir("/tmp/radiusd/") {
+	test_fail
+}
+
+if %file.touch("~/radiusd") {
+	test_fail
+}
+
+head := %file.head("/etc/passwd")
+if head {
+	test_fail
+}
+
+#
+#  A ".." component must not be able to escape the "limit files"
+#  directory, even though the path starts with the allowed prefix.
+#
+head := %file.head("${tmp}/../all.mk")
+if head {
+	test_fail
+}
+
+success

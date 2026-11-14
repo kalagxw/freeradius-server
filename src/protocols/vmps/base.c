@@ -25,7 +25,7 @@
 
 RCSID("$Id$")
 
-#include <freeradius-devel/util/base.h>
+#include <freeradius-devel/util/pair.h>
 #include "vmps.h"
 #include "attrs.h"
 
@@ -36,7 +36,7 @@ fr_dict_t const *dict_vmps;
 extern fr_dict_autoload_t libfreeradius_vmps[];
 fr_dict_autoload_t libfreeradius_vmps[] = {
 	{ .out = &dict_vmps, .proto = "vmps" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 fr_dict_attr_t const *attr_error_code;
@@ -48,35 +48,38 @@ fr_dict_attr_autoload_t libfreeradius_vmps_dict_attr[] = {
 	{ .out = &attr_error_code, .name = "Error-Code", .type = FR_TYPE_UINT8, .dict = &dict_vmps },
 	{ .out = &attr_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_vmps },
 	{ .out = &attr_sequence_number, .name = "Sequence-Number", .type = FR_TYPE_UINT32, .dict = &dict_vmps },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 
-int fr_vmps_init(void)
+int fr_vmps_global_init(void)
 {
 	if (instance_count > 0) {
 		instance_count++;
 		return 0;
 	}
 
+	instance_count++;
+
 	if (fr_dict_autoload(libfreeradius_vmps) < 0) {
-		fr_strerror_const_push("Failed loading the 'vmps' dictionary");
+	fail:
+		instance_count--;
 		return -1;
 	}
 
 	if (fr_dict_attr_autoload(libfreeradius_vmps_dict_attr) < 0) {
-		fr_strerror_const("Failed loading the 'vmps' attributes");
 		fr_dict_autofree(libfreeradius_vmps);
-		return -1;
+		goto fail;
 	}
 
-	instance_count++;
 
 	return 0;
 }
 
-void fr_vmps_free(void)
+void fr_vmps_global_free(void)
 {
+	fr_assert(instance_count > 0);
+
 	if (--instance_count > 0) return;
 
 	fr_dict_autofree(libfreeradius_vmps);

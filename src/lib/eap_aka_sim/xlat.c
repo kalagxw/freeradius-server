@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -25,6 +25,8 @@
  */
 
 #include <freeradius-devel/server/base.h>
+#include <freeradius-devel/unlang/xlat_func.h>
+
 #include "base.h"
 #include "attrs.h"
 
@@ -39,19 +41,20 @@ static xlat_arg_parser_t const aka_sim_xlat_id_method_xlat_args[] = {
 /** Returns the SIM method EAP-SIM or EAP-AKA hinted at by the user identifier
  *
 @verbatim
-%(aka_sim_id_method:%{id_attr})
+%aka_sim_id_method(%{id_attr})
 @endverbatim
  *
  * @ingroup xlat_functions
  */
-static xlat_action_t aka_sim_xlat_id_method_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-						 UNUSED void const *xlat_inst, UNUSED void *xlat_thread_inst,
+static xlat_action_t aka_sim_xlat_id_method_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
+						 UNUSED xlat_ctx_t const *xctx,
+						 request_t *request,
 						 fr_value_box_list_t *in)
 {
 	char const			*method;
 	fr_aka_sim_id_type_t		type_hint;
 	fr_aka_sim_method_hint_t	method_hint;
-	fr_value_box_t			*id = fr_dlist_head(in);
+	fr_value_box_t			*id = fr_value_box_list_head(in);
 	fr_value_box_t			*vb;
 
 	if (fr_aka_sim_id_type(&type_hint, &method_hint, id->vb_strvalue, id->vb_length) < 0) {
@@ -80,7 +83,12 @@ static xlat_action_t aka_sim_xlat_id_method_xlat(TALLOC_CTX *ctx, fr_dcursor_t *
 		break;
 	}
 
-	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_STRING, NULL, false));
+	if (!method) {
+		REDEBUG2("No dictionary value name for method hint");
+		return XLAT_ACTION_FAIL;
+	}
+
+	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_STRING, NULL));
 	fr_value_box_bstrndup(vb, vb, NULL, method, strlen(method), false);
 	fr_dcursor_append(out, vb);
 
@@ -95,19 +103,19 @@ static xlat_arg_parser_t const aka_sim_xlat_id_type_xlat_args[] = {
 /** Returns the type of identity used
  *
 @verbatim
-%(aka_sim_id_type:%{id_attr})
+%aka_sim_id_type(%{id_attr})
 @endverbatim
  *
  * @ingroup xlat_functions
  */
-static xlat_action_t aka_sim_xlat_id_type_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-					       UNUSED void const *xlat_inst, UNUSED void *xlat_thread_inst,
-					       fr_value_box_list_t *in)
+static xlat_action_t aka_sim_xlat_id_type_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
+					       UNUSED xlat_ctx_t const *xctx,
+					       request_t *request, fr_value_box_list_t *in)
 {
 	char const			*type;
 	fr_aka_sim_id_type_t		type_hint;
 	fr_aka_sim_method_hint_t	method_hint;
-	fr_value_box_t			*id = fr_dlist_head(in);
+	fr_value_box_t			*id = fr_value_box_list_head(in);
 	fr_value_box_t			*vb;
 
 	if (fr_aka_sim_id_type(&type_hint, &method_hint, id->vb_strvalue, id->vb_length) < 0) {
@@ -136,8 +144,13 @@ static xlat_action_t aka_sim_xlat_id_type_xlat(TALLOC_CTX *ctx, fr_dcursor_t *ou
 		break;
 	}
 
-	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_STRING, NULL, false));
-	fr_value_box_bstrndup(ctx, vb, NULL, type, strlen(type), false);
+	if (!type) {
+		REDEBUG2("No dictionary value name for identity type");
+		return XLAT_ACTION_FAIL;
+	}
+
+	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_STRING, NULL));
+	fr_value_box_bstrndup(vb, vb, NULL, type, strlen(type), false);
 	fr_dcursor_append(out, vb);
 
 	return XLAT_ACTION_DONE;
@@ -151,36 +164,37 @@ static xlat_arg_parser_t const aka_sim_id_3gpp_temporary_id_key_index_xlat_args[
 /** Returns the key index from a 3gpp temporary id
  *
 @verbatim
-%(3gpp_temporary_id_key_index:%{id_attr})
+%3gpp_temporary_id.key_index(%{id_attr})
 @endverbatim
  *
  * @ingroup xlat_functions
  */
-static xlat_action_t aka_sim_id_3gpp_temporary_id_key_index_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-							      UNUSED void const *xlat_inst,
-							      UNUSED void *xlat_thread_inst, fr_value_box_list_t *in)
+static xlat_action_t aka_sim_id_3gpp_temporary_id_key_index_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
+						 		 UNUSED xlat_ctx_t const *xctx,
+								 request_t *request, fr_value_box_list_t *in)
 {
-	fr_value_box_t	*id = fr_dlist_head(in);
+	fr_value_box_t	*id = fr_value_box_list_head(in);
 	fr_value_box_t	*vb;
 
 	if (id->vb_length != AKA_SIM_3GPP_PSEUDONYM_LEN) {
-		REDEBUG2("3gpp pseudonym incorrect length, expected %i bytes, got %zu bytes",
+		REDEBUG2("3gpp pseudonym incorrect length, expected %u bytes, got %zu bytes",
 			 AKA_SIM_3GPP_PSEUDONYM_LEN, id->vb_length);
 		return XLAT_ACTION_FAIL;
 	}
 
-	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_UINT8, NULL, false));
+	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_UINT8, NULL));
 	vb->vb_uint8 = fr_aka_sim_id_3gpp_pseudonym_tag(id->vb_strvalue);
 	fr_dcursor_append(out, vb);
 
 	return XLAT_ACTION_DONE;
 }
 
-extern xlat_arg_parser_t aka_sim_3gpp_temporary_id_decrypt_xlat_args[];
-xlat_arg_parser_t aka_sim_3gpp_temporary_id_decrypt_xlat_args[] = {
-	{ .required = true, .concat = true, .single = false, .variadic = false, .type = FR_TYPE_STRING,
+static xlat_arg_parser_t aka_sim_3gpp_temporary_id_decrypt_xlat_args[] = {
+	{ .required = true, .concat = true, .single = false, .type = FR_TYPE_STRING,
 	  .func = NULL, .uctx = NULL },
-	{ .required = true, .concat = true, .single = false, .variadic = false, .type = FR_TYPE_OCTETS,
+	{ .required = true, .concat = true, .single = false, .type = FR_TYPE_OCTETS,
+	  .func = NULL, .uctx = NULL },
+	{ .required = false, .concat = false, .single = true, .type = FR_TYPE_BOOL,
 	  .func = NULL, .uctx = NULL },
 	XLAT_ARG_PARSER_TERMINATOR
 };
@@ -188,7 +202,7 @@ xlat_arg_parser_t aka_sim_3gpp_temporary_id_decrypt_xlat_args[] = {
 /** Decrypt a 3gpp temporary id
  *
  @verbatim
- %(3gpp_temporary_id_decrypt:<id> <key>)
+ %3gpp_temporary_id.decrypt(<id> <key>)
  @endverbatim
  *
  * The pseudonym is in the format
@@ -219,28 +233,33 @@ xlat_arg_parser_t aka_sim_3gpp_temporary_id_decrypt_xlat_args[] = {
  *
  * @ingroup xlat_functions
  */
-static xlat_action_t aka_sim_3gpp_temporary_id_decrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-							    UNUSED void const *xlat_inst,
-							    UNUSED void *xlat_thread_inst, fr_value_box_list_t *in)
+static xlat_action_t aka_sim_3gpp_temporary_id_decrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
+						 	    UNUSED xlat_ctx_t const *xctx,
+							    request_t *request, fr_value_box_list_t *in)
 {
 	uint8_t		tag;
-	char		out_tag, *buff;
+	char		out_tag = '\0', *buff;
 
 	char		decrypted[AKA_SIM_IMSI_MAX_LEN + 1];
 
-	fr_value_box_t	*id_vb = fr_dlist_head(in);
+	fr_value_box_t	*id_vb = fr_value_box_list_head(in);
 	char const	*id = id_vb->vb_strvalue;
 	size_t		id_len = id_vb->vb_length;
 
-	fr_value_box_t	*key_vb = fr_dlist_next(in, id_vb);
+	fr_value_box_t	*key_vb = fr_value_box_list_next(in, id_vb);
 	uint8_t const	*key = key_vb->vb_octets;
 	size_t		key_len = key_vb->vb_length;
+
+	fr_value_box_t	*tag_vb = fr_value_box_list_next(in, key_vb);
+	bool		include_tag = true;
 
 	fr_value_box_t	*vb;
 	fr_pair_t	*eap_type;
 
+	if (tag_vb) include_tag = tag_vb->vb_bool;
+
 	if (id_len != (AKA_SIM_3GPP_PSEUDONYM_LEN)) {
-		REDEBUG2("3gpp pseudonym incorrect length, expected %i bytes, got %zu bytes",
+		REDEBUG2("3gpp pseudonym incorrect length, expected %u bytes, got %zu bytes",
 			 AKA_SIM_3GPP_PSEUDONYM_LEN, id_len);
 	error:
 		return XLAT_ACTION_FAIL;
@@ -251,42 +270,44 @@ static xlat_action_t aka_sim_3gpp_temporary_id_decrypt_xlat(TALLOC_CTX *ctx, fr_
 		goto error;
 	}
 
-	/*
-	 *	Figure out what tag we should add to the permanent id
-	 */
-	eap_type = fr_pair_find_by_da(&request->request_pairs, attr_eap_type, 0);
-	if (eap_type) {
-		if (eap_type->vp_uint32 == enum_eap_type_sim->vb_uint32) {
-			out_tag = ID_TAG_SIM_PERMANENT;
-		} else if (eap_type->vp_uint32 == enum_eap_type_aka->vb_uint32) {
-			out_tag = ID_TAG_AKA_PERMANENT;
-		} else if (eap_type->vp_uint32 == enum_eap_type_aka_prime->vb_uint32) {
-			out_tag = ID_TAG_AKA_PRIME_PERMANENT;
+	if (include_tag) {
+		/*
+		 *	Figure out what tag we should add to the permanent id
+		 */
+		eap_type = fr_pair_find_by_da(&request->request_pairs, NULL, attr_eap_type);
+		if (eap_type) {
+			if (eap_type->vp_uint32 == enum_eap_type_sim->vb_uint32) {
+				out_tag = ID_TAG_SIM_PERMANENT;
+			} else if (eap_type->vp_uint32 == enum_eap_type_aka->vb_uint32) {
+				out_tag = ID_TAG_AKA_PERMANENT;
+			} else if (eap_type->vp_uint32 == enum_eap_type_aka_prime->vb_uint32) {
+				out_tag = ID_TAG_AKA_PRIME_PERMANENT;
+			} else {
+				goto use_existing_tag;
+			}
 		} else {
-			goto use_existing_tag;
-		}
-	} else {
-	use_existing_tag:
-		tag = fr_aka_sim_id_3gpp_pseudonym_tag(id);
-		switch (tag) {
-		case ID_TAG_SIM_PSEUDONYM_B64:
-		case ID_TAG_SIM_FASTAUTH_B64:
-			out_tag = ID_TAG_SIM_PERMANENT;
-			break;
+		use_existing_tag:
+			tag = fr_aka_sim_id_3gpp_pseudonym_tag(id);
+			switch (tag) {
+			case ID_TAG_SIM_PSEUDONYM_B64:
+			case ID_TAG_SIM_FASTAUTH_B64:
+				out_tag = ID_TAG_SIM_PERMANENT;
+				break;
 
-		case ID_TAG_AKA_PSEUDONYM_B64:
-		case ID_TAG_AKA_FASTAUTH_B64:
-			out_tag = ID_TAG_AKA_PERMANENT;
-			break;
+			case ID_TAG_AKA_PSEUDONYM_B64:
+			case ID_TAG_AKA_FASTAUTH_B64:
+				out_tag = ID_TAG_AKA_PERMANENT;
+				break;
 
-		case ID_TAG_AKA_PRIME_PSEUDONYM_B64:
-		case ID_TAG_AKA_PRIME_FASTAUTH_B64:
-			out_tag = ID_TAG_AKA_PRIME_PERMANENT;
-			break;
+			case ID_TAG_AKA_PRIME_PSEUDONYM_B64:
+			case ID_TAG_AKA_PRIME_FASTAUTH_B64:
+				out_tag = ID_TAG_AKA_PRIME_PERMANENT;
+				break;
 
-		default:
-			REDEBUG2("Unexpected tag value (%u) in AKA/SIM Id \"%pV\"", tag, fr_box_strvalue_len(id, id_len));
-			goto error;
+			default:
+				REDEBUG2("Unexpected tag value (%u) in AKA/SIM Id \"%pV\"", tag, fr_box_strvalue_len(id, id_len));
+				goto error;
+			}
 		}
 	}
 
@@ -300,34 +321,37 @@ static xlat_action_t aka_sim_3gpp_temporary_id_decrypt_xlat(TALLOC_CTX *ctx, fr_
 	 *	Recombine unencrypted IMSI with tag
 	 */
 	MEM(vb = fr_value_box_alloc_null(ctx));
-	fr_value_box_bstr_alloc(vb, &buff, vb, NULL, AKA_SIM_IMSI_MAX_LEN + 1, false);
-	*buff = out_tag;
-	strncpy(buff + 1, decrypted, AKA_SIM_IMSI_MAX_LEN + 1);
+	if (include_tag) {
+		MEM(fr_value_box_bstr_alloc(vb, &buff, vb, NULL, AKA_SIM_IMSI_MAX_LEN + 1, false) == 0);
+		*buff = out_tag;
+		memcpy(buff + 1, decrypted, AKA_SIM_IMSI_MAX_LEN);
+	} else {
+		MEM(fr_value_box_bstrndup(vb, vb, NULL, decrypted, AKA_SIM_IMSI_MAX_LEN, true) == 0);
+	}
 	fr_dcursor_append(out, vb);
 
 	return XLAT_ACTION_DONE;
 }
 
-extern xlat_arg_parser_t aka_sim_3gpp_temporary_id_encrypt_xlat_args[];
-xlat_arg_parser_t aka_sim_3gpp_temporary_id_encrypt_xlat_args[] = {
-	{ .required = true, .concat = true, .single = false, .variadic = false, .type = FR_TYPE_STRING	},
-	{ .required = true, .concat = true, .single = false, .variadic = false, .type = FR_TYPE_OCTETS	},
-	{ .required = true, .concat = false, .single = true, .variadic = false, .type = FR_TYPE_UINT8	},
-	{ .required = false, .concat = false, .single = true, .variadic = false, .type = FR_TYPE_STRING	},
+static xlat_arg_parser_t aka_sim_3gpp_temporary_id_encrypt_xlat_args[] = {
+	{ .required = true, .concat = true, .single = false, .type = FR_TYPE_STRING	},
+	{ .required = true, .concat = true, .single = false, .type = FR_TYPE_OCTETS	},
+	{ .required = true, .concat = false, .single = true, .type = FR_TYPE_UINT8	},
+	{ .required = false, .concat = false, .single = true, .type = FR_TYPE_STRING	},
 	XLAT_ARG_PARSER_TERMINATOR
 };
 
 /** Encrypts a 3gpp pseudonym
  *
 @verbatim
-%(3gpp_temporary_id_encrypt:<id> <key> <index> [(pseudonym|fastauth)])
+%3gpp_temporary_id.encrypt(<id>, <key>, <index>, [(pseudonym|fastauth)])
 @endverbatim
  *
  * @ingroup xlat_functions
  */
-static xlat_action_t aka_sim_3gpp_temporary_id_encrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-							    UNUSED void const *xlat_inst,
-							    UNUSED void *xlat_thread_inst, fr_value_box_list_t *in)
+static xlat_action_t aka_sim_3gpp_temporary_id_encrypt_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
+							    UNUSED xlat_ctx_t const *xctx,
+							    request_t *request, fr_value_box_list_t *in)
 {
 	char				encrypted[AKA_SIM_3GPP_PSEUDONYM_LEN + 1];
 	uint8_t				tag = 0;
@@ -336,18 +360,18 @@ static xlat_action_t aka_sim_3gpp_temporary_id_encrypt_xlat(TALLOC_CTX *ctx, fr_
 	fr_aka_sim_id_type_t		type_hint;
 	fr_aka_sim_method_hint_t	method_hint;
 
-	fr_value_box_t			*id_vb = fr_dlist_head(in);
+	fr_value_box_t			*id_vb = fr_value_box_list_head(in);
 	char const			*id = id_vb->vb_strvalue;
 	size_t				id_len = id_vb->vb_length;
 
-	fr_value_box_t			*key_vb = fr_dlist_next(in, id_vb);
+	fr_value_box_t			*key_vb = fr_value_box_list_next(in, id_vb);
 	uint8_t	const			*key = key_vb->vb_octets;
 	size_t				key_len = key_vb->vb_length;
 
-	fr_value_box_t			*index_vb = fr_dlist_next(in, key_vb);
+	fr_value_box_t			*index_vb = fr_value_box_list_next(in, key_vb);
 	uint8_t				key_index = index_vb->vb_uint8;
 
-	fr_value_box_t			*type_vb = fr_dlist_next(in, index_vb);
+	fr_value_box_t			*type_vb = fr_value_box_list_next(in, index_vb);
 
 	bool				fastauth = false;
 
@@ -370,8 +394,8 @@ static xlat_action_t aka_sim_3gpp_temporary_id_encrypt_xlat(TALLOC_CTX *ctx, fr_
 	/*
 	 *	Check for the optional type argument
 	 */
-	if (!fr_type_is_null(type_vb->type)) {
-		fr_dict_enum_t const		*type_enum;
+	if (type_vb) {
+		fr_dict_enum_value_t const		*type_enum;
 
 		type_enum = fr_dict_enum_by_name(attr_eap_aka_sim_identity_type,
 						 type_vb->vb_strvalue, type_vb->vb_length);
@@ -435,9 +459,9 @@ static xlat_action_t aka_sim_3gpp_temporary_id_encrypt_xlat(TALLOC_CTX *ctx, fr_
 	} else if ((id_len >= AKA_SIM_IMSI_MIN_LEN) && (id_len <= AKA_SIM_IMSI_MAX_LEN)) {
 		fr_pair_t *eap_type;
 
-		eap_type = fr_pair_find_by_da(&request->request_pairs, attr_eap_type, 0);
+		eap_type = fr_pair_find_by_da(&request->request_pairs, NULL, attr_eap_type);
 		if (!eap_type) {
-			REDEBUG("ID does not contain method hint, and no &request.EAP-Type found.  "
+			REDEBUG("ID does not contain method hint, and no request.EAP-Type found.  "
 				"Don't know what tag to prepend to encrypted identity");
 			goto error;
 		}
@@ -449,13 +473,14 @@ static xlat_action_t aka_sim_3gpp_temporary_id_encrypt_xlat(TALLOC_CTX *ctx, fr_
 		} else if (eap_type->vp_uint32 == enum_eap_type_aka_prime->vb_uint32) {
 			tag = !fastauth ? ID_TAG_AKA_PRIME_PSEUDONYM_B64 : ID_TAG_AKA_PRIME_FASTAUTH_B64;
 		} else {
-			REDEBUG("&request.EAP-Type does not match a SIM based EAP-Type (SIM, AKA, AKA-Prime)");
+			REDEBUG("request.EAP-Type does not match a SIM based EAP-Type (SIM, AKA, AKA-Prime)");
+			goto error;
 		}
 
 		id_p = id;
 		id_end = id_p + id_len;
 	} else {
-		REDEBUG2("IMSI incorrect length, expected %i bytes, got %zu bytes", AKA_SIM_IMSI_MAX_LEN + 1,
+		REDEBUG2("IMSI incorrect length, expected %u bytes, got %zu bytes", AKA_SIM_IMSI_MAX_LEN + 1,
 			 id_len);
 		goto error;
 
@@ -471,46 +496,61 @@ static xlat_action_t aka_sim_3gpp_temporary_id_encrypt_xlat(TALLOC_CTX *ctx, fr_
 		return XLAT_ACTION_FAIL;
 	}
 
-	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_STRING, NULL, false));
-	fr_value_box_bstrndup(ctx, vb, NULL, encrypted, strlen(encrypted), false);
+	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_STRING, NULL));
+	fr_value_box_bstrndup(vb, vb, NULL, encrypted, strlen(encrypted), false);
 	fr_dcursor_append(out, vb);
 
 	return XLAT_ACTION_DONE;
 }
 
-void fr_aka_sim_xlat_register(void)
+int fr_aka_sim_xlat_func_register(void)
 {
 	xlat_t	*xlat;
 
 	if (aka_sim_xlat_refs) {
 		aka_sim_xlat_refs++;
-		return;
+		return 0;
 	}
 
-	xlat = xlat_register(NULL, "aka_sim_id_method", aka_sim_xlat_id_method_xlat, false);
-	xlat_func_args(xlat, aka_sim_xlat_id_method_xlat_args);
-	xlat = xlat_register(NULL, "aka_sim_id_type", aka_sim_xlat_id_type_xlat, false);
-	xlat_func_args(xlat, aka_sim_xlat_id_type_xlat_args);
-	xlat = xlat_register(NULL, "3gpp_temporary_id_key_index", aka_sim_id_3gpp_temporary_id_key_index_xlat, false);
-	xlat_func_args(xlat, aka_sim_id_3gpp_temporary_id_key_index_xlat_args);
-	xlat = xlat_register(NULL, "3gpp_temporary_id_decrypt", aka_sim_3gpp_temporary_id_decrypt_xlat, false);
-	xlat_func_args(xlat, aka_sim_3gpp_temporary_id_decrypt_xlat_args);
-	xlat = xlat_register(NULL, "3gpp_temporary_id_encrypt", aka_sim_3gpp_temporary_id_encrypt_xlat, false);
-	xlat_func_args(xlat, aka_sim_3gpp_temporary_id_encrypt_xlat_args);
+	if (unlikely((xlat = xlat_func_register(NULL, "aka_sim_id_method", aka_sim_xlat_id_method_xlat, FR_TYPE_STRING)) == NULL)) return -1;
+	xlat_func_args_set(xlat, aka_sim_xlat_id_method_xlat_args);
+	if (unlikely((xlat = xlat_func_register(NULL, "aka_sim_id_type", aka_sim_xlat_id_type_xlat, FR_TYPE_STRING)) == NULL)) return -1;
+	xlat_func_args_set(xlat, aka_sim_xlat_id_type_xlat_args);
+	if (unlikely((xlat = xlat_func_register(NULL, "3gpp_temporary_id_key_index", aka_sim_id_3gpp_temporary_id_key_index_xlat, FR_TYPE_UINT8)) == NULL)) return -1;
+	xlat_func_args_set(xlat, aka_sim_id_3gpp_temporary_id_key_index_xlat_args);
+	if (unlikely((xlat = xlat_func_register(NULL, "3gpp_temporary_id.key_index", aka_sim_id_3gpp_temporary_id_key_index_xlat, FR_TYPE_UINT8)) == NULL)) return -1;
+	xlat_func_args_set(xlat, aka_sim_id_3gpp_temporary_id_key_index_xlat_args);
+
+	if (unlikely((xlat = xlat_func_register(NULL, "3gpp_temporary_id_decrypt", aka_sim_3gpp_temporary_id_decrypt_xlat, FR_TYPE_STRING)) == NULL)) return -1;
+	xlat_func_args_set(xlat, aka_sim_3gpp_temporary_id_decrypt_xlat_args);
+
+	if (unlikely((xlat = xlat_func_register(NULL, "3gpp_temporary_id.decrypt", aka_sim_3gpp_temporary_id_decrypt_xlat, FR_TYPE_STRING)) == NULL)) return -1;
+	xlat_func_args_set(xlat, aka_sim_3gpp_temporary_id_decrypt_xlat_args);
+
+	if (unlikely((xlat = xlat_func_register(NULL, "3gpp_temporary_id_encrypt", aka_sim_3gpp_temporary_id_encrypt_xlat, FR_TYPE_STRING)) == NULL)) return -1;
+	xlat_func_args_set(xlat, aka_sim_3gpp_temporary_id_encrypt_xlat_args);
+	if (unlikely((xlat = xlat_func_register(NULL, "3gpp_temporary_id.encrypt", aka_sim_3gpp_temporary_id_encrypt_xlat, FR_TYPE_STRING)) == NULL)) return -1;
+	xlat_func_args_set(xlat, aka_sim_3gpp_temporary_id_encrypt_xlat_args);
+
 	aka_sim_xlat_refs = 1;
+
+	return 0;
 }
 
-void fr_aka_sim_xlat_unregister(void)
+void fr_aka_sim_xlat_func_unregister(void)
 {
 	if (aka_sim_xlat_refs > 1) {
 		aka_sim_xlat_refs--;
 		return;
 	}
 
-	xlat_unregister("aka_sim_id_method");
-	xlat_unregister("aka_sim_id_type");
-	xlat_unregister("3gpp_pseudonym_key_index");
-	xlat_unregister("3gpp_pseudonym_decrypt");
-	xlat_unregister("3gpp_pseudonym_encrypt");
+	xlat_func_unregister("aka_sim_id_method");
+	xlat_func_unregister("aka_sim_id_type");
+	xlat_func_unregister("3gpp_temporary_id_key_index");
+	xlat_func_unregister("3gpp_temporary_id.key_index");
+	xlat_func_unregister("3gpp_temporary_id_decrypt");
+	xlat_func_unregister("3gpp_temporary_id.decrypt");
+	xlat_func_unregister("3gpp_temporary_id_encrypt");
+	xlat_func_unregister("3gpp_temporary_id.encrypt");
 	aka_sim_xlat_refs = 0;
 }

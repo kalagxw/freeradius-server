@@ -1,32 +1,36 @@
-= Mapping and testing with ldapsearch
+= Map and Test with ldapsearch
 
-Every LDAP directory is different.  Each directory has different connection parameters,
-locations for objects, and attributes within those objects.
+Every LDAP directory is different.  Each directory has different
+connection parameters, locations for objects, and attributes within
+those objects.
 
-This section of the LDAP howto will guide you through discovering the values
-needed to configure the LDAP module.
+This section of the LDAP howto will guide you through discovering the
+values needed to configure the LDAP module.
 
-We _strongly_ recommend running these checks in this section on the same machine
-that will be used to host the RADIUS server.  A common cause of connectivity
-issues is that a firewall is preventing network access from the RADIUS server to
-the LDAP server. Running `ldapsearch` on a third machine may not reveal these
-firewall issues.
+We _strongly_ recommend running these checks in this section on the
+same machine that will be used to host the RADIUS server.  A common
+cause of connectivity issues is that a firewall is preventing network
+access from the RADIUS server to the LDAP server. Running `ldapsearch`
+on a third machine may not reveal these firewall issues.
 
-== xref:modules/ldap/ldapsearch/before_starting.adoc[Before starting]
+== xref:modules/ldap/ldapsearch/before_starting.adoc[Prerequisites]
 
-What questions to ask your LDAP administrator before you begin working with the
-directory.
+What questions to ask your LDAP administrator before you begin working
+with the directory.
 
-== xref:modules/ldap/ldapsearch/connection_parameters.adoc[Determining connection parameters]
+== xref:modules/ldap/ldapsearch/connection_parameters.adoc[Determine Connection Parameters]
 
 Discover through trial and error, what connection parameters the LDAP
 directory requires.
 
-== xref:modules/ldap/ldapsearch/locating_objects.adoc[Locating objects]
+== xref:modules/ldap/ldapsearch/locating_objects.adoc[Locate objects]
 
 Discover where users and groups are located within the directory.
 
-== xref:modules/ldap/ldapsearch/translating_to_the_ldap_module.adoc[Using results to configure the LDAP module]
+== xref:modules/ldap/ldapsearch/translating_to_the_ldap_module.adoc[Use Results to Configure the LDAP Module]
 
 Translate LDAP search arguments and the results from previous sections
 into LDAP module configuration items.
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

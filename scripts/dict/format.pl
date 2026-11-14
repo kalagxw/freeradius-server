@@ -27,7 +27,7 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
 #
-#    Copyright (C) 2010 Alan DeKok <aland@freeradius.org>
+#    Copyright (C) 2010 Network RADIUS SAS (legal@networkradius.com)
 #
 ######################################################################
 #
@@ -156,15 +156,20 @@ while (@ARGV) {
         #
         #  Remember if we did BEGIN-VENDOR format=
         #
-        if (/^BEGIN-VENDOR\s+([-\w]+)\s+(format=[-\w]+)/) {
+        if (/^BEGIN-VENDOR\s+([-\w]+)\s+(.+)/) {
+	    my $tabs;
+
             $begin_vendor = 1;
             if (!defined $vendor) {
                 $vendor = $1;
             } elsif ($vendor ne $1) {
                 # do something smart
             }
+	    if ($2) {
+		$tabs = tabs(32,$vendor);
+	    }
 
-            push @output, "BEGIN-VENDOR\t$vendor $2\n";
+            push @output, "BEGIN-VENDOR\t$vendor$tabs$2\n";
             next;
         }
 
@@ -192,20 +197,7 @@ while (@ARGV) {
 
             my $value = $2;
             my $type = $3;
-            my $stuff = $4;
-
-            #
-            #  See if it's old format, with the vendor at the end of
-            #  the line.  If so, make it the new format.
-            #
-            if (defined $vendor && $stuff =~ /$vendor/) {
-                if ($begin_vendor == 0) {
-                    push @output, "BEGIN-VENDOR\t$vendor\n\n";
-                    $begin_vendor = 1;
-                }
-                $stuff =~ s/$vendor//;
-                $stuff =~ s/\s+$//;
-            }
+            my $refs = $4;
 
             #
             #  The numerical value doesn't start with ".".
@@ -214,16 +206,33 @@ while (@ARGV) {
             #  one, then just print out the child values.
             #
             #  Otherwise, remember this attribute as the new "previous"
+	    #
+	    #  @todo - these checks get things wrong, so they're commented
+	    #  out until we have time to go fix them.
             #
-            if ($value !~ /^\./) {
-                if ($value =~ /^$previous(\..+)$/) {
-                    $value = $1;
-                } else {
-                    $previous = $value;
-                }
-            }
+#            if ($value !~ /^\./) {
+#                if ($value =~ /^$previous(\..+)$/) {
+#                    $value = $1;
+#                } else {
+#                    $previous = $value;
+#                }
+#            }
 
-            push @output, "ATTRIBUTE\t$name$tabs$value\t$type$stuff\n";
+            push @output, "ATTRIBUTE\t$name$tabs$value\t$type$refs\n";
+            next;
+        }
+
+        #
+        #  Get DEFINE.
+        #
+        if (/^DEFINE\s+([-\w]+)\s+(\w+)(.*)/) {
+            my $name = $1;
+            my $tabs = tabs(40, $name);
+
+            my $type = $2;
+            my $stuff = $3;
+
+            push @output, "DEFINE\t$name$tabs\t$type$stuff\n";
             next;
         }
 
@@ -245,53 +254,13 @@ while (@ARGV) {
         #  STRUCT name attr value
         #
         if (/^STRUCT\s+([-\w]+)\s+([-\w\/,.]+)\s+(\w+)(.*)/) {
-            my $attr = $2;
-            my $len = length $attr;
-
-            if ($len < 32) {
-                my $lenx = 32 - $len;
-                $lenx += 7;                # round up
-                $lenx /= 8;
-                $lenx = int $lenx;
-                $tabsa = "\t" x $lenx;
-                if ($tabsa eq "") {
-                    $tabsa = " ";
-                    $len += 1;
-                } else {
-                    $len -= $len % 8;
-                    $len += 8 * length $tabsa;
-                }
-            } else {
-                $tabsa = " ";
-                $len += 1;
-            }
-
-            #
-            #  For the code below, we assume that the attribute lengths
-            #
-            my $lena;
-            if ($len < 32) {
-                $lena = 0;
-            } else {
-                $lena = $len - 32;
-            }
-
             my $name = $1;
-            $len = length $name;
-            if ($len < 24) {
-                my $lenx = 24 - $lena - $len;
-                $lenx += 7;                # round up
-                $lenx /= 8;
-                $lenx = int $lenx;
-                $tabsn = "\t" x $lenx;
-                if ($tabsn eq "") {
-                    $tabsn = " ";
-                }
-            } else {
-                $tabsn = " ";
-            }
+            my $key = $2;
 
-            push @output, "STRUCT\t$name$tabsa$attr$tabsn$3$4\n";
+            my $tabs = tabs(32, $name);
+            my $tabsv = tabs(24, $key);
+
+            push @output, "STRUCT\t$name$tabs$key$tabsv$3$4\n";
             next;
         }
 
@@ -314,52 +283,12 @@ while (@ARGV) {
         #
         if (/^VALUE\s+([-\w]+)\s+([-\w\/,.]+)\s+(\w+)(.*)/) {
             my $attr = $1;
-            my $len = length $attr;
-
-            if ($len < 32) {
-                my $lenx = 32 - $len;
-                $lenx += 7;                # round up
-                $lenx /= 8;
-                $lenx = int $lenx;
-                $tabsa = "\t" x $lenx;
-                if ($tabsa eq "") {
-                    $tabsa = " ";
-                    $len += 1;
-                } else {
-                    $len -= $len % 8;
-                    $len += 8 * length $tabsa;
-                }
-            } else {
-                $tabsa = " ";
-                $len += 1;
-            }
-
-            #
-            #  For the code below, we assume that the attribute lengths
-            #
-            my $lena;
-            if ($len < 32) {
-                $lena = 0;
-            } else {
-                $lena = $len - 32;
-            }
-
             my $name = $2;
-            $len = length $name;
-            if ($len < 24) {
-                my $lenx = 24 - $lena - $len;
-                $lenx += 7;                # round up
-                $lenx /= 8;
-                $lenx = int $lenx;
-                $tabsn = "\t" x $lenx;
-                if ($tabsn eq "") {
-                    $tabsn = " ";
-                }
-            } else {
-                $tabsn = " ";
-            }
 
-            push @output, "VALUE\t$attr$tabsa$name$tabsn$3$4\n";
+	    my $tabs = tabs(32, $attr);
+	    my $tabsa = tabs(24, $name);
+
+            push @output, "VALUE\t$attr$tabs$name$tabsa$3$4\n";
             next;
         }
 

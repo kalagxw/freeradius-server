@@ -1,16 +1,16 @@
 #
-#  PRE: update if return foreach
+#  PRE: if return foreach
 #
-update control {
-	&Tmp-Integer-0 += 0
-	&Tmp-Integer-0 += 1
-	&Tmp-Integer-0 += 2
-	&Tmp-Integer-0 += 3
+control += {
+	NAS-Port = 0
+	NAS-Port = 1
+	NAS-Port = 2
+	NAS-Port = 3
 }
 
 group {
-	foreach &control.Tmp-Integer-0 {
-		if ("%{Foreach-Variable-0}" == '2') {
+	foreach thing (control.NAS-Port[*]) {
+		if (thing == 2) {
 			accept
 			success
 			return

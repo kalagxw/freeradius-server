@@ -24,7 +24,7 @@
  * @author Matthew Newton
  *
  * @copyright 2015 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
- * @copyright 2015,2020 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2015,2020 Network RADIUS SAS (legal@networkradius.com)
  * @copyright 2015 The FreeRADIUS Server Project
  */
 RCSIDH(json_h, "$Id$")
@@ -34,11 +34,9 @@ RCSIDH(json_h, "$Id$")
 #ifdef HAVE_JSON
 #  if defined(HAVE_JSONMC_JSON_H)
 
-DIAG_OFF(DIAG_UNKNOWN_PRAGMAS)
-DIAG_OFF(documentation-deprecated-sync)
+DIAG_OFF_OPTIONAL(documentation-deprecated-sync)
 #    include <json-c/json.h>
-DIAG_ON(documentation-deprecated-sync)
-DIAG_ON(DIAG_UNKNOWN_PRAGMAS)
+DIAG_ON_OPTIONAL(documentation-deprecated-sync)
 
 #  elif defined(HAVE_JSON_JSON_H)
 #    include <json/json.h>
@@ -50,11 +48,22 @@ DIAG_ON(DIAG_UNKNOWN_PRAGMAS)
 extern fr_table_num_sorted_t const fr_json_format_table[];
 extern size_t fr_json_format_table_len;
 
+/** How to encode FR_TYPE_OCTETS values in JSON output.
+ */
+typedef enum : uint8_t {
+	JSON_BINARY_FORMAT_RAW = 0,	//!< Current behaviour - raw bytes as JSON string.
+	JSON_BINARY_FORMAT_BASE16,	//!< Base16-encode octets values.
+	JSON_BINARY_FORMAT_BASE64	//!< Base64-encode octets values.
+} fr_json_binary_format_t;
+
+extern fr_table_num_sorted_t const fr_json_binary_format_table[];
+extern size_t fr_json_binary_format_table_len;
+
 /** List of possible JSON format output modes.
  *
  * @see fr_json_format_s
  */
-typedef enum {
+typedef enum : uint8_t {
 	JSON_MODE_UNSET = 0,
 	JSON_MODE_OBJECT,
 	JSON_MODE_OBJECT_SIMPLE,
@@ -102,15 +111,15 @@ typedef struct {
  * If an attribute appears only once then the value will normally
  * be written as an object. When an attribute appears more than
  * once then the values will be added as an array instead. Setting
- * **value_as_array** will ensure that values are always written as
+ * **value_is_always_array** will ensure that values are always written as
  * an array, even if containing only a single entry.
  *
- * Example with output_mode `JSON_MODE_OBJECT_SIMPLE` and `value_as_array` is false:
+ * Example with output_mode `JSON_MODE_OBJECT_SIMPLE` and `value_is_always_array` is false:
 @verbatim
 {"User-Name":"john","Filter-Id":["f1","f2"]}
 @endverbatim
  *
- * Example with output_mode `JSON_MODE_OBJECT_SIMPLE` and `value_as_array` is true:
+ * Example with output_mode `JSON_MODE_OBJECT_SIMPLE` and `value_is_always_array` is true:
 @verbatim
 {"User-Name":["john"],"Filter-Id":["f1","f2"]}
 @endverbatim
@@ -145,9 +154,10 @@ typedef struct {
  *
  */
 typedef struct {
-	bool	value_as_array;	//!< Use JSON array for multiple attribute values.
-	bool	enum_as_int;	//!< Output enums as value, not their string representation.
-	bool	always_string;	//!< Output all data types as strings.
+	bool				value_is_always_array;	//!< Use JSON array for multiple attribute values.
+	bool				enum_as_int;		//!< Output enums as value, not their string representation.
+	bool				always_string;		//!< Output all data types as strings.
+	fr_json_binary_format_t		binary_format;		//!< How to encode FR_TYPE_OCTETS values.
 } fr_json_format_value_t;
 
 
@@ -217,7 +227,7 @@ typedef struct {
  *
  */
 struct fr_json_format_s {
-	char const		*output_mode_str;	//!< For CONF_PARSER only.
+	char const		*output_mode_str;	//!< For conf_parser_t only.
 
 	json_mode_type_t	output_mode;		//!< Determine the format of JSON document
 							//!< to generate.
@@ -230,13 +240,13 @@ struct fr_json_format_s {
 
 typedef struct fr_json_format_s fr_json_format_t;
 
-extern CONF_PARSER const fr_json_format_config[];
+extern conf_parser_t const fr_json_format_config[];
 
 
 /* jpath .c */
 typedef struct fr_jpath_node fr_jpath_node_t;
 
-size_t		fr_jpath_escape_func(UNUSED request_t *request, char *out, size_t outlen,
+ssize_t		fr_jpath_escape_func(UNUSED request_t *request, char *out, size_t outlen,
 				     char const *in, UNUSED void *arg);
 
 int		fr_jpath_evaluate_leaf(TALLOC_CTX *ctx, fr_value_box_list_t *out,
@@ -251,11 +261,9 @@ ssize_t		fr_jpath_parse(TALLOC_CTX *ctx, fr_jpath_node_t **head, char const *in,
 int		fr_json_object_to_value_box(TALLOC_CTX *ctx, fr_value_box_t *out, json_object *object,
 					    fr_dict_attr_t const *enumv, bool tainted);
 
-json_object	*json_object_from_value_box(TALLOC_CTX *ctx, fr_value_box_t const *data);
+json_object	*json_object_from_value_box(fr_value_box_t const *data);
 
-char		*fr_json_from_string(TALLOC_CTX *ctx, char const *s, bool include_quotes);
-
-size_t    	fr_json_from_pair(char *out, size_t outlen, fr_pair_t const *vp);
+fr_slen_t	fr_json_str_from_value(fr_sbuff_t *out, fr_value_box_t const *vb, bool include_quotes);
 
 void		fr_json_version_print(void);
 

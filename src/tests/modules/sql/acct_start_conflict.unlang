@@ -5,47 +5,42 @@
 #
 #  Clear out old data
 #
-"%{sql:delete_from_radacct '00000003'}"
+%sql("${delete_from_radacct} '00000003'")
 
 #
 #  Insert the Accounting-Request start
 #
-sql.accounting
-if (ok) {
-	test_pass
-}
-else {
+sql.accounting.start
+if !(ok) {
 	test_fail
 }
 
 #
 #  Check the database has at least one row
 #
-if ("%{sql:SELECT count(*) FROM radacct WHERE AcctSessionId = '00000003'}" != "1") {
+if (%sql("SELECT count(*) FROM radacct WHERE AcctSessionId = '00000003'") != "1") {
 	test_fail
 }
 
 #
 #  Check acctsessiontime matches the value in the request
 #
-if ("%{sql:SELECT acctsessiontime FROM radacct WHERE AcctSessionId = '00000003'}" != "0") {
+if (%sql("SELECT acctsessiontime FROM radacct WHERE AcctSessionId = '00000003'") != "0") {
 	test_fail
 }
 
 #
 #  Change acctsessiontime and verify it's updated
 #
-update request {
-	&Connect-Info = 'updated'
-}
-sql.accounting
-if (ok) {
-	test_pass
-}
-else {
+Connect-Info = 'updated'
+
+sql.accounting.start
+if !(ok) {
 	test_fail
 }
 
-if ("%{sql:SELECT connectinfo_start FROM radacct WHERE AcctSessionId = '00000003'}" != 'updated') {
+if (%sql("SELECT connectinfo_start FROM radacct WHERE AcctSessionId = '00000003'") != 'updated') {
 	test_fail
 }
+
+test_pass

@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -17,10 +17,11 @@ BEGIN-VENDOR	Cosine
 ATTRIBUTE	Connection-Profile-Name			1	string
 ATTRIBUTE	Enterprise-ID				2	string
 ATTRIBUTE	Address-Pool-Name			3	string
-ATTRIBUTE	DS-Byte					4	integer
+ATTRIBUTE	DS-Byte					4	uint32
 ATTRIBUTE	VPI-VCI					5	octets
-ATTRIBUTE	DLCI					6	integer
+ATTRIBUTE	DLCI					6	uint32
 ATTRIBUTE	LNS-IP-Address				7	ipaddr
 ATTRIBUTE	CLI-User-Permission-ID			8	string
 
 END-VENDOR  Cosine
+ALIAS		Cosine					Vendor-Specific.Cosine

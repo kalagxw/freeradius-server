@@ -36,9 +36,15 @@ extern "C" {
  *
  * All module functions must return one of the codes listed below (apart from
  * RLM_MODULE_NUMCODES, which is used to check for validity).
+ *
+ *  When updating this, be sure to check everything using #fr_process_rcode_t, rcode_table, and
+ *  everything which references RLM_MODULE_NUMCODES.  e.g. foo [RLM_MODULE_NUMCODES];
+ 
  */
-typedef enum {
-	RLM_MODULE_REJECT = 0,				//!< Immediately reject the request.
+typedef enum : uint8_t {
+	RLM_MODULE_NOT_SET = 0,				//!< Error resolving rcode (should not be
+							//!< returned by modules).
+	RLM_MODULE_REJECT,				//!< Immediately reject the request.
 	RLM_MODULE_FAIL,				//!< Module failed, don't reply.
 	RLM_MODULE_OK,					//!< The module is OK, continue.
 	RLM_MODULE_HANDLED,				//!< The module handled the request, so stop.
@@ -47,21 +53,28 @@ typedef enum {
 	RLM_MODULE_NOTFOUND,				//!< User not found.
 	RLM_MODULE_NOOP,				//!< Module succeeded without doing anything.
 	RLM_MODULE_UPDATED,				//!< OK (pairs modified).
+	RLM_MODULE_TIMEOUT,				//!< Module (or section) timed out.
 	RLM_MODULE_NUMCODES,				//!< How many valid return codes there are.
-	RLM_MODULE_NOT_SET,				//!< Error resolving rcode (should not be
-							//!< returned by modules).
 } rlm_rcode_t;
 
-#define RETURN_MODULE_REJECT		do { *p_result = RLM_MODULE_REJECT; return UNLANG_ACTION_CALCULATE_RESULT; } while (0)
-#define RETURN_MODULE_FAIL		do { *p_result = RLM_MODULE_FAIL; return UNLANG_ACTION_CALCULATE_RESULT; } while (0)
-#define RETURN_MODULE_OK		do { *p_result = RLM_MODULE_OK; return UNLANG_ACTION_CALCULATE_RESULT; } while (0)
-#define RETURN_MODULE_HANDLED		do { *p_result = RLM_MODULE_HANDLED; return UNLANG_ACTION_CALCULATE_RESULT; } while (0)
-#define RETURN_MODULE_INVALID		do { *p_result = RLM_MODULE_INVALID; return UNLANG_ACTION_CALCULATE_RESULT; } while (0)
-#define RETURN_MODULE_DISALLOW		do { *p_result = RLM_MODULE_DISALLOW; return UNLANG_ACTION_CALCULATE_RESULT; } while (0)
-#define RETURN_MODULE_NOTFOUND		do { *p_result = RLM_MODULE_NOTFOUND; return UNLANG_ACTION_CALCULATE_RESULT; } while (0)
-#define RETURN_MODULE_NOOP		do { *p_result = RLM_MODULE_NOOP; return UNLANG_ACTION_CALCULATE_RESULT; } while (0)
-#define RETURN_MODULE_UPDATED		do { *p_result = RLM_MODULE_UPDATED; return UNLANG_ACTION_CALCULATE_RESULT; } while (0)
-#define RETURN_MODULE_RCODE(_rcode)	do { *p_result = (_rcode); return UNLANG_ACTION_CALCULATE_RESULT; } while (0)
+/** Whether an integer is an rcode which a module may return
+ *
+ * RLM_MODULE_NOT_SET and RLM_MODULE_NUMCODES are not rcodes which a module may return.
+ */
+#define RLM_MODULE_RCODE_VALID(_rcode) (((_rcode) > RLM_MODULE_NOT_SET) && ((_rcode) < RLM_MODULE_NUMCODES))
+
+
+#define RETURN_UNLANG_RCODE(_rcode)	do { p_result->rcode = (_rcode); return UNLANG_ACTION_CALCULATE_RESULT; } while (0)
+#define RETURN_UNLANG_REJECT		RETURN_UNLANG_RCODE(RLM_MODULE_REJECT)
+#define RETURN_UNLANG_FAIL		RETURN_UNLANG_RCODE(RLM_MODULE_FAIL)
+#define RETURN_UNLANG_OK		RETURN_UNLANG_RCODE(RLM_MODULE_OK)
+#define RETURN_UNLANG_HANDLED		RETURN_UNLANG_RCODE(RLM_MODULE_HANDLED)
+#define RETURN_UNLANG_INVALID		RETURN_UNLANG_RCODE(RLM_MODULE_INVALID)
+#define RETURN_UNLANG_DISALLOW		RETURN_UNLANG_RCODE(RLM_MODULE_DISALLOW)
+#define RETURN_UNLANG_NOTFOUND		RETURN_UNLANG_RCODE(RLM_MODULE_NOTFOUND)
+#define RETURN_UNLANG_NOOP		RETURN_UNLANG_RCODE(RLM_MODULE_NOOP)
+#define RETURN_UNLANG_UPDATED		RETURN_UNLANG_RCODE(RLM_MODULE_UPDATED)
+#define RETURN_UNLANG_TIMEOUT		RETURN_UNLANG_RCODE(RLM_MODULE_TIMEOUT)
 
 extern fr_table_num_sorted_t const rcode_table[];
 extern size_t rcode_table_len;
@@ -73,7 +86,8 @@ extern size_t rcode_table_len;
 	RLM_MODULE_REJECT:		\
 	case RLM_MODULE_FAIL:		\
 	case RLM_MODULE_INVALID:	\
-	case RLM_MODULE_DISALLOW
+	case RLM_MODULE_DISALLOW:	\
+	case RLM_MODULE_TIMEOUT
 
 #ifdef __cplusplus
 }

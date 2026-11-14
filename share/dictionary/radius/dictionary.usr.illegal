@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -13,22 +13,22 @@
 #	USR specific attributes
 #
 # Prompt value should be 1 for echo, 0 for no echo, default 1.
-#ATTRIBUTE	Prompt			64	integer
-ATTRIBUTE	Char-Noecho				250	integer
+#ATTRIBUTE	Prompt			64	uint32
+ATTRIBUTE	Char-Noecho				250	uint32
 
 #
 #	USR specific Integer Translations
 #
 
-ATTRIBUTE	Termination-Action			29	integer
+ATTRIBUTE	Termination-Action			29	uint32
 VALUE	Termination-Action		Manage-Resources	2
 
-ATTRIBUTE	Acct-Status-Type			40	integer
+ATTRIBUTE	Acct-Status-Type			40	uint32
 VALUE	Acct-Status-Type		Modem-Start		4
 VALUE	Acct-Status-Type		Modem-Stop		5
 VALUE	Acct-Status-Type		Cancel			6
 
-ATTRIBUTE	Multi-Link-Flag				126	integer
+ATTRIBUTE	Multi-Link-Flag				126	uint32
 VALUE	Multi-Link-Flag			True			1
 VALUE	Multi-Link-Flag			False			0
 
@@ -49,3 +49,4 @@ VALUE	Multi-Link-Flag			False			0
 #VALUE		Acct-Authentic		File			10
 #VALUE		Acct-Authentic		Local-VPN		11
 
+ALIAS  Vendor-Specific.

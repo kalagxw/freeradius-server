@@ -1,8 +1,9 @@
 TARGETNAME	:= @targetname@
 
 ifneq "$(TARGETNAME)" ""
-TARGET		:= $(TARGETNAME).a
+TARGET		:= $(TARGETNAME)$(L)
 endif
+TGT_CATEGORY	:= lib-util
 
 SOURCES		:= json.c jpath.c
 SRC_CFLAGS	+= @mod_cflags@

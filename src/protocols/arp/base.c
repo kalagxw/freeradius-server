@@ -20,7 +20,7 @@
  * @file protocols/arp/base.c
  * @brief Functions to send/receive ARP packets.
  *
- * @copyright 2020 Network RADIUS SARL <legal@networkradius.com?
+ * @copyright 2020 Network RADIUS SAS <legal@networkradius.com?
  */
 
 RCSID("$Id$")
@@ -38,6 +38,18 @@ RCSID("$Id$")
 
 #include <net/if_arp.h>
 
+#ifdef __FreeBSD__
+#include <net/ethernet.h>
+#include <net/if_dl.h>
+#include <netlink/netlink.h>
+#include <netlink/netlink_route.h>
+#include <netlink/netlink_snl.h>
+#include <netlink/netlink_snl_route.h>
+#include <sys/param.h>
+#include <sys/linker.h>
+#include <sys/module.h>
+#endif
+
 static uint32_t instance_count = 0;
 
 fr_dict_t const *dict_arp;
@@ -45,7 +57,7 @@ fr_dict_t const *dict_arp;
 extern fr_dict_autoload_t libfreeradius_arp_dict[];
 fr_dict_autoload_t libfreeradius_arp_dict[] = {
 	{ .out = &dict_arp, .proto = "arp" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 fr_dict_attr_t const *attr_arp_packet;
@@ -53,7 +65,7 @@ fr_dict_attr_t const *attr_arp_packet;
 extern fr_dict_attr_autoload_t libfreeradius_arp_dict_attr[];
 fr_dict_attr_autoload_t libfreeradius_arp_dict_attr[] = {
 	{ .out = &attr_arp_packet, .name = "arp", .type = FR_TYPE_STRUCT, .dict = &dict_arp },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 
@@ -139,6 +151,83 @@ int fr_arp_entry_add(UNUSED int fd, UNUSED char const *interface,
 }
 #endif
 
+#ifdef __FreeBSD__
+/** Use FreeBSD netlink API to add ARP entries
+ */
+int fr_bsd_arp_entry_add(uint32_t ifindex, uint8_t ipaddr[static 4], uint8_t macaddr[static 6])
+{
+	struct sockaddr_in	sin;
+	struct sockaddr_dl	sdl;
+	struct snl_state	state;
+	struct snl_writer	nw;
+	struct nlmsghdr		*msghdr;
+	struct ndmsg		*msg;
+	struct snl_errmsg_data	errmsg = {};
+
+	if (ifindex == 0) {
+		fr_strerror_const("Missing interface index");
+		return -1;
+	}
+
+	sin.sin_family = AF_INET;
+	memcpy(&sin.sin_addr.s_addr, ipaddr, 4);
+
+	sdl = (struct sockaddr_dl){
+		.sdl_len = sizeof(sdl),
+		.sdl_family = AF_LINK,
+		.sdl_alen = ETHER_ADDR_LEN
+	};
+	memcpy(LLADDR(&sdl), macaddr, ETHER_ADDR_LEN);
+
+	if (!snl_init(&state, NETLINK_ROUTE)) {
+		if (modfind("netlink") == -1 && errno == ENOENT) {
+			if (kldload("netlink") == -1) {
+				fr_strerror_const("netlink is not loaded and load attempt failed");
+				return -1;
+			}
+		} else {
+		open_error:
+			fr_strerror_const("Unable to open netlink socket");
+			return -1;
+		}
+		if (!snl_init(&state, NETLINK_ROUTE)) goto open_error;
+	}
+
+	snl_init_writer(&state, &nw);
+	msghdr = snl_create_msg_request(&nw, RTM_NEWNEIGH);
+	msghdr->nlmsg_flags |= NLM_F_CREATE | NLM_F_REPLACE;
+
+	msg = snl_reserve_msg_object(&nw, struct ndmsg);
+	if (!msg) {
+		fr_strerror_const("Failed reserving message");
+	error:
+		snl_free(&state);
+		return -1;
+	}
+	msg->ndm_family = AF_INET;
+	msg->ndm_ifindex = ifindex;
+	msg->ndm_state = NUD_PERMANENT;
+	msg->ndm_flags = NTF_STICKY;
+
+	snl_add_msg_attr_ip(&nw, NDA_DST, (struct sockaddr *)&sin);
+	snl_add_msg_attr(&nw, NDA_LLADDR, sdl.sdl_alen, LLADDR(&sdl));
+
+	if (!(msghdr = snl_finalize_msg(&nw)) || !snl_send_message(&state, msghdr)) {
+		fr_strerror_const("Failed sending netlink message.");
+		goto error;
+	}
+
+	snl_read_reply_code(&state, msghdr->nlmsg_seq, &errmsg);
+	if (errmsg.error != 0) {
+		fr_strerror_printf("Failed adding ARP table entry: %s (%s)", strerror(errmsg.error), errmsg.error_str);
+		goto error;
+	}
+
+	snl_free(&state);
+
+	return 0;
+}
+#endif
 
 /** Encode VPS into a raw ARP packet.
  *
@@ -158,13 +247,9 @@ ssize_t fr_arp_encode(fr_dbuff_t *dbuff, uint8_t const *original, fr_pair_list_t
 	}
 
 	/*
-	 *	Find the first attribute which is parented by ARP-Packet.
+	 *	Get a cursor over the ARP attributes.
 	 */
-	for (vp = fr_dcursor_init(&cursor, vps);
-	     vp;
-	     vp = fr_dcursor_next(&cursor)) {
-		if (vp->da->parent == attr_arp_packet) break;
-	}
+	vp = fr_pair_dcursor_by_ancestor_init(&cursor, vps, attr_arp_packet);
 
 	/*
 	 *	For simplicity, we allow the caller to omit things
@@ -174,7 +259,7 @@ ssize_t fr_arp_encode(fr_dbuff_t *dbuff, uint8_t const *original, fr_pair_list_t
 		fr_strerror_const("No ARP attributes in the attribute list");
 		return -1;
 	}
-	     
+
 	fr_proto_da_stack_build(&da_stack, attr_arp_packet);
 	FR_PROTO_STACK_PRINT(&da_stack, 0);
 
@@ -216,16 +301,15 @@ ssize_t fr_arp_encode(fr_dbuff_t *dbuff, uint8_t const *original, fr_pair_list_t
 		COPY(tpa, spa);		/* answer is sent to the requestor protocol address */
 	}
 
-	return fr_dbuff_set(dbuff, &work_dbuff);;
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
 /** Decode a raw ARP packet into VPs
  *
  */
-ssize_t fr_arp_decode(TALLOC_CTX *ctx, uint8_t const *packet, size_t packet_len, fr_pair_list_t *list)
+ssize_t fr_arp_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, uint8_t const *packet, size_t packet_len)
 {
 	fr_arp_packet_t const *arp;
-	fr_dcursor_t cursor;
 
 	if (packet_len < FR_ARP_PACKET_SIZE) {
 		fr_strerror_printf("Packet is too small (%d) to be ARP", (int) packet_len);
@@ -259,32 +343,37 @@ ssize_t fr_arp_decode(TALLOC_CTX *ctx, uint8_t const *packet, size_t packet_len,
 	/*
 	 *	If the packet is too long, we discard any extra data.
 	 */
-	fr_pair_list_init(list);
-	fr_dcursor_init(&cursor, list);
-	return fr_struct_from_network(ctx, &cursor, attr_arp_packet, packet, FR_ARP_PACKET_SIZE,
+	return fr_struct_from_network(ctx, out, attr_arp_packet, packet, FR_ARP_PACKET_SIZE,
 				      NULL, NULL, NULL);
 }
 
-int fr_arp_init(void)
+int fr_arp_global_init(void)
 {
 	if (instance_count > 0) {
 		instance_count++;
 		return 0;
 	}
 
-	if (fr_dict_autoload(libfreeradius_arp_dict) < 0) return -1;
-	if (fr_dict_attr_autoload(libfreeradius_arp_dict_attr) < 0) {
-		fr_dict_autofree(libfreeradius_arp_dict);
+	instance_count++;
+
+	if (fr_dict_autoload(libfreeradius_arp_dict) < 0) {
+	fail:
+		instance_count--;
 		return -1;
 	}
 
-	instance_count++;
+	if (fr_dict_attr_autoload(libfreeradius_arp_dict_attr) < 0) {
+		fr_dict_autofree(libfreeradius_arp_dict);
+		goto fail;
+	}
 
 	return 0;
 }
 
-void fr_arp_free(void)
+void fr_arp_global_free(void)
 {
+	fr_assert(instance_count > 0);
+
 	if (--instance_count > 0) return;
 
 	fr_dict_autofree(libfreeradius_arp_dict);
@@ -295,6 +384,9 @@ fr_dict_protocol_t libfreeradius_arp_dict_protocol = {
 	.name = "arp",
 	.default_type_size = 4,
 	.default_type_length = 0,
+
+	.init = fr_arp_global_init,
+	.free = fr_arp_global_free,
 };
 
 
@@ -302,23 +394,15 @@ typedef struct {
 	bool		tmp;
 } fr_arp_ctx_t;
 
-static int _test_ctx_free(UNUSED fr_arp_ctx_t *ctx)
-{
-	fr_arp_free();
-
-	return 0;
-}
-
-static int encode_test_ctx(void **out, TALLOC_CTX *ctx)
+static int encode_test_ctx(void **out, TALLOC_CTX *ctx, UNUSED fr_dict_t const *dict,
+			   UNUSED fr_dict_attr_t const *root_da)
 {
 	fr_arp_ctx_t *test_ctx;
 
-	if (fr_arp_init() < 0) return -1;
+	fr_assert(instance_count > 0);
 
 	test_ctx = talloc_zero(ctx, fr_arp_ctx_t);
 	if (!test_ctx) return -1;
-
-	talloc_set_destructor(test_ctx, _test_ctx_free);
 
 	*out = test_ctx;
 
@@ -343,9 +427,10 @@ fr_test_point_proto_encode_t arp_tp_encode_proto = {
 	.func		= fr_arp_encode_proto
 };
 
-static ssize_t fr_arp_decode_proto(TALLOC_CTX *ctx, fr_pair_list_t *list, uint8_t const *data, size_t data_len, UNUSED void *proto_ctx)
+static ssize_t fr_arp_decode_proto(TALLOC_CTX *ctx, fr_pair_list_t *out,
+				   uint8_t const *data, size_t data_len, UNUSED void *proto_ctx)
 {
-	return fr_arp_decode(ctx, data, data_len, list);
+	return fr_arp_decode(ctx, out, data, data_len);
 }
 
 extern fr_test_point_proto_decode_t arp_tp_decode_proto;

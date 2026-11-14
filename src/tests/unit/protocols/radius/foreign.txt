@@ -1,0 +1,86 @@
+proto radius
+proto-dictionary radius
+fuzzer-out radius
+
+#
+# build/fuzzer/radius/timeout-3cc5f1520bf3d7176c65a27f145675f4d2fae5ae
+# build/fuzzer/radius/timeout-a5de113a7713010a42500c7566904b615b32469f
+# build/fuzzer/radius/timeout-07ee59de0d8e62dd362140974e37e203e2abbb11
+# build/fuzzer/radius/timeout-e39e5d1c8d7a1db9a578ead41b688161a8fc0013
+#
+encode-pair Extended-Attribute-5.DHCPv4-Options := { Time-Offset = 2112 }
+match f5 0a 04 00 02 04 00 00 08 40
+
+decode-pair -
+match Extended-Attribute-5 = { DHCPv4-Options = { Time-Offset = 2112 } }
+
+#
+#  So long
+#
+encode-pair Vendor-Specific = { Nokia-SR = { ToServer-Dhcp-Options = { Time-Offset = 2112 } } }
+match 1a 0e 00 00 19 7f 66 08 02 04 00 00 08 40
+
+decode-pair -
+match Vendor-Specific = { Nokia-SR = { ToServer-Dhcp-Options = { Time-Offset = 2112 } } }
+
+encode-pair Vendor-Specific = { Nokia-SR = { ToServer-Dhcp-Options = { Time-Offset = 2112, Error-Message = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz" } } }
+match 1a ff 00 00 19 7f 66 fa 02 04 00 00 08 40 38 f0 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 1a 09 00 00 19 7f 66 04 7a
+
+#
+#  No decode as of yet of concatenated DHCPv4 options
+#
+
+######################################################################
+#
+#  DHCPv6
+#
+encode-pair Extended-Attribute-5 = { DHCPv6-Options = { Rapid-Commit = true, Information-Refresh-Time = 6809 } }
+match f5 10 03 00 00 0e 00 00 00 20 00 04 00 00 1a 99
+
+decode-pair -
+match Extended-Attribute-5 = { DHCPv6-Options = { Rapid-Commit = yes, Information-Refresh-Time = 6809 } }
+
+######################################################################
+#
+#  RADIUS encapsulates DHCPv6, which in turn encapsulates RADIUS
+#
+#encode-pair Extended-Attribute-5 = { DHCPv6-Options = { Rapid-Commit = yes, RADIUS = { User-Name = "bob" } } }
+#match f5 11 03 00 00 0e 00 00 00 51 00 05 01 05 62 6f 62
+
+#decode-pair -
+#match Extended-Attribute-5 = { DHCPv6-Options = { Rapid-Commit = yes, RADIUS = { User-Name = "bob" } } }
+
+######################################################################
+#
+#  Various cross-protocol tests taken from fuzzer output.
+#
+decode-proto 04ac00edf504000060800402f50303f5040403f5040402f50302d604040202046000f30303f5040402f502f50302d604040202046000f30303f5040402f50302040202046000f303040402280303f54404029e0200037d2c0404040404400404040402024404029e0200007d2c04040404044004210404020202046000f30303f50202046000f303029e2c7d0402040400000303f5040402f50302040202046000f303040402280303f54404029e0200037d2c040404040440040404040404020202046000f3000000e902046000f303029eaaaaaaaaaaaaaaaaaaaaaaaa2c7d04020404009004ffff60d000032ae00400000004040303f50404
+match Packet-Type = ::Accounting-Request, Packet-Authentication-Vector = 0xf504000060800402f50303f5040403f5, raw.NAS-IP-Address = 0x02f5, raw.214 = 0x0402, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x02, raw.214 = 0x0402, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x02, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x04, raw.Acct-Status-Type = 0x03, Extended-Attribute-5 = { DHCPv4-Options = { raw.PCP-IPv4-Server-Addresses = 0x0003, raw.V-I-Vendor-Specific = 0x0404040404400404040402024404029e0200007d2c04040404044004210404020202046000f30303f5020204, raw.96 = 0x, Site-specific-19 = 0x029e2c, V-I-Vendor-Specific = { } }, raw.DHCPv4-Options = 0x9e0200037d2c040404040440040404040404020202046000f3000000e902046000f303029eaaaaaaaaaaaaaaaaaaaaaaaa2c7d04020404009004ffff60d00003 }, CHAP-Password = 0xf5, raw.NAS-IP-Address = 0x02f5, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x04, raw.Acct-Status-Type = 0x03
+
+
+decode-proto 03 12 02 00 00 00 00 00 00 03 03 03 03 02 fc 03 02 d7 00 04 04 02 02 02 03 02 3d 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 04 02 02 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 f5 04 04 02 02 02 04 04 04 03 f5 04 04 02 f5 03 02 d6 04 04 02 02 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 04 02 02 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 f5 04 04 02 02 02 04 04 04 04 04 04 04 04 f3 03 03 f5 04 04 02 f5 03 03 04 02 02 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 f5 04 02 02 04 04 04 04 04 04 04 04 f3 03 03 f5 04 04 02 f5 03 03 04 02 02 04 60 00 f3 03 03 f5 9a 04 02 f5 03 03 f5 f1 04 04 04 03 f5 03 02 03 03 04 02 02 00 f3 04 60 03 03 f5 04 04 02 f5 03 03 f5 04 04 02 02 02 03 02 3d 04 60 00 f3 03 03 f5 04 03 03 f5 03 03 03 03 03 03 03 03 03 03 03 03 03 03 03 03 03 03 03 e8 03 03 02 5c 03 03 03 03 03 03 02 5c 04 04 02 f5 03 03 04 02 02 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 f5 04 02 02 04 04 04 04 04 04 04 04 f3 03 03 f5 04 04 02 f5 03 03 04 02 02 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 f5 04 03 03 f5 04 04 02 f5 03 03 04 02 02 02 3d 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 04 02 02 04 60 00 f5 04 02 f3 03 03 04 f5 03 03 f5 04 04 02 02 02 04 04 04 03 f5 04 04 02 f5 03 02 d6 04 04 02 02 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 04 02 02 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 f5 04 04 02 02 02 04 04 04 04 04 04 04 04 f3 03 03 f5 04 04 02 f5 03 03 04 02 02 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 f5 04 03 03 f5 04 04 02 f5 03 03 04 02 02 04 60 00 f3 03 03 f5 04 04 02 f5 03 03 f5 04 04 02 02 02 03 02 46 04 2a 04 04 04 44 03 03 03 03 03 03 03 03 03 72
+match Packet-Type = ::Access-Reject, Packet-Authentication-Vector = 0x00000000000303030302fc0302d70004, raw.NAS-Port-Type = 0x6000, raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.NAS-IP-Address = 0x0403, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x02, raw.214 = 0x0402, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.NAS-IP-Address = 0x0404, raw.NAS-IP-Address = 0x0404, raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, raw.Extended-Attribute-5 = 0x0202, raw.NAS-IP-Address = 0x0404, raw.NAS-IP-Address = 0x0404, raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, Extended-Attribute-5 = { raw.DHCPv4-Options = 0xf50303f5f104040403f50302030304020200f304600303f5040402f50303f5040402020203023d046000f30303f5040303f503030303030303030303030303030303030303e80303025c030303030303025c040402f50303040202046000f30303f5040402f50303f50402020404040404040404f30303f5040402f50303040202046000f30303f5040402f50303f5040303f5040402 }, raw.Extended-Attribute-5 = 0x03, raw.NAS-Port-Type = 0x6000, raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, User-Password = "\366\356", raw.Extended-Attribute-5 = 0x02f3, CHAP-Password = 0x04, raw.Extended-Attribute-5 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.NAS-IP-Address = 0x0403, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x02, raw.214 = 0x0402, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.NAS-IP-Address = 0x0404, raw.NAS-IP-Address = 0x0404, raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, raw.Extended-Attribute-5 = 0x0303, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.ARAP-Password = 0x2a04, raw.NAS-IP-Address = 0x4403, CHAP-Password = 0x03, CHAP-Password = 0x03, CHAP-Password = 0x72
+
+
+decode-proto 04ac00edd604040404040404040404040302d700f30303f5040402f50303f5040303f5040402f50303040202046000f30303f5040402f50303f504040202046000f30303f5040402f50303040202046000f30303f5040402f50303f5040403f5040402f50302d604040202046000f30303f5040402f50303040202046000f30303f5040402f50303f55d04002a006004040404040404f30303f5040402f50303040202046000f30303f5040402f50303f5040303f5040402f50303040202046000f30303f5040402f50303f5040402020203023d046000f30303f5040303f50304020404040404040404040404
+match Packet-Type = ::Accounting-Request, Packet-Authentication-Vector = 0xd604040404040404040404040302d700, raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, raw.Extended-Attribute-5 = 0x0303, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, raw.Extended-Attribute-5 = 0x0402, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, raw.Extended-Attribute-5 = 0x0403, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x02, raw.214 = 0x0402, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, User-Password = "\366\356", raw.Extended-Attribute-3 = 0x03, raw.Extended-Attribute-5 = 0x0402, raw.Extended-Attribute-5 = 0x03, Extended-Attribute-5 = { raw.DHCPv4-Options = 0x2a006004040404040404f30303f5040402f50303040202046000f30303f5040402f50303f5040303f5040402f50303040202046000f30303f5040402f50303f5040402020203023d046000f30303f5040303f5030402040404 }, raw.NAS-IP-Address = 0x0404, raw.NAS-IP-Address = 0x0404
+
+decode-proto 1f000260b50307ffededdef5ff04f504da0000026004ffedf53cfffffdff13daf504ffed000000000c0000180000000000000076e504ffdaf504ffecf504ffddf500ffed8104ffdaf504ff82f504ffda0bfaffdaf504ffdaf504ffecf504ff73f504ffddf504ffedf504ffdaf5ff04f5ed249e0038fffe0002ff2b3100bd001f000000810f02010004000f1b00549e00e402ef046b02cf04c05400046b02cf047d41cf04e7cf02040002fe147c02cf040205cf7d02cf00047d02cf04e802cf067d02cf7a007c02027dcfcf020404e8cf067d02cf04cf02040002fe147c02cf040205cf7d02cf00047d02cf04e802cf067d02cf7a047c02027dcfcf020404e8cf067d02cf047c02cf040302cf04e8023d02cf0024151c2a160000000000000000018303d67b0303023002cf03025902cf0306bd000014fb02cf03000000000076e504ffdaf504ffecf504ffddf500ff82f504ffda0bfaffdaf504ffdaf504ffecf504ff73f504ffddf504ffedf504ffdaf5ff04f5ed249e0038fffe0002ff2b3100bd0000000000810ffeff0000000f1b00549e00e402ef046b02cf04c05400046b02cf047d41cf040000000000000076e504ffdaf504ffecf504ffddf500ffed8104ffdaf504ff82f504ffda0bfaffdaf504ffdaf504ffecf504ff73f504ffddf504ffedf504ffdaf5ff04f5ed249e0038fffe0002ff2b3100bd0000000000810ffeff0000000f1b00549e00e402ef046b02cf04c05400046b02cf047d41cf04e7cf02040002fe147c02cf040205cf7d02cf06bd02cf0302cc03030302cf03435d03594302cf02cf03025902cf03063d02cf2b063d0302cf03435902cf030302029e9e9e9e9e9e9e9e9e9e9e9e9e9e9e46160000000000000000c2c2c2c2c2c2c2e6f604ffedf104045a
+match ERROR: Packet failed verification - unknown packet code
+
+# Regression test for infinite loop when encoding Message-Type DHCP option
+encode-pair Vendor-Specific.Nokia-SR.ToServer-Dhcp-Options.Message-Type = ::Discover
+match 1a 0b 00 00 19 7f 66 05 35 01 01
+
+decode-pair -
+match Vendor-Specific = { Nokia-SR = { ToServer-Dhcp-Options = { Message-Type = ::Discover } } }
+
+decode-proto 05 ff 00 1e 00 2a 3e 00 c7 00 00 18 13 00 2f 00 00 20 00 00 1a 0a 00 00 19 7f 66 04 21 00
+match Packet-Type = ::Accounting-Response, Packet-Authentication-Vector = 0x002a3e00c700001813002f0000200000, Vendor-Specific = { Nokia-SR = { ToServer-Dhcp-Options = { } } }
+
+decode-proto 20 20 00 b5 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 ff f5 a1 03 20 20 20 00 00 20 20 00 00 20 20 00 01 20 20 20 00 00 00 5b 00 21 ff 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 00 00 20 20 00 5b 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 00 00
+
+match ERROR: Packet failed verification - unknown packet code
+
+count
+match 33

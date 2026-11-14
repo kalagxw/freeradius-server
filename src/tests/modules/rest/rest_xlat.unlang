@@ -1,166 +1,247 @@
 #
 # PRE rest_module eval
 #
+string server_host
+uint32 server_port
+uint32 server_ssl_port
+string test_string
+string result_string
 
-update request {
-	&Tmp-String-0 := "$ENV{REST_TEST_SERVER}"
-	&Tmp-Integer-0 := "$ENV{REST_TEST_SERVER_PORT}"
-	&Tmp-Integer-1 := "$ENV{REST_TEST_SERVER_SSL_PORT}"
-	&Tmp-String-1 := "notfound"
-}
+server_host := "$ENV{REST_TEST_SERVER}"
+server_port := "$ENV{REST_TEST_SERVER_PORT}"
+server_ssl_port := "$ENV{REST_TEST_SERVER_SSL_PORT}"
+test_string := 'notfound'
 
 # Retrieve a plain text file
-update control {
-	&Tmp-String-1 := "%(rest:GET http://%{Tmp-String-0}:%{Tmp-Integer-0}/test.txt)"
-}
+result_string := %rest('GET', "http://%{server_host}:%uri.safe(%{server_port})/test.txt")
 
-if (&REST-HTTP-Status-Code != 200) {
+if (!(REST-HTTP-Status-Code == 200)) {
 	test_fail
 }
 
-if (&control.Tmp-String-1 != "Sample text response\n") {
+if (!(result_string == "Sample text response\n")) {
 	test_fail
 }
 
-# Take host from incomming packet
-update control {
-	&Tmp-String-1 := "%(rest:http://%{Login-IP-Host}:%{Tmp-Integer-0}/test.txt)"
-}
+# Take host from incoming packet
+result_string := %rest('GET', "http://%{Login-IP-Host}:%uri.safe(%{server_port})/test.txt")
 
-if ((&REST-HTTP-Status-Code != 200) || (&control.Tmp-String-1 != "Sample text response\n")) {
+if (!(REST-HTTP-Status-Code == 200) || !(result_string == "Sample text response\n")) {
 	test_fail
 }
 
-# Port is not allowed from incomming packet
-update control {
-	&Tmp-String-1 := "%(rest:http://%{Tmp-String-0}:%{NAS-Port}/test.txt)"
-}
+# Port is not allowed from incoming packets
+result_string := %rest('GET', "http://%{server_host}:%{NAS-Port}/test.txt")
 
-if ((&Module-Failure-Message != "Failed escaping URI: Tainted value not allowed for port") || (&control.Tmp-String-1 != "")) {
+if (!(Module-Failure-Message == "Failed escaping URI: Unsafe input \"8080\" not allowed in URI part port") || result_string) {
 	test_fail
 }
 
 # Check a "not found" gives a 404 status code
-update control {
-	&Tmp-String-1 := "%(rest:GET http://%{Tmp-String-0}:%{Tmp-Integer-0}/%{Tmp-String-1})"
+result_string := %rest('GET', "http://%{server_host}:%uri.safe(%{server_port})/%{test_string}")
+
+if (!(REST-HTTP-Status-Code == 404)) {
+	test_fail
 }
 
-if (&REST-HTTP-Status-Code != 404) {
+# Retrieve some XML.  text/xml is not handled by module methods so would be dropped,
+# but with the xlat we just get the body regardless of Content-Type
+result_string := %rest('GET', "http://%{server_host}:%uri.safe(%{server_port})/test.xml")
+
+if (!(REST-HTTP-Status-Code == 200)) {
+	test_fail
+}
+
+if (!(result_string == "<root><child></child></root>\n")) {
 	test_fail
 }
 
 # GET with URL parameters
-update request {
-	&Tmp-String-2 := "%(rest:GET http://%{Tmp-String-0}:%{Tmp-Integer-0}/user/%{User-Name}/mac/%{Called-Station-Id})"
-}
+test_string := %rest('GET', "http://%{server_host}:%uri.safe(%{server_port})/user/%{User-Name}/mac/%{Called-Station-Id}")
 
-if (&REST-HTTP-Status-Code != 200) {
+if (!(REST-HTTP-Status-Code == 200)) {
 	test_fail
 }
 
-map json &Tmp-String-2 {
-	&control.Tmp-String-1 := '$.control\.Tmp-String-1'
-	&control.User-Name := '$.control\.User-Name.value'
+map json test_string {
+	control.Callback-Id := '$.control\.Callback-Id'
+	control.User-Name := '$.control\.User-Name.value'
 }
 
-if (&control.Tmp-String-1 != "[ \"GET\", \"\\/user\\/<username>\\/mac\\/<client>\" ]") {
+if !(control.Callback-Id == '[ "GET", "\/user\\/<username>\/mac\/<client>" ]') {
 	test_fail
 }
 
-if (&control.User-Name != "Bob") {
+if (!(control.User-Name == "Bob")) {
 	test_fail
 }
 
-update control {
-	&Tmp-String-3 := 'dummy'
-}
+control.User-Name := 'dummy'
 
 # Directly use json map and prepend the returned value
-map json "%(rest:GET http://%{Tmp-String-0}:%{Tmp-Integer-0}/user/%{User-Name}/mac/%{Called-Station-Id})" {
-	&control.Tmp-String-3 ^= '$.control\.User-Name.value'
+map json %rest('GET', "http://%{server_host}:%uri.safe(%{server_port})/user/%{User-Name}/mac/%{Called-Station-Id}") {
+	control.User-Name ^= '$.control\.User-Name.value'
 }
 
-if ((&control.Tmp-String-3[0] != 'Bob') || (&control.Tmp-String-3[1] != 'dummy')) {
+if (!(control.User-Name[0] == 'Bob') || !(control.User-Name[1] == 'dummy')) {
 	test_fail
 }
 
-update control {
-	&Tmp-String-2 = "%{json_encode:&request.NAS-IP-Address}"
-}
+test_string := %json.encode('request.NAS-IP-Address')
 
 # POST to https with JSON body data
-update request {
-	&Tmp-String-2 := "%(rest:POST https://%{Tmp-String-0}:%{Tmp-Integer-1}/user/%{User-Name}/mac/%{Called-Station-Id}?section=accounting %{control.Tmp-String-2})"
-}
+result_string := %rest('POST', "https://%{server_host}:%uri.safe(%{server_ssl_port})/user/%{User-Name}/mac/%{Called-Station-Id}?section=accounting", %{test_string})
 
-if (&REST-HTTP-Status-Code != 200) {
+if (!(REST-HTTP-Status-Code == 200)) {
 	test_fail
 }
 
-map json &Tmp-String-2 {
-	&control.Tmp-String-1 := '$.control\.Tmp-String-1'
-	&control.User-Name := '$.control\.User-Name.value'
-	&control.NAS-IP-Address := '$.control\.NAS-IP-Address.value'
+map json result_string {
+	control.Callback-Id := '$.control\.Callback-Id'
+	control.User-Name := '$.control\.User-Name.value'
+	control.NAS-IP-Address := '$.control\.NAS-IP-Address.value'
 }
 
-if (&control.Tmp-String-1 != "[ \"POST\", \"\\/user\\/<username>\\/mac\\/<client>\" ]") {
+if (!(control.Callback-Id == '[ "POST", "\/user\/<username>\/mac\/<client>" ]')) {
 	test_fail
 }
 
-if (&control.User-Name != "Bob") {
+if (!(control.User-Name == "Bob")) {
 	test_fail
 }
 
-if (&control.NAS-IP-Address != "192.168.1.1") {
+if (!(control.NAS-IP-Address == "192.168.1.1")) {
 	test_fail
 }
 
-update control {
-	&Tmp-String-2 := "NAS=%{NAS-IP-Address}&user=%{User-Name}"
-}
+result_string := "NAS=%{NAS-IP-Address}&user=%{User-Name}"
 
 # POST to https with POST body data
-update request {
-	&Tmp-String-2 := "%(rest:POST https://%{Tmp-String-0}:%{Tmp-Integer-1}/post/test?section=dummy %{control.Tmp-String-2})"
-}
+result_string := %rest('POST', "https://%{server_host}:%uri.safe(%{server_ssl_port})/post/test?section=dummy", %{result_string})
 
-if (&REST-HTTP-Status-Code != 200) {
+if (!(REST-HTTP-Status-Code == 200)) {
 	test_fail
 }
 
-if (&Tmp-String-2 != "Section: dummy, User: Bob\n") {
+if (!(result_string == "Section: dummy, User: Bob\n")) {
 	test_fail
 }
 
 # URI with tainted values in the arguments - input argument includes URI argument
 # separator - make sure this doesn't end up generating extra arguments, but gets escaped.
-update request {
-	&Tmp-String-2 := "%(rest:GET http://%{Tmp-String-0}:%{Tmp-Integer-0}/user/%{User-Name}/reflect/?station=%{Calling-Station-Id})"
-}
+group {
+	string headers
+	string arguments
+	string body
 
-if (&Tmp-String-2 != "{\"station\":\"dummy&unsafe=escaped\"}\n" ) {
-	test_fail
+	map json %rest('POST', "http://%{server_host}:%uri.safe(%{server_port})/user/%{User-Name}/reflect/?station=%{Calling-Station-Id}", "{\"test\":\"foo\"}") {
+		headers := '$.reply\.Reply-Message.value[0]'
+		arguments := '$.reply\.Reply-Message.value[1]'
+		body := '$.reply\.Reply-Message.value[2]'
+	}
+
+	headers := (string)%base64.decode(%{headers})
+	arguments := (string)%base64.decode(%{arguments})
+	body := (string)%base64.decode(%{body})
+
+	if (!(arguments == "{\"station\":\"dummy&unsafe=escaped\"}" )) {
+		test_fail
+	}
+
+	if (!(headers =~ /"user-agent":"FreeRADIUS.*"/)) {
+		test_fail
+	}
+
+	if (!(headers =~ /"x-freeradius-server":"default"/)) {
+		test_fail
+	}
+
+	if (!(headers =~ /"x-custom-header":\["test","Bob"\]/)) {
+		test_fail
+	}
+
+	if (!(body == "{\"test\":\"foo\"}")) {
+		test_fail
+	}
 }
 
 # Zero length untainted value - check parsing doesn't break on zero length string
-update request {
-	&Tmp-String-8 := ""
-}
+group {
+	string headers
+	string arguments
 
-update request {
-	&Tmp-String-2 := "%(rest:http://%{Tmp-String-0}:%{Tmp-Integer-0}/user/%{User-Name}/reflect/%{Tmp-String-8}?station=%{User-Name})"
-}
+	test_string := ""
 
-if (&Tmp-String-2 != "{\"station\":\"Bob\"}\n" ) {
-	test_fail
+	map json %rest('GET', "http://%{server_host}:%uri.safe(%{server_port})/user/%{User-Name}/reflect/%{test_string}?station=%{User-Name}") {
+		headers := '$.reply\.Reply-Message.value[0]'
+		arguments := '$.reply\.Reply-Message.value[1]'
+	}
+
+	headers := (string)%base64.decode(%{headers})
+	arguments := (string)%base64.decode(%{arguments})
+
+	if (!(arguments == "{\"station\":\"Bob\"}" )) {
+		test_fail
+	}
+
+	if (!(headers =~ /"user-agent":"FreeRADIUS.*"/)) {
+		test_fail
+	}
+
+	if (!(headers =~ /"x-freeradius-server":"default"/)) {
+		test_fail
+	}
+
+	# Some weird escaping issue prevents matching application/json
+	if (!(headers =~ /"content-type":"application.+json"/)) {
+		test_fail
+	}
 }
 
 # Zero length tainted value - check escaping doesn't break on zero length string
-update request {
-	&Tmp-String-2 := "%(rest:http://%{Tmp-String-0}:%{Tmp-Integer-0}/user/%{User-Name}/reflect/%{Tmp-String-9}?station=%{Called-Station-Id})"
+group {
+	string arguments
+
+	map json %rest('GET', "http://%{server_host}:%uri.safe(%{server_port})/user/%{User-Name}/reflect/%{NAS-Identifier}?station=%{Called-Station-Id}") {
+		arguments := '$.reply\.Reply-Message.value[1]'
+	}
+
+	arguments := (string)%base64.decode(%{arguments})
+
+	if (!(arguments == "{\"station\":\"aa:bb:cc:dd:ee:ff\"}" )) {
+		test_fail
+	}
 }
 
-if (&Tmp-String-2 != "{\"station\":\"aa:bb:cc:dd:ee:ff\"}\n" ) {
+# Test against endpoint which will time out
+result_string := %restshorttimeout('GET', "http://%{server_host}:%uri.safe(%{server_port})/delay")
+
+if (REST-HTTP-Status-Code) {
+	test_fail
+}
+
+if (!(Module-Failure-Message == "curl request failed: Timeout was reached (28)")) {
+	test_fail
+}
+
+# Call an endpoint which will return a "failure" status code
+result_string := %rest('GET', "http://%{server_host}:%uri.safe(%{server_port})/fail")
+
+if (REST-HTTP-Status-Code != 400) {
+	test_fail
+}
+
+# The output should not be returned
+if (result_string) {
+	test_fail
+}
+
+# Server output will be in REST-HTTP-Body (this endpoint returns JSON)
+map json REST-HTTP-Body {
+	test_string := '$.error'
+}
+
+if (test_string != 'Invalid request') {
 	test_fail
 }
 

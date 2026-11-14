@@ -1,25 +1,37 @@
 #
-#  PRE: update
+#  PRE: subrequest
 #
 parallel {
-	update parent.control {
-	       &Tmp-Integer-0 += 1
+	group {
+		parent.control += {
+			NAS-Port = 1
+		}
 	}
-	update parent.control {
-	       &Tmp-Integer-0 += 2
+	group {
+		parent.control += {
+			NAS-Port = 3
+		}
 	}
-	update parent.control {
-	       &Tmp-Integer-0 += 3
+	group {
+		parent.control += {
+			NAS-Port = 5
+		}
 	}
-	update parent.control {
-	       &Tmp-Integer-0 += 4
+	group {
+		parent.control += {
+			NAS-Port = 7
+		}
 	}
 }
 
-if ("%{control.Tmp-Integer-0[#]}" != 4) {
+if (!(%{control.NAS-Port[#]} == 4)) {
 	test_fail
-
-	return
 }
+
+#
+#  We can't check order, as there's officially no guarantee on the
+#  order in which child sections will be evaluated.
+#
+
 
 success

@@ -39,7 +39,7 @@ struct request_data_s {
 	void		*opaque;		//!< Opaque data.
 	bool		free_on_replace;	//!< Whether to talloc_free(opaque) when the request data is removed.
 	bool		free_on_parent;		//!< Whether to talloc_free(opaque) when the request is freed
-	bool		persist;		//!< Whether this data should be transfered to a session_entry_t
+	bool		persist;		//!< Whether this data should be transferred to a session_entry_t
 						//!< after we're done processing this request.
 
 #ifndef NDEBUG
@@ -167,12 +167,13 @@ static inline request_data_t *request_data_alloc(TALLOC_CTX *ctx)
  * @param[in] type		Type of data (if talloced)
  * @param[in] opaque		Data to associate with the request.  May be NULL.
  * @param[in] free_on_replace	Free opaque data if this request_data is replaced.
- * @param[in] free_on_parent	Free opaque data if the request is freed.
+ * @param[in] free_on_parent	Free opaque data if the request or session is freed.
  *				Must not be set if the opaque data is also parented by
  *				the request or state (double free).
  * @param[in] persist		Transfer request data to an #fr_state_entry_t, and
  *				add it back to the next request we receive for the
  *				session.
+ * @param[in] is_const		false if the data was talloc'd, otherwise true if it doesn't need to be freed.
  * @param[in] file		request data was added in.
  * @param[in] line		request data was added on.
  * @return
@@ -181,7 +182,7 @@ static inline request_data_t *request_data_alloc(TALLOC_CTX *ctx)
  *	- 0 on success.
  */
 int _request_data_add(request_t *request, void const *unique_ptr, int unique_int, char const *type, void *opaque,
-		      bool free_on_replace, bool free_on_parent, bool persist,
+		      bool free_on_replace, bool free_on_parent, bool persist, bool is_const,
 #ifndef NDEBUG
 		      char const *file, int line
 #else
@@ -195,11 +196,13 @@ int _request_data_add(request_t *request, void const *unique_ptr, int unique_int
 	 *	Request must have a state ctx
 	 */
 	fr_assert(request);
-	fr_assert(!persist || request->session_state_ctx);
-	fr_assert(!persist ||
-		   (talloc_parent(opaque) == request->session_state_ctx) ||
-		   (talloc_parent(opaque) == talloc_null_ctx()));
-	fr_assert(!free_on_parent || (talloc_parent(opaque) != request));
+	if (!is_const) {
+		fr_assert(!persist || request->session_state_ctx);
+		fr_assert(!persist ||
+			  (talloc_parent(opaque) == request->session_state_ctx) ||
+			  (talloc_parent(opaque) == talloc_null_ctx()));
+		fr_assert(!free_on_parent || (talloc_parent(opaque) != request));
+	}
 
 #ifndef TALLOC_GET_TYPE_ABORT_NOOP
 	if (type) opaque = _talloc_get_type_abort(opaque, type, __location__);
@@ -380,6 +383,7 @@ int request_data_by_persistance(fr_dlist_head_t *out, request_t *request, bool p
 		prev = fr_dlist_remove(&request->data, rd);
 		fr_dlist_insert_tail(out, rd);
 		rd = prev;
+		count++;
 	}
 
 	return count;
@@ -423,6 +427,7 @@ int request_data_by_persistance_reparent(TALLOC_CTX *ctx, fr_dlist_head_t *out, 
 			fr_dlist_insert_tail(&head, new);
 		}
 		rd = prev;
+		count++;
 	}
 
 	if (!out) fr_dlist_move(&request->data, &head);
@@ -482,7 +487,6 @@ void request_data_persistable_free(request_t *request)
 void request_data_list_dump(request_t *request, fr_dlist_head_t *head)
 {
 	request_data_t	*rd = NULL;
-	int count = 0;
 
 	if (fr_dlist_empty(head)) return;
 
@@ -492,7 +496,6 @@ void request_data_list_dump(request_t *request, fr_dlist_head_t *head)
 		desc = request_data_description(NULL, rd);
 		ROPTIONAL(RDEBUG, DEBUG, "%s", desc);
 		talloc_free(desc);
-		count++;
 	}
 }
 

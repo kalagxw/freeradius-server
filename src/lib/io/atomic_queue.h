@@ -25,7 +25,6 @@
  */
 RCSIDH(atomic_queue_h, "$Id$")
 
-#include <stdbool.h>
 
 #ifdef HAVE_STDATOMIC_H
 #  include <stdatomic.h>
@@ -34,37 +33,49 @@ RCSIDH(atomic_queue_h, "$Id$")
 #endif
 #include <freeradius-devel/util/talloc.h>
 
-/*
- *	Some macros to make our life easier.
- */
-#define atomic_int64_t _Atomic(int64_t)
-#define atomic_uint32_t _Atomic(uint32_t)
-#define atomic_uint64_t _Atomic(uint64_t)
-
-#define cas_incr(_store, _var)    atomic_compare_exchange_strong_explicit(&_store, &_var, _var + 1, memory_order_release, memory_order_relaxed)
-#define cas_decr(_store, _var)    atomic_compare_exchange_strong_explicit(&_store, &_var, _var - 1, memory_order_release, memory_order_relaxed)
-#define load(_var)           atomic_load_explicit(&_var, memory_order_relaxed)
-#define aquire(_var)         atomic_load_explicit(&_var, memory_order_acquire)
-#define store(_store, _var)  atomic_store_explicit(&_store, _var, memory_order_release);
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct fr_atomic_queue_s fr_atomic_queue_t;
 
-fr_atomic_queue_t	*fr_atomic_queue_alloc(TALLOC_CTX *ctx, size_t size);
+fr_atomic_queue_t	*fr_atomic_queue_talloc(TALLOC_CTX *ctx, size_t num, size_t elem_len);
+fr_atomic_queue_t	*fr_atomic_queue_malloc(TALLOC_CTX *ctx, size_t num, size_t elem_len);
+fr_atomic_queue_t	*fr_atomic_queue_mmap(TALLOC_CTX *ctx, int *fd, size_t num,
+					      size_t elem_len) CC_HINT(nonnull(2));
 void			fr_atomic_queue_free(fr_atomic_queue_t **aq);
-bool			fr_atomic_queue_push(fr_atomic_queue_t *aq, void *data);
-bool			fr_atomic_queue_pop(fr_atomic_queue_t *aq, void **p_data);
+
+bool			fr_atomic_queue_mpmc_push(fr_atomic_queue_t *aq, void const *data) CC_HINT(nonnull);
+bool			fr_atomic_queue_mpmc_pop(fr_atomic_queue_t *aq, void *data) CC_HINT(nonnull);
+
+bool			fr_atomic_queue_spsc_push(fr_atomic_queue_t *aq, void const *data) CC_HINT(nonnull);
+bool			fr_atomic_queue_spsc_pop(fr_atomic_queue_t *aq, void *data) CC_HINT(nonnull);
 size_t			fr_atomic_queue_size(fr_atomic_queue_t *aq);
+
+/** Unbounded segmented single-producer / single-consumer queue
+ *
+ * Internally a linked list of fixed-size `fr_atomic_queue_t` segments.
+ * When the producer's current segment fills, a new segment is malloc'd
+ * and linked in; the consumer drains segments in order and frees them
+ * as it advances.  Allocation on the producer side uses raw malloc
+ * (not talloc), so the producer thread is free to be one that cannot
+ * safely use talloc (e.g. a library-owned callback thread).
+ *
+ * Exactly one producer and one consumer.  Not safe for MPMC use.
+ */
+typedef struct fr_atomic_ring_s fr_atomic_ring_t;
+
+fr_atomic_ring_t	*fr_atomic_ring_alloc(TALLOC_CTX *ctx, size_t seg_size);
+void			fr_atomic_ring_free(fr_atomic_ring_t **ring);
+bool			fr_atomic_ring_push(fr_atomic_ring_t *ring, void *data);
+bool			fr_atomic_ring_pop(fr_atomic_ring_t *ring, void **p_data);
 
 #ifdef WITH_VERIFY_PTR
 void			fr_atomic_queue_verify(fr_atomic_queue_t *aq);
 #endif
 
 #ifndef NDEBUG
-void			fr_atomic_queue_debug(fr_atomic_queue_t *aq, FILE *fp);
+void			fr_atomic_queue_debug(FILE *fp, fr_atomic_queue_t *aq);
 #endif
 
 

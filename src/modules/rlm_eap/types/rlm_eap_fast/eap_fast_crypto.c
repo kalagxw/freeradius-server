@@ -28,13 +28,11 @@ RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #include <stdio.h>
-#include <freeradius-devel/util/base.h>
 #include <freeradius-devel/tls/base.h>
 #include <freeradius-devel/eap/tls.h>
 
 #include <openssl/evp.h>
 #include <openssl/aes.h>
-#include <openssl/err.h>
 
 #include "eap_fast_crypto.h"
 
@@ -46,6 +44,7 @@ void T_PRF(unsigned char const *secret, unsigned int secret_len,
 {
 	size_t prf_size = strlen(prf_label);
 	size_t pos;
+	uint16_t net_len = htons(out_len);
 	uint8_t	*buf;
 
 	if (prf_size > 128) prf_size = 128;
@@ -55,7 +54,7 @@ void T_PRF(unsigned char const *secret, unsigned int secret_len,
 
 	memcpy(buf + SHA1_DIGEST_LENGTH, prf_label, prf_size);
 	if (seed) memcpy(buf + SHA1_DIGEST_LENGTH + prf_size, seed, seed_len);
-	*(uint16_t *)&buf[SHA1_DIGEST_LENGTH + prf_size + seed_len] = htons(out_len);
+	memcpy(&buf[SHA1_DIGEST_LENGTH + prf_size + seed_len], &net_len, sizeof(net_len));
 	buf[SHA1_DIGEST_LENGTH + prf_size + seed_len + 2] = 1;
 
 	// T1 is just the seed
@@ -125,13 +124,13 @@ int eap_fast_encrypt(uint8_t const *plaintext, size_t plaintext_len,
 	/* Provide any AAD data. This can be called zero or more times as
 	 * required
 	 */
-	if (1 != EVP_EncryptUpdate(ctx, NULL, &len, aad, aad_len))
+	if (1 != EVP_EncryptUpdate(ctx, NULL, &len, aad, (int)aad_len))
 		handleErrors();
 
 	/* Provide the message to be encrypted, and obtain the encrypted output.
 	 * EVP_EncryptUpdate can be called multiple times if necessary
 	 */
-	if (1 != EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, plaintext_len))
+	if (1 != EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, (int)plaintext_len))
 		handleErrors();
 	ciphertext_len = len;
 
@@ -177,13 +176,13 @@ int eap_fast_decrypt(uint8_t const *ciphertext, size_t ciphertext_len,
 	/* Provide any AAD data. This can be called zero or more times as
 	 * required
 	 */
-	if (!EVP_DecryptUpdate(ctx, NULL, &len, aad, aad_len))
+	if (!EVP_DecryptUpdate(ctx, NULL, &len, aad, (int)aad_len))
 		handleErrors();
 
 	/* Provide the message to be decrypted, and obtain the plaintext output.
 	 * EVP_DecryptUpdate can be called multiple times if necessary
 	 */
-	if (!EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len))
+	if (!EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, (int)ciphertext_len))
 		handleErrors();
 	plaintext_len = len;
 
@@ -204,17 +203,10 @@ int eap_fast_decrypt(uint8_t const *ciphertext, size_t ciphertext_len,
 	/* Clean up */
 	EVP_CIPHER_CTX_free(ctx);
 
-	if (ret > 0)
-	{
-		/* Success */
-		plaintext_len += len;
-		return plaintext_len;
-	}
-	else
-	{
-		/* Verify failed */
-		return -1;
-	}
+	if (ret == 0) return -1;
+
+	/* Success */
+	return plaintext_len + len;
 }
 
 
@@ -223,51 +215,61 @@ static void crypto_rfc4346_p_hash(uint8_t *out, size_t out_len,
 				  uint8_t const *secret, size_t secret_len,
 				  uint8_t const *seed,  size_t seed_len)
 {
-	HMAC_CTX *ctx_a, *ctx_out;
-	uint8_t a[HMAC_MAX_MD_CBLOCK];
+	EVP_MD_CTX *ctx_a, *ctx_out;
+	EVP_PKEY *pkey;
+
+	uint8_t a[EVP_MAX_MD_SIZE];
 	size_t size;
 
-	ctx_a = HMAC_CTX_new();
-	ctx_out = HMAC_CTX_new();
-#ifdef EVP_MD_CTX_FLAG_NON_FIPS_ALLOW
-	HMAC_CTX_set_flags(ctx_a, EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
-	HMAC_CTX_set_flags(ctx_out, EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
-#endif
-	HMAC_Init_ex(ctx_a, secret, secret_len, evp_md, NULL);
-	HMAC_Init_ex(ctx_out, secret, secret_len, evp_md, NULL);
+	ctx_a = EVP_MD_CTX_new();
+	ctx_out = EVP_MD_CTX_new();
 
-	size = HMAC_size(ctx_out);
+	MEM(pkey = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, NULL, secret, (int)secret_len));
+
+	EVP_DigestSignInit(ctx_a, NULL, evp_md, NULL, pkey);
+	EVP_DigestSignInit(ctx_out, NULL, evp_md, NULL, pkey);
+
+	size = EVP_MD_size(evp_md);
 
 	/* Calculate A(1) */
-	HMAC_Update(ctx_a, seed, seed_len);
-	HMAC_Final(ctx_a, a, NULL);
+	EVP_DigestSignUpdate(ctx_a, seed, seed_len);
+
+	/*
+	 *	OpenSSL <= 1.1.1 requires a non-null pointer for len
+	 */
+	EVP_DigestSignFinal(ctx_a, a, &(size_t){ sizeof(a) });
 
 	while (1) {
 		/* Calculate next part of output */
-		HMAC_Update(ctx_out, a, size);
-		HMAC_Update(ctx_out, seed, seed_len);
+		EVP_DigestSignUpdate(ctx_out, a, size);
+		EVP_DigestSignUpdate(ctx_out, seed, seed_len);
 
 		/* Check if last part */
 		if (out_len < size) {
-			HMAC_Final(ctx_out, a, NULL);
+			EVP_DigestSignFinal(ctx_out, a, &(size_t){ sizeof(a) });
 			memcpy(out, a, out_len);
 			break;
 		}
 
 		/* Place digest in output buffer */
-		HMAC_Final(ctx_out, out, NULL);
-		HMAC_Init_ex(ctx_out, NULL, 0, NULL, NULL);
+		EVP_DigestSignFinal(ctx_out, out, &(size_t){ EVP_MAX_MD_SIZE });
+		EVP_MD_CTX_reset(ctx_out);
+
+		EVP_DigestSignInit(ctx_out, NULL, evp_md, NULL, pkey);
 		out += size;
 		out_len -= size;
 
 		/* Calculate next A(i) */
-		HMAC_Init_ex(ctx_a, NULL, 0, NULL, NULL);
-		HMAC_Update(ctx_a, a, size);
-		HMAC_Final(ctx_a, a, NULL);
+		EVP_MD_CTX_reset(ctx_a);
+		EVP_DigestSignInit(ctx_a, NULL, evp_md, NULL, pkey);
+		EVP_DigestSignUpdate(ctx_a, a, size);
+		EVP_DigestSignFinal(ctx_a, a, &(size_t){ EVP_MAX_MD_SIZE });
 	}
 
-	HMAC_CTX_free(ctx_a);
-	HMAC_CTX_free(ctx_out);
+	EVP_PKEY_free(pkey);
+
+	EVP_MD_CTX_free(ctx_a);
+	EVP_MD_CTX_free(ctx_out);
 #ifdef __STDC_LIB_EXT1__
 	memset_s(a, 0, sizeof(a), sizeof(a));
 #else
@@ -291,11 +293,16 @@ static void eap_crypto_rfc4346_prf(uint8_t *out, size_t out_len, uint8_t *scratc
 	for (i = 0; i < out_len; i++) out[i] ^= scratch[i];
 }
 
+static void eap_crypto_rfc5246_prf(uint8_t *out, size_t out_len, uint8_t const *secret, size_t secret_len,
+				   uint8_t const *seed, size_t seed_len)
+{
+	crypto_rfc4346_p_hash(out, out_len, EVP_sha256(), secret, secret_len, seed, seed_len);
+}
 
 /*
  *	Same as before, but for EAP-FAST the order of {server,client}_random is flipped
  */
-void eap_fast_tls_gen_challenge(SSL *s, uint8_t *buffer, uint8_t *scratch, size_t size, char const *prf_label)
+void eap_fast_tls_gen_challenge(SSL *s, int version, uint8_t *buffer, uint8_t *scratch, size_t size, char const *prf_label)
 {
 	uint8_t		*p;
 	size_t		len, master_key_len;
@@ -314,5 +321,9 @@ void eap_fast_tls_gen_challenge(SSL *s, uint8_t *buffer, uint8_t *scratch, size_
 	p += SSL3_RANDOM_SIZE;
 
 	master_key_len = SSL_SESSION_get_master_key(SSL_get_session(s), master_key, sizeof(master_key));
-	eap_crypto_rfc4346_prf(buffer, size, scratch, master_key, master_key_len, seed, p - seed);
+	if (version == TLS1_2_VERSION) {
+		eap_crypto_rfc5246_prf(buffer, size, master_key, master_key_len, seed, p - seed);
+	} else {
+		eap_crypto_rfc4346_prf(buffer, size, scratch, master_key, master_key_len, seed, p - seed);
+	}
 }

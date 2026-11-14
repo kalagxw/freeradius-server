@@ -36,11 +36,16 @@ extern "C" {
 #include <freeradius-devel/util/rb.h>
 #include <freeradius-devel/util/dlist.h>
 
-typedef enum conf_type {
+typedef enum conf_type : uint8_t {
 	CONF_ITEM_INVALID = 0,
 	CONF_ITEM_PAIR,
 	CONF_ITEM_SECTION,
 	CONF_ITEM_DATA,
+	CONF_ITEM_COMMENT,		//!< A `# ...` line preserved verbatim
+					///< from the input - only created when
+					///< the parser is asked to keep comments
+					///< (off by default; the runtime parser
+					///< doesn't keep them, tooling can opt in).
 } CONF_ITEM_TYPE;
 
 /** Common header for all CONF_* types
@@ -50,16 +55,18 @@ struct cf_item {
 	fr_rb_node_t		ident1_node;	//!< Entry in the ident1 tree.
 	fr_rb_node_t		ident2_node;	//!< Entry in the ident2 tree.
 
-	CONF_ITEM_TYPE		type;		//!< Whether the config item is a config_pair, conf_section or cf_data.
-
 	fr_dlist_t		entry;		//!< Entry in dlist
-	CONF_ITEM		*parent;	//!< Parent.
-
 	fr_dlist_head_t		children;	//!< The head of the ordered list of children.
+
+	CONF_ITEM		*parent;	//!< Parent
 
 	fr_rb_tree_t		*ident1;	//!< Tree to store the first identifier (name1 || type || attr).
 	fr_rb_tree_t		*ident2;	//!< Tree to store the second identifier (name2 || name).
 
+	CONF_ITEM_TYPE		type;		//!< Whether the config item is a config_pair, conf_section or cf_data.
+
+	bool			parsed;		//!< Was this item used during parsing?
+	bool			referenced;	//!< Was this item referenced in the config?
 	int			lineno;		//!< The line number the config item began on.
 	char const		*filename;	//!< The file the config item was parsed from.
 };
@@ -78,10 +85,20 @@ struct cf_pair {
 	fr_token_t		rhs_quote;	//!< Value Quoting style T_(DOUBLE|SINGLE|BACK)_QUOTE_STRING or T_BARE_WORD.
 
 	bool			pass2;		//!< do expansion in pass2.
-	bool			parsed;		//!< Was this item used during parsing?
 	bool			printed;	//!< Was this item printed already in debug mode?
-	bool			referenced;	//!< Was this item referenced in the config?
 };
+
+typedef enum : uint8_t {
+	CF_UNLANG_NONE = 0,			//!< no unlang
+	CF_UNLANG_ALLOW,			//!< allow unlang in this section
+	CF_UNLANG_SERVER,			//!< this section is a virtual server, allow unlang 2 down
+	CF_UNLANG_POLICY,			//!< this section is a policy, allow unlang 2 down
+	CF_UNLANG_MODULES,			//!< this section is in "modules", allow unlang 2 down
+	CF_UNLANG_EDIT,				//!< only edit commands
+	CF_UNLANG_ASSIGNMENT,  			//!< only assignments inside of map / update
+	CF_UNLANG_DICTIONARY,  			//!< only local variable definitions
+	CF_UNLANG_CAN_HAVE_UPDATE,		//!< can have "update"
+} cf_unlang_t;
 
 /** A section grouping multiple #CONF_PAIR
  *
@@ -100,9 +117,76 @@ struct cf_section {
 
 	void			*base;
 	int			depth;
-	int			allow_unlang;
+	cf_unlang_t    		unlang;
+	bool			allow_locals;	//!< allow local variables
+	bool			at_reference;	//!< this thing was created from an @...
 
 	CONF_SECTION		*template;
+};
+
+/** Limit the nesting depth.
+ *
+ *  256 is way past what any human being would create, and way past
+ *  anything that's reasonable.
+ */
+#define CONF_SECTION_MAX_DEPTH 256
+
+/** Limit the number of direct children that a section can have.
+ *
+ *  This limit is largely for the fuzzers, which find pathological
+ *  cases of copying references.  When copying a ${name} that resolves
+ *  to a section, cf_expand_variables() copies that section into the
+ *  enclosing one. Two references per section double the item count at
+ *  each level, so each extra pair of lines quadruples the memory.
+ *
+ *  Instead of having a limit just for references, we instead limit
+ *  the total number of children that a section can have.
+ *
+ *  The number 1024 here is picked arbitrarily.  It's large enough to
+ *  not affect most cases, including the "cheat" of using the
+ *  configuration as a read-only key-value store.  However, if you're
+ *  storing more than 1024 things, you should really use a database.
+ */
+#define CF_SECTION_MAX_CHILDREN (1024U)
+
+/** Limit the number of indirect children that a section can have.
+ *
+ *  In a pathological case, a configuration can copy sections via:
+ *
+ *	a1 = { a, b }			2 children
+ *	a2 = { a = ${a1}, b = ${a1} }	4 children
+ *	a3 = { a = ${a2}, b = ${a2} }	8 children
+ *	...
+ *
+ *  Therefore before we duplicate a section, we check if the copy will
+ *  result in too many children.  The limit of 1024 is unrelated to
+ *  CF_SECTION_MAX_CHILDREN, but is chosen for similar reasons.
+ */
+#define CF_SECTION_MAX_DUP_ITEMS (1024U)
+
+/*
+ *	Private getter for cf_file.c's parser hook - the public API is the
+ *	`cf_preserve_comments_set()` setter in cf_util.h; the flag itself
+ *	lives static in cf_util.c.
+ */
+bool _cf_preserve_comments(void);
+
+/*
+ *	Private getter for cf_file.c's cf_expand_variables() short-circuit.
+ *	Public API is `cf_expand_variables_set()` in cf_util.h.
+ */
+bool _cf_expand_variables(void);
+
+/** A `# ...` comment line preserved verbatim from the input.
+ *
+ * Only constructed when `cf_preserve_comments` is set before parsing;
+ * the runtime config parser drops comments as it always has.
+ */
+struct cf_comment {
+	CONF_ITEM		item;		//!< Common set of fields.
+
+	char const		*text;		//!< Comment text, with the leading `#`
+						//!< and any surrounding whitespace stripped.
 };
 
 /** Internal data that is associated with a configuration section
@@ -116,7 +200,6 @@ struct cf_data {
 
 	void const   		*data;		//!< User data.
 	bool			is_talloced;	//!< If true we can do extra checks.
-	bool			free;		//!< If true, free data with talloc if parent node is freed.
 };
 
 typedef struct {
@@ -126,6 +209,38 @@ typedef struct {
 	struct stat		buf;		//!< stat about the file
 	bool			from_dir;	//!< was read from a directory
 } cf_file_t;
+
+/** Iterate over the contents of a list
+ *
+ * @param[in] _ci		to iterate over.
+ * @param[in] _iter		Name of iteration variable.
+ *				Will be declared in the scope of the loop.
+ * @param[in] _prev		previous pointer
+ */
+#define cf_item_foreach_next(_ci, _iter, _prev) \
+	for (CONF_ITEM *_iter = fr_dlist_next(&(_ci)->children, _prev); _iter; _iter = fr_dlist_next(&(_ci)->children, _iter))
+
+/** Iterate over the contents of a list in reverse order
+ *
+ * @param[in] _ci		to iterate over.
+ * @param[in] _iter		Name of iteration variable.
+ *				Will be declared in the scope of the loop.
+ * @param[in] _prev		previous pointer
+ */
+#define cf_item_foreach_prev(_ci, _iter, _prev) \
+	for (CONF_ITEM *_iter = fr_dlist_prev(&(_ci)->children, _prev); _iter; _iter = fr_dlist_prev(&(_ci)->children, _iter))
+
+/** Check if the CONF_ITEM has no children.
+ *
+ *  Which is the common use-case
+ *
+ * @param[in] ci		to check
+ * @return			true/false
+ */
+static inline CC_HINT(nonnull) bool cf_item_has_no_children(CONF_ITEM const *ci)
+{
+	return fr_dlist_empty(&ci->children);
+}
 
 #ifdef __cplusplus
 }

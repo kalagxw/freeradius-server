@@ -1,0 +1,20 @@
+#
+#
+#  PRE: if
+#
+if (%str.concat(%test1.passthrough('foo', 'bar'),'|') != "foo|bar") {
+	test_fail
+}
+
+if (%str.concat(%test2.passthrough('foo', 'bar'), '|') != "foo|bar") {
+	test_fail
+}
+
+#
+#  The config has a "redundant" block for test1 and test2.
+#
+if (%str.concat(%redundant_test.passthrough('foo', 'bar'), '|') != "foo|bar") {
+	test_fail
+}
+
+success

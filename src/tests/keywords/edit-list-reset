@@ -1,0 +1,23 @@
+#
+# PRE: edit-list
+#
+
+control.Filter-Id := "foo"
+
+#  must exist
+if (!control.Filter-Id) {
+	test_fail
+}
+
+#
+#  Reset the list to empty contents
+#
+control := {}
+
+#  must not exist
+if (control.Filter-Id) {
+	test_fail
+}
+
+
+success

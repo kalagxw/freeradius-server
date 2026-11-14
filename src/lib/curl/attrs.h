@@ -17,8 +17,8 @@
 
 /** Attribute definitions for lib curl
  *
- * @copyright 2021 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2021 Arran Cudbard-Bell ("a.cudbardb@freeradius.org")
  */
 RCSIDH(attrs_h, "$Id$")
 
-extern fr_dict_attr_t const *attr_tls_certificate;
+extern HIDDEN fr_dict_attr_t const *attr_tls_certificate;

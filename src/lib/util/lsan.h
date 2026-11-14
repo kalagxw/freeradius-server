@@ -27,13 +27,40 @@ RCSIDH(lsan_h, "$Id$")
 extern "C" {
 #endif
 
-#ifdef HAVE_SANITIZER_LSAN_INTERFACE_H
-#  include <sanitizer/lsan_interface.h>
+/*
+ *  clangd doesn't inherit all the implicit includes of clang.
+ */
+#ifdef __clangd__
+#  undef HAVE_SANITIZER_LSAN_INTERFACE_H
 #endif
 
+/*
+ *	Include both ASAN and LSAN headers if they're defined.
+ */
 #ifdef HAVE_SANITIZER_LSAN_INTERFACE_H
+#  include <sanitizer/lsan_interface.h>
+#  include <sanitizer/asan_interface.h>
+
+/*
+ *	Run code in an "LSAN disabled" context.
+ */
 #  define LSAN_DISABLE(_x) __lsan_disable(); _x; __lsan_enable()
+
+#elif defined(FR_ASAN_HARDEN)
+/*
+ *	Manually wiping memory isn't as good as ASAN, but it can be
+ *	done at the byte level.  ASAN poisoning is done on 8 byte
+ *	boundaries.
+ */
+#  define ASAN_POISON_MEMORY_REGION(_start, _end) memset((_start), 0x00, (_end))
+#  define ASAN_UNPOISON_MEMORY_REGION(_start, _end)
+#  define LSAN_DISABLE(_x) _x
 #else
+/*
+ *	Nothing available, don't use any of the ASAN / LSAN features.
+ */
+#  define ASAN_POISON_MEMORY_REGION(_start, _size)
+#  define ASAN_UNPOISON_MEMORY_REGION(_start, _size)
 #  define LSAN_DISABLE(_x) _x
 #endif
 

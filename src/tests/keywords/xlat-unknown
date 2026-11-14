@@ -1,16 +1,16 @@
 #
-# PRE: update escape
+# PRE: escape
 #
-update reply {
-	&Vendor-Specific.WiMAX.Capability.Release = "foo"
+reply += {
+	Vendor-Specific.WiMAX.Capability.Release = "foo"
 }
 
 #
-#  This should be Vendor-Specific.WiMAX.Relase, so the
+#  This should be Vendor-Specific.WiMAX.Release, so the
 #  reference here should be to an unknown attribute,
 #  and the dereference should fail.
 #
-if ("%{reply.WiMAX.Capability.Release}" == "foo") { # ERROR
+if (reply.Capability.Release == "foo") { # ERROR
 	test_fail
 }
 else {

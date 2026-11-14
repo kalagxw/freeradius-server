@@ -19,19 +19,15 @@
  * @file proto_dhcpv6_udp.c
  * @brief DHCPv6 handler for UDP.
  *
- * @copyright 2020 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2020 Network RADIUS SAS (legal@networkradius.com)
  */
-#define LOG_PREFIX "proto_dhcpv6_udp - "
+#define LOG_PREFIX "proto_dhcpv6_udp"
 
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/protocol.h>
 #include <freeradius-devel/util/udp.h>
 #include <freeradius-devel/util/trie.h>
-#include <freeradius-devel/io/base.h>
 #include <freeradius-devel/io/application.h>
 #include <freeradius-devel/io/listen.h>
 #include <freeradius-devel/io/schedule.h>
-#include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/protocol/dhcpv6/freeradius.internal.h>
 #include "proto_dhcpv6.h"
 
@@ -48,6 +44,7 @@ typedef struct {
 
 typedef struct {
 	CONF_SECTION			*cs;			//!< our configuration
+	proto_dhcpv6_t const		*parent;		//!< parent instance
 
 	fr_ipaddr_t			ipaddr;			//!< IP address to listen on.
 
@@ -71,8 +68,8 @@ typedef struct {
 								//!< buffer value.
 	bool				dynamic_clients;	//!< whether we have dynamic clients
 
-	RADCLIENT_LIST			*clients;		//!< local clients
-	RADCLIENT			*default_client;	//!< default 0/0 client
+	fr_client_list_t			*clients;		//!< local clients
+	fr_client_t			*default_client;	//!< default 0/0 client
 
 	fr_trie_t			*trie;			//!< for parsed networks
 	fr_ipaddr_t			*allow;			//!< allowed networks for dynamic clients
@@ -80,33 +77,33 @@ typedef struct {
 } proto_dhcpv6_udp_t;
 
 
-static const CONF_PARSER networks_config[] = {
-	{ FR_CONF_OFFSET("allow", FR_TYPE_COMBO_IP_PREFIX | FR_TYPE_MULTI, proto_dhcpv6_udp_t, allow) },
-	{ FR_CONF_OFFSET("deny", FR_TYPE_COMBO_IP_PREFIX | FR_TYPE_MULTI, proto_dhcpv6_udp_t, deny) },
+static const conf_parser_t networks_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("allow", FR_TYPE_COMBO_IP_PREFIX , CONF_FLAG_MULTI, proto_dhcpv6_udp_t, allow) },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("deny", FR_TYPE_COMBO_IP_PREFIX , CONF_FLAG_MULTI, proto_dhcpv6_udp_t, deny) },
 
 	CONF_PARSER_TERMINATOR
 };
 
 
-static const CONF_PARSER udp_listen_config[] = {
-	{ FR_CONF_OFFSET("ipaddr", FR_TYPE_IPV6_ADDR, proto_dhcpv6_udp_t, ipaddr) },
-	{ FR_CONF_OFFSET("ipv6addr", FR_TYPE_IPV6_ADDR, proto_dhcpv6_udp_t, ipaddr) },
+static const conf_parser_t udp_listen_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("ipaddr", FR_TYPE_IPV6_ADDR, 0, proto_dhcpv6_udp_t, ipaddr) },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("ipv6addr", FR_TYPE_IPV6_ADDR, 0, proto_dhcpv6_udp_t, ipaddr) },
 
-	{ FR_CONF_OFFSET("src_ipaddr", FR_TYPE_COMBO_IP_ADDR, proto_dhcpv6_udp_t, src_ipaddr) },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("src_ipaddr", FR_TYPE_COMBO_IP_ADDR, 0, proto_dhcpv6_udp_t, src_ipaddr) },
 
-	{ FR_CONF_OFFSET("interface", FR_TYPE_STRING, proto_dhcpv6_udp_t, interface) },
-	{ FR_CONF_OFFSET("port_name", FR_TYPE_STRING, proto_dhcpv6_udp_t, port_name) },
+	{ FR_CONF_OFFSET("interface", proto_dhcpv6_udp_t, interface) },
+	{ FR_CONF_OFFSET("port_name", proto_dhcpv6_udp_t, port_name) },
 
-	{ FR_CONF_OFFSET("port", FR_TYPE_UINT16, proto_dhcpv6_udp_t, port), .dflt = "547"  },
-	{ FR_CONF_OFFSET_IS_SET("recv_buff", FR_TYPE_UINT32, proto_dhcpv6_udp_t, recv_buff) },
+	{ FR_CONF_OFFSET("port", proto_dhcpv6_udp_t, port), .dflt = "547"  },
+	{ FR_CONF_OFFSET_IS_SET("recv_buff", FR_TYPE_UINT32, 0, proto_dhcpv6_udp_t, recv_buff) },
 
-	{ FR_CONF_OFFSET("hop_limit", FR_TYPE_UINT32, proto_dhcpv6_udp_t, hop_limit) },
+	{ FR_CONF_OFFSET("hop_limit", proto_dhcpv6_udp_t, hop_limit) },
 
-	{ FR_CONF_OFFSET("dynamic_clients", FR_TYPE_BOOL, proto_dhcpv6_udp_t, dynamic_clients) } ,
-	{ FR_CONF_POINTER("networks", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) networks_config },
+	{ FR_CONF_OFFSET("dynamic_clients", proto_dhcpv6_udp_t, dynamic_clients) } ,
+	{ FR_CONF_POINTER("networks", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) networks_config },
 
-	{ FR_CONF_OFFSET("max_packet_size", FR_TYPE_UINT32, proto_dhcpv6_udp_t, max_packet_size), .dflt = "8192" } ,
-	{ FR_CONF_OFFSET("max_attributes", FR_TYPE_UINT32, proto_dhcpv6_udp_t, max_attributes), .dflt = STRINGIFY(DHCPV4_MAX_ATTRIBUTES) } ,
+	{ FR_CONF_OFFSET("max_packet_size", proto_dhcpv6_udp_t, max_packet_size), .dflt = "8192" } ,
+	{ FR_CONF_OFFSET("max_attributes", proto_dhcpv6_udp_t, max_attributes), .dflt = STRINGIFY(DHCPV6_MAX_ATTRIBUTES) } ,
 
 	CONF_PARSER_TERMINATOR
 };
@@ -116,7 +113,7 @@ static fr_dict_t const *dict_dhcpv6;
 extern fr_dict_autoload_t proto_dhcpv6_udp_dict[];
 fr_dict_autoload_t proto_dhcpv6_udp_dict[] = {
 	{ .out = &dict_dhcpv6, .proto = "dhcpv6" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_packet_type;
@@ -128,13 +125,14 @@ fr_dict_attr_autoload_t proto_dhcpv6_udp_dict_attr[] = {
 	{ .out = &attr_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_dhcpv6},
 	{ .out = &attr_client_id, .name = "Client-ID", .type = FR_TYPE_STRUCT, .dict = &dict_dhcpv6},
 	{ .out = &attr_relay_message, .name = "Relay-Message", .type = FR_TYPE_GROUP, .dict = &dict_dhcpv6 },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
-static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer, size_t buffer_len,
-			size_t *leftover, UNUSED uint32_t *priority, UNUSED bool *is_dup)
+static ssize_t mod_read(fr_listen_instance_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer,
+			size_t buffer_len, size_t *leftover)
 {
-	proto_dhcpv6_udp_t const	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_dhcpv6_udp_t);
+	proto_dhcpv6_udp_t const        *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_dhcpv6_udp_t);
 	proto_dhcpv6_udp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_dhcpv6_udp_thread_t);
 	fr_io_address_t			*address, **address_p;
 
@@ -189,30 +187,52 @@ static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time
 		if ((packet->code == FR_DHCPV6_SOLICIT) ||
 		    (packet->code == FR_DHCPV6_REBIND) ||
 		    (packet->code == FR_DHCPV6_CONFIRM)) {
-			RATE_LIMIT_GLOBAL(WARN, "Unicast packet %s - ignoring", fr_dhcpv6_packet_types[packet->code]);
+			RATE_LIMIT_GLOBAL(WARN, "Unicast packet %s - ignoring", fr_dhcpv6_packet_names[packet->code]);
 			return 0;
 		}
 	} /* else it was multicast... remember that */
 
 	/*
+	 *	@todo - make this take "&packet_len", as the DHCPv4
+	 *	packet may be smaller than the parent UDP packet.
+	 */
+	if (fr_dhcpv6_ok(buffer, data_size, inst->max_attributes) <= 0) {
+		RATE_LIMIT_GLOBAL(PWARN, "Invalid packet - ignoring message which is not DHCPv6");
+		return 0;
+	}
+
+	/*
+	 *	If there is a Server-ID option configured, then it has to match.
+	 */
+	if (inst->parent->server_id &&
+	    !fr_dhcpv6_verify(buffer, data_size, &(fr_dhcpv6_decode_ctx_t) {
+			    .duid = inst->parent->server_id,
+			    .duid_len = talloc_array_length(inst->parent->server_id),
+		    }, false)) {
+		RATE_LIMIT_GLOBAL(PWARN, "Invalid packet - ignoring message which is malformed (%s)", fr_strerror());
+		return 0;
+	}
+
+	/*
 	 *	proto_dhcpv6 sets the priority
 	 */
 
-	xid = (packet->transaction_id[0] << 16) | (packet->transaction_id[1] << 8) | packet->transaction_id[2];
+	xid = fr_nbo_to_uint24(packet->transaction_id);
 
 	/*
 	 *	Print out what we received.
 	 */
-	DEBUG2("Received %s XID %08x length %d %s", fr_dhcpv6_packet_types[packet->code], xid,
+	DEBUG2("Received %s XID %08x length %d %s", fr_dhcpv6_packet_names[packet->code], xid,
 	       (int) packet_len, thread->name);
 
 	return packet_len;
 }
 
-static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, UNUSED fr_time_t request_time,
-			 uint8_t *buffer, size_t buffer_len, UNUSED size_t written)
+static ssize_t mod_write(fr_listen_instance_t *li, void *packet_ctx, UNUSED fr_time_t request_time, uint8_t *buffer,
+			 size_t buffer_len, UNUSED size_t written)
 {
-	proto_dhcpv6_udp_t const	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_dhcpv6_udp_t);
+	proto_dhcpv6_udp_t const        *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_dhcpv6_udp_t);
 	proto_dhcpv6_udp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_dhcpv6_udp_thread_t);
 
 	fr_io_track_t			*track = talloc_get_type_abort(packet_ctx, fr_io_track_t);
@@ -258,7 +278,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, UNUSED fr_time_t req
 }
 
 
-static int mod_connection_set(fr_listen_t *li, fr_io_address_t *connection)
+static int mod_connection_set(fr_listen_instance_t *li, fr_io_address_t *connection)
 {
 	proto_dhcpv6_udp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_dhcpv6_udp_thread_t);
 
@@ -267,7 +287,7 @@ static int mod_connection_set(fr_listen_t *li, fr_io_address_t *connection)
 }
 
 
-static void mod_network_get(void *instance, int *ipproto, bool *dynamic_clients, fr_trie_t const **trie)
+static void mod_network_get(int *ipproto, bool *dynamic_clients, fr_trie_t const **trie, void *instance)
 {
 	proto_dhcpv6_udp_t		*inst = talloc_get_type_abort(instance, proto_dhcpv6_udp_t);
 
@@ -280,17 +300,19 @@ static void mod_network_get(void *instance, int *ipproto, bool *dynamic_clients,
 /** Open a UDP listener for DHCPv6
  *
  */
-static int mod_open(fr_listen_t *li)
+static int mod_open(fr_listen_instance_t *li)
 {
-	proto_dhcpv6_udp_t const	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_dhcpv6_udp_t);
+	proto_dhcpv6_udp_t const        *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_dhcpv6_udp_t);
 	proto_dhcpv6_udp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_dhcpv6_udp_thread_t);
 
 	int				sockfd, rcode;
+	fr_ipaddr_t			ipaddr = inst->ipaddr;
 	uint16_t			port = inst->port;
 
 	li->fd = sockfd = fr_socket_server_udp(&inst->ipaddr, &port, inst->port_name, true);
 	if (sockfd < 0) {
-		PERROR("Failed opening UDP socket");
+		cf_log_err(li->listen->cs, "Failed opening UDP socket - %s", fr_strerror());
 	error:
 		return -1;
 	}
@@ -305,20 +327,32 @@ static int mod_open(fr_listen_t *li)
 		int on = 1;
 
 		if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
-			ERROR("Failed to set socket 'reuseport': %s", fr_syserror(errno));
+			cf_log_err(li->listen->cs, "Failed to set socket 'reuseport' - %s", fr_syserror(errno));
 			close(sockfd);
 			return -1;
 		}
 	}
 
+#ifdef SO_RCVBUF
+	if (inst->recv_buff_is_set) {
+		int opt;
+
+		opt = inst->recv_buff;
+		if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &opt, sizeof(int)) < 0) {
+			cf_log_warn(li->listen->cs, "Failed setting 'recv_buf' - %s", fr_syserror(errno));
+		}
+	}
+#endif
+
 	/*
 	 *	SUID up is really only needed if interface is set, OR port <1024.
 	 */
 	rad_suid_up();
-	rcode = fr_socket_bind(sockfd, &inst->ipaddr, &port, inst->interface);
+	rcode = fr_socket_bind(sockfd, inst->interface, &ipaddr, &port);
 	rad_suid_down();
 	if (rcode < 0) {
-		PERROR("Failed binding socket");
+		cf_log_err(li->listen->cs, "Failed binding to socket - %s", fr_strerror());
+		cf_log_err(li->listen->cs, DOC_ROOT_REF(troubleshooting/network/bind));
 	close_error:
 		close(sockfd);
 		goto error;
@@ -364,9 +398,10 @@ static int mod_open(fr_listen_t *li)
 /** Set the file descriptor for this socket.
  *
  */
-static int mod_fd_set(fr_listen_t *li, int fd)
+static int mod_fd_set(fr_listen_instance_t *li, int fd)
 {
-	proto_dhcpv6_udp_t const	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_dhcpv6_udp_t);
+	proto_dhcpv6_udp_t const        *inst = talloc_get_type_abort_const(li->listen->app_io_instance,
+									    proto_dhcpv6_udp_t);
 	proto_dhcpv6_udp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_dhcpv6_udp_thread_t);
 
 	thread->sockfd = fd;
@@ -379,7 +414,7 @@ static int mod_fd_set(fr_listen_t *li, int fd)
 	return 0;
 }
 
-static void *mod_track_create(UNUSED void const *instance, UNUSED void *thread_instance, UNUSED RADCLIENT *client,
+static void *mod_track_create(UNUSED void const *instance, UNUSED void *thread_instance, UNUSED fr_client_t *client,
 			      fr_io_track_t *track, uint8_t const *packet, size_t packet_len)
 {
 	proto_dhcpv6_track_t *t;
@@ -401,7 +436,7 @@ static void *mod_track_create(UNUSED void const *instance, UNUSED void *thread_i
 		option = fr_dhcpv6_option_find(packet + 2 + 32, packet + packet_len, attr_relay_message->attr);
 		if (!option) return NULL;
 
-		option_len = (option[2] << 8) | option[3];
+		option_len = fr_nbo_to_uint16(option + 2);
 
 		packet = option + 4; /* skip option header */
 		packet_len = option_len;
@@ -415,7 +450,9 @@ static void *mod_track_create(UNUSED void const *instance, UNUSED void *thread_i
 	option = fr_dhcpv6_option_find(packet + 4, packet + packet_len, attr_client_id->attr);
 	if (!option) return NULL;
 
-	option_len = (option[2] << 8) | option[3];
+	option_len = fr_nbo_to_uint16(option + 2);
+
+	if (option_len > ((packet - option) + packet_len)) return NULL;
 
 	t = (proto_dhcpv6_track_t *) talloc_zero_array(track, uint8_t, t_size + option_len);
 	if (!t) return NULL;
@@ -431,7 +468,7 @@ static void *mod_track_create(UNUSED void const *instance, UNUSED void *thread_i
 }
 
 
-static int mod_track_compare(UNUSED void const *instance, UNUSED void *thread_instance, UNUSED RADCLIENT *client,
+static int mod_track_compare(UNUSED void const *instance, UNUSED void *thread_instance, UNUSED fr_client_t *client,
 			     void const *one, void const *two)
 {
 	int ret;
@@ -448,7 +485,7 @@ static int mod_track_compare(UNUSED void const *instance, UNUSED void *thread_in
 }
 
 
-static char const *mod_name(fr_listen_t *li)
+static char const *mod_name(fr_listen_instance_t *li)
 {
 	proto_dhcpv6_udp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_dhcpv6_udp_thread_t);
 
@@ -456,22 +493,23 @@ static char const *mod_name(fr_listen_t *li)
 }
 
 
-static int mod_bootstrap(void *instance, CONF_SECTION *cs)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	proto_dhcpv6_udp_t	*inst = talloc_get_type_abort(instance, proto_dhcpv6_udp_t);
+	proto_dhcpv6_udp_t	*inst = talloc_get_type_abort(mctx->mi->data, proto_dhcpv6_udp_t);
 	size_t			num;
 	CONF_ITEM		*ci;
 	CONF_SECTION		*server_cs;
-	RADCLIENT		*client;
+	fr_client_t		*client;
+	CONF_SECTION		*conf = mctx->mi->conf;
 
-	inst->cs = cs;
+	inst->cs = conf;
 
 	/*
 	 *	Complain if no "ipaddr" is set.
 	 */
 	if (inst->ipaddr.af == AF_UNSPEC) {
 		if (!inst->interface) {
-			cf_log_err(cs, "No 'ipaddr' was specified in the 'udp' section");
+			cf_log_err(conf, "No 'ipaddr' was specified in the 'udp' section");
 			return -1;
 		}
 
@@ -482,14 +520,14 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 		 */
 		if (inst->interface &&
 		    (fr_interface_to_ipaddr(inst->interface, &inst->ipaddr, AF_INET6, true) < 0)) {
-			cf_log_err(cs, "No 'ipaddr' specified, and we cannot determine one for interface '%s'",
+			cf_log_err(conf, "No 'ipaddr' specified, and we cannot determine one for interface '%s'",
 				   inst->interface);
 				return -1;
 		}
 	}
 
 	if (inst->ipaddr.af != AF_INET6) {
-		cf_log_err(cs, "DHCPv6 cannot use IPv4 for 'ipaddr'");
+		cf_log_err(conf, "DHCPv6 cannot use IPv4 for 'ipaddr'");
 		return -1;
 	}
 
@@ -515,7 +553,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 				inst->interface = fr_ipaddr_to_interface(inst, &inst->ipaddr);
 				if (!inst->interface) {
 				interface_fail:
-					cf_log_err(cs, "No 'interface' specified, and we cannot "
+					cf_log_err(conf, "No 'interface' specified, and we cannot "
 						   "determine one for 'ipaddr = %pV'",
 						   fr_box_ipaddr(inst->ipaddr));
 					return -1;
@@ -529,8 +567,8 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 			if (!inst->interface) goto interface_fail;
 
 			if (fr_interface_to_ipaddr(inst->interface, &inst->src_ipaddr, AF_INET6, true) < 0) {
-				cf_log_err(cs, "No 'src_ipaddr' specified, and we cannot determine "
-					   "one for 'ipaddr = %pV and interface '%s'",
+				cf_log_err(conf, "No 'src_ipaddr' specified, and we cannot determine "
+					   "one for 'ipaddr = %pV' and interface '%s'",
 					   fr_box_ipaddr(inst->ipaddr), inst->interface);
 				return -1;
 			}
@@ -541,7 +579,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	 *	src_ipaddr must be of the same address family as "ipaddr"
 	 */
 	if (inst->src_ipaddr.af != inst->ipaddr.af) {
-		cf_log_err(cs, "Both 'ipaddr' and 'src_ipaddr' must be from the same address family");
+		cf_log_err(conf, "Both 'ipaddr' and 'src_ipaddr' must be from the same address family");
 		return -1;
 	}
 
@@ -549,7 +587,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	 *	Get the MAC address associated with this interface.
 	 *	It can be used to create a server ID.
 	 */
-	(void) fr_interface_to_ethernet(inst->interface, &inst->ethernet);
+	if (inst->interface) fr_interface_to_ethernet(inst->interface, &inst->ethernet);
 
 	if (inst->recv_buff_is_set) {
 		FR_INTEGER_BOUND_CHECK("recv_buff", inst->recv_buff, >=, 32);
@@ -563,17 +601,17 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 		struct servent *s;
 
 		if (!inst->port_name) {
-			cf_log_err(cs, "No 'port' was specified in the 'udp' section");
+			cf_log_err(conf, "No 'port' was specified in the 'udp' section");
 			return -1;
 		}
 
 		s = getservbyname(inst->port_name, "udp");
 		if (!s) {
-			cf_log_err(cs, "Unknown value for 'port_name = %s", inst->port_name);
+			cf_log_err(conf, "Unknown value for 'port_name = %s", inst->port_name);
 			return -1;
 		}
 
-		inst->port = ntohl(s->s_port);
+		inst->port = ntohs(s->s_port);
 	}
 
 	/*
@@ -583,19 +621,19 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	num = talloc_array_length(inst->allow);
 	if (!num) {
 		if (inst->dynamic_clients) {
-			cf_log_err(cs, "The 'allow' subsection MUST contain at least one 'network' entry when "
+			cf_log_err(conf, "The 'allow' subsection MUST contain at least one 'network' entry when "
 				   "'dynamic_clients = true'.");
 			return -1;
 		}
 	} else {
 		inst->trie = fr_master_io_network(inst, inst->ipaddr.af, inst->allow, inst->deny);
 		if (!inst->trie) {
-			cf_log_perr(cs, "Failed creating list of networks");
+			cf_log_perr(conf, "Failed creating list of networks");
 			return -1;
 		}
 	}
 
-	ci = cf_parent(inst->cs); /* listen { ... } */
+	ci = cf_section_to_item(mctx->mi->parent->conf); /* listen { ... } */
 	fr_assert(ci != NULL);
 	ci = cf_parent(ci);
 	fr_assert(ci != NULL);
@@ -611,7 +649,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	if (cf_section_find_next(server_cs, NULL, "client", CF_IDENT_ANY)) {
 		inst->clients = client_list_parse_section(server_cs, IPPROTO_UDP, false);
 		if (!inst->clients) {
-			cf_log_err(cs, "Failed creating local clients");
+			cf_log_err(conf, "Failed creating local clients");
 			return -1;
 		}
 	}
@@ -619,8 +657,8 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	/*
 	 *	Create a fake client.
 	 */
-	client = inst->default_client = talloc_zero(inst, RADCLIENT);
-	if (!inst->default_client) return 0;
+	client = inst->default_client = talloc_zero(inst, fr_client_t);
+	if (!inst->default_client) return -1;
 
 	client->ipaddr = (fr_ipaddr_t ) {
 		.af = AF_INET6,
@@ -631,34 +669,34 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	client->longname = client->shortname = client->secret = talloc_strdup(client, "default");
 	client->nas_type = talloc_strdup(client, "other");
 
+	inst->parent = talloc_get_type_abort_const(mctx->mi->parent->data, proto_dhcpv6_t);
+
 	return 0;
 }
 
-static RADCLIENT *mod_client_find(fr_listen_t *li, fr_ipaddr_t const *ipaddr, int ipproto)
+static fr_client_t *mod_client_find(fr_listen_instance_t *li, fr_ipaddr_t const *ipaddr, int ipproto)
 {
-	proto_dhcpv6_udp_t const *inst = talloc_get_type_abort_const(li->app_io_instance, proto_dhcpv6_udp_t);
+	proto_dhcpv6_udp_t const *inst = talloc_get_type_abort_const(li->listen->app_io_instance, proto_dhcpv6_udp_t);
 
 	/*
 	 *	Prefer local clients.
 	 */
 	if (inst->clients) {
-		RADCLIENT *client;
-
-		client = client_find(inst->clients, ipaddr, ipproto);
-		if (client) return client;
+		return client_find(inst->clients, ipaddr, ipproto);
 	}
 
 	return inst->default_client;
 }
 
 fr_app_io_t proto_dhcpv6_udp = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "dhcpv6_udp",
-	.config			= udp_listen_config,
-	.inst_size		= sizeof(proto_dhcpv6_udp_t),
-	.thread_inst_size	= sizeof(proto_dhcpv6_udp_thread_t),
-	.bootstrap		= mod_bootstrap,
-
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "dhcpv6_udp",
+		.config			= udp_listen_config,
+		.inst_size		= sizeof(proto_dhcpv6_udp_t),
+		.thread_inst_size	= sizeof(proto_dhcpv6_udp_thread_t),
+		.instantiate		= mod_instantiate
+	},
 	.default_message_size	= 4096,
 	.track_duplicates	= true,
 

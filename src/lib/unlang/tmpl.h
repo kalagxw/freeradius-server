@@ -30,14 +30,15 @@
 extern "C" {
 #endif
 
-#include <freeradius-devel/server/tmpl.h>
 #include <freeradius-devel/server/rcode.h>
+#include <freeradius-devel/server/tmpl.h>
 #include <freeradius-devel/unlang/tmpl.h>
+#include <freeradius-devel/unlang/interpret.h>
 
 /** Flags that show the type of arguments included
  *
  */
-typedef enum {
+typedef enum : uint8_t {
 	UNLANG_TMPL_ARGS_TYPE_EXEC = 1,				//!< We have arguments for performing an exec.
 } unlang_tmpl_args_type_t;
 
@@ -83,9 +84,9 @@ typedef struct {
 		}, \
 	}
 
-/** A callback when the request gets a fr_state_signal_t.
+/** A callback when the request gets a fr_signal_t.
  *
- * A module may call unlang_yeild(), but still need to do something on FR_SIGNAL_DUP.  If so, it's
+ * A module may call unlang_yield(), but still need to do something on FR_SIGNAL_DUP.  If so, it's
  * set here.
  *
  * @note The callback is automatically removed on unlang_interpret_mark_runnable().
@@ -94,20 +95,21 @@ typedef struct {
  * @param[in] request		The current request.
  * @param[in] action		which is signalling the request.
  */
-typedef void (*fr_unlang_tmpl_signal_t)(request_t *request, void *rctx, fr_state_signal_t action);
+typedef void (*fr_unlang_tmpl_signal_t)(request_t *request, void *rctx, fr_signal_t action);
 
 /** A callback for when the request is resumed.
  *
  * The resumed request cannot call the normal "authorize", etc. method.  It needs a separate callback.
  *
+ * @param[in] p_result		the module return code.
  * @param[in] request		the current request.
  * @param[in] rctx		a local context for the callback.
  * @return an unlang action.
  */
-typedef unlang_action_t (*fr_unlang_tmpl_resume_t)(rlm_rcode_t *p_result, request_t *request, void *rctx);
+typedef unlang_action_t (*fr_unlang_tmpl_resume_t)(unlang_result_t *p_result, request_t *request, void *rctx);
 
-int		unlang_tmpl_push(TALLOC_CTX *ctx, fr_value_box_list_t *out,
-				 request_t *request, tmpl_t const *tmpl, unlang_tmpl_args_t *args)
+int		unlang_tmpl_push(TALLOC_CTX *ctx, unlang_result_t *p_result, fr_value_box_list_t *out,
+				 request_t *request, tmpl_t const *tmpl, unlang_tmpl_args_t *args, bool top_frame)
 		CC_HINT(warn_unused_result);
 
 #ifdef __cplusplus

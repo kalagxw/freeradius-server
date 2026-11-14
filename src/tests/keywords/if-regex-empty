@@ -1,50 +1,50 @@
 #
-# PRE: update if if-regex-match
+# PRE: if if-regex-match
 #
 
-if (&control.Password.Cleartext !~ /hell(o)(.*)/) {
+if !(control.Password.Cleartext =~ /hell(o)(.*)/) {
 	test_fail
 }
 
 #
 #  Verify non-empty capture groups evaluate to true
 #
-if (!"%{1}") {
+#  Note that "%regex.match(1)" evaluates to an empty string!
+#
+if !%regex.match(1) {
 	test_fail
 }
 
 #
 #  Verify empty capture groups evaluate to false
 #
-if ("%{2}") {
+if %regex.match(2) {
 	test_fail
 }
 
-if (&control.Password.Cleartext !~ /hello(.*)/) {
+if !(control.Password.Cleartext =~ /hello(.*)/) {
 	test_fail
 }
 
 #
 #  Check for stale capture group values
 #
-if ("%{1}") {
+if %regex.match(1) {
 	test_fail
 }
 
 #
 #  Check assignment of regex null-match
 #
-if (&control.Password.Cleartext =~ /hell(o)(.*)/) {
-	update {
-		&control.Tmp-String-1 := "%{2}"
-	}
+if (control.Password.Cleartext =~ /hell(o)(.*)/) {
+	control.Filter-Id := "%regex.match(2)"
 }
 
-if (!&control.Tmp-String-1) {
+if (!control.Filter-Id) {
 	test_fail
 }
 
-if (&control.Tmp-String-1 != "") {
+if (!(control.Filter-Id == "")) {
 	test_fail
 }
 

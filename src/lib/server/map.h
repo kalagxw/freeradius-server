@@ -30,7 +30,7 @@ RCSIDH(map_h, "$Id$")
 extern "C" {
 #endif
 
-typedef struct vp_map_s map_t;
+typedef struct map_s map_t;
 typedef struct vp_list_mod_s vp_list_mod_t;
 
 #ifdef __cplusplus
@@ -39,6 +39,7 @@ typedef struct vp_list_mod_s vp_list_mod_t;
 
 #include <freeradius-devel/server/cf_util.h>
 #include <freeradius-devel/server/tmpl.h>
+#include <freeradius-devel/util/dlist.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,11 +57,12 @@ extern "C" {
 	['>'] = true, \
 	['~'] = true
 
-/** Value pair map list
+FR_DLIST_TYPES(map_list)
+
+/** Given these are used in so many places, it's more friendly to have a proper type
  *
- * Specifically define a type for lists of map_t to aid type checking
  */
-typedef fr_dlist_head_t fr_map_list_t;
+typedef FR_DLIST_HEAD(map_list) map_list_t;
 
 /** Value pair map
  *
@@ -72,31 +74,34 @@ typedef fr_dlist_head_t fr_map_list_t;
  *
  * @see tmpl_t
  */
-struct vp_map_s {
-	tmpl_t		*lhs;		//!< Typically describes the attribute to add, modify or compare.
-	tmpl_t		*rhs;   	//!< Typically describes a literal value or a src attribute
-						///< to copy or compare.
+struct map_s {
+	tmpl_t				*lhs;		//!< Typically describes the attribute to add, modify or compare.
+	tmpl_t				*rhs;   	//!< Typically describes a literal value or a src attribute
+							///< to copy or compare.
 
-	fr_token_t		op; 		//!< The operator that controls insertion of the dst attribute.
-	fr_type_t		cast;		//!< Cast value to this type.
+	fr_token_t			op; 		//!< The operator that controls insertion of the dst attribute.
+	fr_type_t			cast;		//!< Cast value to this type.
 
-	CONF_ITEM		*ci;		//!< Config item that the map was created from. Mainly used for
-						//!< logging validation errors.
+	CONF_ITEM			*ci;		//!< Config item that the map was created from. Mainly used for
+							//!< logging validation errors.
 
-	map_t		*parent;	//! parent map, for nested ones
-	fr_map_list_t	child;		//!< a child map.  If it exists, `rhs` MUST be NULL
-	fr_dlist_t	entry;		//!< List entry.
+	map_t				*parent;	//! parent map, for nested ones
+	map_list_t			child;		//!< a child map.  If it exists, `rhs` MUST be NULL
+
+	FR_DLIST_ENTRY(map_list)	entry;		//!< List entry.
 };
+
+FR_DLIST_FUNCS(map_list, map_t, entry)
 
 /** A list modification
  *
  */
 struct vp_list_mod_s {
-	map_t const		*map;		//!< Original map describing the change to be made.
+	map_t const			*map;		//!< Original map describing the change to be made.
 
-	fr_map_list_t		mod;		//!< New map containing the destination (LHS) and
-						///< values (RHS).
-	fr_dlist_t		entry;		//!< Entry into dlist
+	map_list_t			mod;		//!< New map containing the destination (LHS) and
+							///< values (RHS).
+	fr_dlist_t			entry;		//!< Entry into dlist
 };
 
 #ifndef WITH_VERIFY_PTR
@@ -113,11 +118,20 @@ typedef int (*radius_map_getvalue_t)(TALLOC_CTX *ctx, fr_pair_list_t *out, reque
 				     map_t const *map, void *uctx);
 
 int		map_afrom_cp(TALLOC_CTX *ctx, map_t **out, map_t *parent, CONF_PAIR *cp,
-			     tmpl_rules_t const *lhs_rules, tmpl_rules_t const *rhs_rules);
+			     tmpl_rules_t const *lhs_rules, tmpl_rules_t const *rhs_rules, bool edit);
 
-int		map_afrom_cs(TALLOC_CTX *ctx, fr_map_list_t *out, CONF_SECTION *cs,
+int		map_afrom_cs(TALLOC_CTX *ctx, map_list_t *out, CONF_SECTION const *cs,
 			     tmpl_rules_t const *lhs_rules, tmpl_rules_t const *rhs_rules,
 			     map_validate_t validate, void *uctx, unsigned int max) CC_HINT(nonnull(2, 3));
+
+int		map_afrom_cs_edit(TALLOC_CTX *ctx, map_list_t *out, CONF_SECTION *cs,
+				  tmpl_rules_t const *lhs_rules, tmpl_rules_t const *rhs_rules,
+				  map_validate_t validate, void *uctx, unsigned int max) CC_HINT(nonnull(2, 3));
+
+int		map_list_afrom_cs(TALLOC_CTX *ctx, map_list_t *out, CONF_SECTION *cs,
+				  tmpl_rules_t const *t_rules,
+				  map_validate_t validate, void *uctx,
+				  unsigned int max);
 
 int		map_afrom_value_box(TALLOC_CTX *ctx, map_t **out,
 				    char const *lhs, fr_token_t lhs_type, tmpl_rules_t const *lhs_rules,
@@ -127,24 +141,18 @@ int		map_afrom_value_box(TALLOC_CTX *ctx, map_t **out,
 int		map_afrom_attr_str(TALLOC_CTX *ctx, map_t **out, char const *raw,
 				   tmpl_rules_t const *lhs_rules, tmpl_rules_t const *rhs_rules);
 
-int		map_afrom_vp(TALLOC_CTX *ctx, map_t **out, fr_pair_t *vp,
-			     tmpl_rules_t const *rules);
-
 ssize_t		map_afrom_substr(TALLOC_CTX *ctx, map_t **out, map_t **parent_p, fr_sbuff_t *in,
 				fr_table_num_sorted_t const *op_table, size_t op_table_len,
 				tmpl_rules_t const *lhs_rules, tmpl_rules_t const *rhs_rules,
-				fr_sbuff_parse_rules_t const *p_rules);
+				fr_sbuff_parse_rules_t const *p_rules) CC_HINT(nonnull(1,2,4,5,7,8));
 
-void		map_sort(fr_map_list_t *list, fr_cmp_t cmp);
+int		map_afrom_fields(TALLOC_CTX *ctx, map_t **out, map_t **parent_p, request_t *request,
+				 char const *lhs, char const *op, char const *rhs,
+				 tmpl_rules_t const *lhs_rules, tmpl_rules_t const *rhs_rules,
+				 bool bare_word_only) CC_HINT(nonnull);
 
 int		map_to_vp(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *request,
 			  map_t const *map, void *uctx) CC_HINT(nonnull (2,3,4));
-
-int		map_list_mod_apply(request_t *request, vp_list_mod_t const *vlm);
-
-int		map_to_list_mod(TALLOC_CTX *ctx, vp_list_mod_t **out,
-				request_t *request, map_t const *map,
-				fr_value_box_list_t *lhs_result, fr_value_box_list_t *rhs_result);
 
 int		map_to_request(request_t *request, map_t const *map,
 			       radius_map_getvalue_t func, void *ctx);
@@ -159,9 +167,6 @@ extern size_t map_assignment_op_table_len;
 
 extern fr_sbuff_parse_rules_t const map_parse_rules_bareword_quoted;
 extern fr_sbuff_parse_rules_t const *map_parse_rules_quoted[T_TOKEN_LAST];
-
-#define fr_map_list_init(_list) fr_dlist_talloc_init(_list, map_t, entry)
-#define fr_map_list_head(_list) ((map_t *)fr_dlist_head(_list))
 
 #ifdef __cplusplus
 }

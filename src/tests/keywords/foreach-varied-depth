@@ -1,43 +1,31 @@
 #
 #  PRE: foreach
 #
-update {
-	&control.Tmp-String-0 := "ssid=ABCDEF"
-	&control.Tmp-String-0 += "ssid=GHIJKL"
+control += {
+	Filter-Id = "ssid=ABCDEF"
+	Filter-Id = "ssid=GHIJKL"
 }
 
-if (&User-Name) {
-	foreach &control.Tmp-String-0 {
-		if ("%{Foreach-Variable-0}" =~ /(.*)/) {
-			update control {
-				&Tmp-String-1 := "%{1}"
-			}
-		}
+if (User-Name) {
+	foreach thing (control.Filter-Id[*]) {
+		control.Calling-Station-Id := thing
 	}
 }
 
-if (&control.Tmp-String-1 != 'ssid=GHIJKL') {
+if (!(control.Calling-Station-Id == 'ssid=GHIJKL')) {
 	test_fail
 }
 
-update control {
-	&Tmp-String-1 !* ANY
+control -= Calling-Station-Id[*]
+
+foreach thing (control.Filter-Id) {
+	control.Calling-Station-Id := thing
 }
 
-foreach &control.Tmp-String-0 {
-	if ("%{Foreach-Variable-0}" =~ /(.*)/) {
-		update control {
-			&Tmp-String-1 := "%{1}"
-		}
-	}
-}
-
-if (&control.Tmp-String-1 != 'ssid=GHIJKL') {
+if (!(control.Calling-Station-Id == 'ssid=GHIJKL')) {
 	test_fail
 }
 
-update control {
-	&Tmp-String-1 !* ANY
-}
+control -= Calling-Station-Id[*]
 
 success

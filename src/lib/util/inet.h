@@ -26,12 +26,12 @@ RCSIDH(inet_h, "$Id$")
 
 #include <freeradius-devel/build.h>
 #include <freeradius-devel/missing.h>
+#include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/talloc.h>
 
 #include <arpa/inet.h>
 #include <net/if.h>		/* SIOCGIFADDR et al */
 #include <netinet/in.h>		/* in6?_addr */
-#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -96,6 +96,20 @@ extern bool	fr_reverse_lookups;	/* do IP -> hostname lookups? */
 extern bool	fr_hostname_lookups; /* do hostname -> IP lookups? */
 
 /*
+ *	We want to be able to have a separate "filename" socket, which
+ *	is not a unix socket.
+ *
+ *	On some systems, AF_FILE is equivalent to AF_LOCAL.  So we use
+ *	FILENAME, and use a "_FR_" qualifier. too.
+ */
+#define AF_FR_FILENAME (INT_MIN)
+
+/*
+ *	A virtual server.
+ */
+#define AF_FR_VIRTUAL_SERVER (INT_MIN + 1)
+
+/*
  *	Utility functions
  */
 int	fr_ipaddr_is_inaddr_any(fr_ipaddr_t const *ipaddr);
@@ -145,13 +159,17 @@ int	fr_ipaddr_from_ifindex(fr_ipaddr_t *out, int fd, int af, int ifindex);
 #endif
 
 char	*fr_ipaddr_to_interface(TALLOC_CTX *ctx, fr_ipaddr_t *ipaddr);
+void	fr_ipaddr_get_scope_id(fr_ipaddr_t *ipaddr);
 int	fr_interface_to_ipaddr(char const *interface, fr_ipaddr_t *ipaddr, int af, bool link_local);
 
 int	fr_interface_to_ethernet(char const *interface, fr_ethernet_t *ethernet);
+
 /*
  *	Comparison
  */
-int8_t	fr_ipaddr_cmp(fr_ipaddr_t const *a, fr_ipaddr_t const *b);
+fr_cmp_ret_t	fr_ipaddr_cmp(fr_ipaddr_t const *a, fr_ipaddr_t const *b);
+
+fr_cmp_ret_t	fr_sockaddr_cmp(struct sockaddr_storage const *a, struct sockaddr_storage const *b);
 
 /*
  *	Sockaddr conversion functions
@@ -161,6 +179,7 @@ int	fr_ipaddr_to_sockaddr(struct sockaddr_storage *sa, socklen_t *salen,
 
 int	fr_ipaddr_from_sockaddr(fr_ipaddr_t *ipaddr, uint16_t *port,
 				struct sockaddr_storage const *sa, socklen_t salen);
+int	fr_ipaddr_from_ifaddr(fr_ipaddr_t *ipaddr, struct sockaddr const *ifa_addr);
 
 #ifdef __cplusplus
 }

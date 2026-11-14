@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -7,7 +7,7 @@
 #        http://www.ietf.org/rfc/rfc7930.txt
 #
 
-ATTRIBUTE	Response-Length				241.3	integer
-ATTRIBUTE	Original-Packet-Code			241.4	integer
+ATTRIBUTE	Response-Length				241.3	uint32
+ATTRIBUTE	Original-Packet-Code			241.4	uint32 enum=@.Packet-Type
 
 VALUE	Error-Cause			Response-Too-Big	601

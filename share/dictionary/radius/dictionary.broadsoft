@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -223,8 +223,8 @@ ATTRIBUTE	Called-Asserted-Identity		208	string
 ATTRIBUTE	Called-Asserted-Pres-Indicator		209	string
 ATTRIBUTE	SDP					210	string
 ATTRIBUTE	Media-Initiator-Flag			211	string
-ATTRIBUTE	SDP-Offer-Timestamp			212	string
-ATTRIBUTE	SDP-Answer-Timestamp			213	string
+ATTRIBUTE	SDP-Offer-Timestamp			212	string # should probably be date?
+ATTRIBUTE	SDP-Answer-Timestamp			213	string # should probably be date?
 ATTRIBUTE	Early-Media-SDP				214	string
 ATTRIBUTE	Early-Media-Initiator-Flag		215	string
 ATTRIBUTE	Body-Content-Type			216	string
@@ -376,3 +376,4 @@ ATTRIBUTE	FMFM-Call-Push-FAC-Result		348	string
 ATTRIBUTE	SCC-Cause				349	string
 
 END-VENDOR	BroadSoft
+ALIAS		BroadSoft				Vendor-Specific.BroadSoft

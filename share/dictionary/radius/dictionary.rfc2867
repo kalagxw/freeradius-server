@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -9,7 +9,7 @@
 #	$Id$
 #
 ATTRIBUTE	Acct-Tunnel-Connection			68	string
-ATTRIBUTE	Acct-Tunnel-Packets-Lost		86	integer
+ATTRIBUTE	Acct-Tunnel-Packets-Lost		86	uint32
 
 VALUE	Acct-Status-Type		Tunnel-Start		9
 VALUE	Acct-Status-Type		Tunnel-Stop		10

@@ -1,6 +1,9 @@
-TARGET		:= rlm_eap.a
-SOURCES		:= rlm_eap.c
+TARGETNAME	:= rlm_eap
 
-SRC_INCDIRS	:= . lib/base
+TARGET		:= $(TARGETNAME)$(L)
+SOURCES		:= $(TARGETNAME).c
 
-TGT_PREREQS	:= libfreeradius-eap.a
+SRC_INCDIRS	:= .
+
+TGT_PREREQS	:= libfreeradius-eap$(L)
+LOG_ID_LIB	= 15

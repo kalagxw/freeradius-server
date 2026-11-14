@@ -1,17 +1,14 @@
-AC_PREREQ([2.61])
-AC_INIT(redis.c)
+AC_PREREQ([2.73])
+AC_INIT
+AC_CONFIG_SRCDIR([redis.c])
 AC_REVISION($Revision$)
-AC_DEFUN(modname,[libfreeradius-redis])
-AC_DEFUN(modname_useropt,[m4_bpatsubst([]modname,[[-+.]],[_])])
+FR_INIT_LIBRARY([libfreeradius-redis], [redis support])
 
-AC_ARG_WITH([]modname,
-[AS_HELP_STRING([--without-[]modname],[build without redis support])]
-)
-
-fail=
 SMART_LIBS=
 SMART_CLFAGS=
-if test x$with_[]modname_useropt != xno; then
+
+FR_LIBRARY_START_TESTS
+
     dnl ############################################################
     dnl # Check for command line options
     dnl ############################################################
@@ -70,6 +67,11 @@ if test x$with_[]modname_useropt != xno; then
 
     AC_PROG_CC
 
+    dnl #############################################################
+    dnl # Library/include paths
+    dnl #############################################################
+    AX_WITH_LIB_ARGS_OPT([openssl],[yes])
+
     dnl ############################################################
     dnl # Check for header files
     dnl ############################################################
@@ -93,26 +95,34 @@ if test x$with_[]modname_useropt != xno; then
       fail="$fail libhiredis"
     fi
 
-    targetname=modname
-else
-    targetname=
-    echo \*\*\* module modname is disabled.
-fi
+    smart_try_dir="$openssl_lib_dir"
+    FR_SMART_CHECK_LIB(hiredis_ssl, redisCreateSSLContext)
+    if test "x$ac_cv_lib_hiredis_ssl_redisCreateSSLContext" == "xyes"
+    then
+      AC_DEFINE([HAVE_REDIS_SSL],[1],[Build with SSL support])
+    fi
 
-dnl Don't change this section.
-if test "x$fail" != x; then
-	if test "x${enable_strict_dependencies}" = xyes; then
-		AC_MSG_ERROR([set --without-]modname[ to disable it explicitly.])
-	else
-		AC_MSG_WARN([silently not building ]modname[.])
-		AC_MSG_WARN([FAILURE: ]modname[ requires:$fail.]);
-		targetname=
-	fi
-fi
+    smart_try_dir="$redis_lib_dir"
+    FR_SMART_CHECK_LIB(hiredis, redisAsyncHandleTimeout)
+    if test "x$ac_cv_lib_hiredis_redisAsyncHandleTimeout" == "xyes"
+    then
+      AC_DEFINE([HAVE_REDIS_TIMEOUT],[1],[Define if redisAsyncHandleTimeout is available])
+    fi
+
+    smart_try_dir="$redis_lib_dir"
+    FR_SMART_CHECK_LIB(hiredis, redisAsyncSetConnectCallbackNC)
+    if test "x$ac_cv_lib_hiredis_redisAsyncSetConnectCallbackNC" == "xyes"
+    then
+      AC_DEFINE([HAVE_REDIS_CALLBACKNC],[1],[Define if redisAsyncSetConnectCallbackNC is available])
+    fi
+FR_LIBRARY_END_TESTS
 
 mod_ldflags="$SMART_LIBS"
 mod_cflags="$SMART_CPPFLAGS"
+
 AC_SUBST(mod_ldflags)
 AC_SUBST(mod_cflags)
-AC_SUBST(targetname)
-AC_OUTPUT(all.mk)
+
+AC_CONFIG_HEADERS([config.h])
+AC_CONFIG_FILES([all.mk])
+AC_OUTPUT

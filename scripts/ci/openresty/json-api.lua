@@ -93,8 +93,8 @@ end
 Api.endpoint('POST', '/user/<username>/mac/<client>',
     function(body, keyData)
         local returnData = {}
-        returnData["control.Tmp-String-0"] = uriArgs.section
-        returnData["control.Tmp-String-1"] = {
+        returnData["control.Filter-Id"] = uriArgs.section
+        returnData["control.Callback-Id"] = {
             reqMethod,
             reqPath
         }
@@ -106,7 +106,7 @@ Api.endpoint('POST', '/user/<username>/mac/<client>',
             op = "+=",
             value = body.NAS or body['NAS-IP-Address'].value
         }
-        returnData["control.Tmp-String-2"] = {
+        returnData["control.Login-LAT-Node"] = {
             op = "^=",
             value = keyData.username
         }
@@ -118,8 +118,8 @@ Api.endpoint('POST', '/user/<username>/mac/<client>',
 Api.endpoint('GET', '/user/<username>/mac/<client>',
     function(body, keyData)
         local returnData = {}
-        returnData["control.Tmp-String-0"] = uriArgs.section
-        returnData["control.Tmp-String-1"] = {
+        returnData["control.Filter-Id"] = uriArgs.section
+        returnData["control.Callback-Id"] = {
             reqMethod,
             reqPath
         }
@@ -127,9 +127,21 @@ Api.endpoint('GET', '/user/<username>/mac/<client>',
             op = ":=",
             value = keyData.username
         }
-        returnData["control.Tmp-String-2"] = {
+        returnData["control.Login-LAT-Node"] = {
             op = "^=",
             value = keyData.username
+        }
+        returnData["reply.Class"] = {
+            op = ":=",
+            value = "0x010203"
+        }
+        returnData["reply.Chargeable-User-Identity"] = {
+            op = ":=",
+            value = keyData.username
+        }
+        returnData["request.Vendor-Specific.Cisco.AVPair"] = {
+            "cisco=madness",
+            "is=crazy"
         }
         return ngx.say(cjson.encode(returnData))
     end
@@ -139,7 +151,51 @@ Api.endpoint('GET', '/user/<username>/mac/<client>',
 Api.endpoint('GET', '/user/<username>/reflect/',
     function(body, keyData)
         local returnData = {}
-        returnData["station"] = uriArgs.station
+
+        -- Return two Reply-Message attributes, the first with request headers, the second with arguments
+        returnData["reply.Reply-Message"] = {
+            op = ":=",
+            value = { ngx.encode_base64(cjson.encode(ngx.req.get_headers())), ngx.encode_base64(cjson.encode(uriArgs)) }
+        }
+        return ngx.say(cjson.encode(returnData))
+    end
+)
+
+-- Simple reflection of a URI argument
+Api.endpoint('POST', '/user/<username>/reflect/',
+    function(body, keyData)
+        local returnData = {}
+
+        -- Return three Reply-Message attributes, the first with request headers, the second with arguments, the third with the request body
+        returnData["reply.Reply-Message"] = {
+            op = ":=",
+            value = { ngx.encode_base64(cjson.encode(ngx.req.get_headers())), ngx.encode_base64(cjson.encode(uriArgs)), ngx.encode_base64(cjson.encode(body)) }
+        }
+        return ngx.say(cjson.encode(returnData))
+    end
+)
+
+-- Used in the response do_xlat / is_json default tests.  Returns values
+-- containing xlat expansions so the tests can verify whether the
+-- server expanded the values.
+Api.endpoint('GET', '/user/<username>/expand/',
+    function(body, keyData)
+        local returnData = {}
+        -- Bare value, follows the response json.do_xlat default
+        returnData["control.Filter-Id"] = "%{User-Name}"
+        -- Explicit per-attribute flag, overrides the configured default
+        returnData["control.Callback-Id"] = {
+            do_xlat = true,
+            value = "%{User-Name}"
+        }
+        returnData["control.Login-LAT-Node"] = {
+            do_xlat = false,
+            value = "%{User-Name}"
+        }
+        -- Nested JSON, only assigned (in string form) when is_json is true
+        returnData["control.Login-LAT-Service"] = {
+            value = { key = "val" }
+        }
         return ngx.say(cjson.encode(returnData))
     end
 )

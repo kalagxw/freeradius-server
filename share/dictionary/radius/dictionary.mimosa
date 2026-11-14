@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 
@@ -24,9 +24,9 @@ ATTRIBUTE	Traffic-Shaping-Committed		14	string
 ATTRIBUTE	Ethernet-Port-Speed			15	string
 ATTRIBUTE	DNS1					16	ipaddr
 ATTRIBUTE	DNS2					17	ipaddr
-ATTRIBUTE	HTTP-Port				18	integer
+ATTRIBUTE	HTTP-Port				18	uint32
 ATTRIBUTE	Enable-HTTPS				19	byte
-ATTRIBUTE	HTTPS-Port				20	integer
+ATTRIBUTE	HTTPS-Port				20	uint32
 ATTRIBUTE	Cloud-Management			21	byte
 ATTRIBUTE	Enable-SNMP				22	byte
 ATTRIBUTE	SNMP-Community-String			23	string
@@ -34,7 +34,8 @@ ATTRIBUTE	SNMP-Trap-Server			24	ipaddr
 ATTRIBUTE	NTP-Server-Address			25	string
 ATTRIBUTE	Enable-Syslog				26	byte
 ATTRIBUTE	Syslog-Server-Address			27	ipaddr
-ATTRIBUTE	Syslog-Port				28	integer
+ATTRIBUTE	Syslog-Port				28	uint32
 ATTRIBUTE	Syslog-Protocol				29	string
 
 END-VENDOR Mimosa
+ALIAS		Mimosa					Vendor-Specific.Mimosa

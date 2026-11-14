@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -23,45 +23,101 @@
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_chap (%s) - "
-#define LOG_PREFIX_ARGS dl_module_instance_name_by_data(inst)
+#define LOG_PREFIX mctx->mi->name
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/password.h>
-#include <freeradius-devel/server/module.h>
-#include <freeradius-devel/radius/radius.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/util/chap.h>
+#include <freeradius-devel/unlang/xlat_func.h>
 
 typedef struct {
-	char const		*name;		//!< Auth-Type value for this module instance.
-	fr_dict_enum_t		*auth_type;
+	fr_dict_enum_value_t const	*auth_type;
+	size_t				min_challenge_len;
 } rlm_chap_t;
 
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("min_challenge_len", FR_TYPE_SIZE, 0, rlm_chap_t, min_challenge_len), .dflt = "16" },
+	CONF_PARSER_TERMINATOR
+};
+
+typedef struct {
+	fr_value_box_t	chap_challenge;
+} chap_xlat_call_env_t;
+
+static const call_env_method_t chap_xlat_method_env = { \
+	FR_CALL_ENV_METHOD_OUT(chap_xlat_call_env_t),
+	.env = (call_env_parser_t[]){
+		{ FR_CALL_ENV_OFFSET("chap_challenge", FR_TYPE_OCTETS,
+				     CALL_ENV_FLAG_ATTRIBUTE | CALL_ENV_FLAG_REQUIRED | CALL_ENV_FLAG_NULLABLE,
+				     chap_xlat_call_env_t,
+				     chap_challenge), .pair.dflt = "Chap-Challenge", .pair.dflt_quote = T_BARE_WORD },
+		CALL_ENV_TERMINATOR
+	}
+};
+
+typedef struct {
+	fr_value_box_t	chap_password;
+	fr_value_box_t	chap_challenge;
+	tmpl_t		*chap_challenge_tmpl;
+} chap_autz_call_env_t;
+
+static const call_env_method_t chap_autz_method_env = { \
+	FR_CALL_ENV_METHOD_OUT(chap_autz_call_env_t),
+	.env = (call_env_parser_t[]){
+		{ FR_CALL_ENV_OFFSET("chap_password", FR_TYPE_OCTETS,
+				     CALL_ENV_FLAG_ATTRIBUTE | CALL_ENV_FLAG_REQUIRED | CALL_ENV_FLAG_NULLABLE,
+				     chap_autz_call_env_t, chap_password),
+				     .pair.dflt = "Chap-Password", .pair.dflt_quote = T_BARE_WORD },
+		{ FR_CALL_ENV_PARSE_OFFSET("chap_challenge", FR_TYPE_OCTETS,
+					  CALL_ENV_FLAG_ATTRIBUTE | CALL_ENV_FLAG_REQUIRED | CALL_ENV_FLAG_NULLABLE,
+					  chap_autz_call_env_t, chap_challenge, chap_challenge_tmpl),
+					  .pair.dflt = "Chap-Challenge", .pair.dflt_quote = T_BARE_WORD },
+		CALL_ENV_TERMINATOR
+	}
+};
+
+typedef struct {
+	fr_value_box_t	username;
+	fr_value_box_t	chap_password;
+	fr_value_box_t	chap_challenge;
+} chap_auth_call_env_t;
+
+static const call_env_method_t chap_auth_method_env = { \
+	FR_CALL_ENV_METHOD_OUT(chap_auth_call_env_t),
+	.env = (call_env_parser_t[]){
+		{ FR_CALL_ENV_OFFSET("username", FR_TYPE_STRING,
+				     CALL_ENV_FLAG_ATTRIBUTE | CALL_ENV_FLAG_REQUIRED,
+				     chap_auth_call_env_t, username),
+				     .pair.dflt = "User-Name", .pair.dflt_quote = T_BARE_WORD },
+		{ FR_CALL_ENV_OFFSET("chap_password", FR_TYPE_OCTETS,
+				     CALL_ENV_FLAG_ATTRIBUTE | CALL_ENV_FLAG_REQUIRED | CALL_ENV_FLAG_NULLABLE,
+				     chap_auth_call_env_t, chap_password),
+				     .pair.dflt = "Chap-Password", .pair.dflt_quote = T_BARE_WORD },
+		{ FR_CALL_ENV_OFFSET("chap_challenge", FR_TYPE_OCTETS,
+				     CALL_ENV_FLAG_ATTRIBUTE | CALL_ENV_FLAG_REQUIRED | CALL_ENV_FLAG_NULLABLE,
+				     chap_auth_call_env_t, chap_challenge),
+				     .pair.dflt = "Chap-Challenge", .pair.dflt_quote = T_BARE_WORD },
+		CALL_ENV_TERMINATOR
+	}
+};
+
 static fr_dict_t const *dict_freeradius;
-static fr_dict_t const *dict_radius;
 
 extern fr_dict_autoload_t rlm_chap_dict[];
 fr_dict_autoload_t rlm_chap_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
-	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_auth_type;
 static fr_dict_attr_t const *attr_cleartext_password;
-
-static fr_dict_attr_t const *attr_chap_password;
-static fr_dict_attr_t const *attr_chap_challenge;
-static fr_dict_attr_t const *attr_user_name;
 
 extern fr_dict_attr_autoload_t rlm_chap_dict_attr[];
 fr_dict_attr_autoload_t rlm_chap_dict_attr[] = {
 	{ .out = &attr_auth_type, .name = "Auth-Type", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
 	{ .out = &attr_cleartext_password, .name = "Password.Cleartext", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
 
-	{ .out = &attr_chap_password, .name = "Chap-Password", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
-	{ .out = &attr_chap_challenge, .name = "Chap-Challenge", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
-	{ .out = &attr_user_name, .name = "User-Name", .type = FR_TYPE_STRING, .dict = &dict_radius },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static xlat_arg_parser_t const xlat_func_chap_password_args[] = {
@@ -73,33 +129,38 @@ static xlat_arg_parser_t const xlat_func_chap_password_args[] = {
  *
  * Example:
 @verbatim
-"%(chap_password:<password>)" == 0x<id><md5_hash>
+%chap.password(<password>) == 0x<id><md5_hash>
 @endverbatim
  *
  * @ingroup xlat_functions
  */
 static xlat_action_t xlat_func_chap_password(TALLOC_CTX *ctx, fr_dcursor_t *out,
-					     request_t *request, UNUSED void const *xlat_inst,
-					     UNUSED void *xlat_thread_inst,
-					     fr_value_box_list_t *in)
+				 	     xlat_ctx_t const *xctx,
+					     request_t *request, fr_value_box_list_t *in)
 {
-	uint8_t		chap_password[1 + RADIUS_CHAP_CHALLENGE_LENGTH];
-	fr_value_box_t	*vb;
-	fr_pair_t	*challenge;
-	uint8_t	const	*vector;
-	fr_value_box_t	*in_head = fr_dlist_head(in);
+	rlm_chap_t const	*inst = talloc_get_type_abort_const(xctx->mctx->mi->data, rlm_chap_t);
+	uint8_t			chap_password[1 + FR_CHAP_CHALLENGE_LENGTH];
+	fr_value_box_t		*vb;
+	uint8_t	const		*challenge;
+	size_t			challenge_len;
+	fr_value_box_t		*in_head = fr_value_box_list_head(in);
+	chap_xlat_call_env_t	*env_data = talloc_get_type_abort(xctx->env_data, chap_xlat_call_env_t);
 
 	/*
 	 *	Use Chap-Challenge pair if present,
 	 *	Request Authenticator otherwise.
 	 */
-	challenge = fr_pair_find_by_da(&request->request_pairs, attr_chap_challenge, 0);
-	if (challenge && (challenge->vp_length == RADIUS_AUTH_VECTOR_LENGTH)) {
-		vector = challenge->vp_octets;
+	if ((env_data->chap_challenge.type == FR_TYPE_OCTETS) &&
+	    (env_data->chap_challenge.vb_length >= inst->min_challenge_len)) {
+		challenge = env_data->chap_challenge.vb_octets;
+		challenge_len = env_data->chap_challenge.vb_length;
 	} else {
-		vector = request->packet->vector;
+		if (env_data->chap_challenge.type == FR_TYPE_OCTETS)
+			RWDEBUG("request.CHAP-Challenge shorter than minimum length (%zu)", inst->min_challenge_len);
+		challenge = request->packet->vector;
+		challenge_len = RADIUS_AUTH_VECTOR_LENGTH;
 	}
-	fr_radius_encode_chap_password(chap_password, (uint8_t)(fr_rand() & 0xff), vector,
+	fr_chap_encode(chap_password, (uint8_t)(fr_rand() & 0xff), challenge, challenge_len,
 				       in_head->vb_strvalue, in_head->vb_length);
 
 	MEM(vb = fr_value_box_alloc_null(ctx));
@@ -109,22 +170,23 @@ static xlat_action_t xlat_func_chap_password(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	return XLAT_ACTION_DONE;
 }
 
-static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_authorize(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
 	fr_pair_t		*vp;
-	rlm_chap_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_chap_t);
+	rlm_chap_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_chap_t);
+	chap_autz_call_env_t	*env_data = talloc_get_type_abort(mctx->env_data, chap_autz_call_env_t);
 
-	if (fr_pair_find_by_da(&request->control_pairs, attr_auth_type, 0) != NULL) {
-		RDEBUG3("Auth-Type is already set.  Not setting 'Auth-Type := %s'", inst->name);
-		RETURN_MODULE_NOOP;
+	if (fr_pair_find_by_da(&request->control_pairs, NULL, attr_auth_type) != NULL) {
+		RDEBUG3("Auth-Type is already set.  Not setting 'Auth-Type := %s'", mctx->mi->name);
+		RETURN_UNLANG_NOOP;
 	}
 
 	/*
 	 *	This case means the warnings below won't be printed
 	 *	unless there's a CHAP-Password in the request.
 	 */
-	if (!fr_pair_find_by_da(&request->request_pairs, attr_chap_password, 0)) {
-		RETURN_MODULE_NOOP;
+	if (env_data->chap_password.type != FR_TYPE_OCTETS) {
+		RETURN_UNLANG_NOOP;
 	}
 
 	/*
@@ -133,26 +195,25 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, mod
 	 *	This is so that the rest of the code does not need to
 	 *	understand CHAP.
 	 */
-	vp = fr_pair_find_by_da(&request->request_pairs, attr_chap_challenge, 0);
-	if (!vp) {
-		RDEBUG2("Creating &%s from request authenticator", attr_chap_challenge->name);
+	if (env_data->chap_challenge.type != FR_TYPE_OCTETS) {
+		RDEBUG2("Creating %s from request authenticator", env_data->chap_challenge_tmpl->name);
 
-		MEM(vp = fr_pair_afrom_da(request->request_ctx, attr_chap_challenge));
+		MEM(vp = fr_pair_afrom_da(request->request_ctx, tmpl_attr_tail_da(env_data->chap_challenge_tmpl)));
 		fr_pair_value_memdup(vp, request->packet->vector, sizeof(request->packet->vector), true);
 		fr_pair_append(&request->request_pairs, vp);
 	}
 
 	if (!inst->auth_type) {
 		WARN("No 'authenticate %s {...}' section or 'Auth-Type = %s' set.  Cannot setup CHAP authentication",
-		     inst->name, inst->name);
-		RETURN_MODULE_NOOP;
+		     mctx->mi->name, mctx->mi->name);
+		RETURN_UNLANG_NOOP;
 	}
 
-	if (!module_section_type_set(request, attr_auth_type, inst->auth_type)) {
-		RETURN_MODULE_NOOP;
+	if (!module_rlm_section_type_set(request, attr_auth_type, inst->auth_type)) {
+		RETURN_UNLANG_NOOP;
 	}
 
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
 /*
@@ -161,41 +222,40 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, mod
  *	from the database. The authentication code only needs to check
  *	the password, the rest is done here.
  */
-static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_authenticate(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
+	rlm_chap_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_chap_t);
 	fr_pair_t		*known_good;
-	fr_pair_t		*chap, *username;
-	uint8_t			pass_str[1 + RADIUS_CHAP_CHALLENGE_LENGTH];
+	uint8_t			pass_str[1 + FR_CHAP_CHALLENGE_LENGTH];
+	chap_auth_call_env_t	*env_data = talloc_get_type_abort(mctx->env_data, chap_auth_call_env_t);
 
 	int			ret;
 
 	fr_dict_attr_t const	*allowed_passwords[] = { attr_cleartext_password };
 	bool			ephemeral;
 
-	fr_pair_t		*challenge;
-	uint8_t	const		*vector;
+	uint8_t	const		*challenge;
+	size_t			challenge_len;
 
-	username = fr_pair_find_by_da(&request->request_pairs, attr_user_name, 0);
-	if (!username) {
-		REDEBUG("&User-Name attribute is required for authentication");
-		RETURN_MODULE_INVALID;
+	if (env_data->username.type != FR_TYPE_STRING) {
+		REDEBUG("User-Name attribute is required for authentication");
+		RETURN_UNLANG_INVALID;
 	}
 
-	chap = fr_pair_find_by_da(&request->request_pairs, attr_chap_password, 0);
-	if (!chap) {
-		REDEBUG("You set '&control.Auth-Type = CHAP' for a request that "
+	if (env_data->chap_password.type != FR_TYPE_OCTETS) {
+		REDEBUG("You set 'control.Auth-Type = CHAP' for a request that "
 			"does not contain a CHAP-Password attribute!");
-		RETURN_MODULE_INVALID;
+		RETURN_UNLANG_INVALID;
 	}
 
-	if (chap->vp_length == 0) {
-		REDEBUG("&request.CHAP-Password is empty");
-		RETURN_MODULE_INVALID;
+	if (env_data->chap_password.vb_length == 0) {
+		REDEBUG("request.CHAP-Password is empty");
+		RETURN_UNLANG_INVALID;
 	}
 
-	if (chap->vp_length != RADIUS_CHAP_CHALLENGE_LENGTH + 1) {
-		REDEBUG("&request.CHAP-Password has invalid length");
-		RETURN_MODULE_INVALID;
+	if (env_data->chap_password.vb_length != FR_CHAP_CHALLENGE_LENGTH + 1) {
+		REDEBUG("request.CHAP-Password has invalid length");
+		RETURN_UNLANG_INVALID;
 	}
 
 	/*
@@ -209,7 +269,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 				   false);
 	if (!known_good) {
 		REDEBUG("No \"known good\" password found for user");
-		RETURN_MODULE_FAIL;
+		RETURN_UNLANG_FAIL;
 	}
 
 	/*
@@ -220,14 +280,18 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	 *	Use Chap-Challenge pair if present,
 	 *	Request Authenticator otherwise.
 	 */
-	challenge = fr_pair_find_by_da(&request->request_pairs, attr_chap_challenge, 0);
-	if (challenge && (challenge->vp_length == RADIUS_AUTH_VECTOR_LENGTH)) {
-		vector = challenge->vp_octets;
+	if ((env_data->chap_challenge.type == FR_TYPE_OCTETS) &&
+	    (env_data->chap_challenge.vb_length >= inst->min_challenge_len)) {
+		challenge = env_data->chap_challenge.vb_octets;
+		challenge_len = env_data->chap_challenge.vb_length;
 	} else {
-		vector = request->packet->vector;
+		if (env_data->chap_challenge.type == FR_TYPE_OCTETS)
+			RWDEBUG("request.CHAP-Challenge shorter than minimum length (%zu)", inst->min_challenge_len);
+		challenge = request->packet->vector;
+		challenge_len = RADIUS_AUTH_VECTOR_LENGTH;
 	}
-	fr_radius_encode_chap_password(pass_str, chap->vp_octets[0], vector,
-				       known_good->vp_strvalue, known_good->vp_length);
+	fr_chap_encode(pass_str, env_data->chap_password.vb_octets[0], challenge, challenge_len,
+		       known_good->vp_strvalue, known_good->vp_length);
 
 	/*
 	 *	The password_find function already emits
@@ -237,13 +301,11 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	if (RDEBUG_ENABLED3) {
 		uint8_t	const	*p;
 		size_t		length;
-		fr_pair_t	*vp;
 
-		vp = fr_pair_find_by_da(&request->request_pairs, attr_chap_challenge, 0);
-		if (vp) {
-			RDEBUG2("Using challenge from &request.CHAP-Challenge");
-			p = vp->vp_octets;
-			length = vp->vp_length;
+		if (env_data->chap_challenge.type == FR_TYPE_OCTETS) {
+			RDEBUG2("Using challenge from request.CHAP-Challenge");
+			p = env_data->chap_challenge.vb_octets;
+			length = env_data->chap_challenge.vb_length;
 		} else {
 			RDEBUG2("Using challenge from authenticator field");
 			p = request->packet->vector;
@@ -252,8 +314,9 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 
 		RINDENT();
 		RDEBUG3("CHAP challenge : %pH", fr_box_octets(p, length));
-		RDEBUG3("Client sent    : %pH", fr_box_octets(chap->vp_octets + 1, RADIUS_CHAP_CHALLENGE_LENGTH));
-		RDEBUG3("We calculated  : %pH", fr_box_octets(pass_str + 1, RADIUS_CHAP_CHALLENGE_LENGTH));
+		RDEBUG3("Client sent    : %pH", fr_box_octets(env_data->chap_password.vb_octets + 1,
+							      FR_CHAP_CHALLENGE_LENGTH));
+		RDEBUG3("We calculated  : %pH", fr_box_octets(pass_str + 1, FR_CHAP_CHALLENGE_LENGTH));
 		REXDENT();
 	}
 
@@ -261,60 +324,46 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	 *	Skip the id field at the beginning of the
 	 *	password and chap response.
 	 */
-	ret = fr_digest_cmp(pass_str + 1, chap->vp_octets + 1, RADIUS_CHAP_CHALLENGE_LENGTH);
+	ret = fr_digest_cmp(pass_str + 1, env_data->chap_password.vb_octets + 1, FR_CHAP_CHALLENGE_LENGTH);
 	if (ephemeral) TALLOC_FREE(known_good);
 	if (ret != 0) {
 		REDEBUG("Password comparison failed: password is incorrect");
 
-		RETURN_MODULE_REJECT;
+		RETURN_UNLANG_REJECT;
 	}
 
-	RDEBUG2("CHAP user \"%pV\" authenticated successfully", &username->data);
+	RDEBUG2("CHAP user \"%pV\" authenticated successfully", &env_data->username);
 
-	RETURN_MODULE_OK;
-}
-
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
-{
-	rlm_chap_t	*inst = instance;
-
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) inst->name = cf_section_name1(conf);
-
-	return 0;
+	RETURN_UNLANG_OK;
 }
 
 /*
  *	Create instance for our module. Allocate space for
  *	instance structure and read configuration parameters
  */
-static int mod_instantiate(void *instance, UNUSED CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_chap_t		*inst = instance;
+	rlm_chap_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_chap_t);
 
-	inst->auth_type = fr_dict_enum_by_name(attr_auth_type, inst->name, -1);
+	inst->auth_type = fr_dict_enum_by_name(attr_auth_type, mctx->mi->name, -1);
 	if (!inst->auth_type) {
 		WARN("Failed to find 'authenticate %s {...}' section.  CHAP authentication will likely not work",
-		     inst->name);
+		     mctx->mi->name);
 	}
 
 	return 0;
 }
 
-static int mod_load(void)
+static int mod_bootstrap(module_inst_ctx_t const *mctx)
 {
 	xlat_t	*xlat;
 
-	xlat = xlat_register(NULL, "chap_password", xlat_func_chap_password, false);
-	if (!xlat) return -1;
-	xlat_func_args(xlat, xlat_func_chap_password_args);
+	if (unlikely((xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, "password", xlat_func_chap_password,
+						       FR_TYPE_OCTETS)) == NULL)) return -1;
+	xlat_func_args_set(xlat, xlat_func_chap_password_args);
+	xlat_func_call_env_set(xlat, &chap_xlat_method_env);
 
 	return 0;
-}
-
-static void mod_unload(void)
-{
-	xlat_unregister("chap_password");
 }
 
 /*
@@ -322,22 +371,25 @@ static void mod_unload(void)
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern module_t rlm_chap;
-module_t rlm_chap = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "chap",
-	.inst_size	= sizeof(rlm_chap_t),
-	.onload		= mod_load,
-	.unload		= mod_unload,
-	.bootstrap	= mod_bootstrap,
-	.instantiate	= mod_instantiate,
-	.dict		= &dict_radius,
-	.methods = {
-		[MOD_AUTHENTICATE]	= mod_authenticate,
-		[MOD_AUTHORIZE]		= mod_authorize,
+extern module_rlm_t rlm_chap;
+module_rlm_t rlm_chap = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "chap",
+		.inst_size	= sizeof(rlm_chap_t),
+		.bootstrap	= mod_bootstrap,
+		.config		= module_config,
+		.instantiate	= mod_instantiate
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("authenticate", CF_IDENT_ANY), .method = mod_authenticate, .method_env = &chap_auth_method_env },
+			{ .section = SECTION_NAME("recv", "Access-Request"), .method = mod_authorize, .method_env = &chap_autz_method_env },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

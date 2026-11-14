@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -22,11 +22,12 @@
  * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  *
  * @copyright 2016-2019 The FreeRADIUS server project
- * @copyright 2016-2019 Network RADIUS SARL <sales@networkradius.com>
+ * @copyright 2016-2019 Network RADIUS SAS <legal.com>
  */
 RCSIDH(lib_eap_aka_sim_state_machine_h, "$Id$")
 
 #include <freeradius-devel/eap_aka_sim/base.h>
+#include <freeradius-devel/unlang/interpret.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,29 +35,17 @@ extern "C" {
 
 typedef struct eap_aka_sim_session_s eap_aka_sim_session_t;
 
-/** The state function which should receive any incoming packets
- *
- */
-typedef unlang_action_t (*eap_aka_sim_state_t)(rlm_rcode_t *p_result, module_ctx_t const *mctx,
-					       request_t *request, eap_aka_sim_session_t *eap_aka_sim_session);
-
-/** The function to execute after common code has completed
- *
- * Mostly used to set functions to run after pseudonym and session
- * loading/clearing/storing is complete.
- */
-typedef unlang_action_t (*eap_aka_sim_next_t)(rlm_rcode_t *p_result, module_ctx_t const *mctx,
-					      request_t *request, eap_aka_sim_session_t *eap_aka_sim_session);
-
 struct eap_aka_sim_session_s {
 	/*
 	 *	State machine management
 	 */
-	eap_aka_sim_state_t		state;				//!< The process function to run when we
+	module_method_t			state;				//!< The process function to run when we
 									///< receive the next round of EAP-SIM/AKA/AKA'.
 
-	eap_aka_sim_next_t		next;				//!< Resumption function to call after
+	module_method_t			next;				//!< Resumption function to call after
 									///< executing common code.
+
+	unlang_result_t			section_result;			//!< The result of the last unlang section we evaluted.
 
 	eap_type_t			type;				//!< Either FR_TYPE_AKA, or FR_TYPE_AKA_PRIME.
 
@@ -122,7 +111,7 @@ typedef struct {
 
 			CONF_SECTION	*recv_aka_authentication_reject;//!< Called if the supplicant rejects the
 									///< authentication attempt.
-			CONF_SECTION	*recv_aka_syncronization_failure;//!< Called if the supplicant determines
+			CONF_SECTION	*recv_aka_synchronization_failure;//!< Called if the supplicant determines
 									///< the AUTN value is invalid.
 									///< Usually used for resyncing with the HLR.
 
@@ -221,9 +210,8 @@ typedef struct {
 	eap_aka_sim_actions_t		actions;			//!< Pre-compiled virtual server sections.
 } eap_aka_sim_process_conf_t;
 
-unlang_action_t eap_aka_sim_state_machine_process(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request);
+unlang_action_t eap_aka_sim_state_machine_process(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request);
 
 #ifdef __cplusplus
 }
 #endif
-

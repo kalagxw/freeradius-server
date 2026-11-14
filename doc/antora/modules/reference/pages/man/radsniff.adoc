@@ -4,7 +4,6 @@ Alan DeKok
 :release-version: 4.0.0
 :man manual: FreeRADIUS
 :man source: FreeRADIUS
-:page-layout: base
 :manvolnum: 8
 
 == NAME
@@ -13,12 +12,12 @@ radsniff - dump radius protocol
 
 == SYNOPSIS
 
-*radsniff _[ OPTIONS ]_
+*radsniff* _[ OPTIONS ]_
 
 == DESCRIPTION
 
-*radsniff  is a simple wrapper around libpcap. It can also print out the
-contents of RADIUS packets using the FreeRADIUS dictionaries.
+*radsniff* is a simple wrapper around libpcap. It can also print out
+the contents of RADIUS packets using the FreeRADIUS dictionaries.
 
 == OPTIONS
 
@@ -110,7 +109,7 @@ The following options are for statistics gathering.
   The instance name passed to the collectd plugin.
 
 *-O server*::
-  Write output statics to the named collectd server.
+  Write output statistics to the named collectd server.
 
 *-T timeout*::
   The timeout in milliseconds before the request is considered
@@ -121,8 +120,11 @@ The following options are for statistics gathering.
 
 == SEE ALSO
 
-radiusd(8),pcap(3)
+radiusd(8), pcap(3)
 
 == AUTHOR
 
-The FreeRADIUS Server Project (http://www.freeradius.org)
+The FreeRADIUS Server Project (https://freeradius.org)
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

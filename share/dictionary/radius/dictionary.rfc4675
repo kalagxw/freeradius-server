@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -17,8 +17,8 @@
 #
 #  Lower 12 bits is the IEEE-802.1Q VLAN VID.
 #
-ATTRIBUTE	Egress-VLANID				56	integer
-ATTRIBUTE	Ingress-Filters				57	integer
+ATTRIBUTE	Egress-VLANID				56	uint32
+ATTRIBUTE	Ingress-Filters				57	uint32
 
 #
 #  First byte == '1' (0x31) means that the frames are tagged.

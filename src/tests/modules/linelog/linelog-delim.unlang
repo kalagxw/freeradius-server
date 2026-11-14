@@ -1,33 +1,16 @@
-update control {
-	&Exec-Export := 'PATH="$ENV{PATH}:/bin:/usr/bin:/opt/bin:/usr/local/bin"'
-}
+string test_string
+
+control.Exec-Export := 'PATH="$ENV{PATH}:/bin:/usr/bin:/opt/bin:/usr/local/bin"'
 
 #
 #  Remove old log files
 #
-group {
-	update request {
-		&Tmp-String-0 := `/bin/sh -c "rm $ENV{MODULE_TEST_DIR}/test_delim.log"`
-	}
-
-	#
-	#  We can only over-ride actions in an "actions" subsection,
-	#  and then only as the last item in a group.
-	#
-	actions {
-		fail = 1
-	}
-}
-if (fail) {
-	ok
-}
+%file.rm("$ENV{MODULE_TEST_DIR}/test_delim.log")
 
 linelog_fmt_delim
-update request {
-	&Tmp-String-0 := `/bin/sh -c "tail -n1 $ENV{MODULE_TEST_DIR}/test_delim.log"`
-}
+test_string := %file.tail("$ENV{MODULE_TEST_DIR}/test_delim.log")
 
-if (&Tmp-String-0 == 'bob, ') {
+if (test_string == 'bob, ') {
 	test_pass
 }
 else {
@@ -36,11 +19,9 @@ else {
 
 #  Check strings are appended
 linelog_fmt_delim
-update request {
-	&Tmp-String-0 := `/bin/sh -c "tail -n1 $ENV{MODULE_TEST_DIR}/test_delim.log"`
-}
+test_string := %file.tail("$ENV{MODULE_TEST_DIR}/test_delim.log")
 
-if (&Tmp-String-0 == 'bob, bob, ') {
+if (test_string == 'bob, bob, ') {
 	test_pass
 }
 else {
@@ -48,6 +29,4 @@ else {
 }
 
 #  Remove the file
-update request {
-	&Tmp-String-0 := `/bin/sh -c "rm $ENV{MODULE_TEST_DIR}/test_delim.log"`
-}
+%file.rm("$ENV{MODULE_TEST_DIR}/test_delim.log")

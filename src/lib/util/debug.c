@@ -21,36 +21,20 @@
  * @copyright 2013 The FreeRADIUS server project
  * @copyright 2013 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
+#include <freeradius-devel/util/backtrace.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/hash.h>
-#include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/strerror.h>
 #include <freeradius-devel/util/syserror.h>
-#include <freeradius-devel/util/talloc.h>
 
-#include <assert.h>
-#include <limits.h>
 #include <pthread.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <unistd.h>
 
 #if defined(HAVE_MALLOPT) && defined(HAVE_MALLOC_H)
 #  include <malloc.h>
-#endif
-
-/*
- *	runtime backtrace functions are not POSIX but are included in
- *	glibc, OSX >= 10.5 and various BSDs
- */
-#ifdef HAVE_EXECINFO
-#  include <execinfo.h>
 #endif
 
 #ifdef HAVE_SYS_PRCTL_H
@@ -63,7 +47,6 @@
 
 #ifdef HAVE_SYS_PTRACE_H
 #  include <sys/ptrace.h>
-#  include <sys/types.h>
 #  if !defined(PT_ATTACH) && defined(PTRACE_ATTACH)
 #    define PT_ATTACH PTRACE_ATTACH
 #  endif
@@ -77,31 +60,7 @@
 #endif
 
 #ifdef __APPLE__
-#include <sys/types.h>
 #include <sys/sysctl.h>
-#endif
-
-#ifdef HAVE_EXECINFO
-#  ifndef MAX_BT_FRAMES
-#    define MAX_BT_FRAMES 128
-#  endif
-#  ifndef MAX_BT_CBUFF
-#    define MAX_BT_CBUFF  1048576			//!< Should be a power of 2
-#  endif
-
-static pthread_mutex_t fr_debug_init = PTHREAD_MUTEX_INITIALIZER;
-
-typedef struct {
-	void 		*obj;				//!< Memory address of the block of allocated memory.
-	void		*frames[MAX_BT_FRAMES];		//!< Backtrace frame data
-	int		count;				//!< Number of frames stored
-} fr_bt_info_t;
-
-struct fr_bt_marker {
-	void 		*obj;				//!< Pointer to the parent object, this is our needle
-							//!< when we iterate over the contents of the circular buffer.
-	fr_fring_t 	*fring;				//!< Where we temporarily store the backtraces
-};
 #endif
 
 static char panic_action[512];				//!< The command to execute when panicking.
@@ -110,7 +69,7 @@ static fr_fault_cb_t panic_cb = NULL;			//!< Callback to execute whilst panickin
 
 static bool dump_core;					//!< Whether we should drop a core on fatal signals.
 
-static int fr_fault_log_fd = STDERR_FILENO;		//!< Where to write debug output.
+int fr_fault_log_fd = STDERR_FILENO;		//!< Where to write debug output.
 
 fr_debug_state_t fr_debug_state = DEBUGGER_STATE_UNKNOWN;	//!< Whether we're attached to by a debugger.
 
@@ -118,19 +77,17 @@ fr_debug_state_t fr_debug_state = DEBUGGER_STATE_UNKNOWN;	//!< Whether we're att
 static struct rlimit init_core_limit;
 #endif
 
-static TALLOC_CTX *talloc_autofree_ctx;
-
 /*
  * On BSD systems, ptrace(PT_DETACH) uses a third argument for
  * resume address, with the magic value (void *)1 to resume where
  * process stopped. Specifying NULL there leads to a crash because
  * process resumes at address 0.
  */
-#ifdef HAVE_SYS_PTRACE_H
+#if defined(HAVE_SYS_PTRACE_H)
 #  ifdef __linux__
 #    define _PTRACE(_x, _y) ptrace(_x, _y, NULL, NULL)
 #    define _PTRACE_DETACH(_x) ptrace(PT_DETACH, _x, NULL, NULL)
-#  elif !defined(__APPLE__) && !defined(HAVE_SYS_PROCCTL_H)
+#  elif !defined(__APPLE__) && !defined(__EMSCRIPTEN__) && !defined(HAVE_SYS_PROCCTL_H)
 #    define _PTRACE(_x, _y) ptrace(_x, _y, NULL, 0)
 #    define _PTRACE_DETACH(_x) ptrace(PT_DETACH, _x, (void *)1, 0)
 #endif
@@ -165,25 +122,44 @@ char const CC_HINT(used) *__lsan_default_suppressions(void)
 {
 	return
 		"leak:CRYPTO_THREAD_lock_new\n"		/* OpenSSL init leak - reported by heaptrack */
+		/* librdkafka initialises Cyrus SASL on first rd_kafka_new(), which dlopens
+		 * libsasl2 and never unloads it.  Not an rlm_kafka bug. */
+		"leak:rd_kafka_sasl_cyrus_global_init\n"
 #if defined(__APPLE__)
+		"leak:*gmtsub*\n"
+		"leak:ImageLoaderMachO::doImageInit\n"
+		"leak:initializeNonMetaClass\n"
+		"leak:_st_tzset_basic\n"
+		"leak:attachCategories\n"
+		"leak:fork\n"
 		"leak:getaddrinfo\n"
 		"leak:getpwuid_r\n"
-		"leak:*gmtsub*\n"
-		"leak:tzsetwall_basic\n"
-		"leak:ImageLoaderMachO::doImageInit\n"
 		"leak:libSystem_atfork_child\n"
-		"leak:fork\n"
-		"leak:tzset\n"
-		"leak:_st_tzset_basic\n"
-		"leak:newlocale\n"
 		"leak:libsystem_notify\n"
+		"leak:load_images\n"
+		"leak:newlocale\n"
 		/* Perl >= 5.32.0 - Upstream bug, tracked by https://github.com/Perl/perl5/issues/18108 */
-		"leak:perl_construct"
+		"leak:perl_construct\n"
+		"leak:realizeClassWithoutSwift\n"
+		"leak:tzset\n"
+		"leak:tzsetwall_basic\n"
+		/* macOS Objective-C runtime and CoreFoundation lazily allocate
+		 * metadata on first class touch (e.g. inside libsasl2 which
+		 * librdkafka dlopens, or on dispatch-apply worker threads).
+		 * These stacks have no symbols, only library paths; suppress by
+		 * path substring since the process-wide state is reclaimed on
+		 * exit by the OS. */
+		"leak:libobjc.A.dylib\n"
+		"leak:CoreFoundation.framework\n"
+		"leak:td::__1::thread::thread\n"
 #elif defined(__linux__)
-		"leak:kqueue\n"
 		"leak:*getpwnam_r*\n"			/* libc startup leak - reported by heaptrack */
+		"leak:_dl_init\n"			/* dl startup leak - reported by heaptrack */
 		"leak:initgroups\n"			/* libc startup leak - reported by heaptrack */
-		"leak:_dl_init"				/* dl startup leak - reported by heaptrack */
+		"leak:kqueue\n"
+		/* libdigestmd5 (cyrus-sasl) calls EVP_CIPHER_fetch on OpenSSL 3.x
+		 * but never calls EVP_CIPHER_free.  Third-party bug; not ours to fix. */
+		"leak:libdigestmd5\n"
 #endif
 		;
 }
@@ -337,7 +313,7 @@ int fr_get_debug_state(void)
 	/* We're being debugged if the P_TRACED flag is set */
 	return ((info.kp_proc.p_flag & P_TRACED) != 0);
 }
-#elif defined(HAVE_SYS_PTRACE_H)
+#elif defined(HAVE_SYS_PTRACE_H) && !defined(__EMSCRIPTEN__)
 /** Determine if we're running under a debugger by attempting to attach using pattach
  *
  * @return
@@ -408,7 +384,6 @@ int fr_get_debug_state(void)
 	if (pid == 0) {
 		int8_t	ret = DEBUGGER_STATE_NOT_ATTACHED;
 		int	ppid = getppid();
-		int	flags;
 
 		/*
 		 *	Disable the leak checker for this forked process
@@ -417,10 +392,6 @@ int fr_get_debug_state(void)
 #ifdef HAVE_SANITIZER_LSAN_INTERFACE_H
 		lsan_disable = true;
 #endif
-
-DIAG_OFF(deprecated-declarations)
-		flags = PT_ATTACH;
-DIAG_ON(deprecated-declarations)
 
 		/* Close parent's side */
 		close(from_child[0]);
@@ -434,42 +405,65 @@ DIAG_ON(deprecated-declarations)
 		 *	a SIGKILL.
 		 */
 		errno = 0;
-		_PTRACE(flags, ppid);
+DIAG_OFF(deprecated-declarations)
+		_PTRACE(PT_ATTACH, ppid);
+DIAG_ON(deprecated-declarations)
 		if (errno == 0) {
 			/* Wait for the parent to stop */
 			waitpid(ppid, NULL, 0);
 
 			/* Tell the parent what happened */
+		send_status:
 			if (write(from_child[1], &ret, sizeof(ret)) < 0) {
-				fprintf(stderr, "Writing ptrace status to parent failed: %s", fr_syserror(errno));
+				fprintf(stderr, "Writing ptrace status to parent failed: %s\n", fr_syserror(errno));
 			}
 
 			/* Detach */
 			_PTRACE_DETACH(ppid);
-			exit(0);
+
+
+			/*
+			*	We call _exit() instead of exit().  This means that we skip the atexit() handlers,
+			*	which don't need to run in a temporary child process.  Skipping them means that we
+			*	avoid dirtying those pages to "clean things up", which is then immediately followed by
+			*	exiting.
+			*
+			*	Skipping the atexit() handlers also means that we're not worried about memory leaks
+			*	because things "aren't cleaned up correctly".  We're not exiting cleanly here (and
+			*	don't care to exit cleanly).  So just exiting with no cleanups is fine.
+			*/
+			_exit(0); /* don't run the atexit() handlers. */
 		/*
-		 *	We could attach because of a permissions issue, we don't know
-		 *      whether we're being traced or not.
+		 *	man ptrace says the following:
+		 *
+		 *	EPERM  The specified process cannot be traced.  This could be
+                 *	because the tracer has insufficient privileges (the
+                 *	required capability is CAP_SYS_PTRACE); unprivileged
+                 *	processes cannot trace processes that they cannot send
+                 *	signals to or those running set-user-ID/set-group-ID
+                 *	programs, for obvious reasons.  Alternatively, the process
+		 *	may already be being traced, or (before Linux 2.6.26) be
+        	 *	init(1) (PID 1).
+		 *
+		 *	In any case, we are very unlikely to be able to attach to
+		 *	the process from the panic action.
+		 *
+		 *	We checked for CAP_SYS_PTRACE previously, so know that
+		 *	we _should_ haven been ablle to attach, so if we can't, it's
+		 *	likely that we're already being traced.
 		 */
 		} else if (errno == EPERM) {
-			ret = DEBUGGER_STATE_UNKNOWN;
-
-			/* Tell the parent what happened */
-			if (write(from_child[1], &ret, sizeof(ret)) < 0) {
-				fprintf(stderr, "Writing ptrace status to parent failed: %s", fr_syserror(errno));
-			}
-
-			_PTRACE_DETACH(ppid);
-			exit(0);
+			ret = DEBUGGER_STATE_ATTACHED;
+			goto send_status;
 		}
 
-		ret = DEBUGGER_STATE_ATTACHED;
-		/* Tell the parent what happened */
-		if (write(from_child[1], &ret, sizeof(ret)) < 0) {
-			fprintf(stderr, "Writing ptrace status to parent failed: %s", fr_syserror(errno));
-		}
-
-		exit(0);
+		/*
+		 *	Unexpected error, we don't know whether we're already running
+		 * 	under a debugger or not...
+		 */
+		ret = DEBUGGER_STATE_UNKNOWN;
+		fprintf(stderr, "Debugger check failed to attach to parent with unexpected error: %s\n", fr_syserror(errno));
+		goto send_status;
 	/* Parent */
 	} else {
 		int8_t ret = DEBUGGER_STATE_UNKNOWN;
@@ -493,7 +487,7 @@ DIAG_ON(deprecated-declarations)
 	}
 }
 #else
-static int fr_get_debug_state(void)
+int fr_get_debug_state(void)
 {
 	fr_strerror_const("PTRACE not available");
 
@@ -567,124 +561,6 @@ void fr_debug_break(bool always)
 	}
 }
 
-#ifdef HAVE_EXECINFO
-/** Print backtrace entry for a given object
- *
- * @param fring to search in.
- * @param obj pointer to original object
- */
-void backtrace_print(fr_fring_t *fring, void *obj)
-{
-	fr_bt_info_t *p;
-	bool found = false;
-
-	while ((p = fr_fring_next(fring))) {
-		if ((p->obj == obj) || !obj) {
-			found = true;
-
-			fprintf(stderr, "Stacktrace for: %p\n", p->obj);
-			backtrace_symbols_fd(p->frames, p->count, STDERR_FILENO);
-		}
-	};
-
-	if (!found) {
-		fprintf(stderr, "No backtrace available for %p", obj);
-	}
-}
-
-/** Generate a backtrace for an object
- *
- * If this is the first entry being inserted
- */
-int fr_backtrace_do(fr_bt_marker_t *marker)
-{
-	fr_bt_info_t *bt;
-
-	if (!fr_cond_assert(marker->obj) || !fr_cond_assert(marker->fring)) return -1;
-
-	bt = talloc_zero(NULL, fr_bt_info_t);
-	if (!bt) return -1;
-
-	bt->obj = marker->obj;
-	bt->count = backtrace(bt->frames, MAX_BT_FRAMES);
-
-	fr_fring_overwrite(marker->fring, bt);
-
-	return 0;
-}
-
-/** Inserts a backtrace marker into the provided context
- *
- * Allows for maximum laziness and will initialise a circular buffer if one has not already been created.
- *
- * Code augmentation should look something like:
-@verbatim
-	// Create a static fringer pointer, the first call to backtrace_attach will initialise it
-	static fr_fring_t *my_obj_bt;
-
-	my_obj_t *alloc_my_obj(TALLOC_CTX *ctx) {
-		my_obj_t *this;
-
-		this = talloc(ctx, my_obj_t);
-
-		// Attach backtrace marker to object
-		backtrace_attach(&my_obj_bt, this);
-
-		return this;
-	}
-@endverbatim
- *
- * Then, later when a double free occurs:
-@verbatim
-	(gdb) call backtrace_print(&my_obj_bt, <pointer to double freed memory>)
-@endverbatim
- *
- * which should print a limited backtrace to stderr. Note, this backtrace will not include any argument
- * values, but should at least show the code path taken.
- *
- * @param fring this should be a pointer to a static *fr_fring_buffer.
- * @param obj we want to generate a backtrace for.
- */
-fr_bt_marker_t *fr_backtrace_attach(fr_fring_t **fring, TALLOC_CTX *obj)
-{
-	fr_bt_marker_t *marker;
-
-	if (*fring == NULL) {
-		pthread_mutex_lock(&fr_debug_init);
-		/* Check again now we hold the mutex - eww*/
-		if (*fring == NULL) *fring = fr_fring_alloc(NULL, MAX_BT_CBUFF, true);
-		pthread_mutex_unlock(&fr_debug_init);
-	}
-
-	marker = talloc(obj, fr_bt_marker_t);
-	if (!marker) {
-		return NULL;
-	}
-
-	marker->obj = (void *) obj;
-	marker->fring = *fring;
-
-	fprintf(stderr, "Backtrace attached to %s %p\n", talloc_get_name(obj), obj);
-	/*
-	 *	Generate the backtrace for memory allocation
-	 */
-	fr_backtrace_do(marker);
-	talloc_set_destructor(marker, fr_backtrace_do);
-
-	return marker;
-}
-#else
-void backtrace_print(UNUSED fr_fring_t *fring, UNUSED void *obj)
-{
-	fprintf(stderr, "Server built without fr_backtrace_* support, requires execinfo.h and possibly -lexecinfo\n");
-}
-fr_bt_marker_t *fr_backtrace_attach(UNUSED fr_fring_t **fring, UNUSED TALLOC_CTX *obj)
-{
-	fprintf(stderr, "Server built without fr_backtrace_* support, requires execinfo.h and possibly -lexecinfo\n");
-	abort();
-}
-#endif /* ifdef HAVE_EXECINFO */
-
 static int _panic_on_free(UNUSED char *foo)
 {
 	fr_fault(SIGABRT);
@@ -708,7 +584,7 @@ void fr_panic_on_free(TALLOC_CTX *ctx)
  *
  * @param dumpable whether we should allow core dumping
  */
-#if defined(HAVE_SYS_PRCTL_H) && defined(PR_SET_DUMPABLE)
+#if defined(HAVE_SYS_PRCTL_H) && defined(PR_SET_DUMPABLE) && !defined(__EMSCRIPTEN__)
 static int fr_set_pr_dumpable_flag(bool dumpable)
 {
 	if (prctl(PR_SET_DUMPABLE, dumpable ? 1 : 0) < 0) {
@@ -743,7 +619,7 @@ static int fr_set_pr_dumpable_flag(UNUSED bool dumpable)
 /** Get the processes dumpable flag
  *
  */
-#if defined(HAVE_SYS_PRCTL_H) && defined(PR_GET_DUMPABLE)
+#if defined(HAVE_SYS_PRCTL_H) && defined(PR_GET_DUMPABLE) && !defined(__EMSCRIPTEN__)
 static int fr_get_pr_dumpable_flag(void)
 {
 	int ret;
@@ -811,45 +687,48 @@ int fr_set_dumpable(bool allow_core_dumps)
 	dump_core = allow_core_dumps;
 
 #ifdef HAVE_SYS_RESOURCE_H
-	struct rlimit current;
+	{
+		struct rlimit current;
 
-	/*
-	 *	Reset the core limits (or disable them)
-	 */
-	if (getrlimit(RLIMIT_CORE, &current) < 0) {
-		fr_strerror_printf("Failed to get current core limit:  %s", fr_syserror(errno));
-		return -1;
-	}
+		/*
+		 *	Reset the core limits (or disable them)
+		 */
+		if (getrlimit(RLIMIT_CORE, &current) < 0) {
+			fr_strerror_printf("Failed to get current core limit:  %s", fr_syserror(errno));
+			return -1;
+		}
 
-	if (allow_core_dumps) {
-		if ((current.rlim_cur != init_core_limit.rlim_cur) || (current.rlim_max != init_core_limit.rlim_max)) {
-			if (setrlimit(RLIMIT_CORE, &init_core_limit) < 0) {
-				fr_strerror_printf("Cannot update core dump limit: %s", fr_syserror(errno));
+		if (allow_core_dumps) {
+			if ((current.rlim_cur != init_core_limit.rlim_cur) ||
+			    (current.rlim_max != init_core_limit.rlim_max)) {
+				if (setrlimit(RLIMIT_CORE, &init_core_limit) < 0) {
+					fr_strerror_printf("Cannot update core dump limit: %s", fr_syserror(errno));
+
+					return -1;
+				}
+			}
+		/*
+		 *	We've been told to disable core dumping,
+		 *	rlim_cur is not set to zero.
+		 *
+		 *	Set rlim_cur to zero, but leave rlim_max
+		 *	set to whatever the current value is.
+		 *
+		 *	This is because, later, we may need to
+		 *	re-enable core dumps to allow the debugger
+		 *	to attach *sigh*.
+		 */
+		} else if (current.rlim_cur != 0) {
+			struct rlimit no_core;
+
+			no_core.rlim_cur = 0;
+			no_core.rlim_max = current.rlim_max;
+
+			if (setrlimit(RLIMIT_CORE, &no_core) < 0) {
+				fr_strerror_printf("Failed disabling core dumps: %s", fr_syserror(errno));
 
 				return -1;
 			}
-		}
-	/*
-	 *	We've been told to disable core dumping,
-	 *	rlim_cur is not set to zero.
-	 *
-	 *	Set rlim_cur to zero, but leave rlim_max
-	 *	set to whatever the current value is.
-	 *
-	 *	This is because, later, we may need to
-	 *	re-enable core dumps to allow the debugger
-	 *	to attach *sigh*.
-	 */
-	} else if (current.rlim_cur != 0) {
-		struct rlimit no_core;
-
-		no_core.rlim_cur = 0;
-		no_core.rlim_max = current.rlim_max;
-
-		if (setrlimit(RLIMIT_CORE, &no_core) < 0) {
-			fr_strerror_printf("Failed disabling core dumps: %s", fr_syserror(errno));
-
-			return -1;
 		}
 	}
 #endif
@@ -961,26 +840,7 @@ NEVER_RETURNS void fr_fault(int sig)
 	 */
 	if (panic_cb && (panic_cb(sig) < 0)) goto finish;
 
-	/*
-	 *	Produce a simple backtrace - They're very basic but at least give us an
-	 *	idea of the area of the code we hit the issue in.
-	 *
-	 *	See below in fr_fault_setup() and
-	 *	https://sourceware.org/bugzilla/show_bug.cgi?id=16159
-	 *	for why we only print backtraces in debug builds if we're using GLIBC.
-	 */
-#if defined(HAVE_EXECINFO) && (!defined(NDEBUG) || !defined(__GNUC__))
-	if (fr_fault_log_fd >= 0) {
-		size_t frame_count;
-		void *stack[MAX_BT_FRAMES];
-
-		frame_count = backtrace(stack, MAX_BT_FRAMES);
-
-		FR_FAULT_LOG("Backtrace of last %zu frames:", frame_count);
-
-		backtrace_symbols_fd(stack, frame_count, fr_fault_log_fd);
-	}
-#endif
+	fr_backtrace();
 
 	/* No panic action set... */
 	if (panic_action[0] == '\0') {
@@ -1075,16 +935,7 @@ static void _fr_talloc_fault_simple(char const *reason)
 {
 	FR_FAULT_LOG("talloc abort: %s\n", reason);
 
-#if defined(HAVE_EXECINFO) && (!defined(NDEBUG) || !defined(__GNUC__))
-	if (fr_fault_log_fd >= 0) {
-		size_t frame_count;
-		void *stack[MAX_BT_FRAMES];
-
-		frame_count = backtrace(stack, MAX_BT_FRAMES);
-		FR_FAULT_LOG("Backtrace of last %zu frames:", frame_count);
-		backtrace_symbols_fd(stack, frame_count, fr_fault_log_fd);
-	}
-#endif
+	fr_backtrace();
 	abort();
 }
 
@@ -1159,7 +1010,7 @@ int fr_log_talloc_report(TALLOC_CTX const *ctx)
 			talloc_report_full(ctx, log);
 		} while ((ctx = talloc_parent(ctx)) &&
 			 (i < TALLOC_REPORT_MAX_DEPTH) &&
-			 (talloc_parent(ctx) != talloc_autofree_ctx) &&	/* Stop before we hit the autofree ctx */
+			 (talloc_parent(ctx) != talloc_autofree_context_global()) &&	/* Stop before we hit the autofree ctx */
 			 (talloc_parent(ctx) != talloc_null_ctx()));  	/* Stop before we hit NULL ctx */
 	}
 
@@ -1167,7 +1018,6 @@ int fr_log_talloc_report(TALLOC_CTX const *ctx)
 
 	return 0;
 }
-
 
 static int _disable_null_tracking(UNUSED bool *p)
 {
@@ -1204,16 +1054,21 @@ void fr_talloc_fault_setup(void)
  *
  * May be called multiple time to change the panic_action/program.
  *
- * @param[in] ctx	to allocate autofreeable resources in.
- * @param[in] cmd	to execute on fault. If present %p will be substituted
- *      		for the parent PID before the command is executed, and %e
- *      		will be substituted for the currently running program.
- * @param program Name of program currently executing (argv[0]).
+ * @param[in] ctx		to allocate autofreeable resources in.
+ * @param[in] cmd		to execute on fault. If present %p will be substituted
+ *      			for the parent PID before the command is executed, and %e
+ *      			will be substituted for the currently running program.
+ * @param[in] program		Name of program currently executing (argv[0]).
+ * @param[in] fault_signals	Bitmask (bit N = signal N) of signals to install the
+ *				panic-action handler on. Callers pass
+ *				#PANIC_ACTION_SIGNALS unless they need to leave a
+ *				specific signal's handler alone (e.g. the fuzzer
+ *				shares SIGALRM with libFuzzer's own timeout).
  * @return
  *	- 0 on success.
  *	- -1 on failure.
  */
-int fr_fault_setup(TALLOC_CTX *ctx, char const *cmd, char const *program)
+int fr_fault_setup(TALLOC_CTX *ctx, char const *cmd, char const *program, unsigned long fault_signals)
 {
 	static bool setup = false;
 
@@ -1281,22 +1136,41 @@ int fr_fault_setup(TALLOC_CTX *ctx, char const *cmd, char const *program)
 		default:
 		case DEBUGGER_STATE_NOT_ATTACHED:
 #ifdef SIGABRT
-			if (fr_set_signal(SIGABRT, fr_fault) < 0) return -1;
+			if (fault_signals & (1UL << SIGABRT)) {
+				if (fr_set_signal(SIGABRT, fr_fault) < 0) return -1;
 
-			/*
-			 *  Use this instead of abort so we get a
-			 *  full backtrace with broken versions of LLDB
-			 */
-			talloc_set_abort_fn(_fr_talloc_fault);
+				/*
+				 *  Use this instead of abort so we get a
+				 *  full backtrace with broken versions of LLDB
+				 */
+				talloc_set_abort_fn(_fr_talloc_fault);
+			}
 #endif
 #ifdef SIGILL
-			if (fr_set_signal(SIGILL, fr_fault) < 0) return -1;
+			if ((fault_signals & (1UL << SIGILL)) &&
+			    (fr_set_signal(SIGILL, fr_fault) < 0)) return -1;
 #endif
 #ifdef SIGFPE
-			if (fr_set_signal(SIGFPE, fr_fault) < 0) return -1;
+			if ((fault_signals & (1UL << SIGFPE)) &&
+			    (fr_set_signal(SIGFPE, fr_fault) < 0)) return -1;
 #endif
 #ifdef SIGSEGV
-			if (fr_set_signal(SIGSEGV, fr_fault) < 0) return -1;
+			if ((fault_signals & (1UL << SIGSEGV)) &&
+			    (fr_set_signal(SIGSEGV, fr_fault) < 0)) return -1;
+#endif
+#ifdef SIGBUS
+			if ((fault_signals & (1UL << SIGBUS)) &&
+			    (fr_set_signal(SIGBUS, fr_fault) < 0)) return -1;
+#endif
+#ifdef SIGALRM
+			/*
+			 *  Used by jlibtool to terminate processes
+			 *  that have been running too long. The fuzzer
+			 *  clears this bit so libFuzzer's own SIGALRM
+			 *  timeout handler stays in place.
+			 */
+			if ((fault_signals & (1UL << SIGALRM)) &&
+			    (fr_set_signal(SIGALRM, fr_fault) < 0)) return -1;
 #endif
 			break;
 
@@ -1315,26 +1189,14 @@ int fr_fault_setup(TALLOC_CTX *ctx, char const *cmd, char const *program)
 		 *  uninitialised and freed memory, to make memory issues easier
 		 *  to track down.
 		 */
+#  ifdef M_PERTURB
 		if (!getenv("TALLOC_FREE_FILL")) mallopt(M_PERTURB, 0x42);
+#  endif
+#  ifdef M_CHECK_ACTION
 		mallopt(M_CHECK_ACTION, 3);
+#  endif
 #endif
-
-#if defined(HAVE_EXECINFO) && defined(__GNUC__) && !defined(NDEBUG)
-	       /*
-		*  We need to pre-load lgcc_s, else we can get into a deadlock
-		*  in fr_fault, as backtrace() attempts to dlopen it.
-		*
-		*  Apparently there's a performance impact of loading lgcc_s,
-		*  so only do it if this is a debug build.
-		*
-		*  See: https://sourceware.org/bugzilla/show_bug.cgi?id=16159
-		*/
-		{
-			void *stack[10];
-
-			backtrace(stack, 10);
-		}
-#endif
+		fr_backtrace_init(program);
 	}
 	setup = true;
 
@@ -1377,16 +1239,16 @@ void fr_fault_log(char const *msg, ...)
 void fr_fault_log_hex(uint8_t const *data, size_t data_len)
 {
 	size_t		i, j, len;
-	char		*p;
 	char		buffer[(0x10 * 3) + 1];
+	char		*p, *end = buffer + sizeof(buffer);
 
 	for (i = 0; i < data_len; i += 0x10) {
 		len = 0x10;
 		if ((i + len) > data_len) len = data_len - i;
 
-		for (p = buffer, j = 0; j < len; j++, p += 3) sprintf(p, "%02x ", data[i + j]);
+		for (p = buffer, j = 0; j < len; j++, p += 3) snprintf(p, end - p, "%02x ", data[i + j]);
 
-		dprintf(fr_fault_log_fd, "%04x: %s\n", (int)i, buffer);
+		dprintf(fr_fault_log_fd, "%04x: %s\n", (unsigned int) i, buffer);
 	}
 }
 
@@ -1419,19 +1281,19 @@ bool _fr_assert_fail(char const *file, int line, char const *expr, char const *m
 		va_end(ap);
 
 #ifndef NDEBUG
-		FR_FAULT_LOG("ASSERT FAILED %s[%u]: %s: %s", file, line, expr, str);
+		FR_FAULT_LOG("ASSERT FAILED %s[%d]: %s: %s", file, line, expr, str);
 		fr_fault(SIGABRT);
 #else
-		FR_FAULT_LOG("ASSERT WOULD FAIL %s[%u]: %s: %s", file, line, expr, str);
+		FR_FAULT_LOG("ASSERT WOULD FAIL %s[%d]: %s: %s", file, line, expr, str);
 		return false;
 #endif
 	}
 
 #ifndef NDEBUG
-	FR_FAULT_LOG("ASSERT FAILED %s[%u]: %s", file, line, expr);
+	FR_FAULT_LOG("ASSERT FAILED %s[%d]: %s", file, line, expr);
 	fr_fault(SIGABRT);
 #else
-	FR_FAULT_LOG("ASSERT WOULD FAIL %s[%u]: %s", file, line, expr);
+	FR_FAULT_LOG("ASSERT WOULD FAIL %s[%d]: %s", file, line, expr);
 	return false;
 #endif
 }
@@ -1454,9 +1316,9 @@ void _fr_assert_fatal(char const *file, int line, char const *expr, char const *
 		(void)vsnprintf(str, sizeof(str), msg, ap);
 		va_end(ap);
 
-		FR_FAULT_LOG("FATAL ASSERT %s[%u]: %s: %s", file, line, expr, str);
+		FR_FAULT_LOG("FATAL ASSERT %s[%d]: %s: %s", file, line, expr, str);
 	} else {
-		FR_FAULT_LOG("FATAL ASSERT %s[%u]: %s", file, line, expr);
+		FR_FAULT_LOG("FATAL ASSERT %s[%d]: %s", file, line, expr);
 	}
 
 #ifdef NDEBUG
@@ -1482,10 +1344,10 @@ NEVER_RETURNS void _fr_exit(char const *file, int line, int status, bool now)
 		char const *error = fr_strerror();
 
 		if (error && *error && (status != 0)) {
-			FR_FAULT_LOG("%sEXIT(%i) CALLED %s[%u].  Last error was: %s", now ? "_" : "",
+			FR_FAULT_LOG("%sEXIT(%i) CALLED %s[%d].  Last error was: %s", now ? "_" : "",
 				     status, file, line, error);
 		} else {
-			FR_FAULT_LOG("%sEXIT(%i) CALLED %s[%u]", now ? "_" : "", status, file, line);
+			FR_FAULT_LOG("%sEXIT(%i) CALLED %s[%d]", now ? "_" : "", status, file, line);
 		}
 
 		fr_debug_break(false);	/* If running under GDB we'll break here */
@@ -1503,44 +1365,3 @@ NEVER_RETURNS void _fr_exit(UNUSED char const *file, UNUSED int line, int status
 	exit(status);
 }
 #endif
-
-/*
- *	Sign a structure, but skip _signature at "offset".
- */
-static uint32_t fr_hash_struct(void const *ptr, size_t size, size_t offset)
-{
-	uint32_t hash;
-
-	/*
-	 *	Hash entry is at the end of the structure, that's
-	 *	best...
-	 */
-	if ((size + 4) == offset) {
-		return fr_hash(ptr, size);
-	}
-
-	hash = fr_hash(ptr, offset);
-	return fr_hash_update(((uint8_t const *) ptr) + offset + 4, size - (offset + 4), hash);
-}
-
-void fr_sign_struct(void *ptr, size_t size, size_t offset)
-{
-	*(uint32_t *) (((uint8_t *) ptr) + offset) = fr_hash_struct(ptr, size, offset);
-}
-
-void fr_verify_struct(void const *ptr, size_t size, size_t offset)
-{
-	uint32_t hash;
-
-	hash = fr_hash_struct(ptr, size, offset);
-
-	(void) fr_cond_assert(hash == *(uint32_t const *) (((uint8_t const *) ptr) + offset));
-}
-
-void fr_verify_struct_member(void const *ptr, size_t len, uint32_t *signature)
-{
-	uint32_t hash;
-
-	hash = fr_hash(ptr, len);
-	(void) fr_cond_assert(hash == *signature);
-}

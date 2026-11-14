@@ -28,11 +28,12 @@ RCSIDH(types_h, "$Id$")
 extern "C" {
 #endif
 
-#include <stdbool.h>
+#include <freeradius-devel/util/table.h>
+#include <freeradius-devel/util/talloc.h>
 
 /** Internal data types
  */
-typedef enum {
+typedef enum : uint8_t {
 	FR_TYPE_NULL = 0,			//!< Invalid (uninitialised) attribute type.
 
 	FR_TYPE_STRING,				//!< String of printable characters.
@@ -77,10 +78,16 @@ typedef enum {
 	FR_TYPE_VENDOR,				//!< Attribute that represents a vendor in the attribute tree.
 
 	FR_TYPE_GROUP,				//!< A grouping of other attributes
+	FR_TYPE_UNION,				//!< A union of limited children
 	FR_TYPE_VALUE_BOX,			//!< A boxed value.
+	FR_TYPE_ATTR,				//!< A contains an attribute reference
 
 	FR_TYPE_VOID,				//!< User data.  Should be a talloced chunk
 						///< assigned to the ptr value of the union.
+
+	FR_TYPE_VALUE_BOX_CURSOR,   		//!< cursor over a #fr_value_box_t
+
+	FR_TYPE_PAIR_CURSOR,   			//!< cursor over a #fr_pair_t
 
 	FR_TYPE_MAX				//!< Number of defined data types.
 } fr_type_t;
@@ -119,6 +126,21 @@ typedef enum {
 #define FR_TYPE_INTEGER_DEF(_beg, _mid, _end) \
 	_beg(FR_TYPE_BOOL) \
 	FR_TYPE_INTEGER_EXCEPT_BOOL_DEF(_mid, _mid, _end)
+
+/** Signed values
+ *
+ * - Int8, 16, 32, 64
+ * - Deltas
+ * - Floats
+ */
+#define FR_TYPE_SIGNED_DEF(_beg, _mid, _end) \
+	_beg(FR_TYPE_INT8) \
+	_mid(FR_TYPE_INT16) \
+	_mid(FR_TYPE_INT32) \
+	_mid(FR_TYPE_INT64) \
+	_mid(FR_TYPE_TIME_DELTA) \
+	_mid(FR_TYPE_FLOAT32) \
+	_end(FR_TYPE_FLOAT64)
 
 /** Naturally numeric types
  *
@@ -198,6 +220,21 @@ typedef enum {
 	_beg(FR_TYPE_GROUP) \
 	_mid(FR_TYPE_STRUCT) \
 	_mid(FR_TYPE_TLV) \
+	_mid(FR_TYPE_UNION) \
+	_end(FR_TYPE_VENDOR)
+
+/** Hack for truthiness check
+ *
+ * - VSAs
+ * - Structs
+ * - TLVs
+ * - Vendors
+ */
+#define FR_TYPE_STRUCTURAL_EXCEPT_GROUP_DEF(_beg, _mid, _end) \
+	_beg(FR_TYPE_VSA) \
+	_mid(FR_TYPE_STRUCT) \
+	_mid(FR_TYPE_TLV) \
+	_mid(FR_TYPE_UNION) \
 	_end(FR_TYPE_VENDOR)
 
 /** Match all non value types in case statements
@@ -222,9 +259,23 @@ typedef enum {
 #define FR_TYPE_LEAF_DEF(_beg, _mid, _end) \
 	_beg(FR_TYPE_ETHERNET) \
 	_mid(FR_TYPE_IFID) \
+	_mid(FR_TYPE_ATTR) \
 	FR_TYPE_IP_DEF(_mid, _mid, _mid) \
 	FR_TYPE_VARIABLE_SIZE_DEF(_mid, _mid, _mid) \
 	FR_TYPE_NUMERIC_DEF(_mid, _mid, _end)
+
+/** Types which are internal, and should not be used for real data.
+ *
+ * - Boxes (can represent any type)
+ * - Void (opaque types)
+ * - Invalid values
+ */
+#define FR_TYPE_INTERNAL_DEF(_beg, _mid, _end) \
+	_beg(FR_TYPE_VALUE_BOX) \
+	_mid(FR_TYPE_VOID) \
+	_mid(FR_TYPE_VALUE_BOX_CURSOR) \
+	_mid(FR_TYPE_PAIR_CURSOR) \
+	_end(FR_TYPE_MAX)
 
 /** Types which do not represent leaf values
  *
@@ -235,11 +286,10 @@ typedef enum {
  * - Invalid values
  */
 #define FR_TYPE_NON_LEAF_DEF(_beg, _mid, _end) \
-	_beg(FR_TYPE_VALUE_BOX) \
-	_mid(FR_TYPE_VOID) \
-	_mid(FR_TYPE_NULL) \
-	_mid(FR_TYPE_MAX) \
+	_beg(FR_TYPE_NULL) \
+	FR_TYPE_INTERNAL_DEF(_mid, _mid, _mid) \
 	FR_TYPE_STRUCTURAL_DEF(_mid, _mid, _end)
+
 /** @} */
 
 /** @name Macros that emit multiple case statements to group types
@@ -252,6 +302,7 @@ typedef enum {
 
 #define FR_TYPE_INTEGER_EXCEPT_BOOL		FR_TYPE_INTEGER_EXCEPT_BOOL_DEF(CASE_BEG, CASE_MID, CASE_END)
 #define FR_TYPE_INTEGER				FR_TYPE_INTEGER_DEF(CASE_BEG, CASE_MID, CASE_END)
+#define FR_TYPE_SIGNED				FR_TYPE_SIGNED_DEF(CASE_BEG, CASE_MID, CASE_END)
 #define FR_TYPE_NUMERIC				FR_TYPE_NUMERIC_DEF(CASE_BEG, CASE_MID, CASE_END)
 
 #define FR_TYPE_IP				FR_TYPE_IP_DEF(CASE_BEG, CASE_MID, CASE_END)
@@ -261,9 +312,11 @@ typedef enum {
 #define FR_TYPE_QUOTED				FR_TYPE_QUOTED_DEF(CASE_BEG, CASE_MID, CASE_END)
 
 #define FR_TYPE_STRUCTURAL_EXCEPT_VSA		FR_TYPE_STRUCTURAL_EXCEPT_VSA_DEF(CASE_BEG, CASE_MID, CASE_END)
+#define FR_TYPE_STRUCTURAL_EXCEPT_GROUP		FR_TYPE_STRUCTURAL_EXCEPT_GROUP_DEF(CASE_BEG, CASE_MID, CASE_END)
 #define FR_TYPE_STRUCTURAL			FR_TYPE_STRUCTURAL_DEF(CASE_BEG, CASE_MID, CASE_END)
 #define FR_TYPE_LEAF				FR_TYPE_LEAF_DEF(CASE_BEG, CASE_MID, CASE_END)
 #define FR_TYPE_NON_LEAF			FR_TYPE_NON_LEAF_DEF(CASE_BEG, CASE_MID, CASE_END)
+#define FR_TYPE_INTERNAL			FR_TYPE_INTERNAL_DEF(CASE_BEG, CASE_MID, CASE_END)
 /** @} */
 
 /** @name Bool arrays that group types
@@ -272,6 +325,7 @@ typedef enum {
  */
 extern bool const fr_type_integer_except_bool[FR_TYPE_MAX + 1];
 extern bool const fr_type_integer[FR_TYPE_MAX + 1];
+extern bool const fr_type_signed[FR_TYPE_MAX + 1];
 extern bool const fr_type_numeric[FR_TYPE_MAX + 1];
 
 extern bool const fr_type_ip[FR_TYPE_MAX + 1];
@@ -326,6 +380,7 @@ extern bool const fr_type_non_leaf[FR_TYPE_MAX + 1];
 #define fr_type_is_integer_except_bool(_x)	(fr_type_integer_except_bool[_x])
 #define fr_type_is_integer(_x)			(fr_type_integer[_x])
 #define fr_type_is_numeric(_x)			(fr_type_numeric[_x])
+#define fr_type_is_signed(_x)			(fr_type_signed[_x])
 
 #define fr_type_is_ip(_x)			(fr_type_ip[_x])
 
@@ -339,8 +394,97 @@ extern bool const fr_type_non_leaf[FR_TYPE_MAX + 1];
 #define fr_type_is_non_leaf(_x)			(fr_type_non_leaf[_x])
 /** @} */
 
+/** Given a variable, return the equivalent FR_TYPE_* value
+ *
+ * @note Does not work for:
+ * - size_t / FR_TYPE_SIZE - Conflicts with other integers on many systems.
+ * - fr_ipaddr_t - Too many potential type mappings.
+ * - tmpl_t - Not an FR_TYPE_*.
+ *
+ * @param[in] _ct variable to translate.
+ */
+#  define FR_CTYPE_TO_TYPE(_ct) \
+_Generic(&(_ct), \
+	fr_ethernet_t *		: FR_TYPE_ETHERNET, \
+	fr_ethernet_t **	: FR_TYPE_ETHERNET, \
+	fr_ifid_t *		: FR_TYPE_IFID, \
+	fr_ifid_t **		: FR_TYPE_IFID, \
+	fr_time_t *		: FR_TYPE_DATE, \
+	fr_time_t **		: FR_TYPE_DATE, \
+	fr_time_delta_t *	: FR_TYPE_TIME_DELTA, \
+	fr_time_delta_t **	: FR_TYPE_TIME_DELTA, \
+	char const **		: FR_TYPE_STRING, \
+	char const ***		: FR_TYPE_STRING, \
+	bool *			: FR_TYPE_BOOL, \
+	bool **			: FR_TYPE_BOOL, \
+	uint8_t const **	: FR_TYPE_OCTETS, \
+	uint8_t const ***	: FR_TYPE_OCTETS, \
+	uint8_t *		: FR_TYPE_UINT8, \
+	uint8_t **		: FR_TYPE_UINT8, \
+	uint16_t *		: FR_TYPE_UINT16, \
+	uint16_t **		: FR_TYPE_UINT16, \
+	uint32_t * 		: FR_TYPE_UINT32, \
+	uint32_t **		: FR_TYPE_UINT32, \
+	uint64_t *		: FR_TYPE_UINT64, \
+	uint64_t **		: FR_TYPE_UINT64, \
+	int8_t *		: FR_TYPE_INT8, \
+	int8_t **		: FR_TYPE_INT8, \
+	int16_t	*		: FR_TYPE_INT16, \
+	int16_t **		: FR_TYPE_INT16, \
+	int32_t	*		: FR_TYPE_INT32, \
+	int32_t **		: FR_TYPE_INT32, \
+	int64_t	*		: FR_TYPE_INT64, \
+	int64_t **		: FR_TYPE_INT64, \
+	float *			: FR_TYPE_FLOAT32, \
+	float **		: FR_TYPE_FLOAT32, \
+	double *		: FR_TYPE_FLOAT64, \
+	double **		: FR_TYPE_FLOAT64, \
+	default			: FR_TYPE_VOID )
+
+extern fr_table_num_ordered_t const fr_type_table[];
+extern size_t fr_type_table_len;
+
+/** Return a static string containing the type name
+ *
+ * @param[in] type to return name for.
+ * @return name of the type
+ *
+ * @hidecallergraph
+ */
+static inline char const *fr_type_to_str(fr_type_t type)
+{
+	return fr_table_str_by_value(fr_type_table, type, "<INVALID>");
+}
+
+/** Return the source-identifier name for a type (e.g. "FR_TYPE_STRING").
+ *
+ * Counterpart to fr_type_to_str() which returns the short config-file
+ * form ("string", "ipv4addr", ...).  This is what tooling that wants
+ * to grep the v4 source tree by enum identifier should emit (radmod2json
+ * in particular).
+ *
+ * @param[in] t	type to look up.
+ * @return	the enum-identifier name, or "FR_TYPE_NULL" if `t` is
+ *		out of range.
+ *
+ * @hidecallergraph
+ */
+char const *fr_type_to_enum_str(fr_type_t t);
+
+/** Return the constant value representing a type
+ *
+ * @param[in] type to return the constant value for.
+ * @return The constant type value or FR_TYPE_NULL if no type matches.
+ */
+static inline fr_type_t fr_type_from_str(char const *type)
+{
+	return fr_table_value_by_str(fr_type_table, type, FR_TYPE_NULL);
+}
+
 bool		fr_type_cast(fr_type_t dst, fr_type_t src);
 fr_type_t	fr_type_promote(fr_type_t a, fr_type_t b);
+
+void		**fr_type_array_alloc(TALLOC_CTX *ctx, fr_type_t type, size_t count);
 
 #ifdef __cplusplus
 }

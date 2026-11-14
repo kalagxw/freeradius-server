@@ -16,6 +16,73 @@ AC_DEFUN([AX_CC_IS_CLANG],[
 ])
 
 dnl #
+dnl # gcc >= 14 and clang >= 18 accept -std=c23.  gcc 13 and clang 17 only
+dnl # accept the draft spelling -std=c2x, so fall back to that.  Both test
+dnl # programs use a fixed underlying enum type: the codebase relies on the
+dnl # feature, and older compilers (e.g. gcc 12) accept -std=c2x without
+dnl # implementing it, so the flag alone proves nothing.
+dnl #
+dnl # The probe adds -Werror, and rpm builds inject -Wall through CFLAGS,
+dnl # so every variable in the test programs must be used or the probe
+dnl # fails on unused-variable warnings.
+dnl #
+AC_DEFUN([AX_CC_STD_C23],[
+  AC_CACHE_CHECK([for the compiler flag to enable C23 support], [ax_cv_cc_std_c23_flag],[
+    ax_cv_cc_std_c23_flag=
+
+    CFLAGS_SAVED=$CFLAGS
+    CFLAGS="$CFLAGS -Werror -std=c23"
+
+    AC_LANG_PUSH(C)
+    AC_TRY_COMPILE(
+      [],
+      [
+        enum : signed char {
+          FOO_A = -128,
+          FOO_B = 1
+        } foo = FOO_A;
+
+        struct bar {
+          union {
+            int a;
+            int b;
+          };
+        } baz;
+
+        baz.a = (int)foo;
+        return baz.a;
+      ],
+      [ax_cv_cc_std_c23_flag="-std=c23"])
+
+    if test "x$ax_cv_cc_std_c23_flag" = x; then
+      CFLAGS="$CFLAGS_SAVED -Werror -std=c2x"
+      AC_TRY_COMPILE(
+        [],
+        [
+          enum : signed char {
+            FOO_A = -128,
+            FOO_B = 1
+          } foo = FOO_A;
+
+          struct bar {
+            union {
+              int a;
+              int b;
+            };
+          } baz;
+
+          baz.a = (int)foo;
+          return baz.a;
+        ],
+        [ax_cv_cc_std_c23_flag="-std=c2x"])
+    fi
+
+    AC_LANG_POP
+    CFLAGS="$CFLAGS_SAVED"
+  ])
+])
+
+dnl #
 dnl # clang and gcc originally used different flags to specify c11 support
 dnl #
 AC_DEFUN([AX_CC_STD_C11],[
@@ -59,12 +126,38 @@ AC_DEFUN([AX_CC_STD_C11],[
 ])
 
 dnl #
+dnl # clang and gcc originally used different flags to specify c11 support
+dnl #
+AC_DEFUN([AX_CC_UNWINDLIB_ARG],[
+  AC_CACHE_CHECK([if the compiler accepts --unwindlib], [ax_cv_cc_unwindlib_arg],[
+    LDFLAGS_SAVED=$LDFLAGS
+    LDFLAGS="$LDFLAGS -Werror --rtlib=compiler-rt --unwindlib=libunwind"
+
+    AC_LINK_IFELSE(
+    [
+      AC_LANG_SOURCE(
+      [
+        int main(int argc, char **argv) {
+          return 0;
+        }
+      ])
+    ],
+      [ax_cv_cc_unwindlib_arg=yes],
+      [ax_cv_cc_unwindlib_arg=no]
+    )
+
+    LDFLAGS="$LDFLAGS_SAVED"
+  ])
+])
+
+
+dnl #
 dnl #  Check if we have the _Generic construct
 dnl #
 AC_DEFUN([AX_CC_HAVE_C11_GENERIC],
 [
 AC_CACHE_CHECK([for _Generic support in compiler], [ax_cv_cc_c11_generic],[
-  AC_RUN_IFELSE(
+  AC_COMPILE_IFELSE(
     [
       AC_LANG_SOURCE(
       [
@@ -126,13 +219,29 @@ AC_DEFUN([AX_CC_NO_UNKNOWN_WARNING_OPTION_FLAG],[
   ])
 ])
 
+AC_DEFUN([AX_CC_WDECLARATION_AFTER_STATEMENT_FLAG],[
+  AC_CACHE_CHECK([for the compiler flag "-Wdeclaration-after-statement"],  [ax_cv_cc_wdeclaration_after_statement_flag],[
 
+    CFLAGS_SAVED=$CFLAGS
+    CFLAGS="$CFLAGS -Werror -Wdeclaration-after-statement"
+
+    AC_LANG_PUSH(C)
+    AC_TRY_COMPILE(
+      [],
+      [return 0;],
+      [ax_cv_cc_wdeclaration_after_statement_flag="yes"],
+      [ax_cv_cc_wdeclaration_after_statement_flag="no"])
+    AC_LANG_POP
+
+    CFLAGS="$CFLAGS_SAVED"
+  ])
+])
 
 AC_DEFUN([AX_CC_WEVERYTHING_FLAG],[
   AC_CACHE_CHECK([for the compiler flag "-Weverything"], [ax_cv_cc_weverything_flag],[
 
     CFLAGS_SAVED=$CFLAGS
-    CFLAGS="$CFLAGS -Werror -Weverything -Wno-reserved-id-macro -Wno-unused-macros -Wno-unreachable-code-return -Wno-poison-system-directories"
+    CFLAGS="$CFLAGS -Weverything"
 
     AC_LANG_PUSH(C)
     AC_TRY_COMPILE(
@@ -243,7 +352,7 @@ dnl #
 AC_DEFUN([AX_CC_BUILTIN_CHOOSE_EXPR],
 [
 AC_CACHE_CHECK([for __builtin_choose_expr support in compiler], [ax_cv_cc_builtin_choose_expr],[
-  AC_RUN_IFELSE(
+  AC_COMPILE_IFELSE(
     [
       AC_LANG_SOURCE(
       [
@@ -268,7 +377,7 @@ dnl #
 AC_DEFUN([AX_CC_BUILTIN_TYPES_COMPATIBLE_P],
 [
 AC_CACHE_CHECK([for __builtin_types_compatible_p support in compiler], [ax_cv_cc_builtin_types_compatible_p],[
-  AC_RUN_IFELSE(
+  AC_COMPILE_IFELSE(
     [
       AC_LANG_SOURCE(
       [
@@ -293,7 +402,7 @@ dnl #
 AC_DEFUN([AX_CC_BUILTIN_BSWAP64],
 [
 AC_CACHE_CHECK([for __builtin_bswap64 support in compiler], [ax_cv_cc_builtin_bswap64],[
-  AC_RUN_IFELSE(
+  AC_COMPILE_IFELSE(
     [
       AC_LANG_SOURCE([
         int main(int argc, char **argv) {
@@ -317,7 +426,7 @@ dnl #
 AC_DEFUN([AX_CC_BUILTIN_CLZLL],
 [
 AC_CACHE_CHECK([for __builtin_clzll support in compiler], [ax_cv_cc_builtin_clzll],[
-  AC_RUN_IFELSE(
+  AC_COMPILE_IFELSE(
     [
       AC_LANG_SOURCE([
         int main(int argc, char **argv) {
@@ -332,6 +441,83 @@ AC_CACHE_CHECK([for __builtin_clzll support in compiler], [ax_cv_cc_builtin_clzl
 ])
 if test "x$ax_cv_cc_builtin_clzll" = "xyes"; then
   AC_DEFINE([HAVE_BUILTIN_CLZLL],1,[Define if the compiler supports __builtin_clzll])
+fi
+])
+
+dnl #
+dnl #  Check if we have the ctzll builtin
+dnl #
+AC_DEFUN([AX_CC_BUILTIN_CTZLL],
+[
+AC_CACHE_CHECK([for __builtin_ctzll support in compiler], [ax_cv_cc_builtin_ctzll],[
+  AC_COMPILE_IFELSE(
+    [
+      AC_LANG_SOURCE([
+        int main(int argc, char **argv) {
+          if ((argc < 0) || !argv) return 1; /* -Werror=unused-parameter */
+          return __builtin_ctzll(1);
+        }
+      ])
+    ],
+    [ax_cv_cc_builtin_ctzll=yes],
+    [ax_cv_cc_builtin_ctzll=no]
+  )
+])
+if test "x$ax_cv_cc_builtin_ctzll" = "xyes"; then
+  AC_DEFINE([HAVE_BUILTIN_CTZLL],1,[Define if the compiler supports __builtin_ctzll])
+fi
+])
+
+dnl #
+dnl #  Check if size_t and int64_t are identical
+dnl #
+AC_DEFUN([AX_CC_SIZE_SAME_AS_UINT64],
+[
+AC_CACHE_CHECK([if size_t == uint64_t], [ax_cv_cc_size_same_as_uint64],[
+  AC_COMPILE_IFELSE(
+    [
+      AC_LANG_SOURCE([
+        #include <stdint.h>
+        #include <stddef.h>
+
+        int main(int argc, char **argv) {
+          return _Generic((size_t)(0), uint64_t: 1, size_t: 0);
+        }
+      ])
+    ],
+    [ax_cv_cc_size_same_as_uint64=no],
+    [ax_cv_cc_size_same_as_uint64=yes]
+  )
+])
+if test "x$ax_cv_cc_size_same_as_uint64" = "xyes"; then
+  AC_DEFINE([SIZE_SAME_AS_UINT64],1,[Define if the compiler supports size_t has the same underlying type as uint64])
+fi
+])
+
+dnl #
+dnl #  Check if ssize_t and int64_t are identical
+dnl #
+AC_DEFUN([AX_CC_SSIZE_SAME_AS_INT64],
+[
+AC_CACHE_CHECK([if ssize_t == int64_t], [ax_cv_cc_ssize_same_as_int64],[
+  AC_COMPILE_IFELSE(
+    [
+      AC_LANG_SOURCE([
+        #include <stdint.h>
+        #include <stddef.h>
+        #include <sys/types.h>
+
+        int main(int argc, char **argv) {
+          return _Generic((ssize_t)(0), int64_t: 1, ssize_t: 0);
+        }
+      ])
+    ],
+    [ax_cv_cc_ssize_same_as_int64=no],
+    [ax_cv_cc_ssize_same_as_int64=yes]
+  )
+])
+if test "x$ax_cv_cc_ssize_same_as_int64" = "xyes"; then
+  AC_DEFINE([SSIZE_SAME_AS_INT64],1,[Define if the compiler supports ssize_t has the same underlying type as int64])
 fi
 ])
 

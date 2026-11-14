@@ -1,7 +1,7 @@
 TARGETNAME	:= @targetname@
 
 ifneq "$(TARGETNAME)" ""
-TARGET		:= $(TARGETNAME).a
+TARGET		:= $(TARGETNAME)$(L)
 endif
 
 SOURCES		:= $(TARGETNAME).c
@@ -13,10 +13,11 @@ ifneq "$(TARGETNAME)" ""
 install: $(R)$(modconfdir)/python/example.py
 
 $(R)$(modconfdir)/python: | $(R)$(modconfdir)
-	@echo INSTALL $(patsubst $(R)$(raddbdir)%,raddb%,$@)
+	@echo INSTALL $(patsubst $(R)$(confdir)%,raddb%,$@)
 	@$(INSTALL) -d -m 750 $@
 
 $(R)$(modconfdir)/python/example.py: src/modules/rlm_python/example.py | $(R)$(modconfdir)/python
 	@$(ECHO) INSTALL $(notdir $<)
 	@$(INSTALL) -m 755 $< $(R)$(modconfdir)/python
 endif
+LOG_ID_LIB	= 38

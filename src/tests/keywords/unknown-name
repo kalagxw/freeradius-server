@@ -1,10 +1,10 @@
 #
-#  PRE: update unknown
+#  PRE: unknown
 #
 
 #
 #  This delayed binding should result in a parse error
 #
-if (&User-Name == &Foo-Bar-Baz) { # ERROR
+if (User-Name == Foo-Bar-Baz) { # ERROR
 	test_fail
 }

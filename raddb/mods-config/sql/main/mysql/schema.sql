@@ -135,7 +135,7 @@ CREATE TABLE radusergroup (
 #
 # Table structure for table 'radpostauth'
 #
-# Note: MySQL versions since 5.6.4 support fractional precision timestamps
+# NOTE: MySQL versions since 5.6.4 support fractional precision timestamps
 #        which we use here. Replace the authdate definition with the following
 #        if your software is too old:
 #
@@ -164,6 +164,17 @@ CREATE TABLE nas (
   server varchar(64),
   community varchar(50),
   description varchar(200) DEFAULT 'RADIUS Client',
+  require_ma varchar(4) DEFAULT 'auto',
+  limit_proxy_state varchar(4) DEFAULT 'auto',
   PRIMARY KEY (id),
   KEY nasname (nasname)
-);
+) ENGINE = INNODB;
+
+#
+# Table structure for table 'nasreload'
+#
+CREATE TABLE IF NOT EXISTS nasreload (
+  nasipaddress varchar(15) NOT NULL,
+  reloadtime datetime NOT NULL,
+  PRIMARY KEY (nasipaddress)
+) ENGINE = INNODB;

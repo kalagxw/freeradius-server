@@ -1,0 +1,205 @@
+# -*- text -*-
+# Copyright (C) 2025 The FreeRADIUS Server project and contributors
+# This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
+# Version $Id$
+DEFINE	Certificate-Extensions				x509_extensions
+
+DEFINE Test-GeneralNames				group sequence_of=choice,ref=@.GeneralName
+
+DEFINE	Issuer						sequence sequence_of=set
+BEGIN Issuer
+DEFINE	RelativeDistinguishedName			set clone=@.RelativeDistinguishedName
+END Issuer
+
+DEFINE	Issuer-Set					set set_of=set
+BEGIN Issuer-Set
+DEFINE	RelativeDistinguishedName			set clone=@.RelativeDistinguishedName
+END Issuer-Set
+
+DEFINE	Test-Seq-Of					sequence sequence_of=integer
+BEGIN Test-Seq-Of
+DEFINE	Test-First-Integer				integer
+END Test-Seq-Of
+
+DEFINE	Test-Set-Of					set set_of=integer
+BEGIN Test-Set-Of
+DEFINE	Test-First-Integer				integer
+END Test-Set-Of
+
+#
+#  A zero-length element whose attribute carries a default value.  The
+#  element occupies its own header on the wire, so decoding it has to
+#  report that length, whether the caller walks the input (sequence_of)
+#  or the dictionary's children (a plain sequence).
+#
+DEFINE	Test-Seq-Of-Default				sequence sequence_of=integer
+BEGIN Test-Seq-Of-Default
+DEFINE	Test-Default-Integer				integer default=0
+END Test-Seq-Of-Default
+
+DEFINE	Test-Seq-Default-Member				sequence
+BEGIN Test-Seq-Default-Member
+DEFINE	Test-Default-Member				integer default=7
+DEFINE	Test-Bool-Member				bool
+END Test-Seq-Default-Member
+
+DEFINE	Test-Set-Of-Default				set set_of=integer
+BEGIN Test-Set-Of-Default
+DEFINE	Test-Default-Set-Integer			integer default=0
+END Test-Set-Of-Default
+
+DEFINE	Test-Boolean					bool
+
+DEFINE	Test-Integer					integer
+
+DEFINE	Test-IPv4-Address				ipv4addr
+DEFINE	Test-IPv4-Prefix				ipv4prefix
+DEFINE	Test-IPv6-Address				ipv6addr
+DEFINE	Test-IPv6-Prefix				ipv6prefix
+
+DEFINE	Foo						sequence sequence_of=integer
+BEGIN Foo
+DEFINE		Test-Integer				integer
+END Foo
+
+DEFINE	Bar						sequence sequence_of=boolean
+BEGIN Bar
+DEFINE		Test-Boolean				bool
+END Bar
+
+DEFINE	Foo-Bar						sequence
+BEGIN Foo-Bar
+DEFINE		Test-Integer				integer default=1
+DEFINE		Test-Boolean				bool
+END Foo-Bar
+
+DEFINE	Test-Bitstring					bitstring
+
+DEFINE	Seq-Bitstring-Octets				sequence
+BEGIN Seq-Bitstring-Octets
+DEFINE		Test-Bitstring				bitstring
+END Seq-Bitstring-Octets
+
+DEFINE	Bitstring-Struct				struct der_type=bitstring
+MEMBER		foo					bit[8]
+MEMBER		bar					bit[4]
+MEMBER		foo-bar					bit[4]
+
+DEFINE	Bitstring-Struct-7				struct der_type=bitstring
+MEMBER		foo					bit[2]
+MEMBER		bar					bit[1]
+MEMBER		foo-bar					bit[4]
+
+DEFINE	Octetstring					octetstring
+
+DEFINE	Seq-Octetstring					sequence
+BEGIN Seq-Octetstring
+DEFINE		Octetstring				octetstring
+END Seq-Octetstring
+
+DEFINE	Test-NULL					null
+
+DEFINE	Seq-Null					sequence
+BEGIN Seq-Null
+DEFINE		Test-Null				null
+END Seq-Null
+
+DEFINE	Seq-Integer-Null				sequence
+BEGIN Seq-Integer-Null
+DEFINE		Test-Integer				integer
+DEFINE		Test-Null				null
+END Seq-Integer-Null
+
+DEFINE	Test-Oid					oid
+
+DEFINE	Seq-Oid						sequence
+BEGIN Seq-Oid
+DEFINE		Test-Oid				oid
+END Seq-Oid
+
+DEFINE	Test-Enumerated					enumerated
+
+DEFINE	Test-String					ia5string
+
+DEFINE	Test-String-Max					utf8string max=5
+
+DEFINE	Test-String-UTF8				utf8string
+
+DEFINE	Test-String-Custom				utf8string
+
+DEFINE	Test-String-Printable				printablestring
+
+DEFINE	Test-String-T61					t61string
+
+DEFINE	Test-String-IA5					ia5string
+
+DEFINE	Test-String-Visible				visiblestring
+
+DEFINE	Test-String-General				generalstring
+
+DEFINE	Test-String-Universal				universalstring
+
+DEFINE	Seq-String					sequence
+BEGIN Seq-String
+DEFINE		Test-String				utf8string
+END Seq-String
+
+DEFINE	Test-Date					date
+
+DEFINE	Test-UTC					utctime
+
+DEFINE	Test-Generalized-Time				generalizedtime
+
+DEFINE	Seq-Date					sequence
+BEGIN Seq-Date
+DEFINE		Test-Date				date
+END Seq-Date
+
+DEFINE	Set-Bool-Integer				set
+BEGIN Set-Bool-Integer
+DEFINE		Test-Bool				bool
+DEFINE		Test-Integer				integer
+END Set-Bool-Integer
+
+DEFINE	Test-Context-Specific				bool option=0
+
+DEFINE	Test-Sequence-TLV				sequence
+BEGIN Test-Sequence-TLV
+DEFINE	Test-Integer					integer
+DEFINE	Test-Boolean					bool
+END Test-Sequence-TLV
+
+DEFINE	Test-TLV					sequence
+BEGIN Test-TLV
+DEFINE	Test-Integer					integer
+DEFINE	Test-Boolean					bool
+END Test-TLV
+
+DEFINE	Test-Sequence-GROUP				group der_type=sequence,ref=@.Test-TLV
+
+DEFINE	Test-Set-Struct					set
+BEGIN Test-Set-Struct
+DEFINE		Test-Boolean				bool
+DEFINE		Test-Integer				integer
+END Test-Set-Struct
+
+DEFINE	Test-Set-Bad-Struct				set
+BEGIN Test-Set-Bad-Struct
+DEFINE		Test-Integer				integer
+DEFINE		Test-Boolean				bool
+END Test-Set-Bad-Struct
+
+DEFINE	Test-Set-TLV					set
+BEGIN Test-Set-TLV
+DEFINE	Test-Integer					integer
+DEFINE	Test-Boolean					bool
+END Test-Set-TLV
+
+DEFINE Test-Choice					sequence
+BEGIN Test-Choice
+ATTRIBUTE option0					0 integer class=private
+ATTRIBUTE option1					1 integer class=private
+END Test-Choice
+
+#DEFINE	Test-Attr					attribute
+#VALUE	Test-Attr	Test-TLV			@.Test-TLV

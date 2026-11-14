@@ -27,9 +27,6 @@ RCSID("$Id$")
 #include <freeradius-devel/io/worker.h>
 #include <freeradius-devel/radius/defs.h>
 #include <freeradius-devel/util/debug.h>
-#include <freeradius-devel/util/base.h>
-#include <freeradius-devel/util/inet.h>
-#include <freeradius-devel/util/log.h>
 #include <freeradius-devel/util/md5.h>
 #include <freeradius-devel/util/syserror.h>
 
@@ -37,10 +34,8 @@ RCSID("$Id$")
 #  include <getopt.h>
 #endif
 
-#include <pthread.h>
 #include <signal.h>
 
-#include <sys/event.h>
 
 #define MAX_MESSAGES		(2048)
 #define MAX_CONTROL_PLANE	(1024)
@@ -64,7 +59,7 @@ typedef struct {
 
 	struct sockaddr_storage src;
 	socklen_t	salen;
-} fr_radius_packet_ctx_t;
+} fr_packet_ctx_t;
 
 static int		debug_lvl = 0;
 static int		max_control_plane = 0;
@@ -93,14 +88,14 @@ static NEVER_RETURNS void usage(void)
 static rlm_rcode_t test_process(UNUSED void const *instance, request_t *request, fr_io_action_t action)
 {
 	MPRINT1("\t\tPROCESS --- request %"PRIu64" action %d\n", request->number, action);
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
 
 static int test_decode(UNUSED void const *instance, request_t *request, uint8_t *const data, size_t data_len)
 {
-	fr_radius_packet_ctx_t const *pc = talloc_get_type_abort_const(request->async->listen->app_instance,
-								       fr_radius_packet_ctx_t);
+	fr_packet_ctx_t const *pc = talloc_get_type_abort_const(request->async->listen->app_instance,
+								       fr_packet_ctx_t);
 
 	request->number = pc->id;
 	request->async->process = test_process;
@@ -115,8 +110,8 @@ static int test_decode(UNUSED void const *instance, request_t *request, uint8_t 
 static ssize_t test_encode(UNUSED void const *instance, request_t *request, uint8_t *buffer, size_t buffer_len)
 {
 	fr_md5_ctx_t	*md5_ctx;
-	fr_radius_packet_ctx_t const *pc = talloc_get_type_abort_const(request->async->listen->app_instance,
-								       fr_radius_packet_ctx_t);
+	fr_packet_ctx_t const *pc = talloc_get_type_abort_const(request->async->listen->app_instance,
+								       fr_packet_ctx_t);
 
 	MPRINT1("\t\tENCODE >>> request %"PRIu64" - data %p %p room %zd\n",
 		request->number, pc, buffer, buffer_len);
@@ -128,11 +123,11 @@ static ssize_t test_encode(UNUSED void const *instance, request_t *request, uint
 
 	memcpy(buffer + 4, pc->vector, 16);
 
-	md5_ctx = fr_md5_ctx_alloc(true);
+	md5_ctx = fr_md5_ctx_alloc_from_list();
 	fr_md5_update(md5_ctx, buffer, 20);
 	fr_md5_update(md5_ctx, (uint8_t const *) secret, strlen(secret));
 	fr_md5_final(buffer + 4, md5_ctx);
-	fr_md5_ctx_free(&md5_ctx);
+	fr_md5_ctx_free_from_list(&md5_ctx);
 
 	return 20;
 }
@@ -190,7 +185,7 @@ static void *worker_thread(void *arg)
 
 static void send_reply(int sockfd, fr_channel_data_t *reply)
 {
-	fr_radius_packet_ctx_t *pc = talloc_get_type_abort(reply->packet_ctx, fr_radius_packet_ctx_t);
+	fr_packet_ctx_t *pc = talloc_get_type_abort(reply->packet_ctx, fr_packet_ctx_t);
 
 	MPRINT1("Master got reply %d size %zd\n", pc->id, reply->m.data_size);
 
@@ -224,7 +219,7 @@ static void master_process(TALLOC_CTX *ctx)
 
 	MPRINT1("Master started.\n");
 
-	ms = fr_message_set_create(ctx, MAX_MESSAGES, sizeof(fr_channel_data_t), MAX_MESSAGES * 1024);
+	ms = fr_message_set_create(ctx, MAX_MESSAGES, sizeof(fr_channel_data_t), MAX_MESSAGES * 1024, false);
 	if (!ms) {
 		fprintf(stderr, "Failed creating message set\n");
 		fr_exit_now(EXIT_FAILURE);
@@ -236,7 +231,7 @@ static void master_process(TALLOC_CTX *ctx)
 	kq_master = kqueue();
 	fr_assert(kq_master >= 0);
 
-	aq_master = fr_atomic_queue_alloc(ctx, max_control_plane);
+	aq_master = fr_atomic_queue_talloc(ctx, max_control_plane);
 	fr_assert(aq_master != NULL);
 
 	control_master = fr_control_create(ctx, kq_master, aq_master, 1024);
@@ -248,7 +243,7 @@ static void master_process(TALLOC_CTX *ctx)
 		fr_exit_now(EXIT_FAILURE);
 	}
 
-	if (fr_socket_bind(sockfd, &my_ipaddr, &my_port, NULL) < 0) {
+	if (fr_socket_bind(sockfd, NULL, &my_ipaddr, &my_port) < 0) {
 		fr_perror("radius_test: Failed binding to socket");
 		fr_exit_now(EXIT_FAILURE);
 	}
@@ -333,7 +328,7 @@ static void master_process(TALLOC_CTX *ctx)
 			uint8_t			*packet, *attr, *end;
 			size_t			total_len;
 			ssize_t			data_size;
-			fr_radius_packet_ctx_t	*packet_ctx;
+			fr_packet_ctx_t	*packet_ctx;
 
 			if (events[i].filter == EVFILT_USER) {
 				(void) fr_channel_service_kevent(workers[0].ch, control_master, &events[i]);
@@ -343,10 +338,10 @@ static void master_process(TALLOC_CTX *ctx)
 
 			fr_assert(events[i].filter == EVFILT_READ);
 
-			cd = (fr_channel_data_t *) fr_message_reserve(ms, 4096);
+			cd = (fr_channel_data_t *) fr_message_and_data_reserve(ms, 4096);
 			fr_assert(cd != NULL);
 
-			packet_ctx = talloc(ctx, fr_radius_packet_ctx_t);
+			packet_ctx = talloc(ctx, fr_packet_ctx_t);
 			fr_assert(packet_ctx != NULL);
 			packet_ctx->salen = sizeof(packet_ctx->src);
 
@@ -361,7 +356,7 @@ static void master_process(TALLOC_CTX *ctx)
 				MPRINT1("Master ignoring packet (data length %zd)\n", data_size);
 
 			discard:
-				fr_message_done(&cd->m); /* yeah, re-use it for the next packet... */
+				fr_message_done(&cd->m); /* yeah, reuse it for the next packet... */
 				continue;
 			}
 
@@ -374,7 +369,7 @@ static void master_process(TALLOC_CTX *ctx)
 				goto discard;
 			}
 
-			total_len = (packet[2] << 8) | packet[3];
+			total_len = fr_nbo_to_uint16(packet + 2);
 			if (total_len < 20) {
 				MPRINT1("Master ignoring packet (header length %zu)\n", total_len);
 				goto discard;
@@ -396,7 +391,7 @@ static void master_process(TALLOC_CTX *ctx)
 				attr += attr[1];
 			}
 
-			(void) fr_message_alloc(ms, &cd->m, total_len);
+			(void) fr_message_and_data_commit(ms, &cd->m, total_len);
 
 			MPRINT1("Master sending packet size %zd to worker %d\n", cd->m.data_size, which_worker);
 			cd->m.when = fr_time();
@@ -503,7 +498,7 @@ static void master_process(TALLOC_CTX *ctx)
 	MPRINT2("GC\n");
 	fr_message_set_gc(ms);
 
-	if (debug_lvl > 1) fr_message_set_debug(ms, stdout);
+	if (debug_lvl > 1) fr_message_set_debug(stdout, ms);
 
 	/*
 	 *	After the garbage collection, all messages marked "done" MUST also be marked "free".
@@ -527,7 +522,7 @@ int main(int argc, char *argv[])
 
 	fr_time_start();
 
-	fr_log_init(&default_log, false);
+	fr_log_init_legacy(&default_log, false);
 
 	memset(&my_ipaddr, 0, sizeof(my_ipaddr));
 	my_ipaddr.af = AF_INET;

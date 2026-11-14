@@ -24,34 +24,40 @@
  */
 RCSID("$Id$")
 
-#include <freeradius-devel/util/misc.h>
-#include <freeradius-devel/util/strerror.h>
+#include <stdio.h>
+
+#include <freeradius-devel/util/skip.h>
 #include <freeradius-devel/util/token.h>
 
-#include <ctype.h>
-#include <stdio.h>
-#include <string.h>
 
 fr_table_num_ordered_t const fr_tokens_table[] = {
 	{ L("=~"), 	T_OP_REG_EQ	}, /* order is important! */
-	{ L("!~"),	 T_OP_REG_NE	},
+	{ L("!~"),	T_OP_REG_NE	},
 	{ L("{"),	T_LCBRACE	},
 	{ L("}"),	T_RCBRACE	},
 	{ L("("),	T_LBRACE	},
 	{ L(")"),	T_RBRACE	},
 	{ L(","),	T_COMMA		},
 	{ L("++"),	T_OP_INCRM	},
-	{ L("+="),	T_OP_ADD	},
-	{ L("-="),	T_OP_SUB	},
+	{ L("+="),	T_OP_ADD_EQ	},
+	{ L("-="),	T_OP_SUB_EQ	},
+	{ L("*="),	T_OP_MUL_EQ	},
+	{ L("/="),	T_OP_DIV_EQ	},
 	{ L(":="),	T_OP_SET	},
 	{ L("=*"), 	T_OP_CMP_TRUE	},
 	{ L("!*"), 	T_OP_CMP_FALSE	},
 	{ L("=="),	T_OP_CMP_EQ	},
+	{ L("==="),	T_OP_CMP_EQ_TYPE },
 	{ L("^="),	T_OP_PREPEND	},
+	{ L("|="),	T_OP_OR_EQ	},
+	{ L("&="),	T_OP_AND_EQ	},
 	{ L("="),	T_OP_EQ		},
 	{ L("!="),	T_OP_NE		},
+	{ L("!=="),	T_OP_CMP_NE_TYPE },
+	{ L(">>="),	T_OP_RSHIFT_EQ	},
 	{ L(">="),	T_OP_GE		},
 	{ L(">"),	T_OP_GT		},
+	{ L("<<="),	T_OP_LSHIFT_EQ	},
 	{ L("<="),	T_OP_LE		},
 	{ L("<"),	T_OP_LT		},
 	{ L("#"),	T_HASH		},
@@ -68,182 +74,231 @@ fr_table_num_sorted_t const fr_token_quotes_table[] = {
 };
 size_t fr_token_quotes_table_len = NUM_ELEMENTS(fr_token_quotes_table);
 
-/*
- *  This is a hack, and has to be kept in sync with tokens.h
+/** Map each `fr_token_t` to the C identifier of its enum constant.
+ *
+ * Complement of `fr_tokens[]` (the operator-character / human-display
+ * form like ":=" / "<BARE-WORD>") - this one returns the source-identical
+ * `T_OP_SET` / `T_BARE_WORD` form so tooling (radconf2json, etc.) can
+ * round-trip enum names through a JSON intermediate.
  */
-char const *fr_tokens[] = {
-	"?",			/* T_INVALID */
-	"EOL",			/* T_EOL */
-	"{",
-	"}",
-	"(",
-	")",
-	",",
-	";",
-	"++",
-	"+=",
-	"-=",
-	":=",
-	"=",
-	"!=",
-	">=",
-	">",
-	"<=",
-	"<",
-	"=~",
-	"!~",
-	"=*",
-	"!*",
-	"==",
-	"^=",
-	"#",
-	"<BARE-WORD>",
-	"<\"STRING\">",
-	"<'STRING'>",
-	"<`STRING`>",
-	"</STRING/>"
+static fr_table_num_indexed_t const fr_token_to_enum_str_table[] = {
+	FR_TABLE_INDEXED_ENTRY(T_BARE_WORD),
+	FR_TABLE_INDEXED_ENTRY(T_DOUBLE_QUOTED_STRING),
+	FR_TABLE_INDEXED_ENTRY(T_SINGLE_QUOTED_STRING),
+	FR_TABLE_INDEXED_ENTRY(T_BACK_QUOTED_STRING),
+	FR_TABLE_INDEXED_ENTRY(T_SOLIDUS_QUOTED_STRING),
+	FR_TABLE_INDEXED_ENTRY(T_OP_EQ),
+	FR_TABLE_INDEXED_ENTRY(T_OP_NE),
+	FR_TABLE_INDEXED_ENTRY(T_OP_GE),
+	FR_TABLE_INDEXED_ENTRY(T_OP_GT),
+	FR_TABLE_INDEXED_ENTRY(T_OP_LE),
+	FR_TABLE_INDEXED_ENTRY(T_OP_LT),
+	FR_TABLE_INDEXED_ENTRY(T_OP_CMP_EQ),
+	FR_TABLE_INDEXED_ENTRY(T_OP_CMP_EQ_TYPE),
+	FR_TABLE_INDEXED_ENTRY(T_OP_CMP_NE_TYPE),
+	FR_TABLE_INDEXED_ENTRY(T_OP_ADD_EQ),
+	FR_TABLE_INDEXED_ENTRY(T_OP_SUB_EQ),
+	FR_TABLE_INDEXED_ENTRY(T_OP_MUL_EQ),
+	FR_TABLE_INDEXED_ENTRY(T_OP_DIV_EQ),
+	FR_TABLE_INDEXED_ENTRY(T_OP_AND_EQ),
+	FR_TABLE_INDEXED_ENTRY(T_OP_OR_EQ),
+	FR_TABLE_INDEXED_ENTRY(T_OP_RSHIFT_EQ),
+	FR_TABLE_INDEXED_ENTRY(T_OP_LSHIFT_EQ),
+	FR_TABLE_INDEXED_ENTRY(T_OP_SET),
+	FR_TABLE_INDEXED_ENTRY(T_OP_PREPEND),
+	FR_TABLE_INDEXED_ENTRY(T_OP_REG_EQ),
+	FR_TABLE_INDEXED_ENTRY(T_OP_REG_NE),
+	FR_TABLE_INDEXED_ENTRY(T_OP_CMP_TRUE),
+	FR_TABLE_INDEXED_ENTRY(T_OP_CMP_FALSE),
+	FR_TABLE_INDEXED_ENTRY(T_OP_INCRM),
+};
+static size_t fr_token_to_enum_str_table_len = NUM_ELEMENTS(fr_token_to_enum_str_table);
+
+char const *fr_token_to_enum_str(fr_token_t t)
+{
+	return fr_table_str_by_value(fr_token_to_enum_str_table, t, "T_INVALID");
+}
+
+/** Quote-token names that radconf2json's JSON output uses.
+ *
+ * Only the five quote-typed tokens, kept sorted by name so the
+ * `fr_table_value_by_str` binary search can find them.  Used by
+ * radjson2conf when rebuilding a CF tree from JSON.
+ */
+static fr_table_num_sorted_t const fr_token_from_quote_enum_str_table[] = {
+	{ L("T_BACK_QUOTED_STRING"),	T_BACK_QUOTED_STRING	},
+	{ L("T_BARE_WORD"),		T_BARE_WORD		},
+	{ L("T_DOUBLE_QUOTED_STRING"),	T_DOUBLE_QUOTED_STRING	},
+	{ L("T_SINGLE_QUOTED_STRING"),	T_SINGLE_QUOTED_STRING	},
+	{ L("T_SOLIDUS_QUOTED_STRING"),	T_SOLIDUS_QUOTED_STRING	},
+};
+static size_t fr_token_from_quote_enum_str_table_len = NUM_ELEMENTS(fr_token_from_quote_enum_str_table);
+
+fr_token_t fr_token_from_quote_enum_str(char const *s, fr_token_t dflt)
+{
+	if (!s) return dflt;
+	return fr_table_value_by_str(fr_token_from_quote_enum_str_table, s, dflt);
+}
+
+/*
+ *  String versions for all of the tokens.
+ */
+char const *fr_tokens[T_TOKEN_LAST] = {
+	[T_INVALID] = "?",
+	[T_EOL] = "EOL",
+
+	[T_LCBRACE] = "{",
+	[T_RCBRACE] = "}",
+	[T_LBRACE] = "(",
+	[T_RBRACE] = ")",
+	[T_COMMA] = ",",
+	[T_SEMICOLON] = ";",
+
+	[T_ADD]	     = "+",
+	[T_SUB]	     = "-",
+	[T_MUL]	     = "*",
+	[T_DIV]	     = "/",
+	[T_AND]	     = "&",
+	[T_OR]	     = "|",
+	[T_NOT]	     = "!",
+	[T_XOR]	     = "^",
+	[T_COMPLEMENT]  = "~",
+	[T_MOD]  = "%",
+
+	[T_RSHIFT]   = ">>",
+	[T_LSHIFT]   = "<<",
+
+	[T_LAND]     = "&&",
+	[T_LOR]	     = "||",
+
+	[T_OP_INCRM] = "++",
+
+	[T_OP_ADD_EQ] = "+=",
+	[T_OP_SUB_EQ] = "-=",
+	[T_OP_SET]    = ":=",
+	[T_OP_EQ]     = "=",
+	[T_OP_OR_EQ]  = "|=",
+	[T_OP_AND_EQ]  = "&=",
+
+	[T_OP_RSHIFT_EQ]   = ">>=",
+	[T_OP_LSHIFT_EQ]   = "<<=",
+
+	[T_OP_NE]     = "!=",
+	[T_OP_GE]     = ">=",
+	[T_OP_GT]     = ">",
+	[T_OP_LE]     = "<=",
+	[T_OP_LT]     = "<",
+	[T_OP_REG_EQ] = "=~",
+	[T_OP_REG_NE] = "!~",
+
+	[T_OP_CMP_TRUE] = "=*",
+	[T_OP_CMP_FALSE] = "!*",
+
+	[T_OP_CMP_EQ] = "==",
+
+	[T_OP_CMP_EQ_TYPE] = "===",
+	[T_OP_CMP_NE_TYPE] = "!==",
+
+	[T_OP_PREPEND] = "^=",
+
+	[T_HASH]                  = "#",
+	[T_BARE_WORD]             = "<BARE-WORD>",
+	[T_DOUBLE_QUOTED_STRING]  = "<\"STRING\">",
+	[T_SINGLE_QUOTED_STRING]  = "<'STRING'>",
+	[T_BACK_QUOTED_STRING]    = "<`STRING`>",
+	[T_SOLIDUS_QUOTED_STRING] = "</STRING/>",
 };
 
+
+/*
+ *	This is fine.  Don't complain.
+ */
+DIAG_OFF_OPTIONAL(gnu-designator)
 
 /** Convert tokens back to a quoting character
  *
- * None string types convert to '?' to screw ups can be identified easily
+ * Non-string types convert to '?' to screw ups can be identified easily
  */
-const char fr_token_quote[] = {
-	'?',		/* invalid token */
-	'?',		/* end of line */
-	'?',		/* { */
-	'?',		/* } */
-	'?',		/* ( */
-	'?',		/* ) 		 5 */
-	'?',		/* , */
-	'?',		/* ; */
+const char fr_token_quote[T_TOKEN_LAST] = {
+	[ 0 ... T_HASH ] = '?',	/* GCC extension for range initialization, also allowed by clang */
 
-	'?',		/* ++ */
-	'?',		/* += */
-	'?',		/* -=  		10 */
-	'?',		/* := */
-	'?',		/* = */
-	'?',		/* != */
-	'?',		/* >= */
-	'?',		/* > 		15 */
-	'?',		/* <= */
-	'?',		/* < */
-	'?',		/* =~ */
-	'?',		/* !~ */
-	'?',		/* =* 		20 */
-	'?',		/* !* */
-	'?',		/* == */
-	'?',		/* ^= */
-	'?',		/* # */
-	'\0',		/* bare word 	25 */
-	'"',		/* "foo" */
-	'\'',		/* 'foo' */
-	'`',		/* `foo` */
-	'/',		/* /foo/ */
-	'?'
+	[T_BARE_WORD] = '\0',
+	[T_DOUBLE_QUOTED_STRING] = '"',
+	[T_SINGLE_QUOTED_STRING] = '\'',
+	[T_BACK_QUOTED_STRING] = '`',
+	[T_SOLIDUS_QUOTED_STRING] = '/',
 };
 
-const bool fr_assignment_op[] = {
-	false,		/* invalid token */
-	false,		/* end of line */
-	false,		/* { */
-	false,		/* } */
-	false,		/* ( */
-	false,		/* ) 		 5 */
-	false,		/* , */
-	false,		/* ; */
+#define T(_x) [T_OP_ ## _x] = true
 
-	true,		/* ++ */
-	true,		/* += */
-	true,		/* -=  		10 */
-	true,		/* := */
-	true,		/* = */
-	false,		/* != */
-	false,		/* >= */
-	false,		/* > 		15 */
-	false,		/* <= */
-	false,		/* < */
-	false,		/* =~ */
-	false,		/* !~ */
-	false,		/* =* 		20 */
-	false,		/* !* */
-	false,		/* == */
-	true,		/* ^= */
-	false,		/* # */
-	false,		/* bare word 	25 */
-	false,		/* "foo" */
-	false,		/* 'foo' */
-	false,		/* `foo` */
-	false
+const bool fr_assignment_op[T_TOKEN_LAST] = {
+	T(INCRM),		/* only used by LDAP :( */
+
+	T(ADD_EQ),
+	T(SUB_EQ),
+	T(MUL_EQ),
+	T(DIV_EQ),
+	T(AND_EQ),
+	T(OR_EQ),
+	T(RSHIFT_EQ),
+	T(LSHIFT_EQ),
+
+	T(SET),
+	T(EQ),
+	T(PREPEND),
 };
 
-const bool fr_equality_op[] = {
-	false,		/* invalid token */
-	false,		/* end of line */
-	false,		/* { */
-	false,		/* } */
-	false,		/* ( */
-	false,		/* ) 		 5 */
-	false,		/* , */
-	false,		/* ; */
+const bool fr_list_assignment_op[T_TOKEN_LAST] = {
+	T(ADD_EQ),		/* append */
+	T(SUB_EQ),		/* remove */
+	T(AND_EQ),		/* intersection */
+	T(OR_EQ),		/* union */
+	T(LE),			/* merge RHS */
+	T(GE),			/* merge LHS */
 
-	false,		/* ++ */
-	false,		/* += */
-	false,		/* -=  		10 */
-	false,		/* := */
-	false,		/* = */
-	true,		/* != */
-	true,		/* >= */
-	true,		/* > 		15 */
-	true,		/* <= */
-	true,		/* < */
-	true,		/* =~ */
-	true,		/* !~ */
-	true,		/* =* 		20 */
-	true,		/* !* */
-	true,		/* == */
-	false,		/* ^= */
-	false,		/* # */
-	false,		/* bare word 	25 */
-	false,		/* "foo" */
-	false,		/* 'foo' */
-	false,		/* `foo` */
-	false
+	T(SET),
+	T(EQ),
+	T(PREPEND),		/* prepend */
 };
 
-const bool fr_str_tok[] = {
-	false,		/* invalid token */
-	false,		/* end of line */
-	false,		/* { */
-	false,		/* } */
-	false,		/* ( */
-	false,		/* ) 		 5 */
-	false,		/* , */
-	false,		/* ; */
+const bool fr_comparison_op[T_TOKEN_LAST] = {
+	T(NE),
+	T(GE),
+	T(GT),
+	T(LE),
+	T(LT),
+	T(REG_EQ),
+	T(REG_NE),
+	T(CMP_TRUE),
+	T(CMP_FALSE),
+	T(CMP_EQ),
+	T(CMP_EQ_TYPE),
+	T(CMP_NE_TYPE),
+};
 
-	false,		/* ++ */
-	false,		/* += */
-	false,		/* -=  		10 */
-	false,		/* := */
-	false,		/* = */
-	false,		/* != */
-	false,		/* >= */
-	false,		/* > 		15 */
-	false,		/* <= */
-	false,		/* < */
-	false,		/* =~ */
-	false,		/* !~ */
-	false,		/* =* 		20 */
-	false,		/* !* */
-	false,		/* == */
-	false,		/* ^= */
-	false,		/* # */
-	true,		/* bare word 	25 */
-	true,		/* "foo" */
-	true,		/* 'foo' */
-	true,		/* `foo` */
-	false
+#undef T
+#define T(_x) [T_ ## _x] = true
+
+const bool fr_binary_op[T_TOKEN_LAST] = {
+	T(ADD),
+	T(SUB),
+	T(MUL),
+	T(DIV),
+	T(AND),
+	T(OR),
+	T(MOD),
+	T(RSHIFT),
+	T(LSHIFT),
+};
+
+
+#undef T
+#define T(_x) [T_## _x] = true
+const bool fr_str_tok[T_TOKEN_LAST] = {
+	T(BARE_WORD),
+	T(DOUBLE_QUOTED_STRING),
+	T(SINGLE_QUOTED_STRING),
+	T(BACK_QUOTED_STRING),
 };
 
 /*
@@ -261,13 +316,13 @@ const bool fr_str_tok[] = {
  *	At end-of-line, buf[0] is set to '\0'.
  *	Returns 0 or special token value.
  */
-static fr_token_t getthing(char const **ptr, char *buf, int buflen, bool tok,
+static fr_token_t getthing(char const **ptr, char *buf, size_t buflen, bool tok,
 			 fr_table_num_ordered_t const *tokenlist, size_t tokenlist_len, bool unescape)
 {
 	char			*s;
 	char const		*p;
 	char			quote;
-	unsigned int		x;
+	bool			triple = false;
 	size_t			i;
 	fr_token_t 		token;
 
@@ -291,6 +346,12 @@ static fr_token_t getthing(char const **ptr, char *buf, int buflen, bool tok,
 			if (TOKEN_MATCH(p, tokenlist[i].name.str)) {
 				strcpy(buf, tokenlist[i].name.str);
 				p += tokenlist[i].name.len;
+
+				/*
+				 *	Try to shut up Coverity, which claims fr_token_t can be between 0..63, not
+				 *	0..48???
+				 */
+				if ((tokenlist[i].value < 0) || (tokenlist[i].value >= T_TOKEN_LAST)) return T_INVALID;
 
 				token = tokenlist[i].value;
 				goto done;
@@ -320,7 +381,16 @@ static fr_token_t getthing(char const **ptr, char *buf, int buflen, bool tok,
 
 	if (token != T_BARE_WORD) {
 		quote = *p;
-		p++;
+
+		/*
+		 *	Triple-quoted strings are copied over verbatim, without escapes.
+		 */
+		if ((buflen >= 3) && (p[1] == quote) && (p[2] == quote)) {
+			p += 3;
+			triple = true;
+		} else {
+			p++;
+		}
 	}
 	s = buf;
 
@@ -331,7 +401,7 @@ static fr_token_t getthing(char const **ptr, char *buf, int buflen, bool tok,
 		 *	comma.
 		 */
 		if (!quote) {
-			if (isspace((int) *p)) break;
+			if (isspace((uint8_t) *p)) break;
 
 
 			if (tok) {
@@ -355,9 +425,20 @@ static fr_token_t getthing(char const **ptr, char *buf, int buflen, bool tok,
 		 *	Un-escaped quote character.  We're done.
 		 */
 		if (*p == quote) {
-			p++;
-			*s++ = 0;
-			goto done;
+			if (!triple) {
+				p++;
+				*s++ = 0;
+				goto done;
+			}
+
+			if ((buflen >= 3) && (p[1] == quote) && (p[2] == quote)) {
+				p += 3;
+				*s++ = 0;
+				goto done;
+			}
+
+			*s++ = *p++;
+			continue;
 		}
 
 		/*
@@ -373,6 +454,7 @@ static fr_token_t getthing(char const **ptr, char *buf, int buflen, bool tok,
 		 */
 		if (!p[1]) {
 			fr_strerror_const("Unterminated string");
+			*s = '\0';
 			return T_INVALID;
 		}
 
@@ -391,9 +473,10 @@ static fr_token_t getthing(char const **ptr, char *buf, int buflen, bool tok,
 					break;
 
 				default:
-					if (*p >= '0' && *p <= '9' &&
-					    sscanf(p, "%3o", &x) == 1) {
-						*s++ = x;
+					if ((p[0] >= '0') && (p[0] <= '3') &&
+					    (p[1] >= '0') && (p[1] <= '7') &&
+					    (p[2] >= '0') && (p[2] <= '7')) {
+						*s++ = (char) (((p[0] - '0') << 6) | ((p[1] - '0') << 3) | (p[2] - '0'));
 						p += 2;
 					} else
 						*s++ = *p;
@@ -411,6 +494,7 @@ static fr_token_t getthing(char const **ptr, char *buf, int buflen, bool tok,
 			} else {
 				if (buflen < 2) {
 					fr_strerror_const("Truncated input");
+					*s = '\0';
 					return T_INVALID;
 				}
 
@@ -440,7 +524,7 @@ done:
  *	Read a "word" - this means we don't honor
  *	tokens as delimiters.
  */
-int getword(char const **ptr, char *buf, int buflen, bool unescape)
+int getword(char const **ptr, char *buf, size_t buflen, bool unescape)
 {
 	return getthing(ptr, buf, buflen, false, fr_tokens_table, fr_tokens_table_len, unescape) == T_EOL ? 0 : 1;
 }
@@ -449,7 +533,7 @@ int getword(char const **ptr, char *buf, int buflen, bool unescape)
 /*
  *	Read the next word, use tokens as delimiters.
  */
-fr_token_t gettoken(char const **ptr, char *buf, int buflen, bool unescape)
+fr_token_t gettoken(char const **ptr, char *buf, size_t buflen, bool unescape)
 {
 	return getthing(ptr, buf, buflen, true, fr_tokens_table, fr_tokens_table_len, unescape);
 }
@@ -463,7 +547,7 @@ fr_token_t getop(char const **ptr)
 	fr_token_t token;
 
 	token = getthing(ptr, op, sizeof(op), true, fr_tokens_table, fr_tokens_table_len, false);
-	if (!fr_assignment_op[token] && !fr_equality_op[token]) {
+	if (!fr_assignment_op[token] && !fr_comparison_op[token]) {
 		fr_strerror_const("Expected operator");
 		return T_INVALID;
 	}
@@ -473,7 +557,7 @@ fr_token_t getop(char const **ptr)
 /*
  *	Expect a string.
  */
-fr_token_t getstring(char const **ptr, char *buf, int buflen, bool unescape)
+fr_token_t getstring(char const **ptr, char *buf, size_t buflen, bool unescape)
 {
 	char const *p;
 
@@ -494,38 +578,5 @@ fr_token_t getstring(char const **ptr, char *buf, int buflen, bool unescape)
 
 char const *fr_token_name(int token)
 {
-	return fr_table_str_by_value(fr_tokens_table, token, "???");
-}
-
-
-ssize_t fr_skip_string(char const *start, char const *end)
-{
-	char const *p = start;
-	char quote;
-
-	quote = *(p++);
-
-	while (p < end) {
-		if (*p == quote) {
-			p++;
-			return p - start;
-		}
-
-		if (*p == '\\') {
-			if (((p + 1) >= end) || !p[1]) {
-				break;
-			}
-
-			p += 2;
-			continue;
-		}
-
-		p++;
-	}
-
-	/*
-	 *	Unexpected end of string.
-	 */
-	fr_strerror_const("Unexpected end of string");
-	return -(p - start);
+	return fr_table_str_by_value(fr_tokens_table, token, "<INVALID>");
 }

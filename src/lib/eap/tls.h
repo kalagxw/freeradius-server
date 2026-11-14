@@ -55,6 +55,13 @@ USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 #define TLS_HEADER_LEN 4
 #define TLS_HEADER_LENGTH_FIELD_LEN 4
 
+/** Overhead subtracted from the MTU of an EAP-TLS session which is nested inside a tunneled method.
+ *
+ * The outer TLS session adds a 5 octet record header, plus the IV, MAC or tag, and padding of the cipher
+ * suite, to every inner EAP packet.  This value is a conservative allowance and is not an exact figure.
+ */
+#define EAP_TLS_NESTED_OVERHEAD 100
+
 /*
  *	RFC 2716, Section 4.2:
  *
@@ -79,15 +86,11 @@ USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 #define TLS_MORE_FRAGMENTS(x) 	(((x) & 0x40) != 0)
 #define TLS_LENGTH_INCLUDED(x) 	(((x) & 0x80) != 0)
 
-#define TLS_CHANGE_CIPHER_SPEC(x) 	(((x) & 0x0014) == 0x0014)
-#define TLS_ALERT(x) 			(((x) & 0x0015) == 0x0015)
-#define TLS_HANDSHAKE(x) 		(((x) & 0x0016) == 0x0016)
-
 #define SET_START(x) 		((x) | (0x20))
 #define SET_MORE_FRAGMENTS(x) 	((x) | (0x40))
 #define SET_LENGTH_INCLUDED(x) 	((x) | (0x80))
 
-typedef enum {
+typedef enum : uint8_t {
 	EAP_TLS_INVALID = 0,	  			//!< Invalid, don't reply.
 	EAP_TLS_ESTABLISHED,       			//!< Session established, send success (or start phase2).
 	EAP_TLS_FAIL,       				//!< Fail, send fail.
@@ -113,7 +116,7 @@ typedef enum {
 
 typedef struct {
 	uint8_t		flags;
-	uint8_t		data[1];
+	uint8_t		data[];
 } eap_tls_data_t;
 
 /** Tracks the state of an EAP-TLS session
@@ -176,15 +179,17 @@ unlang_action_t		eap_tls_process(request_t *request, eap_session_t *eap_session)
 
 int			eap_tls_start(request_t *request, eap_session_t *eap_session) CC_HINT(nonnull);
 
-int			eap_tls_success(request_t *request, eap_session_t *eap_session, eap_tls_prf_label_t *prf_label) CC_HINT(nonnull(1,2));
+unlang_action_t		eap_tls_success(request_t *request, eap_session_t *eap_session, eap_tls_prf_label_t *prf_label) CC_HINT(nonnull(1,2));
 
-int			eap_tls_fail(request_t *request, eap_session_t *eap_session) CC_HINT(nonnull);
+unlang_action_t		eap_tls_fail(request_t *request, eap_session_t *eap_session) CC_HINT(nonnull);
+			/*!< The caller must set its result before calling this,
+			     because the return value may be UNLANG_ACTION_PUSHED_CHILD. */
 
 int			eap_tls_request(request_t *request, eap_session_t *eap_session) CC_HINT(nonnull);
 
 int			eap_tls_compose(request_t *request, eap_session_t *eap_session,
 					eap_tls_status_t status, uint8_t flags,
-		    			fr_tls_record_t *record, size_t record_len, size_t frag_len);
+					fr_dbuff_t *record, size_t record_len, size_t frag_len);
 
 /* MPPE key generation */
 void			eap_crypto_prf_label_init(eap_tls_prf_label_t *prf_label, eap_session_t *eap_session,
@@ -201,4 +206,6 @@ eap_tls_session_t	*eap_tls_session_init(request_t *request, eap_session_t *eap_s
 					      SSL_CTX *ssl_ctx, bool client_cert) CC_HINT(nonnull);
 
 
-fr_tls_conf_t		*eap_tls_conf_parse(CONF_SECTION *cs, char const *key) CC_HINT(nonnull);
+void			eap_tls_conf_check(CONF_SECTION *cs, fr_tls_conf_t *tls_conf, bool delayed_tickets) CC_HINT(nonnull);
+
+int			eap_tls_check_stateless(CONF_SECTION *cs, fr_tls_conf_t const *tls_conf) CC_HINT(nonnull);

@@ -1,19 +1,20 @@
-#include <freeradius-devel/util/acutest.h>
-#include <sys/types.h>
+#include <freeradius-devel/util/test/acutest.h>
+#include <freeradius-devel/util/test/acutest_helpers.h>
+#include <freeradius-devel/util/syserror.h>
 #include <sys/socket.h>
 
+#define TRUNK_TESTS 1
 #include "trunk.c"
 
-#if 0
-//#include <gperftools/profiler.h>
 typedef struct {
-	fr_trunk_request_t	*treq;			//!< Trunk request.
+	trunk_request_t	*treq;			//!< Trunk request.
 	bool			cancelled;		//!< Seen by the cancelled callback.
 	bool			completed;		//!< Seen by the complete callback.
 	bool			failed;			//!< Seen by the failed callback.
 	bool			freed;			//!< Seen by the free callback.
 	bool			signal_partial;		//!< Muxer should signal that this request is partially written.
 	bool			signal_cancel_partial;	//!< Muxer should signal that this request is partially cancelled.
+	int			priority;		//!< Priority of request
 } test_proto_request_t;
 
 typedef struct {
@@ -23,16 +24,58 @@ typedef struct {
 	uint64_t		freed;			//!< Count of tests in this run that were freed.
 } test_proto_stats_t;
 
-#define DEBUG_LVL_SET if (test_verbose_level_ >= 3) fr_debug_lvl = L_DBG_LVL_4 + 1
+/** A request the muxer has written, waiting for the demuxer
+ *
+ * The muxer keeps written requests in memory, and writes one byte to the
+ * socket pair for each.  The demuxer takes one request off the list for
+ * each byte that comes back.  Writing the request pointers themselves
+ * through the socket would make every pointer the demuxer reads back
+ * untrusted data.
+ */
+typedef struct {
+	fr_dlist_t		entry;			//!< Entry in test_conn_t sent.
+	test_proto_request_t	*preq;			//!< Request that was written.
+} test_sent_t;
 
-static void test_mux(UNUSED fr_event_list_t *el, fr_trunk_connection_t *tconn, fr_connection_t *conn, UNUSED void *uctx)
+typedef struct {
+	int			fd[2];			//!< Socket pair.  fd[1] loops data back to fd[0].
+	fr_dlist_head_t		sent;			//!< Requests written, in the order they were written.
+} test_conn_t;
+
+#define DEBUG_LVL_SET if (acutest_verbose_level_ >= 3) fr_debug_lvl = L_DBG_LVL_4 + 1
+
+/** Write a request to the connection
+ *
+ * @return
+ *	- 1 if the request was written.
+ *	- 0 if the socket would block.
+ *	- -1 on error.
+ */
+static int test_conn_write(test_conn_t *tc, test_proto_request_t *preq)
 {
-	fr_trunk_request_t	*treq;
-	size_t			count = 0;
-	int			fd = *(talloc_get_type_abort(conn->h, int));
-	ssize_t			slen;
+	test_sent_t	*sent;
+	uint8_t		wake = 0;
+	ssize_t		slen;
 
-	while (fr_trunk_connection_pop_request(&treq, tconn) == 0) {
+	slen = write(tc->fd[0], &wake, sizeof(wake));
+	if (slen < 0) return -1;
+	if (slen == 0) return 0;
+
+	MEM(sent = talloc(tc, test_sent_t));
+	sent->preq = preq;
+	fr_dlist_insert_tail(&tc->sent, sent);
+
+	return 1;
+}
+
+static void test_mux(UNUSED fr_event_list_t *el, trunk_connection_t *tconn, connection_t *conn, UNUSED void *uctx)
+{
+	trunk_request_t	*treq;
+	size_t			count = 0;
+	test_conn_t		*tc = talloc_get_type_abort(conn->h, test_conn_t);
+	int			ret;
+
+	while (trunk_connection_pop_request(&treq, tconn) == 0) {
 		test_proto_request_t	*preq = treq->pub.preq;
 		count++;
 
@@ -40,34 +83,32 @@ static void test_mux(UNUSED fr_event_list_t *el, fr_trunk_connection_t *tconn, f
 		 *	Simulate a partial write
 		 */
 		if (preq && preq->signal_partial) {
-			fr_trunk_request_signal_partial(treq);
+			trunk_request_signal_partial(treq);
 			preq->signal_partial = false;
 			break;
 		}
 
-		if (test_verbose_level_ >= 3) printf("%s - Wrote %p\n", __FUNCTION__, preq);
+		if (acutest_verbose_level_ >= 3) printf("%s - Wrote %p\n", __FUNCTION__, preq);
 
-		slen = write(fd, &preq, sizeof(preq));
-		if (slen < 0) return;
-		if (slen == 0) return;
-		if (slen < (ssize_t)sizeof(preq)) abort();
+		ret = test_conn_write(tc, preq);
+		if (ret <= 0) return;
 
-		fr_trunk_request_signal_sent(treq);
+		trunk_request_signal_sent(treq);
 	}
 	TEST_CHECK(count > 0);
 }
 
-static void test_cancel_mux(fr_trunk_connection_t *tconn, fr_connection_t *conn, UNUSED void *uctx)
+static void test_cancel_mux(UNUSED fr_event_list_t *el, trunk_connection_t *tconn, connection_t *conn, UNUSED void *uctx)
 {
-	fr_trunk_request_t	*treq;
+	trunk_request_t	*treq;
 	size_t			count = 0;
-	int			fd = *(talloc_get_type_abort(conn->h, int));
-	ssize_t			slen;
+	test_conn_t		*tc = talloc_get_type_abort(conn->h, test_conn_t);
+	int			ret;
 
 	/*
 	 *	For cancellation we just do
 	 */
-	while ((fr_trunk_connection_pop_cancellation(&treq, tconn) == 0)) {
+	while ((trunk_connection_pop_cancellation(&treq, tconn) == 0)) {
 		test_proto_request_t	*preq = treq->pub.preq;
 		count++;
 
@@ -75,39 +116,39 @@ static void test_cancel_mux(fr_trunk_connection_t *tconn, fr_connection_t *conn,
 		 *	Simulate a partial cancel write
 		 */
 		if (preq && preq->signal_cancel_partial) {
-			fr_trunk_request_signal_cancel_partial(treq);
+			trunk_request_signal_cancel_partial(treq);
 			preq->signal_cancel_partial = false;
 			break;
 		}
 
-		if (test_verbose_level_ >= 3) printf("%s - Wrote %p\n", __FUNCTION__, preq);
-		slen = write(fd, &preq, sizeof(preq));
-		if (slen < 0) {
+		if (acutest_verbose_level_ >= 3) printf("%s - Wrote %p\n", __FUNCTION__, preq);
+		ret = test_conn_write(tc, preq);
+		if (ret < 0) {
 			fr_perror("%s - %s", __FUNCTION__, fr_syserror(errno));
 			return;
 		}
-		if (slen < 0) return;
-		if (slen == 0) return;
-		if (slen < (ssize_t)sizeof(preq)) abort();
+		if (ret == 0) return;
 
-		fr_trunk_request_signal_cancel_sent(treq);
+		trunk_request_signal_cancel_sent(treq);
 	}
 	TEST_CHECK(count > 0);
 }
 
-static void test_demux(UNUSED fr_trunk_connection_t *tconn, fr_connection_t *conn, UNUSED void *uctx)
+static void test_demux(UNUSED fr_event_list_t *el, UNUSED trunk_connection_t *tconn, connection_t *conn, UNUSED void *uctx)
 {
-	int			fd = *(talloc_get_type_abort(conn->h, int));
+	test_conn_t		*tc = talloc_get_type_abort(conn->h, test_conn_t);
 	test_proto_request_t	*preq;
-	ssize_t			slen;
+	test_sent_t		*sent;
+	uint8_t			wake;
 
-	do {
-		slen = read(fd, &preq, sizeof(preq));
-		if (slen <= 0) return;
+	while (read(tc->fd[0], &wake, sizeof(wake)) > 0) {
+		sent = fr_dlist_pop_head(&tc->sent);
+		if (!fr_cond_assert(sent)) break;
 
-		if (test_verbose_level_ >= 3) printf("%s - Read %p (%zu)\n", __FUNCTION__, preq, (size_t)slen);
-		TEST_CHECK(slen == sizeof(preq));
-		talloc_get_type_abort(preq, test_proto_request_t);
+		preq = sent->preq;
+		talloc_free(sent);
+
+		if (acutest_verbose_level_ >= 3) printf("%s - Read %p\n", __FUNCTION__, preq);
 
 		if (preq->freed) continue;
 
@@ -115,66 +156,67 @@ static void test_demux(UNUSED fr_trunk_connection_t *tconn, fr_connection_t *con
 		 *	Demuxer can handle both normal requests and cancelled ones
 		 */
 		switch (preq->treq->pub.state) {
-		case FR_TRUNK_REQUEST_STATE_CANCEL:
+		case TRUNK_REQUEST_STATE_CANCEL:
 			break;		/* Hack - just ignore it */
 
-		case FR_TRUNK_REQUEST_STATE_CANCEL_SENT:
-			fr_trunk_request_signal_cancel_complete(preq->treq);
+		case TRUNK_REQUEST_STATE_CANCEL_SENT:
+			trunk_request_signal_cancel_complete(preq->treq);
 			break;
 
-		case FR_TRUNK_REQUEST_STATE_SENT:
-			fr_trunk_request_signal_complete(preq->treq);
+		case TRUNK_REQUEST_STATE_SENT:
+			trunk_request_signal_complete(preq->treq);
 			break;
 
 		default:
 			fr_assert(0);
 			break;
 		}
-	} while (slen >= 0);
+	}
 }
 
 static void _conn_io_error(UNUSED fr_event_list_t *el, UNUSED int fd, UNUSED int flags,
 			   UNUSED int fd_errno, void *uctx)
 {
 
-	fr_trunk_connection_t	*tconn = talloc_get_type_abort(uctx, fr_trunk_connection_t);
+	trunk_connection_t	*tconn = talloc_get_type_abort(uctx, trunk_connection_t);
 
-	fr_trunk_connection_signal_reconnect(tconn, FR_CONNECTION_FAILED);
+	trunk_connection_signal_reconnect(tconn, CONNECTION_FAILED);
 }
 
 static void _conn_io_read(UNUSED fr_event_list_t *el, UNUSED int fd, UNUSED int flags, void *uctx)
 {
-	fr_trunk_connection_t *tconn = talloc_get_type_abort(uctx, fr_trunk_connection_t);
-	fr_trunk_connection_signal_readable(tconn);
+	trunk_connection_t *tconn = talloc_get_type_abort(uctx, trunk_connection_t);
+	trunk_connection_signal_readable(tconn);
 }
 
 static void _conn_io_write(UNUSED fr_event_list_t *el, UNUSED int fd, UNUSED int flags, void *uctx)
 {
-	fr_trunk_connection_t *tconn = talloc_get_type_abort(uctx, fr_trunk_connection_t);
-	fr_trunk_connection_signal_writable(tconn);
+	trunk_connection_t *tconn = talloc_get_type_abort(uctx, trunk_connection_t);
+	trunk_connection_signal_writable(tconn);
 }
 
-static void _conn_notify(fr_trunk_connection_t *tconn, fr_connection_t *conn,
+static void _conn_notify(trunk_connection_t *tconn, connection_t *conn,
 			 fr_event_list_t *el,
-			 fr_trunk_connection_event_t notify_on, UNUSED void *uctx)
+			 trunk_connection_event_t notify_on, UNUSED void *uctx)
 {
-	int fd = *(talloc_get_type_abort(conn->h, int));
+	test_conn_t *tc = talloc_get_type_abort(conn->h, test_conn_t);
+	int fd = tc->fd[0];
 
 	switch (notify_on) {
-	case FR_TRUNK_CONN_EVENT_NONE:
+	case TRUNK_CONN_EVENT_NONE:
 		fr_event_fd_delete(el, fd, FR_EVENT_FILTER_IO);
 		break;
 
-	case FR_TRUNK_CONN_EVENT_READ:
-		fr_event_fd_insert(conn, el, fd, _conn_io_read, NULL, _conn_io_error, tconn);
+	case TRUNK_CONN_EVENT_READ:
+		TEST_CHECK(fr_event_fd_insert(conn, NULL, el, fd, _conn_io_read, NULL, _conn_io_error, tconn) == 0);
 		break;
 
-	case FR_TRUNK_CONN_EVENT_WRITE:
-		fr_event_fd_insert(conn, el, fd, NULL, _conn_io_write, _conn_io_error, tconn);
+	case TRUNK_CONN_EVENT_WRITE:
+		TEST_CHECK(fr_event_fd_insert(conn, NULL, el, fd, NULL, _conn_io_write, _conn_io_error, tconn) == 0);
 		break;
 
-	case FR_TRUNK_CONN_EVENT_BOTH:
-		fr_event_fd_insert(conn, el, fd, _conn_io_read, _conn_io_write, _conn_io_error, tconn);
+	case TRUNK_CONN_EVENT_BOTH:
+		TEST_CHECK(fr_event_fd_insert(conn, NULL, el, fd, _conn_io_read, _conn_io_write, _conn_io_error, tconn) == 0);
 		break;
 
 	default:
@@ -182,8 +224,8 @@ static void _conn_notify(fr_trunk_connection_t *tconn, fr_connection_t *conn,
 	}
 }
 
-static void test_request_cancel(UNUSED fr_connection_t *conn, void *preq,
-				UNUSED fr_trunk_cancel_reason_t reason, void *uctx)
+static void test_request_cancel(UNUSED connection_t *conn, void *preq,
+				UNUSED trunk_cancel_reason_t reason, void *uctx)
 {
 	test_proto_stats_t	*stats = uctx;
 	test_proto_request_t	*our_preq;
@@ -207,7 +249,7 @@ static void test_request_complete(UNUSED request_t *request, void *preq, UNUSED 
 	if (stats) stats->completed++;
 }
 
-static void test_request_fail(UNUSED request_t *request, void *preq, UNUSED void *rctx, UNUSED fr_trunk_request_state_t state, void *uctx)
+static void test_request_fail(UNUSED request_t *request, void *preq, UNUSED void *rctx, UNUSED trunk_request_state_t state, void *uctx)
 {
 	test_proto_stats_t	*stats = uctx;
 	test_proto_request_t	*our_preq;
@@ -236,12 +278,12 @@ static void test_request_free(UNUSED request_t *request, void *preq, void *uctx)
  */
 static void _conn_io_loopback(UNUSED fr_event_list_t *el, int fd, UNUSED int flags, void *uctx)
 {
-	int		*our_h = talloc_get_type_abort(uctx, int);
+	test_conn_t	*tc = talloc_get_type_abort(uctx, test_conn_t);
 	static uint8_t	buff[1024];
 	static size_t	to_write;
 	ssize_t		slen;
 
-	fr_assert(fd == our_h[1]);
+	fr_assert(fd == tc->fd[1]);
 
 	while (true) {
 		slen = read(fd, buff, sizeof(buff));
@@ -249,80 +291,82 @@ static void _conn_io_loopback(UNUSED fr_event_list_t *el, int fd, UNUSED int fla
 
 		to_write = (size_t)slen;
 
-		if (test_verbose_level_ >= 3) printf("%s - Read %zu bytes of data\n", __FUNCTION__, slen);
-		slen = write(our_h[1], buff, (size_t)to_write);
+		if (acutest_verbose_level_ >= 3) printf("%s - Read %zu bytes of data\n", __FUNCTION__, (size_t)slen);
+		slen = write(tc->fd[1], buff, (size_t)to_write);
 		if (slen < 0) return;
 
 		if (slen < (ssize_t)to_write) {
 			to_write -= slen;
-			if (test_verbose_level_ >= 3) {
+			if (acutest_verbose_level_ >= 3) {
 				printf("%s - Partial write %zu bytes left\n", __FUNCTION__, to_write);
 			}
 			return;
 		} else {
-			if (test_verbose_level_ >= 3) printf("%s - Wrote %zu bytes of data\n", __FUNCTION__, slen);
+			if (acutest_verbose_level_ >= 3) printf("%s - Wrote %zu bytes of data\n", __FUNCTION__, (size_t)slen);
 		}
 	}
 }
 
 static void _conn_close(UNUSED fr_event_list_t *el, void *h, UNUSED void *uctx)
 {
-	int *our_h = talloc_get_type_abort(h, int);
+	test_conn_t *tc = talloc_get_type_abort(h, test_conn_t);
 
-	talloc_free_children(our_h);	/* Clear the IO handlers */
+	talloc_free_children(tc);	/* Clear the IO handlers, and any requests not read back */
 
-	close(our_h[0]);
-	close(our_h[1]);
+	close(tc->fd[0]);
+	close(tc->fd[1]);
 
-	talloc_free(our_h);
+	talloc_free(tc);
 }
 
 /** Insert I/O handlers that loop any data back round
  *
  */
-static fr_connection_state_t _conn_open(fr_event_list_t *el, void *h, UNUSED void *uctx)
+static connection_state_t _conn_open(fr_event_list_t *el, void *h, UNUSED void *uctx)
 {
-	int *our_h = talloc_get_type_abort(h, int);
+	test_conn_t *tc = talloc_get_type_abort(h, test_conn_t);
 
 	/*
 	 *	This always needs to be inserted
 	 */
-	fr_event_fd_insert(our_h, el, our_h[1], _conn_io_loopback, NULL, NULL, our_h);
+	TEST_CHECK(fr_event_fd_insert(tc, NULL, el, tc->fd[1], _conn_io_loopback, NULL, NULL, tc) == 0);
 
-	return FR_CONNECTION_STATE_CONNECTED;
+	return CONNECTION_STATE_CONNECTED;
 }
 
 /** Allocate a basic socket pair
  *
  */
-static fr_connection_state_t _conn_init(void **h_out, fr_connection_t *conn, UNUSED void *uctx)
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static connection_state_t _conn_init(void **h_out, connection_t *conn, UNUSED void *uctx)
 {
-	int *h;
+	test_conn_t *tc;
 
-	h = talloc_array(conn, int, 2);
-	socketpair(AF_UNIX, SOCK_STREAM, 0, h);
+	MEM(tc = talloc_zero(conn, test_conn_t));
+	fr_dlist_talloc_init(&tc->sent, test_sent_t, entry);
+	socketpair(AF_UNIX, SOCK_STREAM, 0, tc->fd);
 
-	fr_nonblock(h[0]);
-	fr_nonblock(h[1]);
-	fr_connection_signal_on_fd(conn, h[0]);
-	*h_out = h;
+	(void) fr_nonblock(tc->fd[0]);
+	(void) fr_nonblock(tc->fd[1]);
+	connection_signal_on_fd(conn, tc->fd[0]);
+	*h_out = tc;
 
-	return FR_CONNECTION_STATE_CONNECTING;
+	return CONNECTION_STATE_CONNECTING;
 }
 
-static fr_connection_t *test_setup_socket_pair_connection_alloc(fr_trunk_connection_t *tconn,
+static connection_t *test_setup_socket_pair_connection_alloc(trunk_connection_t *tconn,
 								fr_event_list_t *el,
-								fr_connection_conf_t const *conn_conf,
+								connection_conf_t const *conn_conf,
 								char const *log_prefix, UNUSED void *uctx)
 {
-	fr_connection_conf_t cstat;
+	connection_conf_t cstat;
 
 	if (!conn_conf) {
 		memset(&cstat, 0, sizeof(cstat));
 		conn_conf = &cstat;
 	}
-	return fr_connection_alloc(tconn, el,
-				   &(fr_connection_funcs_t){
+	return connection_alloc(tconn, el,
+				   &(connection_funcs_t){
 				   	.init = _conn_init,
 				   	.open = _conn_open,
 				   	.close = _conn_close
@@ -331,12 +375,20 @@ static fr_connection_t *test_setup_socket_pair_connection_alloc(fr_trunk_connect
 				   log_prefix, tconn);
 }
 
-static fr_trunk_t *test_setup_trunk(TALLOC_CTX *ctx, fr_event_list_t *el, fr_trunk_conf_t *conf, bool with_cancel_mux, void *uctx)
+static fr_cmp_ret_t test_preq_cmp(void const *a, void const *b)
 {
-	fr_trunk_io_funcs_t	io_funcs = {
+	test_proto_request_t const	*preq_a = a;
+	test_proto_request_t const	*preq_b = b;
+
+	return CMP_PREFER_SMALLER(preq_a->priority, preq_b->priority); /* our priorities are NOT request->priority */
+}
+
+static trunk_t *test_setup_trunk(TALLOC_CTX *ctx, fr_event_list_t *el, trunk_conf_t *conf, bool with_cancel_mux, void *uctx)
+{
+	trunk_io_funcs_t	io_funcs = {
 					.connection_alloc = test_setup_socket_pair_connection_alloc,
 					.connection_notify = _conn_notify,
-					.request_prioritise = fr_pointer_cmp,
+					.request_prioritise = test_preq_cmp,
 					.request_mux = test_mux,
 					.request_demux = test_demux,
 					.request_cancel = test_request_cancel,
@@ -350,21 +402,21 @@ static fr_trunk_t *test_setup_trunk(TALLOC_CTX *ctx, fr_event_list_t *el, fr_tru
 	 */
 	if (with_cancel_mux) io_funcs.request_cancel_mux = test_cancel_mux;
 
-	return fr_trunk_alloc(ctx, el, &io_funcs, conf, "test_socket_pair", uctx, false);
+	return trunk_alloc(ctx, el, &io_funcs, conf, "test_socket_pair", uctx, false, NULL);
 }
 
 static void test_socket_pair_alloc_then_free(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
 	int			events;
 
-	fr_trunk_conf_t		conf = {
+	trunk_conf_t		conf = {
 					.start = 2,
 					.min = 2
 				};
-	fr_trunk_io_funcs_t	io_funcs = {
+	trunk_io_funcs_t	io_funcs = {
 					.connection_alloc = test_setup_socket_pair_connection_alloc,
 					.request_prioritise = fr_pointer_cmp,
 				};
@@ -373,17 +425,17 @@ static void test_socket_pair_alloc_then_free(void)
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
 
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
-	trunk = fr_trunk_alloc(ctx, el, &io_funcs, &conf, "test_socket_pair", NULL, false);
+	trunk = trunk_alloc(ctx, el, &io_funcs, &conf, "test_socket_pair", NULL, false, NULL);
 	TEST_CHECK(trunk != NULL);
 	if (!trunk) return;
 
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 2);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 2);
 	events = fr_event_corral(el, test_time_base, true);
 	TEST_CHECK(events == 2);	/* Two I/O write events, no timers */
 	fr_event_service(el);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 2);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 2);
 
 	events = fr_event_corral(el, test_time_base, false);
 	TEST_CHECK(events == 0);	/* I/O events should have been cleared */
@@ -395,17 +447,17 @@ static void test_socket_pair_alloc_then_free(void)
 static void test_socket_pair_alloc_then_reconnect_then_free(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
 	int			events;
-	fr_trunk_conf_t		conf = {
+	trunk_conf_t		conf = {
 					.start = 2,
 					.min = 2,
-					.conn_conf = &(fr_connection_conf_t){
-						.reconnection_delay = NSEC * 0.5
+					.conn_conf = &(connection_conf_t){
+						.reconnection_delay = fr_time_delta_from_nsec(NSEC / 2)
 					}
 				};
-	fr_trunk_io_funcs_t	io_funcs = {
+	trunk_io_funcs_t	io_funcs = {
 					.connection_alloc = test_setup_socket_pair_connection_alloc,
 					.request_prioritise = fr_pointer_cmp,
 				};
@@ -415,37 +467,37 @@ static void test_socket_pair_alloc_then_reconnect_then_free(void)
 
 	if (!el) return;
 
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
-	trunk = fr_trunk_alloc(ctx, el, &io_funcs, &conf, "test_socket_pair", NULL, false);
+	trunk = trunk_alloc(ctx, el, &io_funcs, &conf, "test_socket_pair", NULL, false, NULL);
 	TEST_CHECK(trunk != NULL);
 	if (!trunk) return;
 
 	events = fr_event_corral(el, test_time_base, true);
 	TEST_CHECK(events == 2);	/* Two I/O write events, no timers */
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 2);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 2);
 	fr_event_service(el);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 2);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 2);
 
 	events = fr_event_corral(el, test_time_base, false);
 	TEST_CHECK(events == 0);	/* I/O events should have been cleared */
-	TEST_MSG("Got %u events", events);
+	TEST_MSG("Got %d events", events);
 
-	fr_trunk_reconnect(trunk, FR_TRUNK_CONN_ACTIVE, FR_CONNECTION_FAILED);
+	trunk_reconnect(trunk, TRUNK_CONN_ACTIVE, CONNECTION_FAILED);
 
-	test_time_base += NSEC * 2;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(2));
 	events = fr_event_corral(el, test_time_base, true);
 	TEST_CHECK(events == 1);	/* Two timer events but event loops only adds one to the total*/
-	TEST_MSG("Got %u events", events);
+	TEST_MSG("Got %d events", events);
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 2);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 2);
 
 	events = fr_event_corral(el, test_time_base, true);
 	TEST_CHECK(events == 2);	/* Two I/O write events, no timers */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 2);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 2);
 	events = fr_event_corral(el, test_time_base, false);
 	TEST_CHECK(events == 0);	/* I/O events should have been cleared */
 
@@ -453,31 +505,33 @@ static void test_socket_pair_alloc_then_reconnect_then_free(void)
 	talloc_free(ctx);
 }
 
-static fr_connection_state_t _conn_init_no_signal(void **h_out, fr_connection_t *conn, UNUSED void *uctx)
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static connection_state_t _conn_init_no_signal(void **h_out, connection_t *conn, UNUSED void *uctx)
 {
-	int *h;
+	test_conn_t *tc;
 
-	h = talloc_array(conn, int, 2);
-	socketpair(AF_UNIX, SOCK_STREAM, 0, h);
-	*h_out = h;
+	MEM(tc = talloc_zero(conn, test_conn_t));
+	fr_dlist_talloc_init(&tc->sent, test_sent_t, entry);
+	socketpair(AF_UNIX, SOCK_STREAM, 0, tc->fd);
+	*h_out = tc;
 
-	return FR_CONNECTION_STATE_CONNECTING;
+	return CONNECTION_STATE_CONNECTING;
 }
 
-static fr_connection_t *test_setup_socket_pair_1s_timeout_connection_alloc(fr_trunk_connection_t *tconn,
+static connection_t *test_setup_socket_pair_1s_timeout_connection_alloc(trunk_connection_t *tconn,
 									   fr_event_list_t *el,
-									   UNUSED fr_connection_conf_t const *conf,
+									   UNUSED connection_conf_t const *conf,
 									   char const *log_prefix, void *uctx)
 {
-	return fr_connection_alloc(tconn, el,
-				   &(fr_connection_funcs_t){
+	return connection_alloc(tconn, el,
+				   &(connection_funcs_t){
 				   	.init = _conn_init_no_signal,
 				   	.open = _conn_open,
 				   	.close = _conn_close
 				   },
-				   &(fr_connection_conf_t){
-				   	.connection_timeout = NSEC * 1,
-				   	.reconnection_delay = NSEC * 1
+				   &(connection_conf_t){
+				   	.connection_timeout = fr_time_delta_from_sec(1),
+				   	.reconnection_delay = fr_time_delta_from_sec(1)
 				   },
 				   log_prefix, uctx);
 }
@@ -485,15 +539,15 @@ static fr_connection_t *test_setup_socket_pair_1s_timeout_connection_alloc(fr_tr
 static void test_socket_pair_alloc_then_connect_timeout(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
 	int			events;
-	fr_trunk_connection_t		*tconn;
-	fr_trunk_conf_t		conf = {
+	trunk_connection_t		*tconn;
+	trunk_conf_t		conf = {
 					.start = 1,
 					.min = 1
 				};
-	fr_trunk_io_funcs_t	io_funcs = {
+	trunk_io_funcs_t	io_funcs = {
 					.connection_alloc = test_setup_socket_pair_1s_timeout_connection_alloc,
 					.request_prioritise = fr_pointer_cmp,
 				};
@@ -502,17 +556,17 @@ static void test_socket_pair_alloc_then_connect_timeout(void)
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
 
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
 
-	trunk = fr_trunk_alloc(ctx, el, &io_funcs, &conf, "test_socket_pair", NULL, false);
+	trunk = trunk_alloc(ctx, el, &io_funcs, &conf, "test_socket_pair", NULL, false, NULL);
 	TEST_CHECK(trunk != NULL);
 	if (!trunk) return;
 
 	/*
 	 *	Trigger connection timeout
 	 */
-	test_time_base += NSEC * 1.5;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_nsec(NSEC + (NSEC / 2)));
 	TEST_CHECK(fr_event_list_num_timers(el) == 1);	/* One timer event for the connection timeout */
 	events = fr_event_corral(el, test_time_base, true);
 	TEST_CHECK(events == 1);	/* We didn't install the I/O events */
@@ -521,8 +575,8 @@ static void test_socket_pair_alloc_then_connect_timeout(void)
 	TEST_CHECK(tconn != NULL);
 	if (tconn == NULL) return;
 
-	TEST_CHECK(fr_connection_get_num_timed_out(tconn->pub.conn) == 0);
-	TEST_CHECK(fr_connection_get_num_reconnected(tconn->pub.conn) == 0);
+	TEST_CHECK(connection_get_num_timed_out(tconn->pub.conn) == 0);
+	TEST_CHECK(connection_get_num_reconnected(tconn->pub.conn) == 0);
 
 	/*
 	 *	Timeout should now fire
@@ -532,8 +586,8 @@ static void test_socket_pair_alloc_then_connect_timeout(void)
 	/*
 	 *	Connection delay not implemented for timed out connections
 	 */
-	TEST_CHECK(fr_connection_get_num_timed_out(tconn->pub.conn) == 1);
-	TEST_CHECK(fr_connection_get_num_reconnected(tconn->pub.conn) == 1);
+	TEST_CHECK(connection_get_num_timed_out(tconn->pub.conn) == 1);
+	TEST_CHECK(connection_get_num_reconnected(tconn->pub.conn) == 1);
 
 	events = fr_event_corral(el, test_time_base, false);
 	TEST_CHECK(events == 0);	/* I/O events should have been cleared */
@@ -542,20 +596,20 @@ static void test_socket_pair_alloc_then_connect_timeout(void)
 	talloc_free(ctx);
 }
 
-static fr_connection_t *test_setup_socket_pair_1s_reconnection_delay_alloc(fr_trunk_connection_t *tconn,
+static connection_t *test_setup_socket_pair_1s_reconnection_delay_alloc(trunk_connection_t *tconn,
 									   fr_event_list_t *el,
-									   UNUSED fr_connection_conf_t const *conn_conf,
+									   UNUSED connection_conf_t const *conn_conf,
 									   char const *log_prefix, void *uctx)
 {
-	return fr_connection_alloc(tconn, el,
-				   &(fr_connection_funcs_t){
+	return connection_alloc(tconn, el,
+				   &(connection_funcs_t){
 				   	.init = _conn_init,
 				   	.open = _conn_open,
 				   	.close = _conn_close
 				   },
-				   &(fr_connection_conf_t){
-				   	.connection_timeout = NSEC * 1,
-				   	.reconnection_delay = NSEC * 1
+				   &(connection_conf_t){
+				   	.connection_timeout = fr_time_delta_from_sec(1),
+				   	.reconnection_delay = fr_time_delta_from_sec(1)
 				   },
 				   log_prefix, uctx);
 }
@@ -563,19 +617,19 @@ static fr_connection_t *test_setup_socket_pair_1s_reconnection_delay_alloc(fr_tr
 static void test_socket_pair_alloc_then_reconnect_check_delay(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
 	int			events;
-	fr_trunk_connection_t	*tconn;
-	fr_trunk_conf_t		conf = {
+	trunk_connection_t	*tconn;
+	trunk_conf_t		conf = {
 					.start = 1,
 					.min = 1,
-					.conn_conf = &(fr_connection_conf_t){
-						.reconnection_delay = NSEC * 1,
-						.connection_timeout = NSEC * 1
+					.conn_conf = &(connection_conf_t){
+						.reconnection_delay = fr_time_delta_from_sec(1),
+						.connection_timeout = fr_time_delta_from_sec(1)
 					}
 				};
-	fr_trunk_io_funcs_t	io_funcs = {
+	trunk_io_funcs_t	io_funcs = {
 					.connection_alloc = test_setup_socket_pair_1s_reconnection_delay_alloc,
 					.request_prioritise = fr_pointer_cmp,
 				};
@@ -583,46 +637,46 @@ static void test_socket_pair_alloc_then_reconnect_check_delay(void)
 	DEBUG_LVL_SET;
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
-	trunk = fr_trunk_alloc(ctx, el, &io_funcs, &conf, "test_socket_pair", NULL, false);
+	trunk = trunk_alloc(ctx, el, &io_funcs, &conf, "test_socket_pair", NULL, false, NULL);
 	TEST_CHECK(trunk != NULL);
 	if (!trunk) return;
 
 	/*
 	 *	Trigger connection timeout
 	 */
-	test_time_base += NSEC * 1.5;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_nsec(NSEC + (NSEC / 2)));
 	TEST_CHECK(fr_event_list_num_timers(el) == 1);	/* One timer event for the connection timeout */
 	events = fr_event_corral(el, test_time_base, true);
 	TEST_CHECK(events == 2);	/* We didn't install the I/O events */
 	fr_event_service(el);
 
-	tconn = fr_heap_peek(trunk->active);
+	tconn = fr_minmax_heap_min_peek(trunk->active);
 	TEST_CHECK(tconn != NULL);
 	if (tconn == NULL) return;
 
-	TEST_CHECK(fr_connection_get_num_timed_out(tconn->pub.conn) == 0);
-	TEST_CHECK(fr_connection_get_num_reconnected(tconn->pub.conn) == 0);
+	TEST_CHECK(connection_get_num_timed_out(tconn->pub.conn) == 0);
+	TEST_CHECK(connection_get_num_reconnected(tconn->pub.conn) == 0);
 
 	/*
 	 *	Trigger reconnection
 	 */
-	fr_connection_signal_reconnect(tconn->pub.conn, FR_CONNECTION_FAILED);
-	test_time_base += NSEC * 0.5;
+	connection_signal_reconnect(tconn->pub.conn, CONNECTION_FAILED);
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_nsec(NSEC / 2));
 
 	events = fr_event_corral(el, test_time_base, false);
 	TEST_CHECK(events == 0);	/* Reconnect delay not ready to fire yet, no I/O handlers installed */
 	TEST_CHECK(fr_event_list_num_timers(el) == 1);	/* One timer event for reconnect delay */
 
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	events = fr_event_corral(el, test_time_base, false);
 	TEST_CHECK(events == 1);	/* Reconnect delay should now be ready to fire */
 
 	fr_event_service(el);		/* Services the timer, which then triggers init */
 
-	TEST_CHECK(fr_connection_get_num_timed_out(tconn->pub.conn) == 0);
-	TEST_CHECK(fr_connection_get_num_reconnected(tconn->pub.conn) == 1);
+	TEST_CHECK(connection_get_num_timed_out(tconn->pub.conn) == 0);
+	TEST_CHECK(connection_get_num_reconnected(tconn->pub.conn) == 1);
 
 	events = fr_event_corral(el, test_time_base, true);
 	TEST_CHECK(events == 1);	/* Should have a pending I/O event and a timer */
@@ -637,21 +691,21 @@ static void test_socket_pair_alloc_then_reconnect_check_delay(void)
 static void test_enqueue_basic(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
-	fr_trunk_conf_t		conf = {
+	trunk_conf_t		conf = {
 					.start = 1,
 					.min = 1,
-					.manage_interval = NSEC * 0.5
+					.manage_interval = fr_time_delta_from_nsec(NSEC / 2)
 				};
 	test_proto_request_t	*preq;
-	fr_trunk_request_t	*treq = NULL;
-	fr_trunk_enqueue_t	rcode;
+	trunk_request_t	*treq = NULL;
+	trunk_enqueue_t	rcode;
 
 	DEBUG_LVL_SET;
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
 	trunk = test_setup_trunk(ctx, el, &conf, true, NULL);
 
@@ -670,11 +724,11 @@ static void test_enqueue_basic(void)
 	 *      so the request should enter the
 	 *	backlog.
 	 */
-	rcode = fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	rcode = trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	preq->treq = treq;
-	TEST_CHECK(rcode == FR_TRUNK_ENQUEUE_IN_BACKLOG);
+	TEST_CHECK(rcode == TRUNK_ENQUEUE_IN_BACKLOG);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_BACKLOG) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_BACKLOG) == 1);
 
 	/*
 	 *	Allow the connection to establish
@@ -682,14 +736,14 @@ static void test_enqueue_basic(void)
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_BACKLOG) == 0);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_BACKLOG) == 0);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING) == 1);
 
 	/*
 	 *	Should now be active and have a write event
 	 *	inserted into the event loop.
 	 */
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 1);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 1);
 
 	/*
 	 *	Trunk should be signalled the connection is
@@ -702,7 +756,7 @@ static void test_enqueue_basic(void)
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT) == 1);
 
 	/*
 	 *	Gives the loopback function a chance
@@ -738,26 +792,26 @@ static void test_enqueue_basic(void)
 static void test_enqueue_cancellation_points(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
-	fr_trunk_conf_t		conf = {
+	trunk_conf_t		conf = {
 					.start = 1,
 					.min = 1,
-					.manage_interval = NSEC * 0.5
+					.manage_interval = fr_time_delta_from_nsec(NSEC / 2)
 				};
 	test_proto_request_t	*preq;
-	fr_trunk_request_t	*treq = NULL;
+	trunk_request_t	*treq = NULL;
 
 	DEBUG_LVL_SET;
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
 	trunk = test_setup_trunk(ctx, el, &conf, false, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 
-	TEST_CASE("cancellation via trunk free - FR_TRUNK_REQUEST_STATE_BACKLOG");
+	TEST_CASE("cancellation via trunk free - TRUNK_REQUEST_STATE_BACKLOG");
 	talloc_free(trunk);
 	TEST_CHECK(preq->completed == false);
 	TEST_CHECK(preq->failed == true);
@@ -765,14 +819,14 @@ static void test_enqueue_cancellation_points(void)
 	TEST_CHECK(preq->freed == true);
 	talloc_free(preq);
 
-	TEST_CASE("cancellation via signal - FR_TRUNK_REQUEST_STATE_BACKLOG");
+	TEST_CASE("cancellation via signal - TRUNK_REQUEST_STATE_BACKLOG");
 	trunk = test_setup_trunk(ctx, el, &conf, false, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
 	treq = NULL;
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	preq->treq = treq;
-	fr_trunk_request_signal_cancel(treq);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_ALL) == 0);
+	trunk_request_signal_cancel(treq);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_ALL) == 0);
 
 	TEST_CHECK(preq->completed == false);
 	TEST_CHECK(preq->failed == false);	/* Request/rctx not guaranteed after signal, so can't call fail */
@@ -781,12 +835,12 @@ static void test_enqueue_cancellation_points(void)
 	talloc_free(preq);
 	talloc_free(trunk);
 
-	TEST_CASE("cancellation via trunk free - FR_TRUNK_REQUEST_STATE_PARTIAL");
+	TEST_CASE("cancellation via trunk free - TRUNK_REQUEST_STATE_PARTIAL");
 	trunk = test_setup_trunk(ctx, el, &conf, false, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
 	preq->signal_partial = true;
 	treq = NULL;
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	preq->treq = treq;
 
 	fr_event_corral(el, test_time_base, false);	/* Connect the connection */
@@ -795,7 +849,7 @@ static void test_enqueue_cancellation_points(void)
 	fr_event_corral(el, test_time_base, false);	/* Send the request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PARTIAL));
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PARTIAL));
 
 	talloc_free(trunk);
 
@@ -805,12 +859,12 @@ static void test_enqueue_cancellation_points(void)
 	TEST_CHECK(preq->freed == true);
 	talloc_free(preq);
 
-	TEST_CASE("cancellation via signal - FR_TRUNK_REQUEST_STATE_PARTIAL");
+	TEST_CASE("cancellation via signal - TRUNK_REQUEST_STATE_PARTIAL");
 	trunk = test_setup_trunk(ctx, el, &conf, false, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
 	preq->signal_partial = true;
 	treq = NULL;
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	preq->treq = treq;
 
 	fr_event_corral(el, test_time_base, false);	/* Connect the connection */
@@ -819,9 +873,9 @@ static void test_enqueue_cancellation_points(void)
 	fr_event_corral(el, test_time_base, false);	/* Send the request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PARTIAL) == 1);
-	fr_trunk_request_signal_cancel(treq);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_ALL) == 0);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PARTIAL) == 1);
+	trunk_request_signal_cancel(treq);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_ALL) == 0);
 
 	TEST_CHECK(preq->completed == false);
 	TEST_CHECK(preq->failed == false);	/* Request/rctx not guaranteed after signal, so can't call fail */
@@ -830,11 +884,11 @@ static void test_enqueue_cancellation_points(void)
 	talloc_free(preq);
 	talloc_free(trunk);
 
-	TEST_CASE("cancellation via trunk free - FR_TRUNK_REQUEST_STATE_SENT");
+	TEST_CASE("cancellation via trunk free - TRUNK_REQUEST_STATE_SENT");
 	trunk = test_setup_trunk(ctx, el, &conf, false, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
 	treq = NULL;
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	preq->treq = treq;
 
 	fr_event_corral(el, test_time_base, false);	/* Connect the connection */
@@ -843,7 +897,7 @@ static void test_enqueue_cancellation_points(void)
 	fr_event_corral(el, test_time_base, false);	/* Send the request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT) == 1);
 	talloc_free(trunk);
 
 	TEST_CHECK(preq->completed == false);
@@ -852,11 +906,11 @@ static void test_enqueue_cancellation_points(void)
 	TEST_CHECK(preq->freed == true);
 	talloc_free(preq);
 
-	TEST_CASE("cancellation via signal - FR_TRUNK_REQUEST_STATE_SENT");
+	TEST_CASE("cancellation via signal - TRUNK_REQUEST_STATE_SENT");
 	trunk = test_setup_trunk(ctx, el, &conf, false, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
 	treq = NULL;
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	preq->treq = treq;
 
 	fr_event_corral(el, test_time_base, false);	/* Connect the connection */
@@ -865,9 +919,9 @@ static void test_enqueue_cancellation_points(void)
 	fr_event_corral(el, test_time_base, false);	/* Send the request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 1);
-	fr_trunk_request_signal_cancel(treq);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_ALL) == 0);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT) == 1);
+	trunk_request_signal_cancel(treq);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_ALL) == 0);
 
 	TEST_CHECK(preq->completed == false);
 	TEST_CHECK(preq->failed == false);	/* Request/rctx not guaranteed after signal, so can't call fail */
@@ -876,12 +930,12 @@ static void test_enqueue_cancellation_points(void)
 	talloc_free(preq);
 	talloc_free(trunk);
 
-	TEST_CASE("cancellation via trunk free - FR_TRUNK_REQUEST_STATE_CANCEL_PARTIAL");
+	TEST_CASE("cancellation via trunk free - TRUNK_REQUEST_STATE_CANCEL_PARTIAL");
 	trunk = test_setup_trunk(ctx, el, &conf, true, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
 	preq->signal_cancel_partial = true;
 	treq = NULL;
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	preq->treq = treq;
 
 	fr_event_corral(el, test_time_base, false);	/* Connect the connection */
@@ -890,14 +944,14 @@ static void test_enqueue_cancellation_points(void)
 	fr_event_corral(el, test_time_base, false);	/* Send the request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 1);
-	fr_trunk_request_signal_cancel(treq);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT) == 1);
+	trunk_request_signal_cancel(treq);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL) == 1);
 
 	fr_event_corral(el, test_time_base, false);	/* Send the cancellation request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL_PARTIAL) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL_PARTIAL) == 1);
 
 	talloc_free(trunk);
 
@@ -907,11 +961,11 @@ static void test_enqueue_cancellation_points(void)
 	TEST_CHECK(preq->freed == true);
 	talloc_free(preq);
 
-	TEST_CASE("cancellation via trunk free - FR_TRUNK_REQUEST_STATE_CANCEL_SENT");
+	TEST_CASE("cancellation via trunk free - TRUNK_REQUEST_STATE_CANCEL_SENT");
 	trunk = test_setup_trunk(ctx, el, &conf, true, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
 	treq = NULL;
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	preq->treq = treq;
 
 	fr_event_corral(el, test_time_base, false);	/* Connect the connection */
@@ -920,14 +974,14 @@ static void test_enqueue_cancellation_points(void)
 	fr_event_corral(el, test_time_base, false);	/* Send the request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 1);
-	fr_trunk_request_signal_cancel(treq);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT) == 1);
+	trunk_request_signal_cancel(treq);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL) == 1);
 
 	fr_event_corral(el, test_time_base, false);	/* Send the cancellation request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL_SENT) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL_SENT) == 1);
 
 	talloc_free(trunk);
 
@@ -937,11 +991,11 @@ static void test_enqueue_cancellation_points(void)
 	TEST_CHECK(preq->freed == true);
 	talloc_free(preq);
 
-	TEST_CASE("trunk free after FR_TRUNK_REQUEST_STATE_CANCEL_COMPLETE");
+	TEST_CASE("trunk free after TRUNK_REQUEST_STATE_CANCEL_COMPLETE");
 	trunk = test_setup_trunk(ctx, el, &conf, true, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
 	treq = NULL;
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	preq->treq = treq;
 
 	fr_event_corral(el, test_time_base, false);	/* Connect the connection */
@@ -950,14 +1004,14 @@ static void test_enqueue_cancellation_points(void)
 	fr_event_corral(el, test_time_base, false);	/* Send the request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 1);
-	fr_trunk_request_signal_cancel(treq);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT) == 1);
+	trunk_request_signal_cancel(treq);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL) == 1);
 
 	fr_event_corral(el, test_time_base, false);	/* Send the cancellation request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL_SENT) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL_SENT) == 1);
 
 	fr_event_corral(el, test_time_base, false);	/* Loop the cancel request back round */
 	fr_event_service(el);
@@ -965,7 +1019,7 @@ static void test_enqueue_cancellation_points(void)
 	fr_event_corral(el, test_time_base, false);	/* Read the cancel ACK (such that it is) */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_ALL) == 0);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_ALL) == 0);
 
 	talloc_free(trunk);
 
@@ -985,29 +1039,29 @@ static void test_enqueue_cancellation_points(void)
 static void test_partial_to_complete_states(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
-	fr_trunk_conf_t		conf = {
+	trunk_conf_t		conf = {
 					.start = 1,
 					.min = 1,
-					.manage_interval = NSEC * 0.5
+					.manage_interval = fr_time_delta_from_nsec(NSEC / 2)
 				};
 	test_proto_request_t	*preq;
-	fr_trunk_request_t	*treq = NULL;
+	trunk_request_t	*treq = NULL;
 
 	DEBUG_LVL_SET;
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
 	trunk = test_setup_trunk(ctx, el, &conf, true, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
 	preq->signal_partial = true;
 	preq->signal_cancel_partial = true;
 
-	TEST_CASE("FR_TRUNK_REQUEST_STATE_PARTIAL -> FR_TRUNK_REQUEST_STATE_SENT");
+	TEST_CASE("TRUNK_REQUEST_STATE_PARTIAL -> TRUNK_REQUEST_STATE_SENT");
 
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	preq->treq = treq;
 
 	fr_event_corral(el, test_time_base, false);	/* Connect the connection */
@@ -1016,32 +1070,32 @@ static void test_partial_to_complete_states(void)
 	fr_event_corral(el, test_time_base, false);	/* Send the request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PARTIAL) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PARTIAL) == 1);
 
 	fr_event_corral(el, test_time_base, false);	/* Complete the partial request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT) == 1);
 
-	fr_trunk_request_signal_cancel(treq);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL) == 1);
+	trunk_request_signal_cancel(treq);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL) == 1);
 
-	TEST_CASE("FR_TRUNK_REQUEST_STATE_CANCEL_PARTIAL -> FR_TRUNK_REQUEST_STATE_CANCEL_SENT");
+	TEST_CASE("TRUNK_REQUEST_STATE_CANCEL_PARTIAL -> TRUNK_REQUEST_STATE_CANCEL_SENT");
 
 	fr_event_corral(el, test_time_base, false);	/* Send partial cancel request */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL_PARTIAL) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL_PARTIAL) == 1);
 
 	fr_event_corral(el, test_time_base, false);	/* Complete the partial cancellation */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL_SENT) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL_SENT) == 1);
 
 	fr_event_corral(el, test_time_base, false);	/* Loop the cancellation request back */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_ALL) == 0);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_ALL) == 0);
 
 	talloc_free(trunk);
 
@@ -1060,81 +1114,83 @@ static void test_partial_to_complete_states(void)
 static void test_requeue_on_reconnect(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
-	fr_trunk_conf_t		conf = {
+	trunk_conf_t		conf = {
 					.start = 2,
 					.min = 2,
-					.manage_interval = NSEC * 0.5,
-					.conn_conf = &(fr_connection_conf_t){
-						.reconnection_delay = NSEC * 0.1
+					.manage_interval = fr_time_delta_from_nsec(NSEC / 2),
+					.conn_conf = &(connection_conf_t){
+						.reconnection_delay = fr_time_delta_from_nsec(NSEC / 10)
 					},
 					.backlog_on_failed_conn = true
 				};
 	test_proto_request_t	*preq;
-	fr_trunk_request_t	*treq = NULL;
-	fr_trunk_connection_t	*tconn;
+	trunk_request_t	*treq = NULL;
+	trunk_connection_t	*tconn;
 
 	DEBUG_LVL_SET;
 	fr_talloc_fault_setup();
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
 	trunk = test_setup_trunk(ctx, el, &conf, true, NULL);
-	preq = talloc_zero(NULL, test_proto_request_t);
+	preq = talloc_zero(ctx, test_proto_request_t);
 	preq->signal_partial = true;
 	preq->signal_cancel_partial = true;
 
 	fr_event_corral(el, test_time_base, false);	/* Connect the connection(s) */
 	fr_event_service(el);
 
-	TEST_CASE("dequeue on reconnect - FR_TRUNK_REQUEST_STATE_PENDING");
+	TEST_CASE("dequeue on reconnect - TRUNK_REQUEST_STATE_PENDING");
 
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 2);
+	TEST_CHECK_LEN(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE), 2);
 
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	preq->treq = treq;
 
 	tconn = treq->pub.tconn;	/* Store the conn the request was assigned to */
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING), 1);
 
-	fr_trunk_connection_signal_reconnect(tconn, FR_CONNECTION_FAILED);
+	trunk_connection_signal_reconnect(tconn, CONNECTION_FAILED);
 
 	/*
 	 *	Should be reassigned to the other connection
 	 */
 	TEST_CHECK(tconn != treq->pub.tconn);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING), 1);
 
 	/*
 	 *	Should be reassigned to the backlog
 	 */
-	fr_trunk_connection_signal_reconnect(treq->pub.tconn, FR_CONNECTION_FAILED);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_BACKLOG) == 1);
+	trunk_connection_signal_reconnect(treq->pub.tconn, CONNECTION_FAILED);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_BACKLOG), 1);
 	TEST_CHECK(!treq->pub.tconn);
 
-	TEST_CASE("cancel on reconnect - FR_TRUNK_REQUEST_STATE_PARTIAL");
+	TEST_CASE("cancel on reconnect - TRUNK_REQUEST_STATE_PARTIAL");
 
 	/*
 	 *	Allow the connections to reconnect
 	 */
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	fr_event_corral(el, test_time_base, false);
-	fr_event_service(el);
+	fr_event_service(el);	/* run management function */
+	fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);	/* service any I/O callbacks */
 
 	/*
 	 *	Request should now be assigned back to one of the reconnected
 	 *	connections.
 	 */
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING), 1);
 	TEST_CHECK(treq->pub.tconn != NULL);
 
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	fr_event_corral(el, test_time_base, false);	/* Send the request (partially) */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PARTIAL) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PARTIAL), 1);
 
 	/*
 	 *	Reconnect the connection.
@@ -1143,7 +1199,7 @@ static void test_requeue_on_reconnect(void)
 	 *	then be re-assigned.
 	 */
 	tconn = treq->pub.tconn;
-	fr_trunk_connection_signal_reconnect(treq->pub.tconn, FR_CONNECTION_FAILED);
+	trunk_connection_signal_reconnect(treq->pub.tconn, CONNECTION_FAILED);
 
 	TEST_CHECK(preq->completed == false);
 	TEST_CHECK(preq->failed == false);
@@ -1152,10 +1208,10 @@ static void test_requeue_on_reconnect(void)
 
 	preq->cancelled = false;		/* Reset */
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING), 1);
 	TEST_CHECK(tconn != treq->pub.tconn);	/* Ensure it moved */
 
-	TEST_CASE("cancel on reconnect - FR_TRUNK_REQUEST_STATE_SENT");
+	TEST_CASE("cancel on reconnect - TRUNK_REQUEST_STATE_SENT");
 
 	/*
 	 *	Sent the request (fully)
@@ -1163,18 +1219,25 @@ static void test_requeue_on_reconnect(void)
 	fr_event_corral(el, test_time_base, false);	/* Send the request (partially) */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 1);
+	/*
+	 *	The above indeed appears to send the request partially;
+	 *	this appears to be required to send it fully, judging by
+	 *	the following check, which fails without it.
+	 */
+	fr_event_corral(el, test_time_base, false);	/* Send the request (partially) */
+	fr_event_service(el);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT), 1);
 
 	tconn = treq->pub.tconn;
-	fr_trunk_connection_signal_reconnect(treq->pub.tconn, FR_CONNECTION_FAILED);
+	trunk_connection_signal_reconnect(treq->pub.tconn, CONNECTION_FAILED);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING), 1);
 
 	/*
 	 *	Allow the connections to reconnect
 	 *	and send the request.
 	 */
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 	TEST_CHECK(tconn != treq->pub.tconn);	/* Ensure it moved */
@@ -1186,129 +1249,143 @@ static void test_requeue_on_reconnect(void)
 
 	preq->cancelled = false;		/* Reset */
 
-	TEST_CASE("free on reconnect - FR_TRUNK_REQUEST_STATE_CANCEL");
+	TEST_CASE("free on reconnect - TRUNK_REQUEST_STATE_CANCEL");
 
 	/*
 	 *	Signal the request should be cancelled
 	 */
-	fr_trunk_request_signal_cancel(treq);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL) == 1);
+	trunk_request_signal_cancel(treq);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL), 1);
 
 	/*
 	 *	Requests in the cancel state, are
 	 *	freed instead of being moved between
 	 *	connections.
 	 */
-	fr_trunk_connection_signal_reconnect(tconn, FR_CONNECTION_FAILED);	/* treq->pub.tconn, now invalid due to cancel */
+	trunk_connection_signal_reconnect(tconn, CONNECTION_FAILED);	/* treq->pub.tconn, now invalid due to cancel */
+
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
+	fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);
+
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
+	fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);
+
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
+	fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);
 
 	TEST_CHECK(preq->completed == false);
 	TEST_CHECK(preq->failed == false);
 	TEST_CHECK(preq->cancelled == true);
 	TEST_CHECK(preq->freed == true);
 
-	talloc_free(preq);
-
 	/*
 	 *	Allow the connection we just reconnected
-	 *	top open so it doesn't interfere with
+	 *	to open so it doesn't interfere with
 	 *	the next test.
 	 */
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	TEST_CASE("free on reconnect - FR_TRUNK_REQUEST_STATE_CANCEL_PARTIAL");
+	TEST_CASE("free on reconnect - TRUNK_REQUEST_STATE_CANCEL_PARTIAL");
 
 	/*
 	 *	Queue up a new request, and get it to the cancel-partial state.
 	 */
-	preq = talloc_zero(NULL, test_proto_request_t);
+	preq = talloc_zero(ctx, test_proto_request_t);
 	preq->signal_cancel_partial = true;
 	treq = NULL;
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	preq->treq = treq;
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING), 1);
 
 	/*
 	 *	Sent the request (fully)
 	 */
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	fr_event_corral(el, test_time_base, false);	/* Send the request (fully) */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 1);
-	fr_trunk_request_signal_cancel(treq);			/* Cancel the request */
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT), 1);
+	trunk_request_signal_cancel(treq);			/* Cancel the request */
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL), 1);
 
 	/*
 	 *	Transition to cancel partial
 	 */
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL_PARTIAL) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL_PARTIAL), 1);
 
 	/*
 	 *	Trigger a reconnection
 	 */
-	fr_trunk_connection_signal_reconnect(treq->pub.tconn, FR_CONNECTION_FAILED);
+	trunk_connection_signal_reconnect(treq->pub.tconn, CONNECTION_FAILED);
+
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
+	fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);
 
 	TEST_CHECK(preq->completed == false);
 	TEST_CHECK(preq->failed == false);
 	TEST_CHECK(preq->cancelled == true);
 	TEST_CHECK(preq->freed == true);
 
-	talloc_free(preq);
-
 	/*
 	 *	Allow the connection we just reconnected
 	 *	top open so it doesn't interfere with
 	 *	the next test.
 	 */
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	TEST_CASE("free on reconnect - FR_TRUNK_REQUEST_STATE_CANCEL_SENT");
+	TEST_CASE("free on reconnect - TRUNK_REQUEST_STATE_CANCEL_SENT");
 
 	/*
 	 *	Queue up a new request, and get it to the cancel-sent state.
 	 */
 	preq = talloc_zero(NULL, test_proto_request_t);
 	treq = NULL;
-	fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+	preq->treq = treq;
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING), 1);
 
 	/*
 	 *	Sent the request (fully)
 	 */
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	fr_event_corral(el, test_time_base, false);	/* Send the request (fully) */
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 1);
-	fr_trunk_request_signal_cancel(treq);			/* Cancel the request */
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT), 1);
+	trunk_request_signal_cancel(treq);		/* Cancel the request */
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL), 1);
 
 	/*
 	 *	Transition to cancel
 	 */
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_CANCEL_SENT) == 1);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_CANCEL_SENT), 1);
 
 	/*
 	 *	Trigger a reconnection
 	 */
-	fr_trunk_connection_signal_reconnect(treq->pub.tconn, FR_CONNECTION_FAILED);
+	trunk_connection_signal_reconnect(treq->pub.tconn, CONNECTION_FAILED);
 
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
@@ -1325,35 +1402,44 @@ static void test_requeue_on_reconnect(void)
 static void test_connection_start_on_enqueue(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
-	fr_trunk_conf_t		conf = {
+	trunk_conf_t		conf = {
 					.start = 0,
 					.min = 0,	/* No connections on start */
-					.manage_interval = NSEC * 0.5
+					.manage_interval = fr_time_delta_from_nsec(NSEC / 2)
 				};
 	test_proto_request_t	*preq;
-	fr_trunk_request_t	*treq_a = NULL, *treq_b = NULL, *treq_c = NULL;
+	trunk_request_t	*treq_a = NULL, *treq_b = NULL, *treq_c = NULL;
 
 	DEBUG_LVL_SET;
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
-	test_time_base += NSEC * 0.5;	/* Need to provide a timer starting value above zero */
+	/* Need to provide a timer starting value above zero */
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_nsec(NSEC / 2));
 
 	trunk = test_setup_trunk(ctx, el, &conf, true, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
 
 	TEST_CASE("C0 - Enqueue should spawn");
-	fr_trunk_request_enqueue(&treq_a, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq_a, trunk, NULL, preq, NULL);
 
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
+	/*
+	 *	This causes the event associated with the request left on
+	 *	the backlog queue to be handled, which (along with the other
+	 *	corral; service sequence, makes the checks all pass.
+	 */
+	fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);
+
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 1);
 
 	TEST_CASE("C1 connecting, !max_req_per_conn - Enqueue MUST NOT spawn");
-	fr_trunk_request_enqueue(&treq_b, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq_b, trunk, NULL, preq, NULL);
 
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 1);
 
 	/*
 	 *	Allow the connections to open
@@ -1361,13 +1447,13 @@ static void test_connection_start_on_enqueue(void)
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 1);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 1);
 
 	TEST_CASE("C1 active, !max_req_per_conn - Enqueue MUST NOT spawn");
-	fr_trunk_request_enqueue(&treq_c, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq_c, trunk, NULL, preq, NULL);
 
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 1);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 3);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING) == 3);
 
 	talloc_free(ctx);
 	talloc_free(preq);
@@ -1376,21 +1462,21 @@ static void test_connection_start_on_enqueue(void)
 static void test_connection_rebalance_requests(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
-	fr_trunk_conf_t		conf = {
+	trunk_conf_t		conf = {
 					.start = 2,
 					.min = 2,	/* No connections on start */
-					.manage_interval = NSEC * 0.5
+					.manage_interval = fr_time_delta_from_nsec(NSEC / 2)
 				};
 	test_proto_request_t	*preq;
-	fr_trunk_connection_t	*tconn;
-	fr_trunk_request_t	*treq_a = NULL, *treq_b = NULL, *treq_c = NULL;
+	trunk_connection_t	*tconn;
+	trunk_request_t	*treq_a = NULL, *treq_b = NULL, *treq_c = NULL;
 
 	DEBUG_LVL_SET;
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
 	trunk = test_setup_trunk(ctx, el, &conf, true, NULL);
 	preq = talloc_zero(NULL, test_proto_request_t);
@@ -1406,19 +1492,19 @@ static void test_connection_rebalance_requests(void)
 	 *	Mark one of the connections as full, and
 	 *	enqueue three requests on the other.
 	 */
-	tconn = fr_heap_peek(trunk->active);
+	tconn = fr_minmax_heap_min_peek(trunk->active);
 
 	TEST_CASE("C2 connected, R0 - Signal inactive");
-	fr_trunk_connection_signal_inactive(tconn);
+	trunk_connection_signal_inactive(tconn);
 
 
-	fr_trunk_request_enqueue(&treq_a, trunk, NULL, preq, NULL);
-	fr_trunk_request_enqueue(&treq_b, trunk, NULL, preq, NULL);
-	fr_trunk_request_enqueue(&treq_c, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq_a, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq_b, trunk, NULL, preq, NULL);
+	trunk_request_enqueue(&treq_c, trunk, NULL, preq, NULL);
 
 	TEST_CASE("C1 connected, C2 inactive, R3 - Enqueued");
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 3);
-	TEST_CHECK(fr_trunk_request_count_by_connection(tconn, FR_TRUNK_REQUEST_STATE_ALL) == 0);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING) == 3);
+	TEST_CHECK(trunk_request_count_by_connection(tconn, TRUNK_REQUEST_STATE_ALL) == 0);
 
 	/*
 	 *	Now mark the previous connection as
@@ -1426,10 +1512,10 @@ static void test_connection_rebalance_requests(void)
 	 *	one of the requests.
 	 */
 	TEST_CASE("C2 active, R3 - Signal active, should balance");
-	fr_trunk_connection_signal_active(tconn);
+	trunk_connection_signal_active(tconn);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 3);
-	TEST_CHECK(fr_trunk_request_count_by_connection(tconn, FR_TRUNK_REQUEST_STATE_ALL) >= 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING) == 3);
+	TEST_CHECK(trunk_request_count_by_connection(tconn, TRUNK_REQUEST_STATE_ALL) >= 1);
 
 	talloc_free(ctx);
 	talloc_free(preq);
@@ -1437,66 +1523,85 @@ static void test_connection_rebalance_requests(void)
 
 #define ALLOC_REQ(_id) \
 do { \
-	treq_##_id = fr_trunk_request_alloc(trunk, NULL); \
+	treq_##_id = trunk_request_alloc(trunk, NULL); \
 	preq_##_id = talloc_zero(ctx, test_proto_request_t); \
 	preq_##_id->treq = treq_##_id; \
+	preq_##_id->priority = next_prio++; \
 } while (0)
 
 static void test_connection_levels_max(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
-	fr_trunk_conf_t		conf = {
+	trunk_conf_t		conf = {
 					.start = 0, 		/* No connections on start */
 					.min = 0,
 					.max = 2,
 					.max_req_per_conn = 2,
 					.target_req_per_conn = 2,	/* One request per connection */
-					.manage_interval = NSEC * 0.5
+					.manage_interval = fr_time_delta_from_nsec(NSEC / 2)
 				};
 	test_proto_request_t	*preq_a, *preq_b, *preq_c, *preq_d, *preq_e;
-	fr_trunk_request_t	*treq_a = NULL, *treq_b = NULL, *treq_c = NULL, *treq_d = NULL, *treq_e = NULL;
+	trunk_request_t	*treq_a = NULL, *treq_b = NULL, *treq_c = NULL, *treq_d = NULL, *treq_e = NULL;
+	int			next_prio = 0;
 
 	DEBUG_LVL_SET;
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
-	test_time_base += NSEC * 0.5;	/* Need to provide a timer starting value above zero */
+	/* Need to provide a timer starting value above zero */
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_nsec(NSEC / 2));
 
 	trunk = test_setup_trunk(ctx, el, &conf, true, NULL);
+	TRUNK_VERIFY(trunk);
 
 	/*
 	 *	Queuing a request should start a connection.
 	 */
 	TEST_CASE("C0, R1 - Enqueue should spawn");
 	ALLOC_REQ(a);
-	TEST_CHECK(fr_trunk_request_enqueue(&treq_a, trunk, NULL, preq_a, NULL) == FR_TRUNK_ENQUEUE_IN_BACKLOG);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
+	TEST_CHECK(trunk_request_enqueue(&treq_a, trunk, NULL, preq_a, NULL) == TRUNK_ENQUEUE_IN_BACKLOG);
+	TRUNK_VERIFY(trunk);
+
+	/*
+	 *	Like test_connection_start_on_enqueue(), you have to process the backlog
+	 *	to start the chain of events.
+	 */
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
+	fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);
+
+	TEST_CHECK_LEN(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING), 1);
+	TRUNK_VERIFY(trunk);
 
 	/*
 	 *	Queuing another request should *NOT* start another connection
 	 */
 	TEST_CASE("C1 connecting, R2 - MUST NOT spawn");
 	ALLOC_REQ(b);
-	TEST_CHECK(fr_trunk_request_enqueue(&treq_b, trunk, NULL, preq_b, NULL) == FR_TRUNK_ENQUEUE_IN_BACKLOG);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
+	TEST_CHECK(trunk_request_enqueue(&treq_b, trunk, NULL, preq_b, NULL) == TRUNK_ENQUEUE_IN_BACKLOG);
+	TEST_CHECK_LEN(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING), 1);
+	TRUNK_VERIFY(trunk);
 
 	TEST_CASE("C1 connecting, R3 - MUST NOT spawn");
 	ALLOC_REQ(c);
-	TEST_CHECK(fr_trunk_request_enqueue(&treq_c, trunk, NULL, preq_c, NULL) == FR_TRUNK_ENQUEUE_IN_BACKLOG);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
+	TEST_CHECK(trunk_request_enqueue(&treq_c, trunk, NULL, preq_c, NULL) == TRUNK_ENQUEUE_IN_BACKLOG);
+	TEST_CHECK_LEN(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING), 1);
+	TRUNK_VERIFY(trunk);
 
 	TEST_CASE("C1 connecting, R4 - MUST NOT spawn");
 	ALLOC_REQ(d);
-	TEST_CHECK(fr_trunk_request_enqueue(&treq_d, trunk, NULL, preq_d, NULL) == FR_TRUNK_ENQUEUE_IN_BACKLOG);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) ==1);
+	TEST_CHECK(trunk_request_enqueue(&treq_d, trunk, NULL, preq_d, NULL) == TRUNK_ENQUEUE_IN_BACKLOG);
+	TEST_CHECK_LEN(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING), 1);
+	TRUNK_VERIFY(trunk);
 
 	TEST_CASE("C1 connecting, R5 - MUST NOT spawn, NO CAPACITY");
 	ALLOC_REQ(e);
-	TEST_CHECK(fr_trunk_request_enqueue(&treq_e, trunk, NULL, preq_e, NULL) == FR_TRUNK_ENQUEUE_NO_CAPACITY);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
+	TEST_CHECK(trunk_request_enqueue(&treq_e, trunk, NULL, preq_e, NULL) == TRUNK_ENQUEUE_NO_CAPACITY);
+	TEST_CHECK_LEN(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING), 1);
+	TRUNK_VERIFY(trunk);
 
 	/*
 	 *	Allowing connection to open
@@ -1505,8 +1610,9 @@ static void test_connection_levels_max(void)
 	fr_event_service(el);
 
 	TEST_CASE("C1 active, R4 - Check pending 2");
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 2);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_BACKLOG) == 2);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING), 2);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_BACKLOG), 2);
+	TRUNK_VERIFY(trunk);
 
 	/*
 	 *	Sending requests
@@ -1515,17 +1621,20 @@ static void test_connection_levels_max(void)
 	fr_event_service(el);
 
 	TEST_CASE("C1 active, R4 - Check sent 2");
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 2);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT), 2);
+	TRUNK_VERIFY(trunk);
 
 	/*
 	 *	Looping I/O
 	 */
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
 	/*
 	 *	Receiving responses
 	 */
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(2));
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
@@ -1539,8 +1648,9 @@ static void test_connection_levels_max(void)
 	TEST_CHECK(preq_b->cancelled == false);
 	TEST_CHECK(preq_b->freed == true);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 2);
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_BACKLOG) == 0);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING), 2);
+	TEST_CHECK_LEN(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_BACKLOG), 0);
+	TRUNK_VERIFY(trunk);
 
 	TEST_CASE("C1 active, R0 - Check complete 2, pending 0");
 
@@ -1572,7 +1682,8 @@ static void test_connection_levels_max(void)
 	TEST_CHECK(preq_d->cancelled == false);
 	TEST_CHECK(preq_d->freed == true);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_ALL) == 0);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_ALL) == 0);
+	TRUNK_VERIFY(trunk);
 
 	talloc_free(trunk);
 	talloc_free(ctx);
@@ -1581,27 +1692,29 @@ static void test_connection_levels_max(void)
 static void test_connection_levels_alternating_edges(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
-	fr_trunk_conf_t		conf = {
+	trunk_conf_t		conf = {
 					.start = 0, 			/* No connections on start */
 					.min = 0,
 					.max = 0,
 					.max_req_per_conn = 0,
 					.target_req_per_conn = 2,	/* One request per connection */
-					.manage_interval = NSEC * 0.1
+					.manage_interval = fr_time_delta_from_nsec(NSEC / 10)
 				};
 
 	test_proto_request_t	*preq_a, *preq_b, *preq_c;
-	fr_trunk_request_t	*treq_a = NULL, *treq_b = NULL, *treq_c = NULL;
+	trunk_request_t	*treq_a = NULL, *treq_b = NULL, *treq_c = NULL;
 	test_proto_stats_t	stats;
+	int			next_prio = 0;
 
 	DEBUG_LVL_SET;
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
-	test_time_base += NSEC * 0.5;	/* Need to provide a timer starting value above zero */
+	/* Need to provide a timer starting value above zero */
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_nsec(NSEC / 2));
 
 	memset(&stats, 0, sizeof(stats));
 	trunk = test_setup_trunk(ctx, el, &conf, true, &stats);
@@ -1611,15 +1724,22 @@ static void test_connection_levels_alternating_edges(void)
 	 */
 	TEST_CASE("C0, R1 - Enqueue should spawn");
 	ALLOC_REQ(a);
-	TEST_CHECK(fr_trunk_request_enqueue(&treq_a, trunk, NULL, preq_a, NULL) == FR_TRUNK_ENQUEUE_IN_BACKLOG);
+	TEST_CHECK(trunk_request_enqueue(&treq_a, trunk, NULL, preq_a, NULL) == TRUNK_ENQUEUE_IN_BACKLOG);
 
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
+	/*
+	 *	Processing the event associated with the backlog creates
+	 *	the connection in connecting state..
+	 */
+	fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);
+
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 1);
 
 	TEST_CASE("C1 connecting, R2 - MUST NOT spawn");
 	ALLOC_REQ(b);
-	TEST_CHECK(fr_trunk_request_enqueue(&treq_b, trunk, NULL, preq_b, NULL) == FR_TRUNK_ENQUEUE_IN_BACKLOG);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
-	test_time_base += NSEC * 1;
+	TEST_CHECK(trunk_request_enqueue(&treq_b, trunk, NULL, preq_b, NULL) == TRUNK_ENQUEUE_IN_BACKLOG);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 1);
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 
 	/*
 	 *	Open connection
@@ -1627,33 +1747,33 @@ static void test_connection_levels_alternating_edges(void)
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 2);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING) == 2);
 
 	TEST_CASE("C1 connected, R3 - should spawn");
 	ALLOC_REQ(c);
-	TEST_CHECK(fr_trunk_request_enqueue(&treq_c, trunk, NULL, preq_c, NULL) == FR_TRUNK_ENQUEUE_OK);
-	test_time_base += NSEC * 1;
+	TEST_CHECK(trunk_request_enqueue(&treq_c, trunk, NULL, preq_c, NULL) == TRUNK_ENQUEUE_OK);
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 3);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 1);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT) == 3);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 1);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 1);
 
 	/*
 	 *	Complete requests
 	 */
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 
 	TEST_CASE("C1 connected, C2 connecting, R2 - MUST NOT spawn");
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_ALL) == 3);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 2);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_ALL) == 3);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 2);
 
 	/*
 	 *	Finish the last request, should close one connection
@@ -1661,11 +1781,11 @@ static void test_connection_levels_alternating_edges(void)
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 
 	TEST_CASE("C1 connected, R0");
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_ALL) == 0);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_ALL) == 0);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 1);
 
 	/*
 	 *	Requests now done, should close another connection
@@ -1673,10 +1793,10 @@ static void test_connection_levels_alternating_edges(void)
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	test_time_base += NSEC * 1;
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 
 	TEST_CASE("C0, R0");
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 0);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 0);
 
 	TEST_CHECK(stats.completed == 3);
 	TEST_CHECK(stats.failed == 0);
@@ -1688,15 +1808,21 @@ static void test_connection_levels_alternating_edges(void)
 	 */
 	TEST_CASE("C0, R1 - Enqueue should spawn");
 	ALLOC_REQ(a);
-	TEST_CHECK(fr_trunk_request_enqueue(&treq_a, trunk, NULL, preq_a, NULL) == FR_TRUNK_ENQUEUE_IN_BACKLOG);
+	TEST_CHECK(trunk_request_enqueue(&treq_a, trunk, NULL, preq_a, NULL) == TRUNK_ENQUEUE_IN_BACKLOG);
 
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
+	/*
+	 *	...once the event associated with the backlogged request is handled.
+	 */
+	fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);
+
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 1);
 
 	TEST_CASE("C1 connecting, R2 - MUST NOT spawn");
 	ALLOC_REQ(b);
-	TEST_CHECK(fr_trunk_request_enqueue(&treq_b, trunk, NULL, preq_b, NULL) == FR_TRUNK_ENQUEUE_IN_BACKLOG);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
-	test_time_base += NSEC * 1;
+	TEST_CHECK(trunk_request_enqueue(&treq_b, trunk, NULL, preq_b, NULL) == TRUNK_ENQUEUE_IN_BACKLOG);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 1);
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 
 	/*
 	 *	Open connection
@@ -1704,19 +1830,162 @@ static void test_connection_levels_alternating_edges(void)
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_PENDING) == 2);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_PENDING) == 2);
 
 	TEST_CASE("C1 connected, R3 - should spawn");
 	ALLOC_REQ(c);
-	TEST_CHECK(fr_trunk_request_enqueue(&treq_c, trunk, NULL, preq_c, NULL) == FR_TRUNK_ENQUEUE_OK);
-	test_time_base += NSEC * 1;
+	TEST_CHECK(trunk_request_enqueue(&treq_c, trunk, NULL, preq_c, NULL) == TRUNK_ENQUEUE_OK);
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
 
 	fr_event_corral(el, test_time_base, false);
 	fr_event_service(el);
 
-	TEST_CHECK(fr_trunk_request_count_by_state(trunk, FR_TRUNK_CONN_ALL, FR_TRUNK_REQUEST_STATE_SENT) == 3);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_ACTIVE) == 1);
-	TEST_CHECK(fr_trunk_connection_count_by_state(trunk, FR_TRUNK_CONN_CONNECTING) == 1);
+	TEST_CHECK(trunk_request_count_by_state(trunk, TRUNK_CONN_ALL, TRUNK_REQUEST_STATE_SENT) == 3);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 1);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 1);
+
+	talloc_free(trunk);
+	talloc_free(ctx);
+}
+
+/*
+ *	Test the global trunk state transitions: PENDING -> ACTIVE -> FAILED.
+ */
+static void test_trunk_state_pending_active_failed(void)
+{
+	TALLOC_CTX		*ctx = talloc_init_const("test");
+	trunk_t			*trunk;
+	fr_event_list_t		*el;
+	int			events;
+	trunk_conf_t		conf = {
+					.start = 2,
+					.min = 2,
+					.conn_conf = &(connection_conf_t){
+						/*
+						 *	Long, so failed connections stay CLOSED
+						 *	while we check the FAILED state.
+						 */
+						.reconnection_delay = fr_time_delta_from_sec(10)
+					}
+				};
+	trunk_io_funcs_t	io_funcs = {
+					.connection_alloc = test_setup_socket_pair_connection_alloc,
+					.request_prioritise = fr_pointer_cmp,
+				};
+
+	DEBUG_LVL_SET;
+
+	el = fr_event_list_alloc(ctx, NULL, NULL);
+	fr_timer_list_set_time_func(el->tl, test_time);
+
+	trunk = trunk_alloc(ctx, el, &io_funcs, &conf, "test_socket_pair", NULL, false, NULL);
+	TEST_CHECK(trunk != NULL);
+	if (!trunk) return;
+
+	/*
+	 *	start = 2 spawns two connections which are connecting.  No
+	 *	active connections yet, so the trunk is PENDING.
+	 */
+	TEST_CASE("PENDING - connections are connecting");
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 2);
+	TEST_CHECK(trunk->pub.state == TRUNK_STATE_PENDING);
+
+	/*
+	 *	Let the connections open.  The trunk becomes ACTIVE.
+	 */
+	events = fr_event_corral(el, test_time_base, true);
+	TEST_CHECK(events == 2);		/* Two I/O write events, no timers */
+	fr_event_service(el);
+
+	TEST_CASE("ACTIVE - connections are active");
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 2);
+	TEST_CHECK(trunk->pub.state == TRUNK_STATE_ACTIVE);
+
+	/*
+	 *	Fail all connections.  With a long reconnection_delay they stay
+	 *	CLOSED, so the trunk becomes FAILED.
+	 */
+	TEST_CASE("FAILED - all connections closed / in reconnect backoff");
+	trunk_reconnect(trunk, TRUNK_CONN_ACTIVE, CONNECTION_FAILED);
+
+	(void) fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);
+
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CLOSED) == 2);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 0);
+	TEST_CHECK(trunk->pub.state == TRUNK_STATE_FAILED);
+
+	talloc_free(trunk);
+	talloc_free(ctx);
+}
+
+/*
+ *	Test the global trunk FULL state: no active connections, but the
+ *	maximum permitted connections are all connected and full.
+ */
+static void test_trunk_state_full(void)
+{
+	TALLOC_CTX		*ctx = talloc_init_const("test");
+	trunk_t			*trunk;
+	fr_event_list_t		*el;
+	trunk_conf_t		conf = {
+					.start = 0,		/* No connections on start */
+					.min = 0,
+					.max = 1,
+					.max_req_per_conn = 1,
+					.target_req_per_conn = 1,
+					.manage_interval = fr_time_delta_from_nsec(NSEC / 2)
+				};
+	test_proto_request_t	*preq_a;
+	trunk_request_t		*treq_a = NULL;
+	int			next_prio = 0;
+
+	DEBUG_LVL_SET;
+
+	el = fr_event_list_alloc(ctx, NULL, NULL);
+	fr_timer_list_set_time_func(el->tl, test_time);
+
+	/* Need to provide a timer starting value above zero */
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_nsec(NSEC / 2));
+
+	trunk = test_setup_trunk(ctx, el, &conf, true, NULL);
+
+	/*
+	 *	No connections at all -> IDLE.
+	 */
+	TEST_CASE("IDLE - no connections");
+	TEST_CHECK(trunk->pub.state == TRUNK_STATE_IDLE);
+
+	/*
+	 *	Enqueue a request.  It enters the backlog and spawns a connection.
+	 */
+	ALLOC_REQ(a);
+	TEST_CHECK(trunk_request_enqueue(&treq_a, trunk, NULL, preq_a, NULL) == TRUNK_ENQUEUE_IN_BACKLOG);
+
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_sec(1));
+	fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);
+
+	/*
+	 *	The connection spawned by the backlog is connecting -> PENDING.
+	 */
+	TEST_CASE("PENDING - connection connecting");
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_CONNECTING) == 1);
+	TEST_CHECK(trunk->pub.state == TRUNK_STATE_PENDING);
+
+	/*
+	 *	Open the connection.  The backlogged request is assigned to it,
+	 *	which fills it (max_req_per_conn == 1).  With max == 1 and that
+	 *	one connection full (and none active or connecting), the trunk
+	 *	is FULL.
+	 */
+	fr_event_corral(el, test_time_base, false);
+	fr_event_service(el);
+
+	TEST_CASE("FULL - the maximum number of connections are all full");
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_FULL) == 1);
+	TEST_CHECK(trunk_connection_count_by_state(trunk, TRUNK_CONN_ACTIVE) == 0);
+	TEST_CHECK(trunk->pub.state == TRUNK_STATE_FULL);
 
 	talloc_free(trunk);
 	talloc_free(ctx);
@@ -1726,10 +1995,10 @@ static void test_connection_levels_alternating_edges(void)
 static void test_enqueue_and_io_speed(void)
 {
 	TALLOC_CTX		*ctx = talloc_init_const("test");
-	fr_trunk_t		*trunk;
+	trunk_t		*trunk;
 	fr_event_list_t		*el;
 	int			events;
-	fr_trunk_conf_t		conf = {
+	trunk_conf_t		conf = {
 					.start = 1,
 					.min = 1,
 					.max = 0,
@@ -1737,21 +2006,22 @@ static void test_enqueue_and_io_speed(void)
 					.target_req_per_conn = 0,	/* One request per connection */
 					.req_pool_headers = 1,
 					.req_pool_size = sizeof(test_proto_request_t),
-					.manage_interval = NSEC * 0.5
+					.manage_interval = fr_time_delta_from_nsec(NSEC / 2)
 				};
 	size_t			i = 0, requests = 100000;
-	fr_time_t		enqueue_start = 0, enqueue_stop = 0, io_start = 0, io_stop = 0;
+	fr_time_t		enqueue_start, enqueue_stop, io_start, io_stop;
 	fr_time_delta_t		enqueue_time, io_time, total_time;
-	fr_trunk_request_t	**treq_array;
+	trunk_request_t	**treq_array;
 	test_proto_request_t	**preq_array;
 	test_proto_stats_t	stats;
 
 	DEBUG_LVL_SET;
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
-	fr_event_list_set_time_func(el, test_time);
+	fr_timer_list_set_time_func(el->tl, test_time);
 
-	test_time_base += NSEC * 0.5;	/* Need to provide a timer starting value above zero */
+	/* Need to provide a timer starting value above zero */
+	test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_nsec(NSEC / 2));
 
 	memset(&stats, 0, sizeof(stats));
 	trunk = test_setup_trunk(ctx, el, &conf, true, &stats);
@@ -1769,30 +2039,32 @@ static void test_enqueue_and_io_speed(void)
 	 *	When the server's running, this does represent
 	 *	close to what we'd have as a steady state.
 	 */
-	MEM(treq_array = talloc_array(ctx, fr_trunk_request_t *, requests));
-	for (i = 0; i < requests; i++) treq_array[i] = fr_trunk_request_alloc(trunk, NULL);
-	for (i = 0; i < requests; i++) fr_trunk_request_free(&treq_array[i]);
+	MEM(treq_array = talloc_array(ctx, trunk_request_t *, requests));
+	for (i = 0; i < requests; i++) treq_array[i] = trunk_request_alloc(trunk, NULL);
+	for (i = 0; i < requests; i++) trunk_request_free(&treq_array[i]);
 
 	MEM(preq_array = talloc_array(ctx, test_proto_request_t *, requests));
+
+	DEBUG_LVL_SET;
 
 	TEST_CASE("Enqueue requests");
 	enqueue_start = fr_time();
 //	ProfilerStart(getenv("FR_PROFILE"));
 	for (i = 0; i < requests; i++) {
-		fr_trunk_request_t	*treq;
+		trunk_request_t	*treq;
 		test_proto_request_t	*preq = NULL;
 
-		treq = fr_trunk_request_alloc(trunk, NULL);
+		treq = trunk_request_alloc(trunk, NULL);
 		preq = talloc_zero(treq, test_proto_request_t);
 		preq->treq = treq;
-		fr_trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
+		trunk_request_enqueue(&treq, trunk, NULL, preq, NULL);
 	}
 	enqueue_stop = fr_time();
-	enqueue_time = enqueue_stop - enqueue_start;
-	if (test_verbose_level_ >= 1) {
+	enqueue_time = fr_time_sub(enqueue_stop, enqueue_start);
+	if (acutest_verbose_level_ >= 1) {
 		INFO("Enqueue time %pV (%u rps) (%"PRIu64"/%"PRIu64")",
 		     fr_box_time_delta(enqueue_time),
-		     (uint32_t)(requests / ((float)enqueue_time / NSEC)),
+		     (uint32_t)((float) requests / ((float)(fr_time_delta_unwrap(enqueue_time)) / NSEC)),
 		     trunk->pub.req_alloc_new, trunk->pub.req_alloc_reused);
 	}
 
@@ -1802,39 +2074,38 @@ static void test_enqueue_and_io_speed(void)
 		events = fr_event_corral(el, test_time_base, false);
 		if (!events) break;
 		fr_event_service(el);
+		test_time_base = fr_time_add_time_delta(test_time_base, fr_time_delta_from_nsec(NSEC / 4));
 	}
 	io_stop = fr_time();
-	io_time = io_stop - io_start;
+	io_time = fr_time_sub(io_stop, io_start);
 
-	if (test_verbose_level_ >= 1) {
+	if (acutest_verbose_level_ >= 1) {
 		INFO("I/O time %pV (%u rps)",
 		     fr_box_time_delta(io_time),
-		     (uint32_t)(requests / ((float)io_time / NSEC)));
+		     (uint32_t)((float) requests / ((float)(fr_time_delta_unwrap(io_time)) / NSEC)));
 	}
 
-	if (test_verbose_level_ >= 1) {
-		total_time = io_stop - enqueue_start;
+	if (acutest_verbose_level_ >= 1) {
+		total_time = fr_time_sub(io_stop, enqueue_start);
 		INFO("Total time %pV (%u rps)",
 		     fr_box_time_delta(total_time),
-		     (uint32_t)(requests / ((float)total_time / NSEC)));
+		     (uint32_t)((float) requests / ((float)(fr_time_delta_unwrap(total_time)) / NSEC)));
 	}
 
-	TEST_CHECK(stats.completed == requests);
-	TEST_CHECK(stats.failed == 0);
-	TEST_CHECK(stats.cancelled == 0);
-	TEST_CHECK(stats.freed == requests);
+	TEST_CHECK_LEN(stats.completed, requests);
+	TEST_CHECK_LEN(stats.failed, 0);
+	TEST_CHECK_LEN(stats.cancelled, 0);
+	TEST_CHECK_LEN(stats.freed, requests);
 
 //	ProfilerStop();
 
 	talloc_free(ctx);
 }
-#endif
 
 /*
  *	Connection spawning
  */
 TEST_LIST = {
-#if 0
 	/*
 	 *	Basic tests
 	 */
@@ -1868,9 +2139,14 @@ TEST_LIST = {
 	{ "Spawn - Connection levels alternating edges",test_connection_levels_alternating_edges },
 
 	/*
+	 *	Trunk state transitions
+	 */
+	{ "State - Pending, active, failed",		test_trunk_state_pending_active_failed },
+	{ "State - Full",				test_trunk_state_full },
+
+	/*
 	 *	Performance tests
 	 */
 	{ "Speed Test - Enqueue, and I/O",		test_enqueue_and_io_speed },
-#endif
-	{ NULL }
+	TEST_TERMINATOR
 };

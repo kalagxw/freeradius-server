@@ -1,0 +1,87 @@
+#
+#  Tests for parsing tmpls
+#
+#  $Id$
+#
+
+proto-dictionary radius
+tmpl-rules allow_unresolved=yes allow_unknown=yes
+
+tmpl-rules allow_unresolved=false
+
+tmpl User-Name
+match User-Name
+
+tmpl User-Name[1]
+match User-Name[1]
+
+tmpl User-Name[*]
+match User-Name[*]
+
+tmpl User-Name[n]
+match User-Name[n]
+
+tmpl User-Name[#]
+match User-Name[#]
+
+tmpl User-Name["foo"]
+match ERROR: offset 10: Invalid data type for array index
+
+#
+#  IPv4 addresses and prefixes.  A missing octet must not be parsed as zero.
+#
+tmpl 192.0.2.1
+match 192.0.2.1
+
+tmpl 192.0.2.1/24
+match 192.0.2.0/24
+
+#
+#  Prefixes may omit trailing octets
+#
+tmpl 192.0.2/24
+match 192.0.2.0/24
+
+tmpl 10/8
+match 10.0.0.0/8
+
+tmpl 192..2.1
+match ERROR: offset 0: Numerical attribute references are not allowed here
+
+tmpl 192.0..1/24
+match ERROR: offset 0: Numerical attribute references are not allowed here
+
+#
+#  Bare words which begin with '%' are handed to xlat_tokenize(), and the
+#  result is hoisted back into the tmpl.
+#
+tmpl %{User-Name}
+match User-Name
+
+tmpl %{Filter-Id}
+match Filter-Id
+
+#
+#  An expression does not hoist to an attribute, so the tmpl keeps the
+#  xlat.
+#
+tmpl %{(1 + 2)}
+match %{(1 + 2)}
+
+#
+#  Parse errors in xlats get hoisted to tmpls.
+#
+tmpl %{
+match ERROR: offset 2: Missing closing brace '}'
+
+tmpl %{}
+match ERROR: offset 2: Empty expressions are invalid
+
+tmpl %{User-Name
+match ERROR: offset 11: Missing closing brace '}'
+
+tmpl %{1 + 2
+match ERROR: offset 7: Missing closing brace '}'
+
+count
+match 41

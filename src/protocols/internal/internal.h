@@ -32,6 +32,15 @@
 #define FR_INTERNAL_FLAG_UNKNOWN	0x80
 #define FR_INTERNAL_FLAG_INTERNAL	0x40
 
+typedef struct {
+	bool	allow_name_only;	//!< Allow name only pairs.  This should be set
+					///< to true when encoding data that's being
+					///< passed between threads in the same process.
+					///< It should be set to false when encoding
+					///< data that's stored in an external database
+					///< or in the cache module.
+} fr_internal_encode_ctx_t;
+
 /*
  * $Id$
  *
@@ -43,8 +52,13 @@
 
 ssize_t fr_internal_encode_pair(fr_dbuff_t *dbuff, fr_dcursor_t *cursor, void *encode_ctx);
 
-ssize_t fr_internal_decode_pair(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+ssize_t fr_internal_encode_list(fr_dbuff_t *dbuff, fr_pair_list_t const *list, void *encode_ctx);
+
+ssize_t fr_internal_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr_t const *parent,
 				uint8_t const *data, size_t data_len, void *decode_ctx);
 
-ssize_t fr_internal_decode_pair_dbuff(TALLOC_CTX *ctx, fr_dcursor_t *cursor, fr_dict_t const *dict,
+ssize_t fr_internal_decode_pair_dbuff(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr_t const *parent,
+				fr_dbuff_t *dbuff, void *decode_ctx);
+
+ssize_t fr_internal_decode_list_dbuff(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr_t const *parent,
 				fr_dbuff_t *dbuff, void *decode_ctx);

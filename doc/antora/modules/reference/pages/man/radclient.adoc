@@ -4,7 +4,6 @@ Alan DeKok
 :release-version: 4.0.0
 :man manual: FreeRADIUS
 :man source: FreeRADIUS
-:page-layout: base
 :manvolnum: 1
 
 == NAME
@@ -13,19 +12,20 @@ radclient - send packets to a RADIUS server, show reply
 
 == SYNOPSIS
 
-*radclient* _[ OPTIONS ]_ _server {acct|auth|status|disconnect|auto} secret_
+*radclient* _[ OPTIONS ]_ _server {acct|auth|status|disconnect|auto}
+secret_
 
 == DESCRIPTION
 
-`radclient* is a radius client program. It can send arbitrary radius
-packets to a radius server, then shows the reply. It can be used to test
-changes you made in the configuration of the radius server, or it can be
-used to monitor if a radius server is up.
+*radclient* is a radius client program. It can send arbitrary radius
+packets to a radius server, then shows the reply. It can be used to
+test changes you made in the configuration of the radius server, or it
+can be used to monitor if a radius server is up.
 
 *radclient* reads radius attribute/value pairs from it standard input,
 or from a file specified on the command line. It then encodes these
-attribute/value pairs using the dictionary, and sends them to the remote
-server.
+attribute/value pairs using the dictionary, and sends them to the
+remote server.
 
 The `User-Password` and `CHAP-Password` attributes are automatically
 encrypted before the packet is sent to the server.
@@ -37,6 +37,14 @@ encrypted before the packet is sent to the server.
 
 *-6*::
   Use IPv6
+
+*-b*::
+  Enforce the Blast RADIUS checks.   All replies to an Access-Request packet
+  must contain a Message-Authenticator as the first attribute.
+
+  For compatibility with old servers, this flag is not set by default.
+  However, radclient still checks for the Blast RADIUS signature, and
+  discards packets which match the attack.
 
 *-c count*::
   Send each packet _count_ times.
@@ -173,8 +181,11 @@ Received Packet from host 192.0.2.42 code=2, id=140, length=54
 
 == SEE ALSO
 
-radiusd(8),
+radiusd(8)
 
 == AUTHOR
 
-The FreeRADIUS Server Project (http://www.freeradius.org)
+The FreeRADIUS Server Project (https://freeradius.org)
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

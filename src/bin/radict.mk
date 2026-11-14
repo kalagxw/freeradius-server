@@ -1,5 +1,5 @@
-TARGET		:= radict
+TARGET		:= radict$(E)
 SOURCES		:= radict.c
 
-TGT_PREREQS	:= libfreeradius-util.a
+TGT_PREREQS	:= $(LIBFREERADIUS_UTIL)
 TGT_LDLIBS	:= $(LIBS)

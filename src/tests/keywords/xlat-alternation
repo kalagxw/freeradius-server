@@ -1,57 +1,64 @@
 #
-# PRE: update
+# PRE:
 #
+string result_string
 
-update request {
-	&Tmp-String-0 := "foo"
-	&Tmp-String-1 := "bar"
-}
+Filter-Id := "foo"
+NAS-Identifier := "bar"
 
 #
 #  First choice
 #
-update request {
-	&Tmp-String-2 := "%{%{Tmp-String-0[0]}:-%{Tmp-String-1[0]}}"
-}
-
-if (&Tmp-String-2[0] != 'foo') {
-	fail
+result_string := "%{Filter-Id || NAS-Identifier}"
+if (result_string != 'foo') {
+	test_fail
 }
 
 #
 #  Second choice
 #
-update request {
-	&Tmp-String-0 !* ANY
-}
-update request {
-	&Tmp-String-2 := "%{%{Tmp-String-0[0]}:-%{Tmp-String-1[0]}}"
-}
-if (&Tmp-String-2[0] != 'bar') {
-	fail
+request -= Filter-Id[*]
+result_string := "%{Filter-Id || NAS-Identifier}"
+if (result_string != 'bar') {
+	test_fail
 }
 
 #
 #  Multiple things in an alternation
 #
-update request {
-	&Tmp-String-2 := "%{%{Tmp-String-0[0]}:-%{Tmp-String-1[0]} foo}"
+result_string := %{%{Filter-Id} || "%{NAS-Identifier} foo"}
+if (result_string != 'bar foo') {
+	test_fail
 }
-if (&Tmp-String-2[0] != 'bar foo') {
-	fail
+
+#
+#  Alternation is empty
+#
+result_string := "%{Filter-Id || ''}"
+if (result_string != '') {
+	test_fail
 }
 
 #
 #  Everything null
 #
-update request {
-	&Tmp-String-1 !* ANY
+request -= NAS-Identifier[*]
+
+#
+#  Both sides are failing, so the assignment returns a NULL string
+#
+result_string := "%{Filter-Id || NAS-Identifier}"
+if (result_string !='') {
+	test_fail
 }
-update request {
-	&Tmp-String-2 := "%{%{Tmp-String-0[0]}:-%{Tmp-String-1[0]}}"
+
+#
+#  And unquoted results return nothing.
+#
+result_string := %{Filter-Id || NAS-Identifier}
+if (result_string) {
+	test_fail
 }
-if (!&Tmp-String-2[0] || (&Tmp-String-2[0] != "")) {
-	fail
-}
+
 
 success

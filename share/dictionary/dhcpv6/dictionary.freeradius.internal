@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2022 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 ##############################################################################
@@ -15,7 +15,7 @@
 #
 FLAGS	internal
 
-ATTRIBUTE	Packet-Type				65536	integer
+ATTRIBUTE	Packet-Type				65536	uint32
 VALUE	Packet-Type			Solicit			1
 VALUE	Packet-Type			Advertise		2
 VALUE	Packet-Type			Request			3

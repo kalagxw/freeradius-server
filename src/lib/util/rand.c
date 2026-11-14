@@ -25,21 +25,81 @@ RCSID("$Id$")
 #include <freeradius-devel/util/rand.h>
 #include <freeradius-devel/util/hash.h>
 
-#include <errno.h>
 #include <fcntl.h>
-#include <stdbool.h>
-#include <string.h>
-#include <time.h>
-#include <unistd.h>
 
 static _Thread_local fr_randctx fr_rand_pool;		//!< A pool of pre-generated random integers
 static _Thread_local bool fr_rand_initialized = false;
 
-/** Seed the random number generator
+void fr_rand_init(void)
+{
+	int fd;
+	uint8_t *p = (uint8_t *) &fr_rand_pool.randrsl[0];
+	uint8_t *end = p + sizeof(fr_rand_pool.randrsl);
+
+	if (fr_rand_initialized) return;
+
+
+	memset(&fr_rand_pool, 0, sizeof(fr_rand_pool));
+
+	fd = open("/dev/urandom", O_RDONLY);
+	if (fd >= 0) {
+		ssize_t rcode;
+
+		while (p < end) {
+			rcode = read(fd, p, (size_t) (end - p));
+			if ((rcode < 0) && (errno != EINTR)) break;
+			if (rcode > 0) p += rcode;
+		}
+		close(fd);
+	} else {
+		/*
+		 *	We use unix_time, because fr_time() is
+		 *	nanoseconds since the server started.
+		 *	Which is likely a very small number.
+		 *	Whereas unix time is somewhat more
+		 *	unknown.  If we're not seeding off of
+		 *	/dev/urandom, then any randomness we
+		 *	get here is terrible.
+		 */
+		int64_t when = fr_unix_time_unwrap(fr_time_to_unix_time(fr_time()));
+
+		memcpy((void *) &fr_rand_pool.randrsl[0], &when, sizeof(when));
+	}
+
+	fr_isaac_init(&fr_rand_pool);
+	fr_rand_pool.randcnt = 0;
+	fr_rand_initialized = true;
+}
+
+/** Seed the random number generator with a fixed value
+ *
+ * The same seed always produces the same sequence from fr_rand(), so tests
+ * can match output that includes random values.  The server must never call
+ * this, as anyone who knows the seed can predict every random value.
+ *
+ * @param[in] seed	to start the sequence from.
+ */
+void fr_rand_seed(uint64_t seed)
+{
+	memset(&fr_rand_pool, 0, sizeof(fr_rand_pool));
+
+	/*
+	 *	Set the seed one 32-bit word at a time, so the sequence
+	 *	is the same whatever the byte order of the host.
+	 */
+	fr_rand_pool.randrsl[0] = (uint32_t)seed;
+	fr_rand_pool.randrsl[1] = (uint32_t)(seed >> 32);
+
+	fr_isaac_init(&fr_rand_pool);
+	fr_rand_pool.randcnt = 0;
+	fr_rand_initialized = true;
+}
+
+/** Mix data into the random number generator.
  *
  * May be called any number of times.
  */
-void fr_rand_seed(void const *data, size_t size)
+void fr_rand_mixin(void const *data, size_t size)
 {
 	uint32_t hash;
 
@@ -47,35 +107,8 @@ void fr_rand_seed(void const *data, size_t size)
 	 *	Ensure that the pool is initialized.
 	 */
 	if (!fr_rand_initialized) {
-		int fd;
-
-		memset(&fr_rand_pool, 0, sizeof(fr_rand_pool));
-
-		fd = open("/dev/urandom", O_RDONLY);
-		if (fd >= 0) {
-			size_t total;
-			ssize_t this;
-
-			total = 0;
-			while (total < sizeof(fr_rand_pool.randrsl)) {
-				this = read(fd, fr_rand_pool.randrsl,
-					    sizeof(fr_rand_pool.randrsl) - total);
-				if ((this < 0) && (errno != EINTR)) break;
-				if (this > 0) total += this;
-			}
-			close(fd);
-		} else {
-			fr_rand_pool.randrsl[0] = fd;
-			fr_rand_pool.randrsl[1] = time(NULL);
-			fr_rand_pool.randrsl[2] = errno;
-		}
-
-		fr_rand_init(&fr_rand_pool, 1);
-		fr_rand_pool.randcnt = 0;
-		fr_rand_initialized = 1;
+		fr_rand_init();
 	}
-
-	if (!data) return;
 
 	/*
 	 *	Hash the user data
@@ -90,6 +123,7 @@ void fr_rand_seed(void const *data, size_t size)
 
 /** Return a 32-bit random number
  *
+ * @hidecallergraph
  */
 uint32_t fr_rand(void)
 {
@@ -99,7 +133,7 @@ uint32_t fr_rand(void)
 	 *	Ensure that the pool is initialized.
 	 */
 	if (!fr_rand_initialized) {
-		fr_rand_seed(NULL, 0);
+		fr_rand_init();
 	}
 
 	num = fr_rand_pool.randrsl[fr_rand_pool.randcnt++];
@@ -120,7 +154,7 @@ void fr_rand_buffer(void *start, size_t length)
 	if (buflen > 4) {
 		size_t i;
 
-		for (i = 0; i < buflen; i += 4) {
+		for (i = 0; i <= (buflen - 4); i += 4) {
 			x = fr_rand();
 			memcpy(buffer + i, &x, sizeof(x));
 		}
@@ -152,7 +186,8 @@ void fr_rand_buffer(void *start, size_t length)
 void fr_rand_str(uint8_t *out, size_t len, char class)
 {
 	uint8_t		*p = out, *end = p + len;
-	unsigned int	word, mod;
+	uint32_t	word;
+	unsigned int	mod;
 	uint8_t		byte;
 
 	/*
@@ -171,26 +206,26 @@ void fr_rand_str(uint8_t *out, size_t len, char class)
  *	yeah yeah not perfect distribution
  *	but close enough.
  */
-#define fill(_expr) \
+#define fill(_expr) do { \
 while (p < end) { \
 	if ((mod = ((p - out) & (sizeof(word) - 1))) == 0) word = fr_rand(); \
 	byte = ((uint8_t *)&word)[mod]; \
 	*p++ = (_expr); \
-}
+} } while (0)
 
 	switch (class) {
 	/*
 	 *  Lowercase letters
 	 */
 	case 'c':
-		fill('a' + (byte % 26))
+		fill('a' + (byte % 26));
 		return;
 
 	/*
 	 *  Uppercase letters
 	 */
 	case 'C':
-		fill('A' + (byte % 26))
+		fill('A' + (byte % 26));
 		return;
 
 	/*
@@ -241,11 +276,30 @@ while (p < end) { \
 	 */
 	case 'b':
 	default:
-		fill(byte)
+		fill(byte);
 		return;
 	}
 }
 
+
+/*
+ *	http://www.cse.yorku.ca/~oz/marsaglia-rng.html
+ *
+ *	We implement MWC here, which uses 2 32-bit numbers for a
+ *	state, and has a period of 2^60.
+ *
+ *	We could extend this to a larger RNG with 4 32-bit state
+ *	numbers {a, b, c, d} and use KISS, which has a period of about
+ *	2^123.
+ *
+ *	a' = 36969 * (a & 65535) + (a >> 16)
+ *	b' = 18000 * (b & 65535) + (b >> 16))
+ *
+ *	MWC	(a' << 16) + b'
+ *	SHR3	(c ^= (c <<17); c ^= ( c>>13); c ^= (c << 5))
+ *	CONG	d' = 69069 * d + 1234567
+ *	KISS	((MWC^CONG)+SHR3)
+ */
 uint32_t fr_fast_rand(fr_fast_rand_t *ctx)
 {
 	ctx->a = (36969 * (ctx->a & 0xffff)) + (ctx->a >> 16);

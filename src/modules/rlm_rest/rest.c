@@ -20,23 +20,17 @@
  * @brief Functions and datatypes for the REST (HTTP) transport.
  * @file rest.c
  *
- * @copyright 2012-2019 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2012-2021 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
-
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_rest (%s) - "
-#define LOG_PREFIX_ARGS inst->xlat_name
+#define LOG_PREFIX mctx->mi->name
 
 #include <ctype.h>
 #include <string.h>
-#include <time.h>
 
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/pool.h>
-#include <freeradius-devel/unlang/call.h>
-#include <freeradius-devel/util/base.h>
-#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/skip.h>
+
 
 #include "rest.h"
 
@@ -48,13 +42,12 @@ RCSID("$Id$")
  * @see http_body_type_t
  */
 const http_body_type_t http_body_type_supported[REST_HTTP_BODY_NUM_ENTRIES] = {
-	REST_HTTP_BODY_UNKNOWN,		// REST_HTTP_BODY_UNKNOWN
+	REST_HTTP_BODY_UNKNOWN,			// REST_HTTP_BODY_UNKNOWN
 	REST_HTTP_BODY_UNSUPPORTED,		// REST_HTTP_BODY_UNSUPPORTED
-	REST_HTTP_BODY_UNSUPPORTED,  	// REST_HTTP_BODY_UNAVAILABLE
+	REST_HTTP_BODY_UNSUPPORTED,  		// REST_HTTP_BODY_UNAVAILABLE
 	REST_HTTP_BODY_UNSUPPORTED,		// REST_HTTP_BODY_INVALID
 	REST_HTTP_BODY_NONE,			// REST_HTTP_BODY_NONE
-	REST_HTTP_BODY_CUSTOM_XLAT,		// REST_HTTP_BODY_CUSTOM_XLAT
-	REST_HTTP_BODY_CUSTOM_LITERAL,	// REST_HTTP_BODY_CUSTOM_LITERAL
+	REST_HTTP_BODY_CUSTOM,			// REST_HTTP_BODY_CUSTOM
 	REST_HTTP_BODY_POST,			// REST_HTTP_BODY_POST
 #ifdef HAVE_JSON
 	REST_HTTP_BODY_JSON,			// REST_HTTP_BODY_JSON
@@ -63,8 +56,16 @@ const http_body_type_t http_body_type_supported[REST_HTTP_BODY_NUM_ENTRIES] = {
 #endif
 	REST_HTTP_BODY_UNSUPPORTED,		// REST_HTTP_BODY_XML
 	REST_HTTP_BODY_UNSUPPORTED,		// REST_HTTP_BODY_YAML
-	REST_HTTP_BODY_INVALID,		// REST_HTTP_BODY_HTML
-	REST_HTTP_BODY_PLAIN			// REST_HTTP_BODY_PLAIN
+	REST_HTTP_BODY_INVALID,			// REST_HTTP_BODY_HTML
+	REST_HTTP_BODY_PLAIN,			// REST_HTTP_BODY_PLAIN
+	REST_HTTP_BODY_PLAIN			// REST_HTTP_BODY_CRL
+};
+
+/** Table of which known body types are expected to give binary data
+ */
+const bool http_body_type_binary[REST_HTTP_BODY_NUM_ENTRIES] = {
+	[REST_HTTP_BODY_UNKNOWN] = true,
+	[REST_HTTP_BODY_CRL] = true,
 };
 
 /*
@@ -98,19 +99,18 @@ const http_body_type_t http_body_type_supported[REST_HTTP_BODY_NUM_ENTRIES] = {
  *  #define curl_easy_setopt(handle,opt,param) curl_easy_setopt(handle,opt,param)
  */
 const unsigned long http_curl_auth[REST_HTTP_AUTH_NUM_ENTRIES] = {
-	[REST_HTTP_AUTH_UNKNOWN]		= 0,
-	[REST_HTTP_AUTH_NONE]			= 0,
-	[REST_HTTP_AUTH_TLS_SRP]		= CURLOPT_TLSAUTH_SRP,
-	[REST_HTTP_AUTH_BASIC]			= CURLAUTH_BASIC,
-	[REST_HTTP_AUTH_DIGEST]			= CURLAUTH_DIGEST,
-	[REST_HTTP_AUTH_DIGEST_IE]		= CURLAUTH_DIGEST_IE,
-	[REST_HTTP_AUTH_GSSNEGOTIATE]		= CURLAUTH_GSSNEGOTIATE,
-	[REST_HTTP_AUTH_NTLM]			= CURLAUTH_NTLM,
-	[REST_HTTP_AUTH_NTLM_WB]		= CURLAUTH_NTLM_WB,
-	[REST_HTTP_AUTH_ANY]			= CURLAUTH_ANY,
-	[REST_HTTP_AUTH_ANY_SAFE]		= CURLAUTH_ANYSAFE
+	[REST_HTTP_AUTH_UNKNOWN]			= 0,
+	[REST_HTTP_AUTH_NONE]				= 0,
+	[REST_HTTP_AUTH_TLS_SRP]			= CURLOPT_TLSAUTH_SRP,
+	[REST_HTTP_AUTH_BASIC]				= CURLAUTH_BASIC,
+	[REST_HTTP_AUTH_DIGEST]				= CURLAUTH_DIGEST,
+	[REST_HTTP_AUTH_DIGEST_IE]			= CURLAUTH_DIGEST_IE,
+	[REST_HTTP_AUTH_GSSNEGOTIATE]			= CURLAUTH_GSSNEGOTIATE,
+	[REST_HTTP_AUTH_NTLM]				= CURLAUTH_NTLM,
+	[REST_HTTP_AUTH_NTLM_WB]			= CURLAUTH_NTLM_WB,
+	[REST_HTTP_AUTH_ANY]				= CURLAUTH_ANY,
+	[REST_HTTP_AUTH_ANY_SAFE]			= CURLAUTH_ANYSAFE
 };
-
 
 /** Conversion table for method config values.
  *
@@ -125,12 +125,12 @@ const unsigned long http_curl_auth[REST_HTTP_AUTH_NUM_ENTRIES] = {
  * @see fr_table_str_by_value
  */
 fr_table_num_sorted_t const http_method_table[] = {
-	{ L("DELETE"),				REST_HTTP_METHOD_DELETE		},
-	{ L("GET"),				REST_HTTP_METHOD_GET		},
-	{ L("PATCH"),				REST_HTTP_METHOD_PATCH		},
-	{ L("POST"),				REST_HTTP_METHOD_POST		},
-	{ L("PUT"),				REST_HTTP_METHOD_PUT		},
-	{ L("UNKNOWN"),				REST_HTTP_METHOD_UNKNOWN	}
+	{ L("DELETE"),					REST_HTTP_METHOD_DELETE		},
+	{ L("GET"),					REST_HTTP_METHOD_GET		},
+	{ L("PATCH"),					REST_HTTP_METHOD_PATCH		},
+	{ L("POST"),					REST_HTTP_METHOD_POST		},
+	{ L("PUT"),					REST_HTTP_METHOD_PUT		},
+	{ L("UNKNOWN"),					REST_HTTP_METHOD_UNKNOWN	}
 };
 size_t http_method_table_len = NUM_ELEMENTS(http_method_table);
 
@@ -144,31 +144,32 @@ size_t http_method_table_len = NUM_ELEMENTS(http_method_table);
  * @see fr_table_str_by_value
  */
 fr_table_num_sorted_t const http_body_type_table[] = {
-	{ L("html"),				REST_HTTP_BODY_HTML		},
-	{ L("invalid"),				REST_HTTP_BODY_INVALID		},
-	{ L("json"),				REST_HTTP_BODY_JSON		},
-	{ L("none"),				REST_HTTP_BODY_NONE		},
-	{ L("plain"),				REST_HTTP_BODY_PLAIN		},
-	{ L("post"),				REST_HTTP_BODY_POST		},
-	{ L("unavailable"),			REST_HTTP_BODY_UNAVAILABLE	},
-	{ L("unknown"),				REST_HTTP_BODY_UNKNOWN		},
-	{ L("unsupported"),			REST_HTTP_BODY_UNSUPPORTED	},
-	{ L("xml"),				REST_HTTP_BODY_XML		},
-	{ L("yaml"),				REST_HTTP_BODY_YAML		}
+	{ L("crl"),					REST_HTTP_BODY_CRL		},
+	{ L("html"),					REST_HTTP_BODY_HTML		},
+	{ L("invalid"),					REST_HTTP_BODY_INVALID		},
+	{ L("json"),					REST_HTTP_BODY_JSON		},
+	{ L("none"),					REST_HTTP_BODY_NONE		},
+	{ L("plain"),					REST_HTTP_BODY_PLAIN		},
+	{ L("post"),					REST_HTTP_BODY_POST		},
+	{ L("unavailable"),				REST_HTTP_BODY_UNAVAILABLE	},
+	{ L("unknown"),					REST_HTTP_BODY_UNKNOWN		},
+	{ L("unsupported"),				REST_HTTP_BODY_UNSUPPORTED	},
+	{ L("xml"),					REST_HTTP_BODY_XML		},
+	{ L("yaml"),					REST_HTTP_BODY_YAML		}
 };
 size_t http_body_type_table_len = NUM_ELEMENTS(http_body_type_table);
 
 fr_table_num_sorted_t const http_auth_table[] = {
-	{ L("any"),				REST_HTTP_AUTH_ANY		},
-	{ L("basic"),				REST_HTTP_AUTH_BASIC		},
-	{ L("digest"),				REST_HTTP_AUTH_DIGEST		},
+	{ L("any"),					REST_HTTP_AUTH_ANY		},
+	{ L("basic"),					REST_HTTP_AUTH_BASIC		},
+	{ L("digest"),					REST_HTTP_AUTH_DIGEST		},
 	{ L("digest-ie"),				REST_HTTP_AUTH_DIGEST_IE	},
-	{ L("gss-negotiate"),			REST_HTTP_AUTH_GSSNEGOTIATE	},
-	{ L("none"),				REST_HTTP_AUTH_NONE		},
-	{ L("ntlm"),				REST_HTTP_AUTH_NTLM		},
-	{ L("ntlm-winbind"),			REST_HTTP_AUTH_NTLM_WB		},
-	{ L("safe"),				REST_HTTP_AUTH_ANY_SAFE		},
-	{ L("srp"),				REST_HTTP_AUTH_TLS_SRP		}
+	{ L("gss-negotiate"),				REST_HTTP_AUTH_GSSNEGOTIATE	},
+	{ L("none"),					REST_HTTP_AUTH_NONE		},
+	{ L("ntlm"),					REST_HTTP_AUTH_NTLM		},
+	{ L("ntlm-winbind"),				REST_HTTP_AUTH_NTLM_WB		},
+	{ L("safe"),					REST_HTTP_AUTH_ANY_SAFE		},
+	{ L("srp"),					REST_HTTP_AUTH_TLS_SRP		}
 };
 size_t http_auth_table_len = NUM_ELEMENTS(http_auth_table);
 
@@ -188,12 +189,14 @@ size_t http_auth_table_len = NUM_ELEMENTS(http_auth_table);
  */
 fr_table_num_sorted_t const http_content_type_table[] = {
 	{ L("application/json"),			REST_HTTP_BODY_JSON		},
+	{ L("application/pkix-crl"),			REST_HTTP_BODY_CRL		},
+	{ L("application/x-pkcs7-crl"),			REST_HTTP_BODY_CRL		},
 	{ L("application/x-www-form-urlencoded"),	REST_HTTP_BODY_POST		},
 	{ L("application/x-yaml"),			REST_HTTP_BODY_YAML		},
 	{ L("application/yaml"),			REST_HTTP_BODY_YAML		},
 	{ L("text/html"),				REST_HTTP_BODY_HTML		},
 	{ L("text/plain"),				REST_HTTP_BODY_PLAIN		},
-	{ L("text/x-yaml"),			REST_HTTP_BODY_YAML		},
+	{ L("text/x-yaml"),				REST_HTTP_BODY_YAML		},
 	{ L("text/xml"),				REST_HTTP_BODY_XML		},
 	{ L("text/yaml"),				REST_HTTP_BODY_YAML		}
 };
@@ -220,12 +223,11 @@ typedef struct {
  * @see json_pair_alloc_leaf
  */
 typedef struct {
-	int do_xlat;		//!< If true value will be expanded with xlat.
-	int is_json;		//!< If true value will be inserted as raw JSON
-				// (multiple values not supported).
-	fr_token_t op;		//!< The operator that determines how the new VP
-				// is processed. @see fr_tokens_table
-} json_flags_t;
+	int		do_xlat;	//!< If true value will be expanded with xlat.
+	int		is_json;	//!< If true value will be inserted as raw JSON
+					///< (multiple values not supported).
+	json_object	*value;		//!< Object to extract value from
+} json_value_ctx_t;
 #endif
 
 /** Frees a libcurl handle, and any additional memory used by context data.
@@ -250,11 +252,6 @@ static int _mod_conn_free(fr_curl_io_request_t *randle)
  * which hold the context data required for generating requests and parsing
  * responses.
  *
- * If instance->connect_uri is not NULL libcurl will attempt to open a
- * TCP socket to the server specified in the URI. This is done so that when the
- * socket is first used, there will already be a cached TCP connection to the
- * REST server associated with the curl handle.
- *
  * @see fr_pool_init
  * @see fr_pool_connection_create_t
  * @see connection.c
@@ -272,7 +269,7 @@ void *rest_mod_conn_create(TALLOC_CTX *ctx, void *instance, UNUSED fr_time_delta
 	randle = fr_curl_io_request_alloc(ctx);
 	if (!randle) return NULL;
 
-	curl_ctx = talloc_zero(randle, rlm_rest_curl_context_t);
+	MEM(curl_ctx = talloc_zero(randle, rlm_rest_curl_context_t));
 
 	curl_ctx->headers = NULL; /* CURL needs this to be NULL */
 	curl_ctx->request.instance = inst;
@@ -359,13 +356,13 @@ static size_t rest_encode_post(void *out, size_t size, size_t nmemb, void *userd
 	request_t			*request = ctx->request; /* Used by RDEBUG */
 	fr_pair_t		*vp;
 
-	char			*p = out;	/* Position in buffer */
-	char			*encoded = p;	/* Position in buffer of last fully encoded attribute or value */
-	char			*escaped;	/* Pointer to current URL escaped data */
-
 	size_t			len = 0;
 	ssize_t			slen;
 	size_t			freespace = (size * nmemb) - 1;
+
+	char			*p = out;	/* Position in buffer */
+	char			*encoded = p;	/* Position in buffer of last fully encoded attribute or value */
+	char			*escaped;	/* Pointer to current URL escaped data */
 
 	/* Allow manual chunking */
 	if ((ctx->chunk) && (ctx->chunk <= freespace)) freespace = (ctx->chunk - 1);
@@ -386,7 +383,7 @@ static size_t rest_encode_post(void *out, size_t size, size_t nmemb, void *userd
 		RDEBUG2("Encoding attribute \"%s\"", vp->da->name);
 
 		if (ctx->state == READ_STATE_ATTR_BEGIN) {
-			escaped = curl_escape(vp->da->name, strlen(vp->da->name));
+			escaped = curl_escape(vp->da->name, 0);
 			if (!escaped) {
 				REDEBUG("Failed escaping string \"%s\"", vp->da->name);
 				return 0;
@@ -411,14 +408,14 @@ static size_t rest_encode_post(void *out, size_t size, size_t nmemb, void *userd
 				if (len == 0) {
 					REDEBUG("Failed encoding attribute");
 				} else {
-					RDEBUG3("Returning %zd bytes of POST data "
+					RDEBUG3("Returning %zu bytes of POST data "
 						"(buffer full or chunk exceeded)", len);
 				}
 
 				return len;
 			}
 
-			len = sprintf(p, "%s=", escaped);
+			len = snprintf(p, freespace, "%s=", escaped);
 			curl_free(escaped);
 			p += len;
 			freespace -= len;
@@ -437,10 +434,10 @@ static size_t rest_encode_post(void *out, size_t size, size_t nmemb, void *userd
 		if (slen < 0) return 0;
 
 		RINDENT();
-		RDEBUG3("Length : %zd", (size_t)slen);
+		RDEBUG3("Length : %zu", (size_t)slen);
 		REXDENT();
 		if (slen > 0) {
-			escaped = curl_escape(p, (size_t)slen);
+			escaped = curl_escape(p, (int)slen);
 			if (!escaped) {
 				REDEBUG("Failed escaping string \"%s\"", vp->da->name);
 				return 0;
@@ -486,7 +483,7 @@ static size_t rest_encode_post(void *out, size_t size, size_t nmemb, void *userd
 	len = p - (char *)out;
 
 	RDEBUG3("POST Data: %s", (char *)out);
-	RDEBUG3("Returning %zd bytes of POST data", len);
+	RDEBUG3("Returning %zu bytes of POST data", len);
 
 	return len;
 }
@@ -551,7 +548,7 @@ static size_t rest_encode_json(void *out, size_t size, size_t nmemb, void *userd
 		data->len = strlen(encoded);
 
 		RDEBUG3("JSON Data: %s", encoded);
-		RDEBUG3("Returning %zd bytes of JSON data", data->len);
+		RDEBUG3("Returning %zu bytes of JSON data", data->len);
 
 		ctx->state = READ_STATE_ATTR_BEGIN;
 	}
@@ -597,24 +594,24 @@ static ssize_t rest_request_encode_wrapper(char **out, UNUSED rlm_rest_t const *
 					   rest_read_t func, size_t limit, void *userdata)
 {
 	char	*buff = NULL;
-	size_t	alloc = REST_BODY_ALLOC_CHUNK;	/* Size of buffer to alloc */
+	size_t	needed = REST_BODY_ALLOC_CHUNK;	/* Size of buffer to alloc */
 	size_t	used = 0;			/* Size of data written */
 	size_t	len = 0;
 
-	buff = talloc_array(NULL, char, alloc);
+	buff = talloc_array(NULL, char, needed);
 	for (;;) {
-		len = func(buff + used, alloc - used, 1, userdata);
+		len = func(buff + used, needed - used, 1, userdata);
 		used += len;
 		if (!len) {
 			*out = buff;
 			return used;
 		}
 
-		alloc = alloc * 2;
-		if (alloc > limit) break;
+		needed *= 2;
+		if (needed > limit) break;
 
-		MEM(buff = talloc_realloc(NULL, buff, char, alloc));
-	};
+		MEM(buff = talloc_realloc(NULL, buff, char, needed));
+	}
 
 	talloc_free(buff);
 
@@ -668,7 +665,7 @@ static int rest_decode_plain(UNUSED rlm_rest_t const *inst, UNUSED rlm_rest_sect
 	MEM(pair_update_request(&vp, attr_rest_http_body) >= 0);
 	fr_pair_value_bstrndup(vp, raw, rawlen, true);
 
-	RDEBUG2("&%pP", vp);
+	RDEBUG2("%pP", vp);
 
 	return 1;
 }
@@ -696,7 +693,7 @@ static int rest_decode_plain(UNUSED rlm_rest_t const *inst, UNUSED rlm_rest_sect
  *	- Number of fr_pair_ts processed.
  *	- -1 on unrecoverable error.
  */
-static int rest_decode_post(UNUSED rlm_rest_t const *instance, UNUSED rlm_rest_section_t const *section,
+static int rest_decode_post(UNUSED rlm_rest_t const *instance, rlm_rest_section_t const *section,
 			    request_t *request, fr_curl_io_request_t *randle, char *raw, size_t rawlen)
 {
 	CURL			*candle = randle->candle;
@@ -723,6 +720,7 @@ static int rest_decode_post(UNUSED rlm_rest_t const *instance, UNUSED rlm_rest_s
 		char			*name  = NULL;
 		char			*value = NULL;
 
+		char const		*to_parse = NULL;
 		char			*expanded = NULL;
 
 		size_t			len;
@@ -740,9 +738,10 @@ static int rest_decode_post(UNUSED rlm_rest_t const *instance, UNUSED rlm_rest_s
 
 		if (tmpl_afrom_attr_str(request, NULL, &dst, name,
 					&(tmpl_rules_t){
-						.prefix = TMPL_ATTR_REF_PREFIX_NO,
-						.dict_def = request->dict,
-						.list_def = PAIR_LIST_REPLY
+						.attr = {
+							.dict_def = request->local_dict,
+							.list_def = request_attr_reply
+						}
 					}) <= 0) {
 			RPWDEBUG("Failed parsing attribute (skipping)");
 			talloc_free(dst);
@@ -762,17 +761,17 @@ static int rest_decode_post(UNUSED rlm_rest_t const *instance, UNUSED rlm_rest_s
 			goto skip;
 		}
 		ctx = tmpl_list_ctx(current, tmpl_list(dst));
-		da = tmpl_da(dst);
+		da = tmpl_attr_tail_da(dst);
 
 		fr_assert(vps);
 
 		RINDENT();
-		RDEBUG3("Type  : %s", fr_table_str_by_value(fr_value_box_type_table, da->type, "<INVALID>"));
+		RDEBUG3("Type  : %s", fr_type_to_str(da->type));
 
 		q = strchr(p, '&');
 		len = (!q) ? (rawlen - (p - raw)) : (unsigned)(q - p);
 
-		value = curl_easy_unescape(candle, p, len, &curl_len);
+		value = curl_easy_unescape(candle, p, (int)len, &curl_len);
 
 		/*
 		 *  If we found a delimiter we want to skip over it,
@@ -787,11 +786,16 @@ static int rest_decode_post(UNUSED rlm_rest_t const *instance, UNUSED rlm_rest_s
 
 		talloc_free(dst);	/* Free our temporary tmpl */
 
-		RDEBUG2("Performing xlat expansion of response value");
+		if (section->response.post.do_xlat) {
+			RDEBUG2("Performing xlat expansion of response value");
 
-		if (xlat_aeval(request, &expanded, request, value, NULL, NULL) < 0) goto skip;
+			if (xlat_aeval(request, &expanded, request, value, NULL, NULL) < 0) goto skip;
 
-		fr_assert(expanded);
+			fr_assert(expanded);
+			to_parse = expanded;
+		} else {
+			to_parse = value;
+		}
 
 		MEM(vp = fr_pair_afrom_da(ctx, da));
 		if (!vp) {
@@ -804,7 +808,7 @@ static int rest_decode_post(UNUSED rlm_rest_t const *instance, UNUSED rlm_rest_s
 			return count;
 		}
 
-		ret = fr_pair_value_from_str(vp, expanded, -1, '\0', true);
+		ret = fr_pair_value_from_str(vp, to_parse, strlen(to_parse), NULL, true);
 		TALLOC_FREE(expanded);
 		if (ret < 0) {
 			RWDEBUG("Incompatible value assignment, skipping");
@@ -830,105 +834,97 @@ static int rest_decode_post(UNUSED rlm_rest_t const *instance, UNUSED rlm_rest_s
 }
 
 #ifdef HAVE_JSON
-/** Converts JSON "value" key into fr_pair_t.
+/** Converts JSON "value" key into fr_pair_t when processing a map_t
  *
  * If leaf is not in fact a leaf node, but contains JSON data, the data will
  * written to the attribute in JSON string format.
  *
- * @param[in] instance	configuration data.
- * @param[in] section	configuration data.
  * @param[in] ctx	to allocate new fr_pair_ts in.
+ * @param[in] out	List to append new pair to.
  * @param[in] request	Current request.
- * @param[in] da	Attribute to create.
- * @param[in] flags	containing the operator other flags controlling value
- *			expansion.
- * @param[in] leaf	object containing the fr_pair_t value.
+ * @param[in] map	being processed.
+ * @param[in] uctx	passed to map_tp_request.
  * @return
- *	- #fr_pair_t just created.
- *	- NULL on error.
+ *	- 0 on success/
+ *	- -1 on error.
  */
-static fr_pair_t *json_pair_alloc_leaf(UNUSED rlm_rest_t const *instance, UNUSED rlm_rest_section_t const *section,
-				        TALLOC_CTX *ctx, request_t *request,
-				        fr_dict_attr_t const *da, json_flags_t *flags, json_object *leaf)
+static int json_map_getvalue(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *request, map_t const *map, void *uctx)
 {
+	fr_dict_attr_t const	*da = tmpl_attr_tail_da(map->lhs);
+	json_value_ctx_t	*value_ctx = (json_value_ctx_t *) uctx;
 	char const		*value;
 	char			*expanded = NULL;
-	int 			ret;
-
+	int 			ret = 0;
 	fr_pair_t		*vp;
+	fr_value_box_t		src = FR_VALUE_BOX_INITIALISER_NULL(src);
 
-	fr_value_box_t		src;
-
-	if (json_object_is_type(leaf, json_type_null)) {
+	if (json_object_is_type(value_ctx->value, json_type_null)) {
 		RDEBUG3("Got null value for attribute \"%s\" (skipping)", da->name);
-		return NULL;
+		return -1;
 	}
 
 	MEM(vp = fr_pair_afrom_da(ctx, da));
-	if (!vp) {
-		RWDEBUG("Failed creating valuepair for attribute \"%s\" (skipping)", da->name);
-		return NULL;
-	}
+	fr_value_box_init_null(&src);
 
-	memset(&src, 0, sizeof(src));
-
-	switch (json_object_get_type(leaf)) {
+	switch (json_object_get_type(value_ctx->value)) {
 	case json_type_int:
-		if (flags->do_xlat) RWDEBUG("Ignoring do_xlat on 'int', attribute \"%s\"", da->name);
-		fr_value_box_shallow(&src, (int32_t)json_object_get_int(leaf), true);
+		if (value_ctx->do_xlat) RWDEBUG("Ignoring do_xlat on 'int', attribute \"%s\"", da->name);
+		fr_value_box(&src, (int32_t)json_object_get_int(value_ctx->value), true);
 		break;
 
 	case json_type_double:
-		if (flags->do_xlat) RWDEBUG("Ignoring do_xlat on 'double', attribute \"%s\"", da->name);
-		fr_value_box_shallow(&src, (double)json_object_get_double(leaf), true);
+		if (value_ctx->do_xlat) RWDEBUG("Ignoring do_xlat on 'double', attribute \"%s\"", da->name);
+		fr_value_box(&src, (double)json_object_get_double(value_ctx->value), true);
 		break;
 
 	case json_type_string:
-		value = json_object_get_string(leaf);
-		if (flags->do_xlat && memchr(value, '%', json_object_get_string_len(leaf))) {
+		value = json_object_get_string(value_ctx->value);
+		if (value_ctx->do_xlat && memchr(value, '%', json_object_get_string_len(value_ctx->value))) {
 			if (xlat_aeval(request, &expanded, request, value, NULL, NULL) < 0) {
 				talloc_free(vp);
-				return NULL;
+				return -1;
 			}
 			fr_value_box_bstrndup_shallow(&src, NULL, expanded,
-						      talloc_array_length(expanded) - 1, true);
+						      talloc_strlen(expanded), true);
 		} else {
-			fr_value_box_bstrndup_shallow(&src, NULL, value,
-						      json_object_get_string_len(leaf), true);
+			if (fr_value_box_from_str(vp, &vp->data, da->type, da, value,
+						  json_object_get_string_len(value_ctx->value), NULL) < 0) ret = -1;
+			goto finish;
 		}
 		break;
 
 	default:
 	{
 		char const *str;
-		if (flags->do_xlat) RWDEBUG("Ignoring do_xlat on 'object', attribute \"%s\"", da->name);
+		if (value_ctx->do_xlat) RWDEBUG("Ignoring do_xlat on 'object', attribute \"%s\"", da->name);
 
 		/*
 		 *	Should encode any nested JSON structures into JSON strings.
 		 *
 		 *	"I knew you liked JSON so I put JSON in your JSON!"
 		 */
-		str = json_object_get_string(leaf);
+		str = json_object_get_string(value_ctx->value);
 		if (!str) {
 			RWDEBUG("Failed getting string value for attribute \"%s\" (skipping)", da->name);
 			talloc_free(vp);
-			return NULL;
+			return -1;
 		}
 		fr_value_box_strdup_shallow(&src, NULL, str, true);
 	}
 	}
 
 	ret = fr_value_box_cast(vp, &vp->data, da->type, da, &src);
+finish:
 	talloc_free(expanded);
 	if (ret < 0) {
 		RWDEBUG("Failed parsing value for attribute \"%s\" (skipping)", da->name);
 		talloc_free(vp);
-		return NULL;
+		return -1;
 	}
 
-	vp->op = flags->op;
+	fr_pair_append(out, vp);
 
-	return vp;
+	return 0;
 }
 
 /** Processes JSON response and converts it into multiple fr_pair_ts
@@ -960,9 +956,13 @@ static fr_pair_t *json_pair_alloc_leaf(UNUSED rlm_rest_t const *instance, UNUSED
 @endverbatim
  *
  * JSON valuepair flags:
- *  - do_xlat	(optional) Controls xlat expansion of values. Defaults to true.
+ *  - do_xlat	(optional) Controls xlat expansion of values. Defaults to the
+ *			   "do_xlat" config item in the response "json"
+ *			   subsection, which itself defaults to false.
  *  - is_json	(optional) If true, any nested JSON data will be copied to the
- *			   fr_pair_t in string form. Defaults to true.
+ *			   fr_pair_t in string form. Defaults to the "is_json"
+ *			   config item in the response "json" subsection, which
+ *			   itself defaults to false.
  *  - op	(optional) Controls how the attribute is inserted into
  *			   the target list. Defaults to ':=' (T_OP_SET).
  *
@@ -983,11 +983,11 @@ static fr_pair_t *json_pair_alloc_leaf(UNUSED rlm_rest_t const *instance, UNUSED
  *	- Number of attributes created.
  *	- < 0 on error.
  */
-static int json_pair_alloc(rlm_rest_t const *instance, rlm_rest_section_t const *section,
+static int json_pair_alloc(UNUSED rlm_rest_t const *instance, rlm_rest_section_t const *section,
 			   request_t *request, json_object *object, UNUSED int level, int max)
 {
 	int max_attrs = max;
-	tmpl_t *dst = NULL;
+	map_t	*map = NULL;
 
 	if (!json_object_is_type(object, json_type_object)) {
 #ifdef HAVE_JSON_TYPE_TO_NAME
@@ -1004,171 +1004,171 @@ static int json_pair_alloc(rlm_rest_t const *instance, rlm_rest_section_t const 
 	/*
 	 *	Process VP container
 	 */
-	json_object_object_foreach(object, name, value) {
-		int		i = 0, elements;
-		struct		json_object *element, *tmp;
-		TALLOC_CTX	*ctx;
+	{
+		json_object_object_foreach(object, name, value) {
+			size_t		i = 0, elements;
+			struct		json_object *element, *tmp;
 
-		json_flags_t flags = {
-			.op = T_OP_SET,
-			.do_xlat = 1,
-			.is_json = 0
-		};
+			json_value_ctx_t value_ctx = {
+				.do_xlat = section->response.json.do_xlat,
+				.is_json = section->response.json.is_json
+			};
 
-		request_t		*current = request;
-		fr_pair_list_t		*vps;
-		fr_pair_t		*vp = NULL;
+			request_t		*current = request;
 
-		TALLOC_FREE(dst);
+			TALLOC_FREE(map);
 
-		/*
-		 *  Resolve attribute name to a dictionary entry and pairlist.
-		 */
-		RDEBUG2("Parsing attribute \"%s\"", name);
-
-		if (tmpl_afrom_attr_str(request, NULL, &dst, name,
-					&(tmpl_rules_t){
-						.prefix = TMPL_ATTR_REF_PREFIX_NO,
-						.dict_def = request->dict,
-						.list_def = PAIR_LIST_REPLY
-					}) <= 0) {
-			RPWDEBUG("Failed parsing attribute (skipping)");
-			continue;
-		}
-
-		if (tmpl_request_ptr(&current, tmpl_request(dst)) < 0) {
-			RWDEBUG("Attribute name refers to outer request but not in a tunnel (skipping)");
-			continue;
-		}
-
-		vps = tmpl_list_head(current, tmpl_list(dst));
-		if (!vps) {
-			RWDEBUG("List not valid in this context (skipping)");
-			continue;
-		}
-		ctx = tmpl_list_ctx(current, tmpl_list(dst));
-
-		/*
-		 *  Alternative JSON structure which allows operator,
-		 *  and other flags to be specified.
-		 *
-		 *	"<name>":{
-		 *		"do_xlat":<bool>,
-		 *		"is_json":<bool>,
-		 *		"op":"<op>",
-		 *		"value":<value>
-		 *	}
-		 *
-		 *	Where value is a:
-		 *	  - []	Multivalued array
-		 *	  - {}	Nested Valuepair
-		 *	  - *	Integer or string value
-		 */
-		if (json_object_is_type(value, json_type_object)) {
 			/*
-			 *  Process operator if present.
+			 *  Resolve attribute name to a dictionary entry and pairlist.
 			 */
-			if (json_object_object_get_ex(value, "op", &tmp)) {
-				flags.op = fr_table_value_by_str(fr_tokens_table, json_object_get_string(tmp), 0);
-				if (!flags.op) {
-					RWDEBUG("Invalid operator value \"%s\" (skipping)",
-						json_object_get_string(tmp));
-					continue;
+			RDEBUG2("Parsing attribute \"%s\"", name);
+
+			map = talloc_zero(NULL, map_t);
+			map_list_init(&map->child);
+			map->op = T_OP_SET;
+
+			if (tmpl_afrom_attr_str(request, NULL, &map->lhs, name,
+						&(tmpl_rules_t){
+							.attr = {
+								.dict_def = request->local_dict,
+								.list_def = request_attr_reply
+							}
+						}) <= 0) {
+				RPWDEBUG("Failed parsing attribute (skipping)");
+				continue;
+			}
+
+			if (tmpl_request_ptr(&current, tmpl_request(map->lhs)) < 0) {
+				RWDEBUG("Attribute name refers to outer request but not in a tunnel (skipping)");
+				continue;
+			}
+
+			if (!tmpl_list_head(current, tmpl_list(map->lhs))) {
+				RWDEBUG("List not valid in this context (skipping)");
+				continue;
+			}
+
+			/*
+			 *  Alternative JSON structure which allows operator,
+			 *  and other flags to be specified.
+			 *
+			 *	"<name>":{
+			 *		"do_xlat":<bool>,
+			 *		"is_json":<bool>,
+			 *		"op":"<op>",
+			 *		"value":<value>
+			 *	}
+			 *
+			 *	Where value is a:
+			 *	  - []	Multivalued array
+			 *	  - {}	Nested Valuepair
+			 *	  - *	Integer or string value
+			 */
+			if (json_object_is_type(value, json_type_object)) {
+				/*
+				 *  Process operator if present.
+				 */
+				if (json_object_object_get_ex(value, "op", &tmp)) {
+					map->op = fr_table_value_by_str(fr_tokens_table, json_object_get_string(tmp), 0);
+					if (!map->op) {
+						RWDEBUG("Invalid operator value \"%s\" (skipping)",
+							json_object_get_string(tmp));
+						continue;
+					}
 				}
-			}
-
-			/*
-			 *  Process optional do_xlat bool.
-			 */
-			if (json_object_object_get_ex(value, "do_xlat", &tmp)) {
-				flags.do_xlat = json_object_get_boolean(tmp);
-			}
-
-			/*
-			 *  Process optional is_json bool.
-			 */
-			if (json_object_object_get_ex(value, "is_json", &tmp)) {
-				flags.is_json = json_object_get_boolean(tmp);
-			}
-
-			/*
-			 *  Value key must be present if were using the expanded syntax.
-			 */
-			if (!json_object_object_get_ex(value, "value", &tmp)) {
-				RWDEBUG("Value key missing (skipping)");
-				continue;
-			}
-
-			/*
-			 *  The value field now becomes the key we're operating on
-			 */
-			value = tmp;
-		}
-
-		/*
-		 *  Setup fr_pair_afrom_da / recursion loop.
-		 */
-		if (!flags.is_json && json_object_is_type(value, json_type_array)) {
-			elements = json_object_array_length(value);
-			if (!elements) {
-				RWDEBUG("Zero length value array (skipping)");
-				continue;
-			}
-			element = json_object_array_get_idx(value, 0);
-		} else {
-			elements = 1;
-			element = value;
-		}
-
-		/*
-		 *  A JSON 'value' key, may have multiple elements, iterate
-		 *  over each of them, creating a new fr_pair_t.
-		 */
-		do {
-			if (max_attrs-- <= 0) {
-				RWDEBUG("At maximum attribute limit");
-				talloc_free(dst);
-				return max;
-			}
-
-			/*
-			 *  Automagically switch the op for multivalued attributes.
-			 */
-			if (((flags.op == T_OP_SET) || (flags.op == T_OP_EQ)) && (i >= 1)) {
-				flags.op = T_OP_ADD;
-			}
-
-			if (json_object_is_type(element, json_type_object) && !flags.is_json) {
-				/* TODO: Insert nested VP into VP structure...*/
-				RWDEBUG("Found nested VP, these are not yet supported (skipping)");
-
-				continue;
 
 				/*
-				vp = json_pair_alloc(instance, section,
-						   request, value,
-						   level + 1, max_attrs);*/
-			} else {
-				vp = json_pair_alloc_leaf(instance, section, ctx, request,
-							  tmpl_da(dst), &flags, element);
-				if (!vp) continue;
-			}
-			RINDENT();
-			RDEBUG2("&%s:%pP", fr_table_str_by_value(pair_list_table, tmpl_list(dst), ""), vp);
-			REXDENT();
+				 *  Process optional do_xlat bool.
+				 */
+				if (json_object_object_get_ex(value, "do_xlat", &tmp)) {
+					value_ctx.do_xlat = json_object_get_boolean(tmp);
+				}
 
-			fr_pair_list_t tmp_list;
-			fr_pair_list_init(&tmp_list);
-			fr_pair_append(&tmp_list, vp);
-			radius_pairmove(current, vps, &tmp_list, false);
-		/*
-		 *  If we call json_object_array_get_idx on something that's not an array
-		 *  the behaviour appears to be to occasionally segfault.
-		 */
-		} while ((++i < elements) && (element = json_object_array_get_idx(value, i)));
+				/*
+				 *  Process optional is_json bool.
+				 */
+				if (json_object_object_get_ex(value, "is_json", &tmp)) {
+					value_ctx.is_json = json_object_get_boolean(tmp);
+				}
+
+				/*
+				 *  Value key must be present if were using the expanded syntax.
+				 */
+				if (!json_object_object_get_ex(value, "value", &tmp)) {
+					RWDEBUG("Value key missing (skipping)");
+					continue;
+				}
+
+				/*
+				 *  The value field now becomes the key we're operating on
+				 */
+				value = tmp;
+			}
+
+			/*
+			 *  Setup fr_pair_afrom_da / recursion loop.
+			 */
+			if (!value_ctx.is_json && json_object_is_type(value, json_type_array)) {
+				elements = json_object_array_length(value);
+				if (!elements) {
+					RWDEBUG("Zero length value array (skipping)");
+					continue;
+				}
+				element = json_object_array_get_idx(value, 0);
+			} else {
+				elements = 1;
+				element = value;
+			}
+
+			/*
+			 *  A JSON 'value' key, may have multiple elements, iterate
+			 *  over each of them, creating a new fr_pair_t.
+			 */
+			do {
+				if (max_attrs-- <= 0) {
+					RWDEBUG("At maximum attribute limit");
+					talloc_free(map);
+					return max;
+				}
+
+				/*
+				 *  Automagically switch the op for multivalued attributes.
+				 */
+				if (((map->op == T_OP_SET) || (map->op == T_OP_EQ)) && (i >= 1)) {
+					map->op = T_OP_ADD_EQ;
+				}
+
+				if (json_object_is_type(element, json_type_object) && !value_ctx.is_json) {
+					/* TODO: Insert nested VP into VP structure...*/
+					RWDEBUG("Found nested VP, these are not yet supported (skipping)");
+
+					continue;
+
+					/*
+					vp = json_pair_alloc(instance, section,
+							request, value,
+							level + 1, max_attrs);*/
+				} else {
+					if (tmpl_afrom_substr(map, &map->rhs,
+							      &FR_SBUFF_IN(json_object_get_string(element),
+									   (size_t) json_object_get_string_len(element)),
+							      T_SINGLE_QUOTED_STRING, NULL, NULL) < 0) {
+						REDEBUG("Failed parsing value into map");
+						continue;
+					}
+					value_ctx.value = element;
+					map_to_request(request, map, json_map_getvalue, &value_ctx);
+					TALLOC_FREE(map->rhs);
+				}
+			/*
+			 *  If we call json_object_array_get_idx on something that's not an array
+			 *  the behaviour appears to be to occasionally segfault.
+			 */
+			} while ((++i < elements) && (element = json_object_array_get_idx(value, i)));
+		}
 	}
 
-	talloc_free(dst);
+	talloc_free(map);
 
 	return max - max_attrs;
 }
@@ -1244,10 +1244,10 @@ static int rest_decode_json(rlm_rest_t const *instance, rlm_rest_section_t const
 static size_t rest_response_header(void *in, size_t size, size_t nmemb, void *userdata)
 {
 	rlm_rest_response_t	*ctx = userdata;
-	request_t			*request = ctx->request; /* Used by RDEBUG */
+	request_t		*request = ctx->request; /* Used by RDEBUG */
 
 	char const		*start = (char *)in, *p = start, *end = p + (size * nmemb);
-	char			*q;
+	char const		*q;
 	size_t			len;
 
 	http_body_type_t	type;
@@ -1283,13 +1283,13 @@ static size_t rest_response_header(void *in, size_t size, size_t nmemb, void *us
 		/*
 		 *  HTTP/<version> <reason_code>[ <reason_phrase>]\r\n
 		 *
-		 *  "HTTP/1.1 " (8) + "100 " (4) + "\r\n" (2) = 14
-		 *  "HTTP/2 " (8) + "100 " (4) + "\r\n" (2) = 12
+		 *  "HTTP/1.1 " (9) + "100" (3) + "\r\n" (2) = 14
+		 *  "HTTP/2 " (7) + "100" (3) + "\r\n" (2) = 12
 		 */
 		if ((end - p) < 12) {
 			REDEBUG("Malformed HTTP header: Status line too short");
 		malformed:
-			REDEBUG("Received %zu bytes of invalid header data: %pV",
+			REDEBUG("Received %td bytes of invalid header data: %pV",
 				(end - start), fr_box_strvalue_len(in, (end - start)));
 			ctx->code = 0;
 
@@ -1343,18 +1343,23 @@ static size_t rest_response_header(void *in, size_t size, size_t nmemb, void *us
 		}
 
 		/*
-		 *  Convert status code into an integer value
+		 *  Convert status code into an integer value.  strtoul needs
+		 *  a writable endptr, so shadow q in a local scope.
 		 */
-		q = NULL;
-		ctx->code = (int)strtoul(p, &q, 10);
-		fr_assert(q == (p + 3));	/* We check this above */
-		p = q;
+		{
+			char *qq = NULL;
+
+			ctx->code = (int)strtoul(p, &qq, 10);
+			fr_assert(qq == (p + 3));	/* We check this above */
+			p = qq;
+		}
 
 		/*
 		 *  Process reason_phrase (if present).
 		 */
 		RINDENT();
 		if (*p == ' ') {
+			p++;
 			q = memchr(p, '\r', (end - p));
 			if (!q) goto malformed;
 			RDEBUG2("Status : %i (%pV)", ctx->code, fr_box_strvalue_len(p, q - p));
@@ -1403,7 +1408,16 @@ static size_t rest_response_header(void *in, size_t size, size_t nmemb, void *us
 			 *  Figure out if the type is supported by one of the decoders.
 			 */
 			} else {
+				/*
+				 *  No need to check supported types if we accept everything.
+				 */
+				if (ctx->section->response.accept_all) {
+					ctx->type = type;
+					break;
+				}
+
 				ctx->type = http_body_type_supported[type];
+
 				switch (ctx->type) {
 				case REST_HTTP_BODY_UNKNOWN:
 					RWDEBUG("Couldn't determine type, using the request's type \"%s\".",
@@ -1459,7 +1473,7 @@ static size_t rest_response_body(void *in, size_t size, size_t nmemb, void *user
 	request_t			*request = ctx->request; /* Used by RDEBUG */
 
 	char const		*start = in, *p = start, *end = p + (size * nmemb);
-	char			*q;
+	char const		*q;
 
 	size_t			needed;
 
@@ -1481,6 +1495,8 @@ static size_t rest_response_body(void *in, size_t size, size_t nmemb, void *user
 	case REST_HTTP_BODY_UNSUPPORTED:
 	case REST_HTTP_BODY_UNAVAILABLE:
 	case REST_HTTP_BODY_INVALID:
+		if (ctx->section->response.accept_all) goto accept_body;
+
 		while ((q = memchr(p, '\n', (end - p)))) {
 			REDEBUG("%pV", fr_box_strvalue_len(p, q - p));
 			p = q + 1;
@@ -1501,10 +1517,10 @@ static size_t rest_response_body(void *in, size_t size, size_t nmemb, void *user
 	default:
 	{
 		char *out_p;
-
-		if ((ctx->section->max_body_in > 0) && ((ctx->used + (end - p)) > ctx->section->max_body_in)) {
+	accept_body:
+		if ((ctx->section->response.max_body_in > 0) && ((ctx->used + (end - p)) > ctx->section->response.max_body_in)) {
 			REDEBUG("Incoming data (%zu bytes) exceeds max_body_in (%zu bytes).  "
-				"Forcing body to type 'invalid'", ctx->used + (end - p), ctx->section->max_body_in);
+				"Forcing body to type 'invalid'", ctx->used + (end - p), ctx->section->response.max_body_in);
 			ctx->type = REST_HTTP_BODY_INVALID;
 			TALLOC_FREE(ctx->buffer);
 			break;
@@ -1536,7 +1552,7 @@ static size_t rest_response_body(void *in, size_t size, size_t nmemb, void *user
 void rest_response_error(request_t *request, fr_curl_io_request_t *handle)
 {
 	char const	*p, *end;
-	char		*q;
+	char const	*q;
 	size_t len;
 
 	len = rest_get_handle_data(&p, handle);
@@ -1561,7 +1577,7 @@ void rest_response_error(request_t *request, fr_curl_io_request_t *handle)
 void rest_response_debug(request_t *request, fr_curl_io_request_t *handle)
 {
 	char const	*p, *end;
-	char		*q;
+	char const	*q;
 	size_t len;
 
 	len = rest_get_handle_data(&p, handle);
@@ -1591,9 +1607,10 @@ void rest_response_debug(request_t *request, fr_curl_io_request_t *handle)
  * @param[in] ctx	data to initialise.
  * @param[in] type	Default http_body_type to use when decoding raw data, may be
  * 			overwritten by rest_response_header.
+ * @param[in] header	Where to write out headers, may be NULL.
  */
 static void rest_response_init(rlm_rest_section_t const *section,
-			       request_t *request, rlm_rest_response_t *ctx, http_body_type_t type)
+			       request_t *request, rlm_rest_response_t *ctx, http_body_type_t type, tmpl_t *header)
 {
 	ctx->section = section;
 	ctx->request = request;
@@ -1601,6 +1618,8 @@ static void rest_response_init(rlm_rest_section_t const *section,
 	ctx->state = WRITE_STATE_INIT;
 	ctx->alloc = 0;
 	ctx->used = 0;
+	ctx->code = 0;
+	ctx->header = header;
 	TALLOC_FREE(ctx->buffer);
 }
 
@@ -1622,13 +1641,26 @@ size_t rest_get_handle_data(char const **out, fr_curl_io_request_t *randle)
 	return ctx->response.used;
 }
 
+/** Return the body type of a HTTP response
+ *
+ * @param[in] randle	used for the last request.
+ * @return
+ *	- http_body_type_t
+ */
+http_body_type_t rest_response_body_type_get(fr_curl_io_request_t *randle)
+{
+	rlm_rest_curl_context_t *ctx = talloc_get_type_abort(randle->uctx, rlm_rest_curl_context_t);
+
+	return ctx->response.type;
+}
+
 /** Configures body specific curlopts.
  *
  * Configures libcurl handle to use either chunked mode, where the request
  * data will be sent using multiple HTTP requests, or contiguous mode where
  * the request data will be sent in a single HTTP request.
  *
- * @param[in] inst	configuration data.
+ * @param[in] mctx	Call data.
  * @param[in] section	configuration data.
  * @param[in] request	Current request.
  * @param[in] randle	fr_curl_io_request_t to configure.
@@ -1638,11 +1670,11 @@ size_t rest_get_handle_data(char const **out, fr_curl_io_request_t *randle)
  *	- 0 on success.
  *	- -1 on failure.
  */
-static int rest_request_config_body(rlm_rest_t const *inst, rlm_rest_section_t const *section,
+static int rest_request_config_body(module_ctx_t const *mctx, rlm_rest_section_t const *section,
 				    request_t *request, fr_curl_io_request_t *randle, rest_read_t func)
 {
+	rlm_rest_t const *inst = talloc_get_type_abort(mctx->mi->data, rlm_rest_t);
 	rlm_rest_curl_context_t	*uctx = talloc_get_type_abort(randle->uctx, rlm_rest_curl_context_t);
-
 	ssize_t len;
 
 	/*
@@ -1650,7 +1682,7 @@ static int rest_request_config_body(rlm_rest_t const *inst, rlm_rest_section_t c
 	 *  no body should be sent.
 	 */
 	if (!func) {
-		FR_CURL_SET_OPTION(CURLOPT_POSTFIELDSIZE, 0);
+		FR_CURL_REQUEST_SET_OPTION(CURLOPT_POSTFIELDSIZE, 0L);
 		return 0;
 	}
 
@@ -1658,9 +1690,9 @@ static int rest_request_config_body(rlm_rest_t const *inst, rlm_rest_section_t c
 	 *  Chunked transfer encoding means the body will be sent in
 	 *  multiple parts.
 	 */
-	if (section->chunk > 0) {
-		FR_CURL_SET_OPTION(CURLOPT_READDATA, &uctx->request);
-		FR_CURL_SET_OPTION(CURLOPT_READFUNCTION, func);
+	if (section->request.chunk > 0) {
+		FR_CURL_REQUEST_SET_OPTION(CURLOPT_READDATA, &uctx->request);
+		FR_CURL_REQUEST_SET_OPTION(CURLOPT_READFUNCTION, func);
 
 		return 0;
 	}
@@ -1674,16 +1706,79 @@ static int rest_request_config_body(rlm_rest_t const *inst, rlm_rest_section_t c
 		REDEBUG("Failed creating HTTP body content");
 		return -1;
 	}
-	RDEBUG2("Content-Length will be %zu bytes", len);
+	RDEBUG2("Content-Length will be %zu bytes", (size_t)len);
 
 	fr_assert((len == 0) || (talloc_array_length(uctx->body) >= (size_t)len));
-	FR_CURL_SET_OPTION(CURLOPT_POSTFIELDS, uctx->body);
-	FR_CURL_SET_OPTION(CURLOPT_POSTFIELDSIZE, len);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_POSTFIELDS, uctx->body);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_POSTFIELDSIZE, len);
 
 	return 0;
 
 error:
 	return -1;
+}
+
+/** Adds an additional header to a handle to use in the next reques
+ *
+ * @param[in] request	Current request.
+ * @param[in] randle	used for the next request.
+ * @param[in] header	to add.
+ * @param[in] validate	whether to perform basic checks on the header
+ * @return
+ *	- 0 on success.
+ *	- -1 on failure.
+ */
+int rest_request_config_add_header(request_t *request, fr_curl_io_request_t *randle, char const *header, bool validate)
+{
+	rlm_rest_curl_context_t *ctx = talloc_get_type_abort(randle->uctx, rlm_rest_curl_context_t);
+	struct curl_slist	*headers;
+
+	if (validate && !strchr(header, ':')) {
+		RWDEBUG("Invalid HTTP header \"%s\" must be in format '<attribute>: <value>'.  Skipping...",
+			header);
+		return -1;
+	}
+
+	RINDENT();
+	RDEBUG3("%s", header);
+	REXDENT();
+
+	headers = curl_slist_append(ctx->headers, header);
+	if (unlikely(!headers)) {
+		REDEBUG("Failed to add header \"%s\"", header);
+		return -1;
+	}
+	ctx->headers = headers;
+
+	return 0;
+}
+
+/** See if the list of headers already contains a header
+ *
+ * @note Only compares the header name, not the value.
+ *
+ * @param[in] randle	to check headers for.
+ * @param[in] header	to find.
+ * @return
+ *	- true if yes
+ *	- false if no
+ */
+static bool rest_request_contains_header(fr_curl_io_request_t *randle, char const *header)
+{
+	rlm_rest_curl_context_t *ctx = talloc_get_type_abort(randle->uctx, rlm_rest_curl_context_t);
+	struct curl_slist	*headers = ctx->headers;
+	char const 		*sep;
+	size_t			cmp_len;
+
+	sep = strchr(header, ':');
+	cmp_len = sep ? (size_t)(sep - header) : strlen(header);
+
+	while (headers) {
+		if (strncasecmp(headers->data, header, cmp_len) == 0) return true;
+		headers = headers->next;
+	}
+
+	return false;
 }
 
 /** Configures request curlopts.
@@ -1698,119 +1793,125 @@ error:
  *
  * Sets up callbacks for all response processing (buffers and body data).
  *
- * @param[in] inst	configuration data.
- * @param[in] t		Thread specific instance data.
+ * @param[in] mctx	call data.
  * @param[in] section	configuration data.
  * @param[in] randle	to configure.
  * @param[in] request	Current request.
  * @param[in] method	to use (HTTP verbs PUT, POST, DELETE etc...).
  * @param[in] type	Content-Type for request encoding, also sets
  *			the default for decoding.
- * @param[in] username	to use for HTTP authentication, may be NULL in
- *			which case configured defaults will be used.
- * @param[in] password	to use for HTTP authentication, may be NULL in
- *			which case configured defaults will be used.
  * @param[in] uri	buffer containing the expanded URI to send the request to.
+ * @param[in] body_data	(optional) custom body data. Must persist whilst we're
+ *			writing data out to the socket.  Must be a talloced buffer
+ *			which is \0 terminated.
  * @return
  *	- 0 on success (all opts configured).
  *	- -1 on failure.
  */
-int rest_request_config(rlm_rest_t const *inst, rlm_rest_thread_t *t, rlm_rest_section_t const *section,
+int rest_request_config(module_ctx_t const *mctx, rlm_rest_section_t const *section,
 			request_t *request, fr_curl_io_request_t *randle, http_method_t method,
 			http_body_type_t type,
-			char const *uri, char const *username, char const *password)
+			char const *uri, char const *body_data)
 {
+	rlm_rest_t const	*inst = talloc_get_type_abort(mctx->mi->data, rlm_rest_t);
+	rlm_rest_call_env_t 	*call_env = talloc_get_type_abort(mctx->env_data, rlm_rest_call_env_t);
 	rlm_rest_curl_context_t *ctx = talloc_get_type_abort(randle->uctx, rlm_rest_curl_context_t);
 	CURL			*candle = randle->candle;
 	fr_time_delta_t		timeout;
 
-	http_auth_type_t	auth = section->auth;
+	http_auth_type_t	auth = section->request.auth;
 
 	CURLcode		ret = CURLE_OK;
-	char const		*option = "unknown";
-	char const		*content_type;
-
-	fr_pair_t 		*header;
-	fr_dcursor_t		headers;
+	char const		*option;
 
 	char			buffer[512];
 
 	fr_assert(candle);
-	fr_assert((!username && !password) || (username && password));
 
 	buffer[(sizeof(buffer) - 1)] = '\0';
 
 	/*
 	 *	Control which HTTP version we're going to use
 	 */
-	if (inst->http_negotiation != CURL_HTTP_VERSION_NONE) FR_CURL_SET_OPTION(CURLOPT_HTTP_VERSION, inst->http_negotiation);
+	if (inst->http_negotiation != CURL_HTTP_VERSION_NONE) FR_CURL_REQUEST_SET_OPTION(CURLOPT_HTTP_VERSION, (long)inst->http_negotiation);
 
 	/*
 	 *	Setup any header options and generic headers.
 	 */
-	FR_CURL_SET_OPTION(CURLOPT_URL, uri);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_URL, uri);
+#if CURL_AT_LEAST_VERSION(7,85,0)
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_PROTOCOLS_STR, "http,https");
+#else
 	FR_CURL_REQUEST_SET_OPTION(CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-	if (section->proxy) FR_CURL_SET_OPTION(CURLOPT_PROXY, section->proxy);
-	FR_CURL_SET_OPTION(CURLOPT_NOSIGNAL, 1L);
-	FR_CURL_SET_OPTION(CURLOPT_USERAGENT, "FreeRADIUS " RADIUSD_VERSION_STRING);
-
-	/*
-	 *	HTTP/1.1 doesn't require a content type, so only set it
-	 *	if we were provided with one explicitly.
-	 */
-	if (type != REST_HTTP_BODY_NONE) {
-		content_type = fr_table_str_by_value(http_content_type_table, type, section->body_str);
-		snprintf(buffer, sizeof(buffer), "Content-Type: %s", content_type);
-		ctx->headers = curl_slist_append(ctx->headers, buffer);
-		if (!ctx->headers) {
-		error_header:
-			REDEBUG("Failed creating header");
-			return -1;
+#endif
+	if (section->request.proxy) {
+		if (section->request.proxy == rest_no_proxy) {
+			FR_CURL_REQUEST_SET_OPTION(CURLOPT_NOPROXY, "*");
+		} else {
+			FR_CURL_REQUEST_SET_OPTION(CURLOPT_PROXY, section->request.proxy);
 		}
 	}
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_NOSIGNAL, 1L);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_USERAGENT, "FreeRADIUS " RADIUSD_VERSION_STRING);
 
-	timeout = fr_pool_timeout(t->pool);
+	timeout = inst->conn_config.connect_timeout;
 	RDEBUG3("Connect timeout is %pVs, request timeout is %pVs",
 	        fr_box_time_delta(timeout), fr_box_time_delta(section->timeout));
-	FR_CURL_SET_OPTION(CURLOPT_CONNECTTIMEOUT_MS, fr_time_delta_to_msec(timeout));
-	FR_CURL_SET_OPTION(CURLOPT_TIMEOUT_MS, fr_time_delta_to_msec(section->timeout));
-	FR_CURL_SET_OPTION(CURLOPT_PROTOCOLS, (CURLPROTO_HTTP | CURLPROTO_HTTPS));
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_CONNECTTIMEOUT_MS, fr_time_delta_to_msec(timeout));
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_TIMEOUT_MS, fr_time_delta_to_msec(section->timeout));
 
 	/*
 	 *	FreeRADIUS custom headers
 	 */
 	RDEBUG3("Adding custom headers:");
 	snprintf(buffer, sizeof(buffer), "X-FreeRADIUS-Section: %s", section->name);
+	if (unlikely(rest_request_config_add_header(request, randle, buffer, false) < 0)) return -1;
 
-	RINDENT();
-	RDEBUG3("%s", buffer);
-	REXDENT();
-	ctx->headers = curl_slist_append(ctx->headers, buffer);
-	if (!ctx->headers) goto error_header;
+	snprintf(buffer, sizeof(buffer), "X-FreeRADIUS-Server: %s", unlang_interpret_virtual_server(request));
+	if (unlikely(rest_request_config_add_header(request, randle, buffer, false) < 0)) return -1;
 
-	snprintf(buffer, sizeof(buffer), "X-FreeRADIUS-Server: %s", cf_section_name2(unlang_call_current(request)));
-	RINDENT();
-	RDEBUG3("%s", buffer);
-	REXDENT();
-	ctx->headers = curl_slist_append(ctx->headers, buffer);
-	if (!ctx->headers) goto error_header;
-
-	for (header =  fr_dcursor_iter_by_da_init(&headers, &request->control_pairs, attr_rest_http_header);
-	     header;
-	     header = fr_dcursor_next(&headers)) {
-		header = fr_dcursor_remove(&headers);
-		if (!strchr(header->vp_strvalue, ':')) {
-			RWDEBUG("Invalid HTTP header \"%s\" must be in format '<attribute>: <value>'.  Skipping...",
-				header->vp_strvalue);
-			talloc_free(header);
-			continue;
+	/*
+	 *	Add in the section headers
+	 */
+	if (call_env->request.header) {
+		size_t len = talloc_array_length(call_env->request.header), i;
+		for (i = 0; i < len; i++) {
+			fr_value_box_list_foreach(&call_env->request.header[i], header) {
+				if (unlikely(rest_request_config_add_header(request, randle, header->vb_strvalue, true) < 0)) return -1;
+			}
 		}
-		RINDENT();
-		RDEBUG3("%pV", &header->data);
-		REXDENT();
+	}
 
-		ctx->headers = curl_slist_append(ctx->headers, header->vp_strvalue);
-		talloc_free(header);
+	/*
+	 *	Add in dynamic headers from the request
+	 */
+	{
+		fr_pair_t 	*header;
+		fr_dcursor_t	header_cursor;
+
+		for (header =  fr_pair_dcursor_by_da_init(&header_cursor, &request->control_pairs, attr_rest_http_header);
+		     header;
+		     header = fr_dcursor_current(&header_cursor)) {
+			header = fr_dcursor_remove(&header_cursor);
+			if (unlikely(rest_request_config_add_header(request, randle, header->vp_strvalue, true) < 0)) return -1;
+
+			talloc_free(header);
+		}
+	}
+
+	if (!rest_request_contains_header(randle, "Content-Type:")) {
+		/*
+		 *  HTTP/1.1 doesn't require a content type so only set it
+		 *  if where body type requires it, and we haven't set one
+		 *  already from attributes.
+		 */
+		if (type != REST_HTTP_BODY_NONE) {
+			char const *content_type = fr_table_str_by_value(http_content_type_table, type, section->request.body_str);
+			snprintf(buffer, sizeof(buffer), "Content-Type: %s", content_type);
+			if (unlikely(rest_request_config_add_header(request, randle, buffer, false) < 0)) return -1;
+
+			RDEBUG3("Request body content-type will be \"%s\"", content_type);
+		}
 	}
 
 	/*
@@ -1818,11 +1919,11 @@ int rest_request_config(rlm_rest_t const *inst, rlm_rest_thread_t *t, rlm_rest_s
 	 */
 	switch (method) {
 	case REST_HTTP_METHOD_GET:
-		FR_CURL_SET_OPTION(CURLOPT_HTTPGET, 1L);
+		FR_CURL_REQUEST_SET_OPTION(CURLOPT_HTTPGET, 1L);
 		break;
 
 	case REST_HTTP_METHOD_POST:
-		FR_CURL_SET_OPTION(CURLOPT_POST, 1L);
+		FR_CURL_REQUEST_SET_OPTION(CURLOPT_POST, 1L);
 		break;
 
 	case REST_HTTP_METHOD_PUT:
@@ -1835,77 +1936,55 @@ int rest_request_config(rlm_rest_t const *inst, rlm_rest_thread_t *t, rlm_rest_s
 		 *	This is many cases will cause the server to block,
 		 *	indefinitely.
 		 */
-		FR_CURL_SET_OPTION(CURLOPT_CUSTOMREQUEST, "PUT");
+		FR_CURL_REQUEST_SET_OPTION(CURLOPT_CUSTOMREQUEST, "PUT");
 		break;
 
 	case REST_HTTP_METHOD_PATCH:
-		FR_CURL_SET_OPTION(CURLOPT_CUSTOMREQUEST, "PATCH");
+		FR_CURL_REQUEST_SET_OPTION(CURLOPT_CUSTOMREQUEST, "PATCH");
 		break;
 
 	case REST_HTTP_METHOD_DELETE:
-		FR_CURL_SET_OPTION(CURLOPT_CUSTOMREQUEST, "DELETE");
+		FR_CURL_REQUEST_SET_OPTION(CURLOPT_CUSTOMREQUEST, "DELETE");
 		break;
 
 	case REST_HTTP_METHOD_CUSTOM:
-		FR_CURL_SET_OPTION(CURLOPT_CUSTOMREQUEST, section->method_str);
+		FR_CURL_REQUEST_SET_OPTION(CURLOPT_CUSTOMREQUEST, section->request.method_str);
 		break;
 
 	default:
 		fr_assert(0);
 		break;
-	};
+	}
 
 	/*
 	 *	Set user based authentication parameters
 	 */
 	if (auth > REST_HTTP_AUTH_NONE) {
-		TALLOC_CTX *cred_ctx = NULL;
 
 #define SET_AUTH_OPTION(_x, _y)\
 do {\
 	if ((ret = curl_easy_setopt(candle, _x, _y)) != CURLE_OK) {\
 		option = STRINGIFY(_x);\
-		REDEBUG("Failed setting curl option %s: %s (%i)", option, curl_easy_strerror(ret), ret); \
-		talloc_free(cred_ctx);\
+		REDEBUG("Failed setting curl option %s: %s (%u)", option, curl_easy_strerror(ret), ret); \
 		goto error;\
 	}\
 } while (0)
-
-		if (!username || !password) cred_ctx = talloc_init_const("cred_ctx");
-
-		if (!username) {
-			char *tmp = NULL;
-			if (xlat_aeval(cred_ctx, &tmp, request, section->username, NULL, NULL) < 0) {
-				REDEBUG("Failed expanding username");
-				talloc_free(cred_ctx);
-				goto error;
-			}
-			username = tmp;
-		}
-
-		if (!password) {
-			char *tmp = NULL;
-			if (xlat_aeval(cred_ctx, &tmp, request, section->password, NULL, NULL) < 0) {
-				REDEBUG("Failed expanding password");
-				talloc_free(cred_ctx);
-				goto error;
-			}
-			password = tmp;
-		}
-
 		RDEBUG3("Configuring HTTP auth type %s, user \"%pV\", password \"%pV\"",
 			fr_table_str_by_value(http_auth_table, auth, "<INVALID>"),
-			fr_box_strvalue_buffer(username), fr_box_strvalue_buffer(password));
+			call_env->request.username ? call_env->request.username : fr_box_strvalue("(none)"),
+			call_env->request.password ? call_env->request.password : fr_box_strvalue("(none)"));
 
-		if ((auth >= REST_HTTP_AUTH_BASIC) &&
-		    (auth <= REST_HTTP_AUTH_ANY_SAFE)) {
+		/*
+		 *	FIXME - We probably want to escape \0s here...
+		 */
+		if ((auth >= REST_HTTP_AUTH_BASIC) && (auth <= REST_HTTP_AUTH_ANY_SAFE)) {
 			SET_AUTH_OPTION(CURLOPT_HTTPAUTH, http_curl_auth[auth]);
-			SET_AUTH_OPTION(CURLOPT_USERNAME, username);
-			SET_AUTH_OPTION(CURLOPT_PASSWORD, password);
+			if (call_env->request.username) SET_AUTH_OPTION(CURLOPT_USERNAME, call_env->request.username->vb_strvalue);
+			if (call_env->request.password) SET_AUTH_OPTION(CURLOPT_PASSWORD, call_env->request.password->vb_strvalue);
 		} else if (auth == REST_HTTP_AUTH_TLS_SRP) {
-			SET_AUTH_OPTION(CURLOPT_TLSAUTH_TYPE, http_curl_auth[auth]);
-			SET_AUTH_OPTION(CURLOPT_TLSAUTH_USERNAME, username);
-			SET_AUTH_OPTION(CURLOPT_TLSAUTH_PASSWORD, password);
+			SET_AUTH_OPTION(CURLOPT_TLSAUTH_TYPE, "SRP");
+			if (call_env->request.username) SET_AUTH_OPTION(CURLOPT_TLSAUTH_USERNAME, call_env->request.username->vb_strvalue);
+			if (call_env->request.password) SET_AUTH_OPTION(CURLOPT_TLSAUTH_PASSWORD, call_env->request.password->vb_strvalue);
 		}
 	}
 
@@ -1917,17 +1996,17 @@ do {\
 	/*
 	 *	Tell CURL how to get HTTP body content, and how to process incoming data.
 	 */
-	rest_response_init(section, request, &ctx->response, type);
+	rest_response_init(section, request, &ctx->response, type, call_env->response.header);
 
-	FR_CURL_SET_OPTION(CURLOPT_HEADERFUNCTION, rest_response_header);
-	FR_CURL_SET_OPTION(CURLOPT_HEADERDATA, &ctx->response);
-	FR_CURL_SET_OPTION(CURLOPT_WRITEFUNCTION, rest_response_body);
-	FR_CURL_SET_OPTION(CURLOPT_WRITEDATA, &ctx->response);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_HEADERFUNCTION, rest_response_header);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_HEADERDATA, &ctx->response);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_WRITEFUNCTION, rest_response_body);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_WRITEDATA, &ctx->response);
 
 	/*
 	 *  Force parsing the body text as a particular encoding.
 	 */
-	ctx->response.force_to = section->force_to;
+	ctx->response.force_to = section->response.force_to;
 
 	switch (method) {
 	case REST_HTTP_METHOD_GET:
@@ -1939,67 +2018,38 @@ do {\
 	case REST_HTTP_METHOD_PUT:
 	case REST_HTTP_METHOD_PATCH:
 	case REST_HTTP_METHOD_CUSTOM:
-		if (section->chunk > 0) {
-			ctx->request.chunk = section->chunk;
+		if (section->request.chunk > 0) {
+			ctx->request.chunk = section->request.chunk;
 
-			ctx->headers = curl_slist_append(ctx->headers, "Expect:");
-			if (!ctx->headers) goto error_header;
-
-			ctx->headers = curl_slist_append(ctx->headers, "Transfer-Encoding: chunked");
-			if (!ctx->headers) goto error_header;
+			if (unlikely(rest_request_config_add_header(request, randle, "Transfer-Encoding: chunked", false) < 0)) return -1;
 		}
 
-		RDEBUG3("Request body content-type will be \"%s\"",
-			fr_table_str_by_value(http_content_type_table, type, section->body_str));
 		break;
 
 	default:
 		fr_assert(0);
-	};
+	}
 
 	/*
 	 *  Setup encoder specific options
 	 */
 	switch (type) {
 	case REST_HTTP_BODY_NONE:
-		if (rest_request_config_body(inst, section, request, randle, NULL) < 0) return -1;
+		if (rest_request_config_body(mctx, section, request, randle, NULL) < 0) return -1;
 
 		break;
 
-	case REST_HTTP_BODY_CUSTOM_XLAT:
-	{
-		rest_custom_data_t *data;
-		char *expanded = NULL;
-
-		if (xlat_aeval(request, &expanded, request, section->data, NULL, NULL) < 0) return -1;
-
-		data = talloc_zero(request, rest_custom_data_t);
-		data->p = expanded;
-		data->start = expanded;
-		data->len = strlen(expanded);	// Fix me when we do binary xlat
-
-		/* Use the encoder specific pointer to store the data we need to encode */
-		ctx->request.encoder = data;
-		if (rest_request_config_body(inst, section, request, randle, rest_encode_custom) < 0) {
-			TALLOC_FREE(ctx->request.encoder);
-			return -1;
-		}
-
-		break;
-	}
-
-	case REST_HTTP_BODY_CUSTOM_LITERAL:
+	case REST_HTTP_BODY_CUSTOM:
 	{
 		rest_custom_data_t *data;
 
 		data = talloc_zero(request, rest_custom_data_t);
-		data->p = section->data;
-		data->start = section->data;
-		data->len = strlen(section->data);
+		data->p = data->start = body_data;
+		data->len = talloc_strlen(body_data);
 
 		/* Use the encoder specific pointer to store the data we need to encode */
 		ctx->request.encoder = data;
-		if (rest_request_config_body(inst, section, request, randle, rest_encode_custom) < 0) {
+		if (rest_request_config_body(mctx, section, request, randle, rest_encode_custom) < 0) {
 			TALLOC_FREE(ctx->request.encoder);
 			return -1;
 		}
@@ -2016,7 +2066,7 @@ do {\
 
 		rest_request_init(section, request, &ctx->request);
 
-		if (rest_request_config_body(inst, section, request, randle, rest_encode_json) < 0) return -1;
+		if (rest_request_config_body(mctx, section, request, randle, rest_encode_json) < 0) return -1;
 	}
 
 		break;
@@ -2024,9 +2074,9 @@ do {\
 
 	case REST_HTTP_BODY_POST:
 		rest_request_init(section, request, &ctx->request);
-		fr_dcursor_init(&(ctx->request.cursor), &request->request_pairs);
+		fr_pair_dcursor_init(&(ctx->request.cursor), &request->request_pairs);
 
-		if (rest_request_config_body(inst, section, request, randle, rest_encode_post) < 0) return -1;
+		if (rest_request_config_body(mctx, section, request, randle, rest_encode_post) < 0) return -1;
 
 		break;
 
@@ -2036,7 +2086,7 @@ do {\
 
 
 finish:
-	FR_CURL_SET_OPTION(CURLOPT_HTTPHEADER, ctx->headers);
+	FR_CURL_REQUEST_SET_OPTION(CURLOPT_HTTPHEADER, ctx->headers);
 
 	return 0;
 
@@ -2100,46 +2150,6 @@ int rest_response_decode(rlm_rest_t const *instance, rlm_rest_section_t const *s
 	return ret;
 }
 
-/** Cleans up after a REST request.
- *
- * Resets all options associated with a CURL handle, and frees any headers
- * associated with it.
- *
- * Calls rest_read_ctx_free and rest_response_free to free any memory used by
- * context data.
- *
- * @param[in] instance configuration data.
- * @param[in] randle to cleanup.
- */
-void rest_request_cleanup(UNUSED rlm_rest_t const *instance, fr_curl_io_request_t *randle)
-{
-	rlm_rest_curl_context_t *ctx = talloc_get_type_abort(randle->uctx, rlm_rest_curl_context_t);
-	CURL			*candle = randle->candle;
-
-	/*
-	 *  Clear any previously configured options
-	 */
-	curl_easy_reset(candle);
-
-	/*
-	 *  Free header list
-	 */
-	if (ctx->headers != NULL) {
-		curl_slist_free_all(ctx->headers);
-		ctx->headers = NULL;
-	}
-
-	/*
-	 *  Free response data
-	 */
-	TALLOC_FREE(ctx->body);
-	TALLOC_FREE(ctx->response.buffer);
-	TALLOC_FREE(ctx->request.encoder);
-	TALLOC_FREE(ctx->response.decoder);
-
-	randle->request = NULL;
-}
-
 /** URL encodes a string.
  *
  * Encode special chars as per RFC 3986 section 4.
@@ -2155,82 +2165,11 @@ size_t rest_uri_escape(UNUSED request_t *request, char *out, size_t outlen, char
 {
 	char *escaped;
 
-	escaped = curl_escape(raw, strlen(raw));
+	escaped = curl_escape(raw, 0);
 	strlcpy(out, escaped, outlen);
 	curl_free(escaped);
 
 	return strlen(out);
-}
-
-/** Builds URI; performs XLAT expansions and encoding.
- *
- * Splits the URI into "http://example.org" and "/%{xlat}/query/?bar=foo"
- * Both components are expanded, but values expanded for the second component
- * are also url encoded.
- *
- * @param[out] out	Where to write the pointer to the new buffer containing the escaped URI.
- * @param[in] inst	of rlm_rest.
- * @param[in] uri	configuration data.
- * @param[in] request	Current request
- * @return
- *	- Length of data written to buffer (excluding NULL).
- *	- < 0 if an error occurred.
- */
-ssize_t rest_uri_build(char **out, UNUSED rlm_rest_t const *inst, request_t *request, char const *uri)
-{
-	char const	*p;
-	char		*path_exp = NULL;
-
-	char		*scheme;
-	char const	*path;
-
-	ssize_t		len;
-
-	p = uri;
-
-	/*
-	 *  All URLs must contain at least <scheme>://<server>/
-	 */
-	p = strchr(p, ':');
-	if (!p || (*++p != '/') || (*++p != '/')) {
-		malformed:
-		REDEBUG("Error URI \"%s\" is malformed, can't find start of path", uri);
-		return -1;
-	}
-	p = strchr(p + 1, '/');
-	if (!p) {
-		goto malformed;
-	}
-
-	len = (p - uri);
-
-	/*
-	 *  Allocate a temporary buffer to hold the first part of the URI
-	 */
-	scheme = talloc_array(request, char, len + 1);
-	strlcpy(scheme, uri, len + 1);
-
-	path = (uri + len);
-
-	len = xlat_aeval(request, out, request, scheme, NULL, NULL);
-	talloc_free(scheme);
-	if (len < 0) {
-		TALLOC_FREE(*out);
-
-		return 0;
-	}
-
-	len = xlat_aeval(request, &path_exp, request, path, rest_uri_escape, NULL);
-	if (len < 0) {
-		TALLOC_FREE(*out);
-
-		return 0;
-	}
-
-	MEM(*out = talloc_strdup_append(*out, path_exp));
-	talloc_free(path_exp);
-
-	return talloc_array_length(*out) - 1;	/* array_length includes \0 */
 }
 
 /** Unescapes the host portion of a URI string
@@ -2280,7 +2219,7 @@ ssize_t rest_uri_host_unescape(char **out, UNUSED rlm_rest_t const *inst, reques
 	/*
 	 *  Unescape any special sequences in the first part of the URI
 	 */
-	scheme = curl_easy_unescape(candle, uri, len, NULL);
+	scheme = curl_easy_unescape(candle, uri, (int)len, NULL);
 	if (!scheme) {
 		REDEBUG("Error unescaping host");
 		return -1;
@@ -2297,5 +2236,5 @@ ssize_t rest_uri_host_unescape(char **out, UNUSED rlm_rest_t const *inst, reques
 	MEM(*out);
 	curl_free(scheme);
 
-	return talloc_array_length(*out) - 1;	/* array_length includes \0 */
+	return talloc_strlen(*out);	/* array_length includes \0 */
 }

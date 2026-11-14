@@ -35,7 +35,8 @@ RCSIDH(io_h, "$Id$")
 extern "C" {
 #endif
 
-typedef struct fr_listen fr_listen_t;
+typedef struct fr_listen_s fr_listen_t;
+typedef struct fr_listen_instance_s fr_listen_instance_t;
 typedef struct fr_trie_s fr_trie_t;
 
 typedef struct {
@@ -64,7 +65,7 @@ typedef struct fr_channel_s fr_channel_t;
  *	- 0 on success
  *	- <0 on error
  */
-typedef int (*fr_io_open_t)(fr_listen_t *li);
+typedef int (*fr_io_open_t)(fr_listen_instance_t *li);
 
 /** Return a selectable file descriptor for this I/O path
  *
@@ -72,7 +73,7 @@ typedef int (*fr_io_open_t)(fr_listen_t *li);
  *
  * @param[in] li the listener for this socket
  */
-typedef int (*fr_io_get_fd_t)(fr_listen_t const *li);
+typedef int (*fr_io_get_fd_t)(fr_listen_instance_t const *li);
 
 /** Set a selectable file descriptor for this I/O path
  *
@@ -80,7 +81,7 @@ typedef int (*fr_io_get_fd_t)(fr_listen_t const *li);
  * @param[in] li	the listener for this socket
  * @param[in] fd	the FD to set
  */
-typedef int (*fr_io_set_fd_t)(fr_listen_t *li, int fd);
+typedef int (*fr_io_set_fd_t)(fr_listen_instance_t *li, int fd);
 
 /** Decode a raw packet and convert it into a request.
  *
@@ -145,7 +146,7 @@ typedef ssize_t (*fr_io_encode_t)(void const *instance, request_t *request, uint
  * @param[in] reply_len		length of the buffer where the reply should be placed.
  * @return length of the data in the reply buffer.
  */
-typedef size_t (*fr_io_nak_t)(fr_listen_t *li, void *packet_ctx, uint8_t *const packet, size_t packet_len,
+typedef size_t (*fr_io_nak_t)(fr_listen_instance_t *li, void *packet_ctx, uint8_t *const packet, size_t packet_len,
 			      uint8_t *reply, size_t reply_len);
 
 /** Read from a socket.
@@ -169,13 +170,12 @@ typedef size_t (*fr_io_nak_t)(fr_listen_t *li, void *packet_ctx, uint8_t *const 
  * @param[in,out] buffer	the buffer where the raw packet will be written to (or read from)
  * @param[in] buffer_len	the length of the buffer
  * @param[out] leftover		bytes left in the buffer after reading a full packet.
- * @param[out] priority		priority of this packet (0 = low, 65535 = high)
- * @param[out] dup		is it dup or new
  * @return
  *	- <0 on error
  *	- >=0 length of the data read or written.
  */
-typedef ssize_t (*fr_io_data_read_t)(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time, uint8_t *buffer, size_t buffer_len, size_t *leftover, uint32_t *priority, bool *dup);
+typedef ssize_t (*fr_io_data_read_t)(fr_listen_instance_t *li, void **packet_ctx, fr_time_t *recv_time, uint8_t *buffer,
+				     size_t buffer_len, size_t *leftover);
 
 /** Write a socket.
  *
@@ -217,8 +217,9 @@ typedef ssize_t (*fr_io_data_read_t)(fr_listen_t *li, void **packet_ctx, fr_time
  *	- <0 on error
  *	- >=0 length of the data read or written.
  */
-typedef ssize_t (*fr_io_data_write_t)(fr_listen_t *li, void *packet_ctx, fr_time_t request_time,
-				      uint8_t *buffer, size_t buffer_len, size_t written);
+typedef ssize_t (*fr_io_data_write_t)(fr_listen_instance_t *li, void *packet_ctx, fr_time_t request_time,
+				      uint8_t *buffer,
+				      size_t buffer_len, size_t written);
 
 /** Inject data into a socket.
  *
@@ -248,14 +249,15 @@ typedef ssize_t (*fr_io_data_write_t)(fr_listen_t *li, void *packet_ctx, fr_time
  *	- <0 on error
  *	- 0 on success
  */
-typedef int (*fr_io_data_inject_t)(fr_listen_t *li,uint8_t *buffer, size_t buffer_len, fr_time_t recv_time);
+typedef int (*fr_io_data_inject_t)(fr_listen_instance_t *li,uint8_t const *buffer, size_t buffer_len,
+				   fr_time_t recv_time);
 
 /** Tell the IO handler that a VNODE has changed
  *
  * @param[in] li		the listener for this socket
- * @param[in] fflags		from kevent.  Usually just NOTE_EXEND
+ * @param[in] fflags		from kevent.  Usually just NOTE_EXTEND
  */
-typedef void (*fr_io_data_vnode_t)(fr_listen_t *li, uint32_t fflags);
+typedef void (*fr_io_data_vnode_t)(fr_listen_instance_t *li, uint32_t fflags);
 
 typedef struct fr_io_track_s fr_io_track_t; /* in master.h */
 
@@ -273,7 +275,8 @@ typedef struct fr_io_track_s fr_io_track_t; /* in master.h */
  *	- NULL on error
  *	- !NULL the packet tracking structure
  */
-typedef void *(*fr_io_track_create_t)(void const *instance, void *thread_instance, RADCLIENT *client, fr_io_track_t *track, uint8_t const *packet, size_t packet_len);
+typedef void *(*fr_io_track_create_t)(void const *instance, void *thread_instance, fr_client_t *client,
+				      fr_io_track_t *track, uint8_t const *packet, size_t packet_len);
 
 /** Compare two tracking structures for storing in a duplicate detection tree.
  *
@@ -301,7 +304,8 @@ typedef void *(*fr_io_track_create_t)(void const *instance, void *thread_instanc
  *	- >0 on packet two "larger" than packet one
  *	- =0 on the two packets being identical
  */
-typedef int (*fr_io_track_cmp_t)(void const *instance, void *thread_instance, RADCLIENT *client, void const *one, void const *two);
+typedef int (*fr_io_track_cmp_t)(void const *instance, void *thread_instance, fr_client_t *client, void const *one,
+				 void const *two);
 
 /**  Handle an error on the socket.
  *
@@ -315,7 +319,7 @@ typedef int (*fr_io_track_cmp_t)(void const *instance, void *thread_instance, RA
  *	- 0 on success
  *	- <0 on error
  */
-typedef int (*fr_io_signal_t)(fr_listen_t *li);
+typedef int (*fr_io_signal_t)(fr_listen_instance_t *li);
 
 /**  Handle a close on the socket.
  *
@@ -329,7 +333,7 @@ typedef int (*fr_io_signal_t)(fr_listen_t *li);
  *	- 0 on success
  *	- <0 on error
  */
-typedef int (*fr_io_close_t)(fr_listen_t *li);
+typedef int (*fr_io_close_t)(fr_listen_instance_t *li);
 
 /*
  *	Structures and definitions for the master IO handler.
@@ -337,18 +341,27 @@ typedef int (*fr_io_close_t)(fr_listen_t *li);
 typedef struct {
 	fr_socket_t		socket;		//!< src/dst ip and port.
 
-	RADCLIENT const		*radclient;	//!< old-style client definition
+	fr_client_t const		*radclient;	//!< old-style client definition
 } fr_io_address_t;
 
-typedef int (*fr_io_connection_set_t)(fr_listen_t *li, fr_io_address_t *connection);
+typedef int (*fr_io_connection_set_t)(fr_listen_instance_t *li, fr_io_address_t *connection);
 
-typedef struct rad_client RADCLIENT;
+typedef struct fr_client_s fr_client_t;
 
-typedef RADCLIENT *(*fr_io_client_find_t)(fr_listen_t *li, fr_ipaddr_t const *ipaddr, int ipproto);
+typedef fr_client_t *(*fr_io_client_find_t)(fr_listen_instance_t *li, fr_ipaddr_t const *ipaddr, int ipproto);
 
-typedef void (*fr_io_network_get_t)(void *instance, int *ipproto, bool *dynamic_clients, fr_trie_t const **trie);
+typedef void (*fr_io_hexdump_set_t)(fr_listen_instance_t *li, void *inst);
 
-typedef char const *(*fr_io_name_t)(fr_listen_t *li);
+/** Callback to return network properties
+ *
+ * @param[out] ipproto		IP protocol (AF_INET or AF_INET6).
+ * @param[out] dynamic_clients	Whether clients are dynamic.
+ * @param[out] trie		Trie of clients.
+ * @param[in] instance		Instance data.
+ */
+typedef void (*fr_io_network_get_t)(int *ipproto, bool *dynamic_clients, fr_trie_t const **trie, void *instance);
+
+typedef char const *(*fr_io_name_t)(fr_listen_instance_t *li);
 
 
 #ifdef __cplusplus

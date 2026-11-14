@@ -1,0 +1,31 @@
+#
+# PRE: edit-merge
+#
+#  A MERGE B, priority B
+#
+#	= A if there's no B
+#	= B if A exists
+#	= A' MERGE B' if A and B are lists
+#
+
+Filter-Id := "foo"
+control.Filter-Id := "bar"
+
+# merge
+request <= control
+
+if (!Filter-Id) {
+	test_fail
+}
+
+# we want the *control* version
+if (!(Filter-Id == "bar")) {
+	test_fail
+}
+
+#  and the original value should not be there
+if (Filter-Id == "foo") {
+	test_fail
+}
+
+success

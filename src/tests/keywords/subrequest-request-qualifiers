@@ -1,0 +1,55 @@
+subrequest ::Access-Request {
+	#
+	#  Prefix/attribute parsing disambiguation
+	#
+	outer.request.Outer-Realm-Name := 'testing123'
+
+	User-Name := "obo"
+
+	subrequest ::Access-Request {
+		User-Name := "jim"
+
+		subrequest ::Access-Request {
+			User-Name := "joe"
+
+			outer.request += {
+				Filter-Id = User-Name				# [0] joe
+				Filter-Id = parent.User-Name			# [1] jim
+				Filter-Id = parent.parent.User-Name		# [2] obo
+				Filter-Id = parent.parent.parent.User-Name	# [3] bob
+				Filter-Id = outer.User-Name			# [4] bob
+				Filter-Id = "%{parent.parent.parent.parent.User-Name}" # [5] Nope!
+			}
+		}
+	}
+}
+
+if !(Outer-Realm-Name == 'testing123') {
+	test_fail
+}
+
+if !(Filter-Id[0] == 'joe') {
+	test_fail
+}
+
+if !(Filter-Id[1] == 'jim') {
+	test_fail
+}
+
+if !(Filter-Id[2] == 'obo') {
+	test_fail
+}
+
+if !(Filter-Id[3] == 'bob') {
+	test_fail
+}
+
+if !(Filter-Id[4] == 'bob') {
+	test_fail
+}
+
+if !(Filter-Id[5] == "") {
+	test_fail
+}
+
+success

@@ -1,0 +1,31 @@
+#
+# PRE: edit-list
+#
+#  A UNION B
+#
+#	= B if there's no A
+#	= A if there's no B
+#	= A' UNION B' if A and B are lists
+#
+
+Reply-Message := "foo"
+control.Reply-Message := "bar"
+
+# union
+request |= control
+
+if (!Reply-Message) {
+	test_fail
+}
+
+# The original value should be unchanged
+if (!(Reply-Message[0] == "foo")) {
+	test_fail
+}
+
+#  and the new value should be there, too
+if (!(Reply-Message[1] == "bar")) {
+	test_fail
+}
+
+success

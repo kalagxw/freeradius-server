@@ -24,37 +24,62 @@
 #include <freeradius-devel/io/listen.h>
 #include <freeradius-devel/io/master.h>
 
-#include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
-#include <freeradius-devel/util/debug.h>
-
-#include <freeradius-devel/unlang/base.h>
-
-#include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/syserror.h>
+
+FR_DLIST_TYPES(fr_io_nak_list)
+FR_DLIST_TYPEDEFS(fr_io_nak_list, fr_io_nak_list_head_t, fr_io_nak_list_entry_t)
+
+/** A negative cache entry.
+ *
+ *  This is smaller and simpler than using a #fr_io_client_t.  Plus, it doesn't affect the lifetime,
+ *  ownership, or parenting of a #fr_io_client_t.
+ */
+typedef struct {
+	fr_ipaddr_t			src_ipaddr;			//!< the address which was NAK'd
+	fr_time_t			expires;			//!< when this entry stops being used
+	fr_io_nak_list_entry_t		entry;
+} fr_io_nak_entry_t;
+
+FR_DLIST_FUNCS(fr_io_nak_list, fr_io_nak_entry_t, entry)
 
 typedef struct {
 	fr_event_list_t			*el;				//!< event list, for the master socket.
 	fr_network_t			*nr;				//!< network for the master socket
 
 	fr_trie_t			*trie;				//!< trie of clients
-	fr_heap_t			*pending_clients;		//!< heap of pending clients
-	fr_heap_t			*alive_clients;			//!< heap of active clients
+	fr_trie_t			*nak_trie;			//!< trie of NAK clients
+	fr_io_nak_list_head_t		nak_list;			//!< time ordered list of NAK entries.
 
-	fr_listen_t			*listen;			//!< The master IO path
-	fr_listen_t			*child;				//!< The child (app_io) IO path
+	fr_heap_t			*pending_clients;		//!< heap of pending clients
+	fr_heap_t			*alive_clients;			//!< heap of active dynamic clients
+
+	fr_listen_instance_t		*inst;				//!< The master IO path
+	fr_listen_instance_t		*child_inst;			//!< The child (app_io) IO path
 	fr_schedule_t			*sc;				//!< the scheduler
 
-	// @todo - count num_nak_clients, and num_nak_connections, too
 	uint32_t			num_connections;		//!< number of dynamic connections
 	uint32_t			num_pending_packets;   		//!< number of pending packets
+	uint64_t			client_id;			//!< Unique client identifier.
+
+	struct {
+		fr_rate_limit_t			accept_failed;
+		fr_rate_limit_t			alloc_failed;
+		fr_rate_limit_t			bad_type;
+		fr_rate_limit_t			conn_alloc_failed;
+		fr_rate_limit_t			max_connections;
+		fr_rate_limit_t			queue_full;
+		fr_rate_limit_t			repeat_nak;
+		fr_rate_limit_t			too_many_pending;
+		fr_rate_limit_t			tracking_failed;
+		fr_rate_limit_t			unknown_client;
+	} rate_limit;
 } fr_io_thread_t;
 
 /** A saved packet
  *
  */
 typedef struct {
-	int			heap_id;
+	fr_heap_index_t		heap_id;
 	uint32_t		priority;
 	fr_time_t		recv_time;
 	fr_io_track_t		*track;
@@ -66,14 +91,29 @@ typedef struct {
 /** Client states
  *
  */
-typedef enum {
+typedef enum : uint8_t {
 	PR_CLIENT_INVALID = 0,
 	PR_CLIENT_STATIC,				//!< static / global clients
-	PR_CLIENT_NAK,					//!< negative cache entry
 	PR_CLIENT_DYNAMIC,				//!< dynamically defined client
 	PR_CLIENT_CONNECTED,				//!< dynamically defined client in a connected socket
 	PR_CLIENT_PENDING,				//!< dynamic client pending definition
 } fr_io_client_state_t;
+
+/*
+ *	Dynamic clients are run through the normal src/process/foo state machine.
+ *
+ *	request->async->packet_ctx is an fr_io_track_t
+ *
+ *	track->dynamic is set to a non-zero value.
+ *
+ *	The dynamic client code returns a buffer of 1 byte for a NAK.
+ *
+ *	If the client creation is successful, then it does talloc(NULL, fr_client_t),
+ *	fills out the structure, and sends the pointer in the buffer (8 bytes).
+ *
+ *	This code will take over ownership of the structure, and
+ *	create the dynamic client.
+ */
 
 typedef struct fr_io_connection_s fr_io_connection_t;
 
@@ -85,11 +125,11 @@ struct fr_io_client_s {
 	fr_io_client_state_t		state;		//!< state of this client
 	fr_ipaddr_t			src_ipaddr;	//!< packets come from this address
 	fr_ipaddr_t			network;	//!< network for dynamic clients
-	RADCLIENT			*radclient;	//!< old-style definition of this client
+	fr_client_t			*radclient;	//!< old-style definition of this client
 
 	int				packets;	//!< number of packets using this client
-	int				pending_id;	//!< for pending clients
-	int				alive_id;	//!< for all clients
+	fr_heap_index_t			pending_id;	//!< for pending clients
+	fr_heap_index_t			alive_id;	//!< for all clients
 
 	bool				use_connected;	//!< does this client allow connected sub-sockets?
 	bool				ready_to_delete; //!< are we ready to delete this client?
@@ -97,7 +137,7 @@ struct fr_io_client_s {
 
 	fr_io_instance_t const		*inst;		//!< parent instance for master IO handler
 	fr_io_thread_t			*thread;
-	fr_event_timer_t const		*ev;		//!< when we clean up the client
+	fr_timer_t			*ev;		//!< when we clean up the client
 	fr_rb_tree_t			*table;		//!< tracking table for packets
 
 	fr_heap_t			*pending;	//!< pending packets for this client
@@ -124,14 +164,15 @@ struct fr_io_connection_s {
 	char const			*name;		//!< taken from proto_FOO_TRANSPORT
 	int				packets;	//!< number of packets using this connection
 	fr_io_address_t   		*address;      	//!< full information about the connection.
-	fr_listen_t			*listen;	//!< master listener for this socket
-	fr_listen_t			*child;		//!< child listener (app_io) for this socket
+	fr_listen_instance_t		*inst;		//!< master listener for this socket
+	fr_listen_instance_t		*child_inst;	//!< child listener (app_io) for this socket
 	fr_io_client_t			*client;	//!< our local client (pending or connected).
 	fr_io_client_t			*parent;	//!< points to the parent client.
-	dl_module_inst_t   		*dl_inst;	//!< for submodule
+	module_instance_t   		*mi;		//!< for submodule
 
 	bool				dead;		//!< roundabout way to get the network side to close a socket
 	bool				paused;		//!< event filter doesn't like resuming something that isn't paused
+	bool				in_parent_hash;	//!< for tracking thread issues
 	fr_event_list_t			*el;		//!< event list for this connection
 	fr_network_t			*nr;		//!< network for this connection
 };
@@ -148,8 +189,7 @@ static fr_event_update_t resume_read[] = {
 
 static int track_free(fr_io_track_t *track)
 {
-	if (track->ev) (void) fr_event_timer_delete(&track->ev);
-
+	FR_TIMER_DELETE_RETURN(&track->ev);
 	talloc_free_children(track);
 
 	fr_assert(track->client->packets > 0);
@@ -160,10 +200,23 @@ static int track_free(fr_io_track_t *track)
 
 static int track_dedup_free(fr_io_track_t *track)
 {
-	fr_assert(track->client->table != NULL);
-	fr_assert(fr_rb_find(track->client->table, track) != NULL);
+	void *found;
 
-	if (!fr_rb_delete(track->client->table, track)) {
+	fr_assert(track->client->table != NULL);
+
+	/*
+	 *	If the tree is being freed, then we don't try to remove ourselves from it.  Doing so would
+	 *	free this node, and therefore corrupt the tree.
+	 *
+	 *	The talloc code will take care of cleaning up the children and events when this chunk is
+	 *	freed.
+	 */
+	if (track->client->table->being_freed) return 0;
+
+	fr_rb_find(&found, track->client->table, track);
+	fr_assert(found != NULL);
+
+	if (fr_rb_delete(track->client->table, track) != 0) {
 		fr_assert(0);
 	}
 
@@ -174,7 +227,7 @@ static int track_dedup_free(fr_io_track_t *track)
  *  Return negative numbers to put 'one' at the top of the heap.
  *  Return positive numbers to put 'two' at the top of the heap.
  */
-static int8_t pending_packet_cmp(void const *one, void const *two)
+static fr_cmp_ret_t pending_packet_cmp(void const *one, void const *two)
 {
 	fr_io_pending_packet_t const *a = talloc_get_type_abort_const(one, fr_io_pending_packet_t);
 	fr_io_pending_packet_t const *b = talloc_get_type_abort_const(two, fr_io_pending_packet_t);
@@ -197,14 +250,14 @@ static int8_t pending_packet_cmp(void const *one, void const *two)
 	 *	packets go in.  Since we'll never have two identical
 	 *	"recv_time" values, the code should never get here.
 	 */
-	return CMP_PREFER_SMALLER(a->recv_time, b->recv_time);
+	return CMP_PREFER_SMALLER(fr_time_unwrap(a->recv_time), fr_time_unwrap(b->recv_time));
 }
 
 /*
  *	Order clients in the pending_clients heap, based on the
  *	packets that they contain.
  */
-static int8_t pending_client_cmp(void const *one, void const *two)
+static fr_cmp_ret_t pending_client_cmp(void const *one, void const *two)
 {
 	fr_io_pending_packet_t const *a;
 	fr_io_pending_packet_t const *b;
@@ -222,11 +275,11 @@ static int8_t pending_client_cmp(void const *one, void const *two)
 }
 
 
-static int8_t address_cmp(void const *one, void const *two)
+static fr_cmp_ret_t address_cmp(void const *one, void const *two)
 {
 	fr_io_address_t const *a = talloc_get_type_abort_const(one, fr_io_address_t);
-	fr_io_address_t const *b = talloc_get_type_abort_const(two, fr_io_address_t);;
-	int8_t ret;
+	fr_io_address_t const *b = talloc_get_type_abort_const(two, fr_io_address_t);
+	fr_cmp_ret_t ret;
 
 	CMP_RETURN(a, b, socket.inet.src_port);
 	CMP_RETURN(a, b, socket.inet.dst_port);
@@ -252,7 +305,7 @@ static uint32_t connection_hash(void const *ctx)
 	return fr_hash_update(&c->address->socket.inet.dst_port, sizeof(c->address->socket.inet.dst_port), hash);
 }
 
-static int8_t connection_cmp(void const *one, void const *two)
+static fr_cmp_ret_t connection_cmp(void const *one, void const *two)
 {
 	fr_io_connection_t const *a = talloc_get_type_abort_const(one, fr_io_connection_t);
 	fr_io_connection_t const *b = talloc_get_type_abort_const(two, fr_io_connection_t);
@@ -261,7 +314,7 @@ static int8_t connection_cmp(void const *one, void const *two)
 }
 
 
-static int8_t track_cmp(void const *one, void const *two)
+static fr_cmp_ret_t track_cmp(void const *one, void const *two)
 {
 	fr_io_track_t const *a = talloc_get_type_abort_const(one, fr_io_track_t);
 	fr_io_track_t const *b = talloc_get_type_abort_const(two, fr_io_track_t);
@@ -284,14 +337,14 @@ static int8_t track_cmp(void const *one, void const *two)
 	 *	Call the per-protocol comparison function.
 	 */
 	ret = a->client->inst->app_io->track_compare(a->client->inst->app_io_instance,
-						     a->client->thread->child->thread_instance,
+						     a->client->thread->child_inst->thread_instance,
 						     a->client->radclient,
 						     a->packet, b->packet);
 	return CMP(ret, 0);
 }
 
 
-static int8_t track_connected_cmp(void const *one, void const *two)
+static fr_cmp_ret_t track_connected_cmp(void const *one, void const *two)
 {
 	fr_io_track_t const *a = talloc_get_type_abort_const(one, fr_io_track_t);
 	fr_io_track_t const *b = talloc_get_type_abort_const(two, fr_io_track_t);
@@ -310,7 +363,7 @@ static int8_t track_connected_cmp(void const *one, void const *two)
 	 *	we may do negotiation specific to this connection.
 	 */
 	ret = a->client->inst->app_io->track_compare(a->client->inst->app_io_instance,
-						     a->client->connection->child->thread_instance,
+						     a->client->connection->child_inst->thread_instance,
 						     a->client->connection->client->radclient,
 						     a->packet, b->packet);
 	return CMP(ret, 0);
@@ -322,8 +375,10 @@ static fr_io_pending_packet_t *pending_packet_pop(fr_io_thread_t *thread)
 	fr_io_client_t *client;
 	fr_io_pending_packet_t *pending;
 
-	client = fr_heap_pop(thread->pending_clients);
+	fr_heap_pop((void **)&client, &thread->pending_clients);
 	if (!client) {
+		fr_assert(thread->num_pending_packets == 0);
+
 		/*
 		 *	99% of the time we don't have pending clients.
 		 *	So we might as well free this, so that the
@@ -334,7 +389,7 @@ static fr_io_pending_packet_t *pending_packet_pop(fr_io_thread_t *thread)
 		return NULL;
 	}
 
-	pending = fr_heap_pop(client->pending);
+	fr_heap_pop((void **)&pending, &client->pending);
 	fr_assert(pending != NULL);
 
 	/*
@@ -342,7 +397,7 @@ static fr_io_pending_packet_t *pending_packet_pop(fr_io_thread_t *thread)
 	 *	the heap.
 	 */
 	if (fr_heap_num_elements(client->pending) > 0) {
-		if (fr_heap_insert(thread->pending_clients, client) < 0) {
+		if (fr_heap_insert(&thread->pending_clients, client) < 0) {
 			fr_assert(0 == 1);
 		}
 	}
@@ -353,13 +408,13 @@ static fr_io_pending_packet_t *pending_packet_pop(fr_io_thread_t *thread)
 	return pending;
 }
 
-static RADCLIENT *radclient_clone(TALLOC_CTX *ctx, RADCLIENT const *parent)
+static fr_client_t *radclient_clone(TALLOC_CTX *ctx, fr_client_t const *parent)
 {
-	RADCLIENT *c;
+	fr_client_t *c;
 
 	if (!parent) return NULL;
 
-	c = talloc_zero(ctx, RADCLIENT);
+	c = talloc_zero(ctx, fr_client_t);
 	if (!c) return NULL;
 
 	/*
@@ -374,13 +429,19 @@ static RADCLIENT *radclient_clone(TALLOC_CTX *ctx, RADCLIENT const *parent)
 	DUP_FIELD(secret);
 	DUP_FIELD(nas_type);
 	DUP_FIELD(server);
-	DUP_FIELD(nas_type);
 
-	COPY_FIELD(message_authenticator);
+	COPY_FIELD(require_message_authenticator);
+	COPY_FIELD(require_message_authenticator_is_set);
+#ifdef NAS_VIOLATES_RFC
+	COPY_FIELD(allow_vulnerable_clients);
+#endif
+	COPY_FIELD(limit_proxy_state);
+	COPY_FIELD(limit_proxy_state_is_set);
 	/* dynamic MUST be false */
 	COPY_FIELD(server_cs);
 	COPY_FIELD(cs);
 	COPY_FIELD(proto);
+	COPY_FIELD(active);
 
 	COPY_FIELD(use_connected);
 
@@ -404,12 +465,108 @@ error:
 #undef COPY_FIELD
 #undef DUP_FIELD
 
+/** Expire entries in the cache.
+ *
+ *  Remove old entries from the head of the queue if they have expired, OR if the NAK list is large.
+ *
+ *  @todo - make the size of the NAK list configurable.  For now, a hard-coded limit of 1000 isn't terrible.
+ *  If there are more NAK IPs than that, the admin should set up firewall rules to block traffic.
+ */
+static void fr_io_nak_expire(fr_io_thread_t *thread, fr_time_t now)
+{
+	fr_io_nak_entry_t *nak;
+
+	while ((nak = fr_io_nak_list_head(&thread->nak_list)) != NULL) {
+		if (fr_time_gt(nak->expires, now) &&
+		    (fr_io_nak_list_num_elements(&thread->nak_list) <= 1000)) {
+			break;
+		}
+
+		/*
+		 *	@todo - if the cache is full because we're expiring entries too quickly, then that's
+		 *	likely a firewall issue for the admin to resolve.
+		 */
+
+		(void) fr_trie_remove_by_key(thread->nak_trie, &nak->src_ipaddr.addr, nak->src_ipaddr.prefix);
+		fr_io_nak_list_remove(&thread->nak_list, nak);
+		talloc_free(nak);
+	}
+
+}
+
+/** Add a negative cache entry.
+ *
+ *  The new entry is either added, or it has its expiry updated.  Deleting the existing entry would cause
+ *  problems for the lifetime of the NAK entry.
+ *
+ * @param[in] thread		thread instance
+ * @param[in] src_ipaddr	to look add
+ * @param[in] lifetime		how long the entry lives for.
+ */
+static void fr_io_nak_insert(fr_io_thread_t *thread, fr_ipaddr_t const *src_ipaddr, fr_time_delta_t lifetime)
+{
+	fr_time_t now = fr_time();
+	fr_io_nak_entry_t *nak;
+
+	fr_io_nak_expire(thread, now);
+
+	nak = fr_trie_match_by_key(thread->nak_trie, &src_ipaddr->addr, src_ipaddr->prefix);
+	if (nak) {
+		fr_io_nak_list_remove(&thread->nak_list, nak);
+		goto do_insert;
+	}
+
+	/*
+	 *	@todo - rate limited warnings if the NAK cache is full.
+	 */
+	if (fr_io_nak_list_num_elements(&thread->nak_list) > 1000) {
+		return;
+	}
+
+	/*
+	 *	No match, allocate and insert a new entry.
+	 */
+	MEM(nak = talloc_zero(thread->nak_trie, fr_io_nak_entry_t));
+	nak->src_ipaddr = *src_ipaddr;
+	fr_io_nak_list_entry_init(nak);
+
+	if (fr_trie_insert_by_key(thread->nak_trie, &src_ipaddr->addr, src_ipaddr->prefix, nak)) {
+		talloc_free(nak);
+		return;
+	}
+
+do_insert:
+	/*
+	 *	This assumes that the lifetime is constant.  If it varies per IP, we will need to move the
+	 *	dlist to an RB tree.
+	 */
+	nak->expires = fr_time_add(now, lifetime);
+	fr_io_nak_list_insert_tail(&thread->nak_list, nak);
+}
+
+/** Look up a negative cache entry.
+ *
+ *  Entries are expired first, and then looked up.
+ *
+ * @param[in] thread		thread instance
+ * @param[in] src_ipaddr	to look up.
+ * @return
+ *	- true if the address is NAK'd, and the caller must refuse it.
+ *	- false if it is not NAK'd, or if the entry has expired.
+ */
+static bool fr_io_nak_find(fr_io_thread_t *thread, fr_ipaddr_t const *src_ipaddr)
+{
+	fr_time_t now = fr_time();
+	fr_io_nak_entry_t *nak;
+
+	fr_io_nak_expire(thread, now);
+
+	nak = fr_trie_lookup_by_key(thread->nak_trie, &src_ipaddr->addr, src_ipaddr->prefix);
+	return (nak != NULL);
+}
+
 
 /** Count the number of connections used by active clients.
- *
- *  Unfortunately, we also count NAK'd connections, too, even if they
- *  are closed.  The alternative is to walk through all connections
- *  for each client, which would be a long time.
  */
 static int count_connections(UNUSED uint8_t const *key, UNUSED size_t keylen, void *data, void *ctx)
 {
@@ -417,15 +574,19 @@ static int count_connections(UNUSED uint8_t const *key, UNUSED size_t keylen, vo
 	int connections;
 
 	/*
-	 *	This client has no connections, skip the mutex lock.
+	 *	The mutex doesn't exist if there isn't a hash table.
 	 */
 	if (!client->ht) return 0;
-
-	fr_assert(client->use_connected);
 
 	pthread_mutex_lock(&client->mutex);
 	connections = fr_hash_table_num_elements(client->ht);
 	pthread_mutex_unlock(&client->mutex);
+
+	/*
+	 *	Don't check "use_connected".  Pending dynamic clients get an entry in the connection tracking
+	 *	table before the client is defined, and therefore before "use_connected" is set.  As a result,
+	 *	we can't check the value of "use_connected" until much later.
+	 */
 
 	*((uint32_t *) ctx) += connections;
 
@@ -435,10 +596,35 @@ static int count_connections(UNUSED uint8_t const *key, UNUSED size_t keylen, vo
 
 static int _client_free(fr_io_client_t *client)
 {
+	/*
+	 *	The mutex is initialized whenever the connection tracking table is created, which can happen
+	 *	for pending clients which do not (yet) have "use_connected" set.  Since the mutex creation is
+	 *	conditional on the existence of the connection tracking table, we make the mutex deletion
+	 *	conditional on the existence of the tracking table.
+	 */
+	if (client->ht) (void) pthread_mutex_destroy(&client->mutex);
+
 	TALLOC_FREE(client->pending);
 
 	return 0;
 }
+
+static void client_pending_free(fr_io_client_t *client)
+{
+	size_t num;
+
+	fr_assert(!client->connection);
+
+	if (!client->pending) return;
+
+	num = fr_heap_num_elements(client->pending);
+
+	fr_assert(client->thread->num_pending_packets >= num);
+	client->thread->num_pending_packets -= num;
+
+	TALLOC_FREE(client->pending);
+}
+
 
 static int connection_free(fr_io_connection_t *connection)
 {
@@ -458,14 +644,14 @@ static int connection_free(fr_io_connection_t *connection)
 static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
 						  fr_io_thread_t *thread,
 						  fr_io_client_t *client, int fd,
-						  fr_io_address_t *address,
-						  fr_io_connection_t *nak)
+						  fr_io_address_t *address)
 {
 	int ret;
 	fr_io_connection_t *connection;
-	dl_module_inst_t *dl_inst = NULL;
-	fr_listen_t *li;
-	RADCLIENT *radclient;
+	module_instance_t *mi = NULL;
+	fr_listen_instance_t *li;
+	fr_client_t *radclient;
+
 
 	/*
 	 *	Reload the app_io module as a "new" library.  This
@@ -476,40 +662,89 @@ static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
 	 *	the original.  It also means that detach should be
 	 *	called when the instance data is freed.
 	 */
-	if (!nak) {
-		if (inst->max_connections) {
+	{
+		CONF_SECTION *cs;
+		char *inst_name;
+
+		if (inst->max_connections || client->radclient->limit.max_connections) {
+			uint32_t max_connections = inst->max_connections ? inst->max_connections : client->radclient->limit.max_connections;
+
 			/*
-			 *	We've hit the connection limit.  Walk
-			 *	over all clients with connections, and
-			 *	count the number of connections used.
+			 *	If we're already at the limit, don't add more.
 			 */
-			if (thread->num_connections >= inst->max_connections) {
+			if (thread->num_connections >= max_connections) {
 				thread->num_connections = 0;
 
 				(void) fr_trie_walk(thread->trie, &thread->num_connections, count_connections);
 
-				if ((thread->num_connections + 1) >= inst->max_connections) {
-					DEBUG("Too many open connections.  Ignoring dynamic client %s.  Discarding packet.", client->radclient->shortname);
+				if (thread->num_connections >= max_connections) {
+					RATE_LIMIT_LOCAL(&thread->rate_limit.max_connections, INFO,
+							 "proto_%s - Ignoring connection from client %s - 'max_connections' limit reached.",
+							 inst->app->common.name, client->radclient->shortname);
+					if (fd >= 0) close(fd);
 					return NULL;
 				}
 			}
 		}
 
-		if (dl_module_instance(NULL, &dl_inst, NULL, inst->dl_inst, inst->transport, DL_MODULE_TYPE_SUBMODULE) < 0) {
-			DEBUG("Failed to find proto_%s_%s", inst->app->name, inst->transport);
-			return NULL;
+		/*
+		 *	Add a client module into a sublist
+		 */
+		inst_name = talloc_asprintf(NULL, "%"PRIu64, thread->client_id++);
+		mi = module_instance_copy(inst->clients, inst->submodule, inst_name);
+		talloc_free(inst_name);
+
+		cs = cf_section_dup(mi, NULL, inst->submodule->conf,
+				    cf_section_name1(inst->submodule->conf),
+				    cf_section_name2(inst->submodule->conf), false);
+
+		if (!cs) {
+			cf_log_err(inst->server_cs, "Failed duplicating module config");
+			goto cleanup;
 		}
-		fr_assert(dl_inst != NULL);
-	} else {
-		dl_inst = talloc_init_const("nak");
+
+		/*
+		 *	Clear the "dynamic_clients" flag, so that the child instantiate routines don't check
+		 *	the network allow / deny list when instantiating child connections.
+		 *
+		 *	This is a short-term and minimal hack to get the problem fixed.  A longer term
+		 *	solution would be to update fr_master_io_network() so that it sets caches the trie
+		 *	_and_ the dynamic client flag in connection data structure.  Which then means that the
+		 *	mod_network_get() API could also go away.
+		 *
+		 *	But doing that involves more rearchitecture and code changes, which we're avoiding at
+		 *	this time.
+		 */
+		cf_pair_replace_or_add(cs, "dynamic_clients", "no");
+
+		if (module_instance_conf_parse(mi, cs) < 0) {
+			cf_log_err(inst->server_cs, "Failed parsing module config");
+			goto cleanup;
+		}
+
+		/* Thread local module lists never run bootstrap */
+		if (module_instantiate(mi) < 0) {
+			cf_log_err(inst->server_cs, "Failed instantiating module");
+			goto cleanup;
+		}
+
+		if (module_thread_instantiate(mi, mi, thread->el) < 0) {
+			cf_log_err(inst->server_cs, "Failed instantiating module");
+			goto cleanup;
+		}
+
+		/*
+		 *	FIXME - Instantiate the new module?!
+		 */
+		fr_assert(mi != NULL);
 	}
 
-	MEM(connection = talloc_zero(dl_inst, fr_io_connection_t));
+	MEM(connection = talloc_zero(mi, fr_io_connection_t));
 	MEM(connection->address = talloc_memdup(connection, address, sizeof(*address)));
 	(void) talloc_set_name_const(connection->address, "fr_io_address_t");
 
 	connection->parent = client;
-	connection->dl_inst = dl_inst;
+	connection->mi = mi;
 
 	MEM(connection->client = talloc_named(NULL, sizeof(fr_io_client_t), "fr_io_client_t"));
 	memset(connection->client, 0, sizeof(*connection->client));
@@ -519,8 +754,8 @@ static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
 	talloc_set_destructor(connection->client, _client_free);
 	talloc_set_destructor(connection, connection_free);
 
-	connection->client->pending_id = -1;
-	connection->client->alive_id = -1;
+	connection->client->pending_id = FR_HEAP_INDEX_INVALID;
+	connection->client->alive_id = FR_HEAP_INDEX_INVALID;
 	connection->client->connection = connection;
 
 	/*
@@ -603,121 +838,94 @@ static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
 		break;
 
 	case PR_CLIENT_INVALID:
-	case PR_CLIENT_NAK:
 	case PR_CLIENT_CONNECTED:
 		fr_assert(0 == 1);
-		talloc_free(dl_inst);
-		return NULL;
+		goto cleanup;
 	}
 
-	if (!nak) {
+	{
 		/*
 		 *	Get the child listener.
 		 */
-		MEM(li = connection->child = talloc(connection, fr_listen_t));
-		memcpy(li, thread->listen, sizeof(*li));
-
-		/*
-		 *	Glue in the actual app_io
-		 */
+		MEM(li = connection->child_inst = fr_listen_instance_alloc(connection, thread->child_inst->listen));
 		li->connected = true;
-		li->app_io = thread->child->app_io;
-		li->thread_instance = connection;
-		li->app_io_instance = dl_inst->data;
-		li->track_duplicates = thread->child->app_io->track_duplicates;
 
 		/*
 		 *	Create writable thread instance data.
 		 */
-		connection->child->thread_instance = talloc_zero_array(NULL, uint8_t,
-								       inst->app_io->thread_inst_size);
-		talloc_set_destructor(connection->child, fr_io_listen_free);
-		talloc_set_name(connection->child->thread_instance, "proto_%s_thread_t",
-				inst->app_io->name);
+		li->thread_instance = talloc_zero_array(NULL, uint8_t, inst->app_io->common.thread_inst_size);
+		talloc_set_destructor(li, fr_io_listen_free);
+		talloc_set_name(li->thread_instance, "proto_%s_thread_t", inst->app_io->common.name);
 
 		/*
-		 *	This is "const", and the user can't
-		 *	touch it.  So we just re-use the same
-		 *	configuration everywhere.
+		 *	Our own socket for the connection.  All the variable
+		 *	data is in the connection, the listener is shared.
 		 */
-		connection->child->app_io_instance = inst->app_io_instance;
-
-		/*
-		 *	Create the listener, based on our listener.
-		 */
-		MEM(li = connection->listen = talloc(connection, fr_listen_t));
-
-		/*
-		 *	Note that our instance is effectively 'const'.
-		 *
-		 *	i.e. we can't add things to it.  Instead, we have to
-		 *	put all variable data into the connection.
-		 */
-		memcpy(li, thread->listen, sizeof(*li));
-
-		/*
-		 *	Glue in the connection to the listener.
-		 */
-		fr_assert(li->app_io == &fr_master_app_io);
+		MEM(li = connection->inst = fr_listen_instance_alloc(connection, thread->inst->listen));
+		fr_assert(li->listen->app_io == &fr_master_app_io);
 
 		li->connected = true;
 		li->thread_instance = connection;
-		li->app_io_instance = li->thread_instance;
-		li->track_duplicates = thread->child->app_io->track_duplicates;
 
 		/*
 		 *	Instantiate the child, and open the socket.
 		 */
 		fr_assert(inst->app_io->connection_set != NULL);
 
-		if (inst->app_io->connection_set(connection->child, connection->address) < 0) {
-			DEBUG("Failed setting connection for socket.");
-			talloc_free(dl_inst);
-			return NULL;
+		if (inst->app_io->connection_set(connection->child_inst, connection->address) < 0) {
+			DEBUG("proto_%s - Failed setting connection for socket.", inst->app->common.name);
+			goto cleanup;
 		}
 
 		/*
 		 *	UDP sockets: open a new socket, and then
 		 *	connect it to the client.  This emulates the
 		 *	behavior of accept().
+		 *
+		 *	Note that there is a small window between the
+		 *	bind() and connect() where UDP packets for the
+		 *	wildcard socket can get received by this
+		 *	socket.  We hope that this time frame is as
+		 *	small as possible.
+		 *
+		 *	i.e. we ignore the problem, and don't
+		 *	currently check dst ip/port for UDP packets
+		 *	received on connected sockets.
 		 */
 		if (fd < 0) {
 			socklen_t salen;
 			struct sockaddr_storage src;
 
-			if (inst->app_io->open(connection->child) < 0) {
-				DEBUG("Failed opening connected socket.");
-				talloc_free(dl_inst);
-				return NULL;
-			}
-
-			fd = connection->child->fd;
-
 			if (fr_ipaddr_to_sockaddr(&src, &salen,
 						  &connection->address->socket.inet.src_ipaddr,
 						  connection->address->socket.inet.src_port) < 0) {
-				DEBUG("Failed getting IP address");
-				talloc_free(dl_inst);
+				DEBUG("proto_%s - Failed getting IP address", inst->app->common.name);
+				talloc_free(mi);
 				return NULL;
 			}
 
-			if (connect(fd, (struct sockaddr *) &src, salen) < 0) {
-				close(fd);
-				ERROR("Failed in connect: %s", fr_syserror(errno));
-				talloc_free(dl_inst);
+			if (inst->app_io->open(connection->child_inst) < 0) {
+				DEBUG("proto_%s - Failed opening connected socket.", inst->app->common.name);
+				talloc_free(mi);
 				return NULL;
 			}
+
+			fd = connection->child_inst->fd;
+
+			if (connect(fd, (struct sockaddr *) &src, salen) < 0) {
+				ERROR("proto_%s - Failed in connect: %s", inst->app->common.name, fr_syserror(errno));
+				goto cleanup;
+			}
 		} else {
-			connection->child->fd = fd;
+			connection->child_inst->fd = fd;
 		}
 
 		/*
 		 *	Set the new FD, and get the module to set it's connection name.
 		 */
-		if (inst->app_io->fd_set(connection->child, fd) < 0) {
-			DEBUG3("Failed setting FD to %s", inst->app_io->name);
-			close(fd);
-			return NULL;
+		if (inst->app_io->fd_set(connection->child_inst, fd) < 0) {
+			DEBUG3("Failed setting FD to %s", inst->app_io->common.name);
+			goto cleanup;
 		}
 
 		li->fd = fd;
@@ -725,64 +933,81 @@ static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
 		if (!inst->app_io->get_name) {
 			connection->name = fr_asprintf(connection, "proto_%s from client %pV port "
 						       "%u to server %pV port %u",
-						       inst->app_io->name,
+						       inst->app->common.name,
 						       fr_box_ipaddr(connection->address->socket.inet.src_ipaddr),
 						       connection->address->socket.inet.src_port,
 						       fr_box_ipaddr(connection->address->socket.inet.dst_ipaddr),
 						       connection->address->socket.inet.dst_port);
 		} else {
-			connection->name = inst->app_io->get_name(connection->child);
+			connection->name = inst->app_io->get_name(connection->child_inst);
 		}
 
 		/*
 		 *	Set the names for the listeners.
 		 */
-		connection->listen->name = connection->name;
-		connection->child->name = connection->name;
+		connection->inst->name = connection->name;
+		connection->child_inst->name = connection->name;
 	}
 
 	/*
-	 *	Add the connection to the set of connections for this
-	 *	client.
+	 *	If the parent client is still PENDING, lazily create the hash table that tracks its child
+	 *	connections.  We need this so that fr_io_connection_allow() can later find any sibling
+	 *	connections, and add them to the scheduler once the dynamic client is defined.
 	 */
+	if ((client->state == PR_CLIENT_PENDING) && !client->ht) {
+		(void) pthread_mutex_init(&client->mutex, NULL);
+		MEM(client->ht = fr_hash_table_alloc(client, connection_hash, connection_cmp, NULL));
+	}
+
+	/*
+	 *	Add the connection to the set of connections for this client.  Capture the pre-insert size so
+	 *	we can tell whether this is the first connection (which runs the dynamic-client verification)
+	 *	or a later connection (which is deferred until the first connection is verified).
+	 */
+	pthread_mutex_lock(&client->mutex);
 	if (client->ht) {
-		pthread_mutex_lock(&client->mutex);
-		if (nak) (void) fr_hash_table_delete(client->ht, nak);
+		size_t pre_size = fr_hash_table_num_elements(client->ht);
+
 		ret = fr_hash_table_insert(client->ht, connection);
 		client->ready_to_delete = false;
-		pthread_mutex_unlock(&client->mutex);
+		connection->in_parent_hash = true;
 
-		if (!ret) {
+		if (ret != 0) {
+			pthread_mutex_unlock(&client->mutex);
 			ERROR("proto_%s - Failed inserting connection into tracking table.  "
 			      "Closing it, and discarding all packets for connection %s.",
-			      inst->app_io->name, connection->name);
+			      inst->app_io->common.name, connection->name);
 			goto cleanup;
 		}
-	}
 
-	/*
-	 *	It's a NAK client.  Set the state to NAK, and don't
-	 *	add it to the scheduler.
-	 */
-	if (nak) {
-		connection->name = talloc_strdup(connection, nak->name);
-		connection->client->state = PR_CLIENT_NAK;
-		connection->el = nak->el;
-		return connection;
+		/*
+		 *	The first connection for a PENDING parent runs the dynamic client definition.  All
+		 *	later connections will be scheduled by fr_io_connection_allow(), once the parent is
+		 *	defined (or not).
+		 */
+		if ((client->state == PR_CLIENT_PENDING) && (pre_size > 0)) {
+			pthread_mutex_unlock(&client->mutex);
+			DEBUG("proto_%s - deferring scheduling of connection %s until parent client %pV is defined",
+			      inst->app_io->common.name, connection->name, fr_box_ipaddr(client->src_ipaddr));
+			thread->num_connections++;
+			return connection;
+		}
 	}
+	pthread_mutex_unlock(&client->mutex);
 
-	DEBUG("proto_%s - starting connection %s", inst->app_io->name, connection->name);
-	connection->nr = fr_schedule_listen_add(thread->sc, connection->listen);
+	DEBUG("proto_%s - starting connection %s", inst->app_io->common.name, connection->name);
+	connection->nr = fr_schedule_listen_add(thread->sc, connection->inst);
 	if (!connection->nr) {
 		ERROR("proto_%s - Failed inserting connection into scheduler.  "
 		      "Closing it, and diuscarding all packets for connection %s.",
-		      inst->app_io->name, connection->name);
+		      inst->app_io->common.name, connection->name);
 		pthread_mutex_lock(&client->mutex);
-		(void) fr_hash_table_delete(client->ht, connection);
+		if (client->ht) (void) fr_hash_table_delete(client->ht, connection);
 		pthread_mutex_unlock(&client->mutex);
 
 	cleanup:
-		talloc_free(dl_inst);
+		if (fd >= 0) close(fd);
+		talloc_free(mi);
 		return NULL;
 	}
 
@@ -807,14 +1032,14 @@ static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
  *	fr_io_connection_io, which will duplicate some code,
  *	but may make things simpler?
  */
-static void get_inst(fr_listen_t *li, fr_io_instance_t const **inst, fr_io_thread_t **thread,
-		     fr_io_connection_t **connection, fr_listen_t **child)
+static void get_inst(fr_listen_instance_t *li, fr_io_instance_t const **inst, fr_io_thread_t **thread,
+		     fr_io_connection_t **connection, fr_listen_instance_t **child)
 {
 	if (!li->connected) {
-		*inst = li->app_io_instance;
+		*inst = li->listen->app_io_instance;
 		if (thread) *thread = li->thread_instance;
 		*connection = NULL;
-		if (child) *child = ((fr_io_thread_t *)li->thread_instance)->child;
+		if (child) *child = ((fr_io_thread_t *)li->thread_instance)->child_inst;
 
 	} else {
 		fr_assert(connection != NULL);
@@ -822,17 +1047,17 @@ static void get_inst(fr_listen_t *li, fr_io_instance_t const **inst, fr_io_threa
 		*connection = li->thread_instance;
 		*inst = (*connection)->client->inst;
 		if (thread) *thread = NULL;
-		if (child) *child = (*connection)->child;
+		if (child) *child = (*connection)->child_inst;
 	}
 }
 
 
-static RADCLIENT *radclient_alloc(TALLOC_CTX *ctx, int ipproto, fr_io_address_t *address)
+static fr_client_t *radclient_alloc(TALLOC_CTX *ctx, int ipproto, fr_io_address_t *address)
 {
-	RADCLIENT	*radclient;
+	fr_client_t	*radclient;
 	char		*shortname;
 
-	MEM(radclient = talloc_zero(ctx, RADCLIENT));
+	MEM(radclient = talloc_zero(ctx, fr_client_t));
 
 	fr_value_box_aprint(radclient, &shortname, fr_box_ipaddr(address->socket.inet.src_ipaddr), NULL);
 	radclient->longname = radclient->shortname = shortname;
@@ -849,15 +1074,165 @@ static RADCLIENT *radclient_alloc(TALLOC_CTX *ctx, int ipproto, fr_io_address_t 
 	return radclient;
 }
 
+/*
+ *	Remove a client from the list of "live" clients.
+ *
+ *	This function is only used for the "main" socket.  Clients
+ *	from connections do not use it.
+ */
+static int _client_live_free(fr_io_client_t *client)
+{
+	talloc_get_type_abort(client, fr_io_client_t);
 
-static fr_io_track_t *fr_io_track_add(fr_io_client_t *client,
-				      fr_io_address_t *address,
-				      uint8_t const *packet, size_t packet_len,
-				      fr_time_t recv_time, bool *is_dup)
+	fr_assert(client->in_trie);
+	fr_assert(!client->connection);
+	fr_assert(client->thread);
+
+	if (client->pending) client_pending_free(client);
+
+	(void) fr_trie_remove_by_key(client->thread->trie, &client->src_ipaddr.addr, client->src_ipaddr.prefix);
+
+	/*
+	 *	A client with pending packets is also in the thread's heap of pending clients.  Nothing
+	 *	else takes it out of that heap, so do it here, or the heap is left holding a pointer to
+	 *	freed memory.
+	 */
+	if (client->thread->pending_clients && fr_heap_entry_inserted(client->pending_id)) {
+		(void) fr_heap_extract(&client->thread->pending_clients, client);
+	}
+
+	if (client->thread->alive_clients) {
+		fr_assert(fr_heap_num_elements(client->thread->alive_clients) > 0);
+		(void) fr_heap_extract(&client->thread->alive_clients, client);
+	}
+
+	/*
+	 *	The mutex/ht pair is initialized either for use_connected
+	 *	clients (in client_alloc) or for PENDING clients with
+	 *	deferred sibling connections (in fr_io_connection_alloc).
+	 *	The ht pointer is the canonical signal that the mutex
+	 *	was initialized.
+	 */
+	if (client->ht) (void) pthread_mutex_destroy(&client->mutex);
+
+	return 0;
+}
+
+/** Allocate a dynamic client.
+ *
+ */
+static fr_io_client_t *client_alloc(TALLOC_CTX *ctx, fr_io_client_state_t state,
+				    fr_io_instance_t const *inst, fr_io_thread_t *thread, fr_client_t *radclient,
+				    fr_ipaddr_t const *network)
+{
+	fr_io_client_t *client;
+
+	/*
+	 *	Create our own local client.  This client
+	 *	holds our state which really shouldn't go into
+	 *	fr_client_t.
+	 *
+	 *	Note that we create a new top-level talloc
+	 *	context for this client, as there may be tens
+	 *	of thousands of packets associated with this
+	 *	client.  And we want to avoid problems with
+	 *	O(N) issues in talloc.
+	 */
+	MEM(client = talloc_named(ctx, sizeof(fr_io_client_t), "fr_io_client_t"));
+	memset(client, 0, sizeof(*client));
+
+	client->state = state;
+	client->src_ipaddr = radclient->ipaddr;
+	client->radclient = radclient;
+	client->inst = inst;
+	client->thread = thread;
+
+	if (network) {
+		client->network = *network;
+	} else {
+		client->network = client->src_ipaddr;
+	}
+
+	/*
+	 *	At this point, this variable can only be true
+	 *	for STATIC clients.  PENDING clients may set
+	 *	it to true later, after they've been defined.
+	 */
+	client->use_connected = radclient->use_connected;
+
+	/*
+	 *	Create the pending heap for pending clients.
+	 */
+	if (state == PR_CLIENT_PENDING) {
+		MEM(client->pending = fr_heap_alloc(client, pending_packet_cmp,
+						    fr_io_pending_packet_t, heap_id, 0));
+	}
+
+	/*
+	 *	Create the packet tracking table for this client.
+	 */
+	if (inst->app_io->track_duplicates) {
+		fr_assert(inst->app_io->track_compare != NULL);
+		MEM(client->table = fr_rb_inline_talloc_alloc(client, fr_io_track_t, node, track_cmp, NULL));
+	}
+
+	/*
+	 *	Allow connected sockets to be set on a
+	 *	per-client basis.
+	 */
+	if (client->use_connected) {
+		fr_assert(client->state == PR_CLIENT_STATIC);
+
+		(void) pthread_mutex_init(&client->mutex, NULL);
+		MEM(client->ht = fr_hash_table_alloc(client, connection_hash, connection_cmp, NULL));
+	}
+
+	/*
+	 *	Add the newly defined client to the trie of
+	 *	allowed clients.
+	 */
+	if (fr_trie_insert_by_key(thread->trie, &client->src_ipaddr.addr, client->src_ipaddr.prefix, client)) {
+		ERROR("proto_%s - Failed inserting client %s into tracking table.  Discarding client, and all packets for it.",
+		      inst->app_io->common.name, client->radclient->shortname);
+		if (client->ht) (void) pthread_mutex_destroy(&client->mutex);
+		talloc_free(client);
+		return NULL;
+	}
+
+	client->in_trie = true;
+
+	/*
+	 *	It's a static client.  Don't insert it into the list of alive clients, as those are only for
+	 *	dynamic clients.
+	 */
+	if (state == PR_CLIENT_STATIC) return client;
+
+	fr_assert(thread->alive_clients != NULL);
+
+	/*
+	 *	Track the live clients so that we can clean
+	 *	them up.
+	 */
+	(void) fr_heap_insert(&thread->alive_clients, client);
+	client->pending_id = FR_HEAP_INDEX_INVALID;
+
+	/*
+	 *	Now that we've inserted it into the heap and
+	 *	incremented the numbers, set the destructor
+	 *	function.
+	 */
+	talloc_set_destructor(client, _client_live_free);
+
+	return client;
+}
+
+
+static fr_io_track_t *fr_io_track_add(fr_listen_instance_t const *li, fr_io_client_t *client, fr_io_address_t *address,
+				      uint8_t const *packet, size_t packet_len, fr_time_t recv_time, bool *is_dup)
 {
 	size_t len;
 	fr_io_track_t *track, *old;
-	fr_io_address_t *my_address;
+	TALLOC_CTX *track_ctx = client->inst->app_io->track_duplicates ? (TALLOC_CTX *)client->table : (TALLOC_CTX *)client;
 
 	*is_dup = false;
 
@@ -865,16 +1240,21 @@ static fr_io_track_t *fr_io_track_add(fr_io_client_t *client,
 	 *	Allocate a new tracking structure.  Most of the time
 	 *	there are no duplicates, so this is fine.
 	 */
-	MEM(track = talloc_zero_pooled_object(client, fr_io_track_t, 1, sizeof(*track) + sizeof(track->address) + 64));
-	MEM(track->address = my_address = talloc_zero(track, fr_io_address_t));
-
-	memcpy(my_address, address, sizeof(*address));
-	my_address->radclient = client->radclient;
-
-	track->client = client;
 	if (client->connection) {
+		MEM(track = talloc_zero_pooled_object(track_ctx, fr_io_track_t, 1, sizeof(*track) + 64));
 		track->address = client->connection->address;
+	} else {
+		fr_io_address_t *my_address;
+
+		MEM(track = talloc_zero_pooled_object(track_ctx, fr_io_track_t, 1, sizeof(*track) + sizeof(*track->address) + 64));
+		MEM(track->address = my_address = talloc(track, fr_io_address_t));
+
+		*my_address = *address;
+		my_address->radclient = client->radclient;
 	}
+
+	track->li = li;
+	track->client = client;
 
 	track->timestamp = recv_time;
 	track->packets = 1;
@@ -895,7 +1275,7 @@ static fr_io_track_t *fr_io_track_add(fr_io_client_t *client,
 	 *	already in the tree.
 	 */
 	track->packet = client->inst->app_io->track_create(client->inst->app_io_instance,
-							   client->thread->child->thread_instance,
+							   client->thread->child_inst->thread_instance,
 							   client->radclient,
 							   track, packet, packet_len);
 	if (!track->packet) {
@@ -906,7 +1286,7 @@ static fr_io_track_t *fr_io_track_add(fr_io_client_t *client,
 	/*
 	 *	No existing duplicate.  Return the new tracking entry.
 	 */
-	old = fr_rb_find(client->table, track);
+	fr_rb_find((void **)&old, client->table, track);
 	if (!old) goto do_insert;
 
 	fr_assert(old->client == client);
@@ -943,6 +1323,7 @@ static fr_io_track_t *fr_io_track_add(fr_io_client_t *client,
 		if (client->state == PR_CLIENT_PENDING) {
 			DEBUG("Ignoring duplicate packet while client %s is still pending dynamic definition",
 			      client->radclient->shortname);
+			talloc_free(track);
 			return NULL;
 		}
 
@@ -956,7 +1337,7 @@ static fr_io_track_t *fr_io_track_add(fr_io_client_t *client,
 		 *	struct while the packet is in the outbound
 		 *	queue.
 		 */
-		if (old->ev) (void) fr_event_timer_delete(&old->ev);
+		FR_TIMER_DISARM(old->ev);
 		return old;
 	}
 
@@ -975,10 +1356,10 @@ static fr_io_track_t *fr_io_track_add(fr_io_client_t *client,
 	} else {
 		fr_assert(client == old->client);
 
-		if (!fr_rb_delete(client->table, old)) {
+		if (fr_rb_delete(client->table, old) != 0) {
 			fr_assert(0);
 		}
-		if (old->ev) (void) fr_event_timer_delete(&old->ev);
+		FR_TIMER_DELETE(&old->ev);
 
 		talloc_set_destructor(old, track_free);
 
@@ -986,7 +1367,7 @@ static fr_io_track_t *fr_io_track_add(fr_io_client_t *client,
 	}
 
 do_insert:
-	if (!fr_rb_insert(client->table, track)) {
+	if (fr_rb_insert(client->table, track) != 0) {
 		fr_assert(0);
 	}
 
@@ -1020,7 +1401,7 @@ static int pending_free(fr_io_pending_packet_t *pending)
 	return 0;
 }
 
-static fr_io_pending_packet_t *fr_io_pending_alloc(fr_io_client_t *client,
+static fr_io_pending_packet_t *fr_io_pending_alloc(fr_io_connection_t *connection, fr_io_client_t *client,
 						   uint8_t const *buffer, size_t packet_len,
 						   fr_io_track_t *track,
 						   int priority)
@@ -1041,7 +1422,7 @@ static fr_io_pending_packet_t *fr_io_pending_alloc(fr_io_client_t *client,
 	 *	Insert the pending packet for this client.  If it
 	 *	fails, silently discard the packet.
 	 */
-	if (fr_heap_insert(client->pending, pending) < 0) {
+	if (fr_heap_insert(&client->pending, pending) < 0) {
 		talloc_free(pending);
 		return NULL;
 	}
@@ -1052,7 +1433,7 @@ static fr_io_pending_packet_t *fr_io_pending_alloc(fr_io_client_t *client,
 	 *	we pause the FD, so the number of
 	 *	pending packets will always be small.
 	 */
-	if (!client->connection) client->thread->num_pending_packets++;
+	if (!connection) client->thread->num_pending_packets++;
 
 	return pending;
 }
@@ -1065,7 +1446,7 @@ static fr_io_pending_packet_t *fr_io_pending_alloc(fr_io_client_t *client,
  *	This function is only used for the "main" socket.  Clients
  *	from connections do not use it.
  */
-static int8_t alive_client_cmp(void const *one, void const *two)
+static fr_cmp_ret_t alive_client_cmp(void const *one, void const *two)
 {
 	fr_io_client_t const *a = talloc_get_type_abort_const(one, fr_io_client_t);
 	fr_io_client_t const *b = talloc_get_type_abort_const(two, fr_io_client_t);
@@ -1073,51 +1454,33 @@ static int8_t alive_client_cmp(void const *one, void const *two)
 	return fr_ipaddr_cmp(&a->src_ipaddr, &b->src_ipaddr);
 }
 
-/*
- *	Remove a client from the list of "live" clients.
- *
- *	This function is only used for the "main" socket.  Clients
- *	from connections do not use it.
- */
-static int _client_live_free(fr_io_client_t *client)
-{
-	fr_assert(client->in_trie);
-	fr_assert(!client->connection);
-	fr_assert(fr_heap_num_elements(client->thread->alive_clients) > 0);
-
-	if (client->pending) TALLOC_FREE(client->pending);
-
-	(void) fr_trie_remove_by_key(client->thread->trie, &client->src_ipaddr.addr, client->src_ipaddr.prefix);
-	(void) fr_heap_extract(client->thread->alive_clients, client);
-
-	return 0;
-}
-
 /**  Implement 99% of the read routines.
  *
  *  The app_io->read does the transport-specific data read.
  */
-static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time_p,
-			uint8_t *buffer, size_t buffer_len, size_t *leftover, uint32_t *priority, bool *is_dup)
+static ssize_t mod_read(fr_listen_instance_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer,
+			size_t buffer_len, size_t *leftover)
 {
-	fr_io_instance_t const *inst;
-	fr_io_thread_t *thread;
-	ssize_t packet_len = -1;
-	fr_time_t recv_time = 0;
-	fr_io_client_t *client;
-	fr_io_address_t address;
-	fr_io_connection_t my_connection, *connection;
-	fr_io_pending_packet_t *pending;
-	fr_io_track_t *track, *new_track;
-	fr_listen_t *child;
-	int value, accept_fd = -1;
+	fr_io_instance_t const	*inst;
+	fr_io_thread_t		*thread;
+	ssize_t			packet_len = -1;
+	fr_time_t		recv_time = fr_time_wrap(0);
+	fr_io_client_t		*client;
+	fr_io_address_t		address;
+	fr_io_connection_t	my_connection, *connection;
+	fr_io_pending_packet_t	*pending = NULL;
+	fr_io_track_t		*track;
+	fr_listen_instance_t	*child;
+	int			value, accept_fd = -1;
+	uint32_t		priority = PRIORITY_NORMAL;
 
-	fr_assert(is_dup != NULL);
-	*is_dup = false;
+/** Log that we ignore clients in debug mode, or when it's enabled for a listener
+ */
+#define LOG_IGNORED_CLIENTS(_inst) ((_inst)->log_ignored_clients || fr_debug_lvl >= 1)
 
 	get_inst(li, &inst, &thread, &connection, &child);
 
-	track = new_track = NULL;
+	track = NULL;
 
 	/*
 	 *	There was data left over from the previous read, go
@@ -1144,7 +1507,7 @@ redo:
 			return -1;
 		}
 
-		pending = fr_heap_pop(connection->client->pending);
+		fr_heap_pop((void **)&pending, &connection->client->pending);
 
 	} else if (thread->pending_clients) {
 		pending = pending_packet_pop(thread);
@@ -1173,9 +1536,9 @@ redo:
 		 *	it's fast, but also that it's hard to look up
 		 *	random packets in the pending heap.
 		 */
-		if (pending->recv_time != track->timestamp) {
+		if (fr_time_neq(pending->recv_time, track->timestamp)) {
 			DEBUG3("Discarding old packet");
-			talloc_free(pending);
+			TALLOC_FREE(pending);
 			goto redo;
 		}
 
@@ -1185,7 +1548,6 @@ redo:
 		 */
 		*packet_ctx = track;
 		*leftover = 0;
-		*priority = pending->priority;
 		recv_time = *recv_time_p = pending->recv_time;
 		client = track->client;
 
@@ -1196,7 +1558,7 @@ redo:
 		 *	Shouldn't be necessary, but what the heck...
 		 */
 		memcpy(&address, track->address, sizeof(address));
-		talloc_free(pending);
+		TALLOC_FREE(pending);
 
 		/*
 		 *	Skip over all kinds of logic to find /
@@ -1224,13 +1586,14 @@ redo:
 		 *	OK.  So don't return -1.
 		 */
 		if (accept_fd < 0) {
-			DEBUG("proto_%s_%s - failed to accept new socket: %s",
-			      inst->app->name, inst->transport, fr_syserror(errno));
+			RATE_LIMIT_LOCAL(&thread->rate_limit.accept_failed,
+					 INFO, "proto_%s - failed to accept new socket: %s",
+					 inst->app->common.name, fr_syserror(errno));
 			return 0;
 		}
 
-#ifdef __clang_analyzer__
-		saremote.ss_family = AF_INET; /* clang doesn't know that accept() initializes this */
+#ifdef STATIC_ANALYZER
+		saremote.ss_family = AF_INET; /* static analyzer doesn't know that accept() initializes this */
 #endif
 
 		/*
@@ -1240,17 +1603,37 @@ redo:
 			memset(&address.socket, 0, sizeof(address.socket));
 			(void) fr_ipaddr_from_sockaddr(&address.socket.inet.src_ipaddr, &address.socket.inet.src_port,
 						       &saremote, salen);
-			salen = sizeof(saremote);
+
+			/*
+			 *	If the IP is in the NAK cache, then ignore the new socket.
+			 *
+			 *	An entry which has passed its expiry time is removed here, and the
+			 *	connection is accepted as normal.
+			 */
+			if (fr_io_nak_find(thread, &address.socket.inet.src_ipaddr)) {
+				RATE_LIMIT_LOCAL(&thread->rate_limit.accept_failed,
+						 INFO, "proto_%s - ignoring connection request from address %pV due to NAK cache",
+						 inst->app->common.name, fr_box_ipaddr(address.socket.inet.src_ipaddr));
+				close(accept_fd);
+				return 0;
+			}
 
 			/*
 			 *	@todo - only if the local listen address is "*".
 			 */
+			salen = sizeof(saremote);
 			(void) getsockname(accept_fd, (struct sockaddr *) &saremote, &salen);
 			(void) fr_ipaddr_from_sockaddr(&address.socket.inet.dst_ipaddr, &address.socket.inet.dst_port,
 						       &saremote, salen);
-			address.socket.proto = inst->ipproto;
+			address.socket.type = (inst->ipproto == IPPROTO_TCP) ? SOCK_STREAM : SOCK_DGRAM;
 			address.socket.fd = accept_fd;
 		}
+
+		/*
+		 *	Set the new descriptor to be non-blocking.
+		 */
+		(void) fr_nonblock(accept_fd);
+
 
 	} else {
 		fr_io_address_t *local_address;
@@ -1281,7 +1664,7 @@ do_read:
 		 *	functions which do all of the TLS work.
 		 */
 		packet_len = inst->app_io->read(child, (void **) &local_address, &recv_time,
-					  buffer, buffer_len, leftover, priority, is_dup);
+					  buffer, buffer_len, leftover);
 		if (packet_len <= 0) {
 			return packet_len;
 		}
@@ -1294,19 +1677,21 @@ do_read:
 		if (inst->app->priority) {
 			value = inst->app->priority(inst->app_instance, buffer, packet_len);
 			if (value <= 0) {
+				static fr_rate_limit_t bad_type;
 
 				/*
 				 *	@todo - unix sockets.  We need to use
 				 *	the "name" of the socket, in the
 				 *	listener?
 				 */
-				DEBUG2("proto_%s - ignoring packet from IP %pV. It is not configured as 'type = ...'",
-				       inst->app_io->name, fr_box_ipaddr(address.socket.inet.src_ipaddr));
+				if (LOG_IGNORED_CLIENTS(inst)) {
+					RATE_LIMIT_LOCAL(thread ? &thread->rate_limit.bad_type : &bad_type, INFO,
+							 "proto_%s - ignoring packet from IP %pV. It is not configured as 'type = ...'",
+							 inst->app_io->common.name, fr_box_ipaddr(address.socket.inet.src_ipaddr));
+				}
 				return 0;
 			}
-			*priority = value;
-		} else {
-			*priority = PRIORITY_NORMAL;
+			priority = value;
 		}
 
 		/*
@@ -1336,6 +1721,21 @@ do_read:
 					&address.socket.inet.src_ipaddr.addr, address.socket.inet.src_ipaddr.prefix);
 		fr_assert(!client || !client->connection);
 
+		/*
+		 *	Verify the cached client is the most specific match.
+		 *	A broader subnet may have been cached first, shadowing
+		 *	a more specific client definition.
+		 */
+		if (client && (client->state == PR_CLIENT_STATIC)) {
+			fr_client_t *radclient;
+
+			radclient = inst->app_io->client_find(thread->child_inst,
+							      &address.socket.inet.src_ipaddr, inst->ipproto);
+			if (radclient && (radclient->ipaddr.prefix > client->src_ipaddr.prefix)) {
+				client = NULL;
+			}
+		}
+
 	} else {
 		client = connection->client;
 
@@ -1347,9 +1747,16 @@ do_read:
 	}
 
 	/*
-	 *	Negative cache entry.  Drop the packet.
+	 *	No client was found, and we don't have a connection.  Check the NAK cache before defining a
+	 *	dynamic client.
+	 *
+	 *	The NAK cache has already been checked on the TCP path above, after the accept().
 	 */
-	if (client && client->state == PR_CLIENT_NAK) {
+	if (!client && !connection &&
+	    fr_io_nak_find(thread, &address.socket.inet.src_ipaddr)) {
+		RATE_LIMIT_LOCAL(&thread->rate_limit.repeat_nak, ERROR,
+				 "proto_%s - Discarding packet from NAK'd dynamic client %pV",
+				 inst->app_io->common.name, fr_box_ipaddr(address.socket.inet.src_ipaddr));
 		if (accept_fd >= 0) close(accept_fd);
 		return 0;
 	}
@@ -1360,16 +1767,18 @@ do_read:
 	 *	allowed, try to define a dynamic client.
 	 */
 	if (!client) {
-		RADCLIENT *radclient = NULL;
+		fr_client_t *radclient = NULL;
 		fr_io_client_state_t state;
 		fr_ipaddr_t const *network = NULL;
+		char const *error;
 
 		/*
 		 *	We MUST be the master socket.
 		 */
 		fr_assert(!connection);
 
-		radclient = inst->app_io->client_find(thread->child, &address.socket.inet.src_ipaddr, inst->ipproto);
+		radclient = inst->app_io->client_find(thread->child_inst, &address.socket.inet.src_ipaddr,
+						      inst->ipproto);
 		if (radclient) {
 			state = PR_CLIENT_STATIC;
 
@@ -1381,17 +1790,8 @@ do_read:
 
 		} else if (inst->dynamic_clients) {
 			if (inst->max_clients && (fr_heap_num_elements(thread->alive_clients) >= inst->max_clients)) {
-				if (accept_fd < 0) {
-					DEBUG("proto_%s - ignoring packet from client IP address %pV - "
-					      "too many dynamic clients are defined",
-					      inst->app_io->name, fr_box_ipaddr(address.socket.inet.src_ipaddr));
-				} else {
-					DEBUG("proto_%s - ignoring connection attempt from client IP address %pV "
-					      "- too many dynamic clients are defined",
-					      inst->app_io->name, fr_box_ipaddr(address.socket.inet.src_ipaddr));
-					close(accept_fd);
-				}
-				return 0;
+				error = "Too many dynamic clients have been defined";
+				goto ignore;
 			}
 
 			/*
@@ -1399,12 +1799,18 @@ do_read:
 			 */
 			network = fr_trie_lookup_by_key(inst->networks, &address.socket.inet.src_ipaddr.addr,
 						 address.socket.inet.src_ipaddr.prefix);
-			if (!network) goto ignore;
+			if (!network) {
+				error = "Address is outside of the the 'allow' network range";
+				goto ignore;
+			}
 
 			/*
 			 *	It exists, but it's a "deny" rule, ignore it.
 			 */
-			if (network->af == AF_UNSPEC) goto ignore;
+			if (network->af == AF_UNSPEC) {
+				error = "Address is forbidden by the 'deny' network range";
+				goto ignore;
+			}
 
 			/*
 			 *	Allocate our local radclient as a
@@ -1414,119 +1820,61 @@ do_read:
 			state = PR_CLIENT_PENDING;
 
 		} else {
+			char const *msg;
+
+			error = "No matching 'client' definition was found";
+
 		ignore:
 			if (accept_fd < 0) {
-				DEBUG("proto_%s - ignoring packet from unknown client IP address %pV",
-				      inst->app_io->name, fr_box_ipaddr(address.socket.inet.src_ipaddr));
+				msg = "packet";
 			} else {
-				DEBUG("proto_%s - ignoring connection attempt from unknown client IP address %pV",
-				      inst->app_io->name, fr_box_ipaddr(address.socket.inet.src_ipaddr));
+				msg = "connection attempt";
 				close(accept_fd);
 			}
+
+			if (LOG_IGNORED_CLIENTS(inst)) {
+				static fr_rate_limit_t unknown_client;
+				RATE_LIMIT_LOCAL(thread ? &thread->rate_limit.unknown_client : &unknown_client,
+						 ERROR, "proto_%s - Ignoring %s from IP address %pV - %s",
+						 inst->app_io->common.name, msg, fr_box_ipaddr(address.socket.inet.src_ipaddr),
+						 error);
+			}
+
 			return 0;
 		}
 
-		/*
-		 *	Create our own local client.  This client
-		 *	holds our state which really shouldn't go into
-		 *	RADCLIENT.
-		 *
-		 *	Note that we create a new top-level talloc
-		 *	context for this client, as there may be tens
-		 *	of thousands of packets associated with this
-		 *	client.  And we want to avoid problems with
-		 *	O(N) issues in talloc.
-		 */
-		MEM(client = talloc_named(NULL, sizeof(fr_io_client_t), "fr_io_client_t"));
-		memset(client, 0, sizeof(*client));
-
-		client->state = state;
-		client->src_ipaddr = radclient->ipaddr;
-		client->radclient = radclient;
-		client->inst = inst;
-		client->thread = thread;
-
-		if (network) {
-			client->network = *network;
-		} else {
-			client->network = client->src_ipaddr;
-		}
+		MEM(client = client_alloc(thread, state, inst, thread, radclient, network));
 
 		/*
-		 *	At this point, this variable can only be true
-		 *	for STATIC clients.  PENDING clients may set
-		 *	it to true later, after they've been defined.
+		 *	Parent the dynamic client radclient off the client - it
+		 *	is the client which gets freed by the dynamic client timers.
 		 */
-		client->use_connected = radclient->use_connected;
-
-		/*
-		 *	Create the pending heap for pending clients.
-		 */
-		if (state == PR_CLIENT_PENDING) {
-			MEM(client->pending = fr_heap_alloc(client, pending_packet_cmp,
-							     fr_io_pending_packet_t, heap_id, 0));
-		}
-
-		/*
-		 *	Create the packet tracking table for this client.
-		 */
-		if (inst->app_io->track_duplicates) {
-			fr_assert(inst->app_io->track_compare != NULL);
-			MEM(client->table = fr_rb_inline_talloc_alloc(client, fr_io_track_t, node, track_cmp, NULL));
-		}
-
-		/*
-		 *	Allow connected sockets to be set on a
-		 *	per-client basis.
-		 */
-		if (client->use_connected) {
-			fr_assert(client->state == PR_CLIENT_STATIC);
-
-			(void) pthread_mutex_init(&client->mutex, NULL);
-			MEM(client->ht = fr_hash_table_alloc(client, connection_hash, connection_cmp, NULL));
-		}
-
-		/*
-		 *	Add the newly defined client to the trie of
-		 *	allowed clients.
-		 */
-		if (fr_trie_insert_by_key(thread->trie, &client->src_ipaddr.addr, client->src_ipaddr.prefix, client)) {
-			ERROR("proto_%s - Failed inserting client %s into tracking table.  Discarding client, and all packets for it.",
-			      inst->app_io->name, client->radclient->shortname);
-			talloc_free(client);
-			if (accept_fd >= 0) close(accept_fd);
-			return -1;
-		}
-
-		client->in_trie = true;
-
-		/*
-		 *	Track the live clients so that we can clean
-		 *	them up.
-		 */
-		(void) fr_heap_insert(thread->alive_clients, client);
-		client->pending_id = -1;
-
-		/*
-		 *	Now that we've inserted it into the heap and
-		 *	incremented the numbers, set the destructor
-		 *	function.
-		 */
-		talloc_set_destructor(client, _client_live_free);
+		if (state == PR_CLIENT_PENDING) talloc_steal(client, radclient);
 	}
 
 have_client:
 	fr_assert(client->state != PR_CLIENT_INVALID);
-	fr_assert(client->state != PR_CLIENT_NAK);
 
 	/*
 	 *	We've accepted a new connection.  Go allocate it, and
 	 *	let it read from the socket.
 	 */
 	if (accept_fd >= 0) {
-		if (!fr_io_connection_alloc(inst, thread, client, accept_fd, &address, NULL)) {
-			DEBUG("Failed to allocate connection from client %s.", client->radclient->shortname);
-			close(accept_fd);
+		connection = fr_io_connection_alloc(inst, thread, client, accept_fd, &address);
+		if (!connection) {
+			static fr_rate_limit_t alloc_failed;
+
+			RATE_LIMIT_LOCAL(thread ? &thread->rate_limit.conn_alloc_failed : &alloc_failed,
+					 ERROR, "Failed to allocate connection from client %s", client->radclient->shortname);
+			return 0;
+		}
+
+		/*
+		 *	The parent is in use - ensure the cleanup timer is disarmed.
+		 */
+		if (fr_timer_armed(connection->parent->ev)) {
+			FR_TIMER_DISARM_RETURN(connection->parent->ev);
+			connection->parent->ready_to_delete = false;
 		}
 
 		return 0;
@@ -1538,6 +1886,7 @@ have_client:
 	 *	Track this packet and return it if necessary.
 	 */
 	if (connection || !client->use_connected) {
+		fr_io_track_t *to_free = NULL;
 
 		/*
 		 *	Add the packet to the tracking table, if it's
@@ -1546,21 +1895,30 @@ have_client:
 		 *	"live" packets.
 		 */
 		if (!track) {
-			track = fr_io_track_add(client, &address, buffer, packet_len, recv_time, is_dup);
+			static 	fr_rate_limit_t tracking_failed;
+			bool	is_dup = false;
+
+			track = fr_io_track_add(li, client, &address, buffer, packet_len, recv_time, &is_dup);
 			if (!track) {
-				DEBUG("Failed tracking packet from client %s - discarding it",
-				      client->radclient->shortname);
+				RATE_LIMIT_LOCAL(thread ? &thread->rate_limit.tracking_failed : &tracking_failed,
+						 ERROR, "Failed tracking packet from client %s - discarding it",
+						 client->radclient->shortname);
 				return 0;
 			}
 
 			/*
 			 *	If there's a cached reply, just send that and don't do anything else.
 			 */
-			if (*is_dup) {
+			if (is_dup) {
 				fr_network_t *nr;
 
 				if (track->do_not_respond) {
 					DEBUG("Ignoring retransmit from client %s - we are not responding to this request", client->radclient->shortname);
+					return 0;
+				}
+
+				if (track->discard) {
+					DEBUG("Ignoring transmit from client %s - we previously received a newer / conflicting packet", client->radclient->shortname);
 					return 0;
 				}
 
@@ -1595,7 +1953,7 @@ have_client:
 			/*
 			 *	Got to free this if we don't process the packet.
 			 */
-			new_track = track;
+			to_free = track;
 		}
 
 		/*
@@ -1617,26 +1975,32 @@ have_client:
 			 *	to track pending packets.
 			 */
 			if (!connection && inst->max_pending_packets && (thread->num_pending_packets >= inst->max_pending_packets)) {
-				DEBUG("Too many pending packets for client %pV - discarding packet",
-				      fr_box_ipaddr(client->src_ipaddr));
-				goto done;
+				RATE_LIMIT_LOCAL(&thread->rate_limit.too_many_pending,
+						 ERROR, "Too many pending dynamic client packets for listener - discarding packet from %pV",
+						 fr_box_ipaddr(client->src_ipaddr));
+
+			discard:
+				talloc_free(to_free);
+				return 0;
 			}
 
 			/*
 			 *	Allocate the pending packet structure.
 			 */
-			pending = fr_io_pending_alloc(client, buffer, packet_len,
-						      track, *priority);
+			pending = fr_io_pending_alloc(connection, client, buffer, packet_len,
+						      track, priority);
 			if (!pending) {
-				DEBUG("Failed tracking packet from client %pV - discarding packet", fr_box_ipaddr(client->src_ipaddr));
-				goto done;
+				static fr_rate_limit_t alloc_failed;
+				RATE_LIMIT_LOCAL(thread ? &thread->rate_limit.alloc_failed : &alloc_failed,
+						 ERROR, "proto_%s - Failed allocating space for dynamic client %pV - discarding packet",
+						 inst->app_io->common.name, fr_box_ipaddr(client->src_ipaddr));
+				goto discard;
 			}
 
 			if (fr_heap_num_elements(client->pending) > 1) {
-				DEBUG("Client %pV is still being dynamically defined.  "
-				      "Caching this packet until the client has been defined",
+				DEBUG("Verification is still pending for dynamic client %pV - queuing additional packet(s)",
 				      fr_box_ipaddr(client->src_ipaddr));
-				goto done;
+				return 0;
 			}
 
 			/*
@@ -1644,6 +2008,9 @@ have_client:
 			 *	dynamic client.
 			 */
 			track->dynamic = recv_time;
+
+			INFO("proto_%s - Verification started for packet from dynamic client %pV - queuing new packets",
+			     inst->app_io->common.name,	fr_box_ipaddr(client->src_ipaddr));
 		}
 
 		/*
@@ -1651,9 +2018,17 @@ have_client:
 		 *	connection.  It's still in use, so we don't
 		 *	want to clean it up.
 		 */
-		if (client->ev) {
-			talloc_const_free(client->ev);
+		if (fr_timer_armed(client->ev)) {
+			FR_TIMER_DISARM_RETURN(client->ev);
 			client->ready_to_delete = false;
+		}
+
+		/*
+		 *	Remove cleanup timers for the connection parent.
+		 */
+		if (connection && fr_timer_armed(connection->parent->ev)) {
+			FR_TIMER_DISARM_RETURN(connection->parent->ev);
+			connection->parent->ready_to_delete = false;
 		}
 
 		/*
@@ -1663,6 +2038,11 @@ have_client:
 		*packet_ctx = track;
 		return packet_len;
 	}
+
+	/*
+	 *
+	 */
+	fr_assert(!pending);
 
 	/*
 	 *	This must be the main UDP socket which creates
@@ -1677,34 +2057,21 @@ have_client:
 	 *	the state, the child socket will take care of handling
 	 *	the packet.  e.g. dynamic clients, etc.
 	 */
-	{
-		bool nak = false;
+	my_connection.address = &address;
 
-		my_connection.address = &address;
-
-		pthread_mutex_lock(&client->mutex);
-		connection = fr_hash_table_find(client->ht, &my_connection);
-		if (connection) nak = (connection->client->state == PR_CLIENT_NAK);
-		pthread_mutex_unlock(&client->mutex);
-
-		/*
-		 *	The connection is in NAK state, ignore packets
-		 *	for it.
-		 */
-		if (nak) {
-			DEBUG("Discarding packet to NAKed connection %s", connection->name);
-			goto done;
-		}
-	}
+	pthread_mutex_lock(&client->mutex);
+	fr_hash_table_find((void **)&connection, client->ht, &my_connection);
+	pthread_mutex_unlock(&client->mutex);
 
 	/*
 	 *	No existing connection, create one.
 	 */
 	if (!connection) {
-		connection = fr_io_connection_alloc(inst, thread, client, -1, &address, NULL);
+		connection = fr_io_connection_alloc(inst, thread, client, -1, &address);
 		if (!connection) {
-			DEBUG("Failed to allocate connection from client %s.  Discarding packet.", client->radclient->shortname);
-			goto done;
+			RATE_LIMIT_LOCAL(&thread->rate_limit.conn_alloc_failed,
+					 ERROR, "Failed to allocate connection from client %s.  Discarding packet.", client->radclient->shortname);
+			return 0;
 		}
 	}
 
@@ -1723,14 +2090,19 @@ have_client:
 	 *	packet, so don't do this.  Instead, the connection
 	 *	will take care of figuring out what to do.
 	 *
-	 *	We don't need "new_track" after this, as it will be
+	 *	We don't need "to_free" after this, as it will be
 	 *	tracked in the connected socket.
 	 */
-	(void) fr_network_listen_inject(connection->nr, connection->listen,
-					buffer, packet_len, recv_time);
+	if (fr_network_listen_inject(connection->nr, connection->inst,
+				     buffer, packet_len, recv_time) < 0) {
+		RATE_LIMIT_LOCAL(&thread->rate_limit.queue_full, PERROR,
+				 "proto_%s - Discarding packet from dynamic client %pV - cannot push packet to connected socket",
+				 inst->app_io->common.name, fr_box_ipaddr(address.socket.inet.src_ipaddr));
+		/*
+		 *	Don't return an error, because that will cause the listener to close its socket.
+		 */
+	}
 
-done:
-	talloc_free(new_track);
 	return 0;
 }
 
@@ -1738,7 +2110,7 @@ done:
  *
  *  Always called in the context of the network.
  */
-static int mod_inject(fr_listen_t *li, uint8_t *buffer, size_t buffer_len, fr_time_t recv_time)
+static int mod_inject(fr_listen_instance_t *li, uint8_t const *buffer, size_t buffer_len, fr_time_t recv_time)
 {
 	fr_io_instance_t const *inst;
 	int		priority;
@@ -1754,15 +2126,19 @@ static int mod_inject(fr_listen_t *li, uint8_t *buffer, size_t buffer_len, fr_ti
 		return -1;
 	}
 
-	priority = inst->app->priority(inst, buffer, buffer_len);
-	if (priority <= 0) {
-		return -1;
+	if (inst->app->priority) {
+		priority = inst->app->priority(inst->app_instance, buffer, buffer_len);
+		if (priority <= 0) {
+			return -1;
+		}
+	} else {
+		priority = PRIORITY_NORMAL;
 	}
 
 	/*
 	 *	Track this packet, because that's what mod_read expects.
 	 */
-	track = fr_io_track_add(connection->client, connection->address,
+	track = fr_io_track_add(li, connection->client, connection->address,
 				buffer, buffer_len, recv_time, &is_dup);
 	if (!track) {
 		DEBUG2("Failed injecting packet to tracking table");
@@ -1779,7 +2155,7 @@ static int mod_inject(fr_listen_t *li, uint8_t *buffer, size_t buffer_len, fr_ti
 	/*
 	 *	Remember to restore this packet later.
 	 */
-	pending = fr_io_pending_alloc(connection->client, buffer, buffer_len,
+	pending = fr_io_pending_alloc(connection, connection->client, buffer, buffer_len,
 				      track, priority);
 	if (!pending) {
 		DEBUG2("Failed injecting packet due to allocation error");
@@ -1792,25 +2168,25 @@ static int mod_inject(fr_listen_t *li, uint8_t *buffer, size_t buffer_len, fr_ti
 /** Open a new listener
  *
  */
-static int mod_open(fr_listen_t *li)
+static int mod_open(fr_listen_instance_t *li)
 {
 	fr_io_thread_t *thread;
 	fr_io_instance_t const *inst;
 
 	thread = li->thread_instance;
-	inst = li->app_io_instance;
+	inst = li->listen->app_io_instance;
 
-	if (inst->app_io->open(thread->child) < 0) return -1;
+	if (inst->app_io->open(thread->child_inst) < 0) return -1;
 
-	li->fd = thread->child->fd;	/* copy this back up */
+	li->fd = thread->child_inst->fd;	/* copy this back up */
 
 	/*
 	 *	Set the name of the socket.
 	 */
-	if (!li->app_io->get_name) {
-		li->name = li->app_io->name;
+	if (!li->listen->app_io->get_name) {
+		li->name = li->listen->app_io->common.name;
 	} else {
-		li->name = li->app_io->get_name(li);
+		li->name = li->listen->app_io->get_name(li);
 	}
 
 	/*
@@ -1828,12 +2204,12 @@ static int mod_open(fr_listen_t *li)
  * @param[in] el the event list
  * @param[in] nr context from the network side
  */
-static void mod_event_list_set(fr_listen_t *li, fr_event_list_t *el, void *nr)
+static void mod_event_list_set(fr_listen_instance_t *li, fr_event_list_t *el, void *nr)
 {
 	fr_io_instance_t const *inst;
 	fr_io_connection_t *connection;
 	fr_io_thread_t *thread;
-	fr_listen_t *child;
+	fr_listen_instance_t *child;
 
 	get_inst(li, &inst, &thread, &connection, &child);
 
@@ -1845,14 +2221,6 @@ static void mod_event_list_set(fr_listen_t *li, fr_event_list_t *el, void *nr)
 
 	if (inst->app_io->event_list_set) {
 		inst->app_io->event_list_set(child, el, nr);
-	}
-
-	/*
-	 *	No dynamic clients AND no packet cleanups?  We don't
-	 *	need timers.
-	 */
-	if (!inst->dynamic_clients && !inst->cleanup_delay) {
-		return;
 	}
 
 	/*
@@ -1869,7 +2237,35 @@ static void mod_event_list_set(fr_listen_t *li, fr_event_list_t *el, void *nr)
 }
 
 
-static void client_expiry_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
+/** Delete a client and any connection it belongs to.
+ *
+ *  A connected socket owns a client, so we have to remove the connection from the parent "accept" connection.
+ *  We also mark the connection as dead, and tell the network side to read from the connection, which then
+ *  closes it.
+ */
+static void fr_io_client_delete(fr_io_client_t *client)
+{
+	fr_io_connection_t *connection = client->connection;
+
+	fr_assert(client->packets == 0);
+
+	if (connection) {
+		pthread_mutex_lock(&connection->parent->mutex);
+		if (connection->in_parent_hash) {
+			connection->in_parent_hash = false;
+			(void) fr_hash_table_delete(connection->parent->ht, connection);
+		}
+		pthread_mutex_unlock(&connection->parent->mutex);
+
+		connection->dead = true;
+		fr_network_listen_read(connection->nr, connection->inst);
+		return;
+	}
+
+	talloc_free(client);
+}
+
+static void client_expiry_timer(fr_timer_list_t *tl, fr_time_t now, void *uctx)
 {
 	fr_io_client_t		*client = talloc_get_type_abort(uctx, fr_io_client_t);
 	fr_io_instance_t const	*inst;
@@ -1880,9 +2276,7 @@ static void client_expiry_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
 	/*
 	 *	No event list?  We don't need to expire the client.
 	 */
-	if (!el) return;
-
-	DEBUG("TIMER - checking status of client %s", client->radclient->shortname);
+	if (!tl) return;
 
 	// @todo - print out what we plan on doing next
 	connection = client->connection;
@@ -1894,20 +2288,24 @@ static void client_expiry_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
 	 *	Called from the read or write functions with
 	 *	now==0, to signal that we have to *set* the timer.
 	 */
-	if (!now) {
+	if (fr_time_eq(now, fr_time_wrap(0))) {
+		/*
+		 *	The timer is already set, don't do anything.
+		 */
+		if (fr_timer_armed(client->ev)) return;
+
 		switch (client->state) {
 		case PR_CLIENT_CONNECTED:
 			fr_assert(connection != NULL);
 			delay = inst->idle_timeout;
+			if (fr_time_delta_ispos(client->radclient->limit.idle_timeout) &&
+			    (fr_time_delta_lt(client->radclient->limit.idle_timeout, inst->idle_timeout))) {
+				delay = client->radclient->limit.idle_timeout;
+			}
 			break;
 
 		case PR_CLIENT_DYNAMIC:
-			delay = inst->idle_timeout;
-			break;
-
-		case PR_CLIENT_NAK:
-			fr_assert(!connection);
-			delay = inst->nak_lifetime;
+			delay = inst->dynamic_timeout;
 			break;
 
 		default:
@@ -1915,40 +2313,12 @@ static void client_expiry_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
 			return;
 		}
 
+		DEBUG("TIMER - setting idle timeout to %pVs for connection from client %s", fr_box_time_delta(delay), client->radclient->shortname);
+
 		goto reset_timer;
 	}
 
-	/*
-	 *	It's a negative cache entry.  Just delete it.
-	 */
-	if (client->state == PR_CLIENT_NAK) {
-	delete_client:
-		fr_assert(client->packets == 0);
-
-		/*
-		 *	It's a connected socket.  Remove it from the
-		 *	parents list of connections, and delete it.
-		 */
-		if (connection) {
-			fr_io_client_t *parent = connection->parent;
-
-			pthread_mutex_lock(&parent->mutex);
-			(void) fr_hash_table_delete(parent->ht, connection);
-			pthread_mutex_unlock(&parent->mutex);
-
-			/*
-			 *	Mark the connection as dead, and tell
-			 *	the network side to stop reading from
-			 *	it.
-			 */
-			connection->dead = true;
-			fr_network_listen_read(connection->nr, connection->listen);
-			return;
-		}
-
-		talloc_free(client);
-		return;
-	}
+	DEBUG2("TIMER - checking status of dynamic client %s %pV", client->radclient->shortname, fr_box_ipaddr(client->src_ipaddr));
 
 	/*
 	 *	It's a dynamically defined client.  If no one is using
@@ -1983,7 +2353,9 @@ static void client_expiry_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
 	 */
 	if (!client->use_connected) {
 		if (!client->packets) {
-			goto delete_client;
+			DEBUG("proto_%s - No packets are using unconnected socket", inst->app_io->common.name);
+			fr_io_client_delete(client);
+			return;
 		}
 
 		/*
@@ -2001,13 +2373,13 @@ static void client_expiry_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
 	}
 
 	fr_assert(!connection);
-	fr_assert(client->ht != NULL);
 
 	/*
 	 *	Find out how many connections are using this
 	 *	client.
 	 */
 	pthread_mutex_lock(&client->mutex);
+	fr_assert(client->ht != NULL);
 	connections = fr_hash_table_num_elements(client->ht);
 	pthread_mutex_unlock(&client->mutex);
 
@@ -2025,11 +2397,12 @@ idle_timeout:
 		 */
 		if (client->ready_to_delete) {
 			if (connection) {
-				DEBUG("proto_%s - idle timeout for connection %s", inst->app_io->name, connection->name);
+				DEBUG("proto_%s - idle timeout for connection %s", inst->app_io->common.name, connection->name);
 			} else {
-				DEBUG("proto_%s - idle timeout for client %s", inst->app_io->name, client->radclient->shortname);
+				DEBUG("proto_%s - idle timeout for client %s", inst->app_io->common.name, client->radclient->shortname);
 			}
-			goto delete_client;
+			fr_io_client_delete(client);
+			return;
 		}
 
 		/*
@@ -2037,7 +2410,7 @@ idle_timeout:
 		 *	idle timeut.
 		 */
 		client->ready_to_delete = true;
-		delay = inst->idle_timeout;
+		delay = client->state == PR_CLIENT_DYNAMIC ? inst->dynamic_timeout : inst->idle_timeout;
 		goto reset_timer;
 	}
 
@@ -2054,10 +2427,10 @@ idle_timeout:
 	delay = inst->check_interval;
 
 reset_timer:
-	if (fr_event_timer_in(client, el, &client->ev,
-			      delay, client_expiry_timer, client) < 0) {
+	if (fr_timer_in(client, tl, &client->ev,
+			delay, false, client_expiry_timer, client) < 0) {
 		ERROR("proto_%s - Failed adding timeout for dynamic client %s.  It will be permanent!",
-		      inst->app_io->name, client->radclient->shortname);
+		      inst->app_io->common.name, client->radclient->shortname);
 		return;
 	}
 
@@ -2068,7 +2441,7 @@ reset_timer:
 /*
  *	Expire cached packets after cleanup_delay time
  */
-static void packet_expiry_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
+static void packet_expiry_timer(fr_timer_list_t *tl, fr_time_t now, void *uctx)
 {
 	fr_io_track_t *track = talloc_get_type_abort(uctx, fr_io_track_t);
 	fr_io_client_t *client = track->client;
@@ -2079,36 +2452,37 @@ static void packet_expiry_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
 	 *
 	 *	On duplicates this also extends the expiry timer.
 	 */
-	if (!now && !track->discard && inst->app_io->track_duplicates) {
-		fr_assert(inst->cleanup_delay > 0);
+	if (fr_time_eq(now, fr_time_wrap(0)) && !track->discard && inst->app_io->track_duplicates) {
+		fr_assert(fr_time_delta_ispos(inst->cleanup_delay));
 		fr_assert(track->do_not_respond || track->reply_len);
 
-		track->expires = fr_time() + inst->cleanup_delay;
+		track->expires = fr_time_add(fr_time(), inst->cleanup_delay);
 
 		/*
 		 *	if the timer succeeds, then "track"
 		 *	will be cleaned up when the timer
 		 *	fires.
 		 */
-		if (fr_event_timer_at(track, el, &track->ev,
-				      track->expires, packet_expiry_timer, track) == 0) {
-			DEBUG("proto_%s - cleaning up request in %d.%06ds", inst->app_io->name,
-			      (int) (inst->cleanup_delay / NSEC), (int) (inst->cleanup_delay % NSEC));
+		if (fr_timer_at(track, tl, &track->ev,
+				track->expires,
+				false, packet_expiry_timer, track) == 0) {
+			DEBUG("proto_%s - cleaning up request in %.6fs", inst->app_io->common.name,
+			      fr_time_delta_to_sec_double(inst->cleanup_delay));
 			return;
 		}
 
 		DEBUG("proto_%s - Failed adding cleanup_delay for packet.  Discarding packet immediately",
-		      inst->app_io->name);
+		      inst->app_io->common.name);
 	}
 
 	/*
 	 *	So that all cleanup paths can come here, not just the
 	 *	timeout ones.
 	 */
-	if (now) {
-		DEBUG2("TIMER - proto_%s - cleanup delay", inst->app_io->name);
+	if (fr_time_neq(now, fr_time_wrap(0))) {
+		DEBUG2("TIMER - proto_%s - cleanup delay", inst->app_io->common.name);
 	} else {
-		DEBUG2("proto_%s - cleaning up", inst->app_io->name);
+		DEBUG2("proto_%s - cleaning up", inst->app_io->common.name);
 	}
 
 	/*
@@ -2121,7 +2495,6 @@ static void packet_expiry_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
 	 */
 	if (client->state == PR_CLIENT_STATIC) return;
 
-	fr_assert(client->state != PR_CLIENT_NAK);
 	fr_assert(client->state != PR_CLIENT_PENDING);
 
 	/*
@@ -2129,30 +2502,230 @@ static void packet_expiry_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
 	 *	the client.
 	 */
 	if (client->packets == 0) {
-		client_expiry_timer(el, now, client);
+		client_expiry_timer(tl, now, client);
 	}
 }
 
-static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_time,
-			 uint8_t *buffer, size_t buffer_len, size_t written)
+static void update_client(fr_io_client_t *client, fr_client_t *radclient)
+{
+
+	/*
+	 *	The new client is mostly OK.  Copy the various fields
+	 *	over.
+	 */
+#define COPY_FIELD(_dest, _x) _dest->radclient->_x = radclient->_x
+#define DUP_FIELD(_dest, _x) _dest->radclient->_x = talloc_strdup(_dest->radclient, radclient->_x)
+
+	/*
+	 *	Only these two fields are set.  Other strings in
+	 *	radclient are copies of these ones.
+	 */
+	talloc_const_free(client->radclient->shortname);
+	talloc_const_free(client->radclient->secret);
+
+	DUP_FIELD(client, longname);
+	DUP_FIELD(client, shortname);
+	DUP_FIELD(client, secret);
+	DUP_FIELD(client, nas_type);
+
+	COPY_FIELD(client, ipaddr);
+	COPY_FIELD(client, src_ipaddr);
+	COPY_FIELD(client, require_message_authenticator);
+	COPY_FIELD(client, require_message_authenticator_is_set);
+#ifdef NAS_VIOLATES_RFC
+	COPY_FIELD(client, allow_vulnerable_clients);
+#endif
+	COPY_FIELD(client, limit_proxy_state);
+	COPY_FIELD(client, limit_proxy_state_is_set);
+	COPY_FIELD(client, use_connected);
+	COPY_FIELD(client, cs);
+}
+
+/** Tear down any deferred sibling connections under a pending parent.
+ *
+ *  This function is Cclled from mod_write() when the first connection dynamic-client verification fails (NAK
+ *  or hard reject).  Any other connections that were inserted into parent->ht are then freed.
+ *
+ *  Walk parent->ht, find every deferred sibling, remove it from the hash table, close the socket, and frees
+ *  its module instance (which cascades to the connection itself).  The first connection (the one whose
+ *  verification just failed) is identified by conn->nr != NULL and is left alone, as the caller already owns
+ *  its cleanup.
+ *
+ *  Uses a find-one-then-restart loop rather than iterate-while-deleting, since the deferred sibling count is
+ *  small and the cost is irrelevant on the failure path.
+ */
+static void fr_io_connection_deny(fr_io_client_t *parent)
+{
+	if (!parent->ht) return;
+
+	while (true) {
+		fr_hash_iter_t		iter;
+		fr_io_connection_t	*target = NULL;
+		fr_io_connection_t	*conn;
+
+		pthread_mutex_lock(&parent->mutex);
+		for (conn = fr_hash_table_iter_init(parent->ht, &iter);
+		     conn != NULL;
+		     conn = fr_hash_table_iter_next(parent->ht, &iter)) {
+			if (conn->nr != NULL) continue;				/* first child, owned by caller */
+			if (conn->client->state != PR_CLIENT_PENDING) continue;	/* already NAK or promoted */
+			target = conn;
+			break;
+		}
+		if (target && target->in_parent_hash) {
+			target->in_parent_hash = false;
+			(void) fr_hash_table_delete(parent->ht, target);
+		}
+		pthread_mutex_unlock(&parent->mutex);
+
+		if (!target) break;
+
+		DEBUG("proto_%s - cleaning up deferred connection %s after verification failure",
+		      target->client->inst->app_io->common.name, target->name);
+
+		if (target->child_inst) {
+			if (target->client->inst->app_io->close) {
+				(void) target->client->inst->app_io->close(target->child_inst);
+			} else if (target->child_inst->fd >= 0) {
+				close(target->child_inst->fd);
+			}
+		}
+
+		talloc_free(target->mi);
+	}
+}
+
+/** Promote a pending dynamic-client parent and all of its child connections.
+ *
+ *  When multiple TCP connections from the same source IP arrive while the parent client is still
+ *  PR_CLIENT_PENDING, only the first connection is added to the scheduler.  Later connection are inserted
+ *  into the parent's hash table, but their fr_schedule_listen_add() call is deferred to this function.  When
+ *  the first connection verification completes successfully, every other connection is finished and
+ *  scheduled.
+ *
+ *  This function:
+ *
+ *  * Promotes the parent itself to PR_CLIENT_DYNAMIC and re-parents the cs.
+ *
+ *  * Walks the parent's hash table of connections.  For the first connection (already in the scheduler with
+ *    connection->nr set), it resumes reads if the connection was paused.  For every later connection,
+ *    (connection->nr == NULL), it copies the verified radclient definition onto the connection and then calls
+ *    fr_schedule_listen_add() to add the connection to the scheduler.
+ *
+ *  @param parent     the parent client whose state and child connections to promote
+ *  @param radclient  the verified radclient (typically the calling child's radclient)
+ */
+static void fr_io_connection_allow(fr_io_client_t *parent, fr_client_t *radclient)
+{
+	fr_hash_iter_t		iter;
+	fr_io_connection_t	*conn;
+	fr_schedule_t		*sc = parent->thread->sc;
+
+	/*
+	 *	Promote the parent itself.  Only the first connection to reach here does the work; later
+	 *	connections will already see the parent as PR_CLIENT_DYNAMIC.
+	 */
+	if (parent->state == PR_CLIENT_PENDING) {
+		parent->radclient->active = true;
+		parent->state = PR_CLIENT_DYNAMIC;
+
+		update_client(parent, radclient);
+
+		/*
+		 *	Re-parent the conf section used to build this
+		 *	client so its lifetime is linked to the parent
+		 *	client.
+		 */
+		talloc_steal(parent->radclient, parent->radclient->cs);
+	} else {
+		fr_assert(parent->state == PR_CLIENT_DYNAMIC);
+	}
+
+	/*
+	 *	Walk every child connection of this parent and promote the pending ones.  The calling
+	 *	connection is itself in parent->ht, so its per-child work is also done here.
+	 */
+	pthread_mutex_lock(&parent->mutex);
+	if (parent->ht) {
+		for (conn = fr_hash_table_iter_init(parent->ht, &iter);
+		     conn != NULL;
+		     conn = fr_hash_table_iter_next(parent->ht, &iter)) {
+			fr_io_client_t *child = conn->client;
+
+			if (child->state != PR_CLIENT_PENDING) continue;
+
+			/*
+			 *	Connections can't spawn new connections.
+			 */
+			child->use_connected = child->radclient->use_connected = false;
+
+			if (conn->nr == NULL) {
+				/*
+				 *	Deferred connection: its radclient was cloned from the parent's
+				 *	placeholder before verification, so copy the now-verified fields onto
+				 *	it before adding it to the scheduler.
+				 */
+				update_client(child, radclient);
+
+				child->state = PR_CLIENT_DYNAMIC;
+				child->radclient->active = true;
+
+				DEBUG("proto_%s - scheduling deferred connection %s",
+				      child->inst->app_io->common.name, conn->name);
+
+				conn->nr = fr_schedule_listen_add(sc, conn->inst);
+				if (!conn->nr) {
+					ERROR("proto_%s - Failed scheduling deferred connection %s",
+					      child->inst->app_io->common.name, conn->name);
+					/*
+					 *	Leave the entry in the hash table; the usual connection
+					 *	cleanup path will eventually remove it.
+					 */
+				}
+			} else {
+				/*
+				 *	The first connection is already scheduled.  Resume reads if it was
+				 *	paused, while waiting on verification.
+				 */
+				if (conn->paused) {
+					conn->paused = false;
+					(void) fr_event_filter_update(conn->el, conn->child_inst->fd,
+								      FR_EVENT_FILTER_IO, resume_read);
+				}
+
+				child->state = PR_CLIENT_DYNAMIC;
+				child->radclient->active = true;
+			}
+		}
+	}
+	pthread_mutex_unlock(&parent->mutex);
+}
+
+static ssize_t mod_write(fr_listen_instance_t *li, void *packet_ctx, fr_time_t request_time, uint8_t *buffer,
+			 size_t buffer_len, size_t written)
 {
 	fr_io_instance_t const *inst;
 	fr_io_thread_t *thread;
 	fr_io_connection_t *connection;
 	fr_io_track_t *track = talloc_get_type_abort(packet_ctx, fr_io_track_t);
 	fr_io_client_t *client;
-	RADCLIENT *radclient;
-	fr_listen_t *child;
+	fr_client_t *radclient;
+	fr_listen_instance_t *child;
 	fr_event_list_t *el;
+	char const *name;
 
 	get_inst(li, &inst, &thread, &connection, &child);
 
 	client = track->client;
 	if (connection) {
 		el = connection->el;
+		name = connection->name;
 	} else {
 		el = thread->el;
+		name = li->name;
 	}
+
+	DEBUG3("Processing reply for %s", name);
 
 	/*
 	 *	A fully defined client means that we just send the reply.
@@ -2163,15 +2736,13 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		track->finished = true;
 
 		/*
-		 *	The request later received a conflicting
-		 *	packet, so we discard this one.
+		 *	The request received a conflicting packet, so we
+		 *	discard this one.
 		 */
-		if ((track->timestamp != request_time) || track->discard) {
+		if (fr_time_neq(track->timestamp, request_time) || track->discard) {
 			fr_assert(track->packets > 0);
 			track->packets--;
-
-			DEBUG3("Suppressing reply as we have a newer packet");
-
+			DEBUG3("Suppressing reply as we have a newer / conflicing packet from the same source");
 			track->discard = true;
 			goto setup_timer;
 		}
@@ -2183,6 +2754,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		 *	"do not respond" reply for a period of time.
 		 */
 		if ((buffer_len == 1) || track->do_not_respond) {
+			DEBUG3("Not sending response to request - it is marked as 'do not respond'");
 			track->do_not_respond = true;
 			goto setup_timer;
 		}
@@ -2194,8 +2766,9 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		packet_len = inst->app_io->write(child, track, request_time,
 						 buffer, buffer_len, written);
 		if (packet_len <= 0) {
+			ERROR("Failed writing the reply - not sending any response on %s", name);
 			track->discard = true;
-			packet_expiry_timer(el, 0, track);
+			packet_expiry_timer(el->tl, fr_time_wrap(0), track);
 			return packet_len;
 		}
 
@@ -2205,6 +2778,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		 *	the expiry timer at that point.
 		 */
 		if ((size_t) packet_len < buffer_len) {
+			DEBUG3("Partial write (%zd < %zu)", packet_len, buffer_len);
 			return packet_len;
 		}
 
@@ -2212,7 +2786,10 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		 *	We're not tracking duplicates, so just expire
 		 *	the packet now.
 		 */
-		if (!inst->app_io->track_duplicates) goto setup_timer;
+		if (!inst->app_io->track_duplicates) {
+			DEBUG3("Not tracking duplicates - expiring the request");
+			goto setup_timer;
+		}
 
 		/*
 		 *	Cache the reply packet if we're doing dedup.
@@ -2221,6 +2798,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		 *	already filled out.  So we don't do that twice.
 		 */
 		if (!track->reply) {
+			DEBUG3("Caching reply");
 			MEM(track->reply = talloc_memdup(track, buffer, buffer_len));
 			track->reply_len = buffer_len;
 		}
@@ -2231,7 +2809,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		 *	On dedup this also extends the timer.
 		 */
 	setup_timer:
-		packet_expiry_timer(el, 0, track);
+		packet_expiry_timer(el->tl, fr_time_wrap(0), track);
 		return buffer_len;
 	}
 
@@ -2245,52 +2823,59 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 	fr_assert(client->pending != NULL);
 
 	/*
-	 *	The request has timed out trying to define the dynamic
-	 *	client.  Oops... try again.
-	 */
-	if ((buffer_len == 1) && (*buffer == true)) {
-		DEBUG("Request has timed out trying to define a new client.  Trying again.");
-		goto reread;
-	}
-
-	/*
-	 *	The dynamic client was NOT defined.  Set it's state to
-	 *	NAK, delete all pending packets, and close the
-	 *	tracking table.
+	 *	We have a response that indicates the dynamic client creation failed.  Delete the client, and
+	 *	all pending packets.  Then, add the connection to the NAK cache.
 	 */
 	if (buffer_len == 1) {
-		client->state = PR_CLIENT_NAK;
-		TALLOC_FREE(client->pending);
-		if (client->table) TALLOC_FREE(client->table);
-		fr_assert(client->packets == 0);
+		if (*buffer == true) {
+			DEBUG("Request failed trying to define a new client.  Discarding client and pending packets.");
+		} else {
+			INFO("proto_%s - Verification failed for packet from dynamic client %pV - adding IP address to the NAK cache",
+			     inst->app_io->common.name, fr_box_ipaddr(client->src_ipaddr));
 
-		/*
-		 *	If we're a connected UDP socket, allocate a
-		 *	new connection which is the place-holder for
-		 *	the NAK.  We will reject packets from from the
-		 *	src/dst IP/port.
-		 *
-		 *	The timer will take care of deleting the NAK
-		 *	connection (which doesn't have any FDs
-		 *	associated with it).  The network side will
-		 *	call mod_close() when the original connection
-		 *	is done, which will then free that connection,
-		 *	too.
-		 */
-		if (connection && (inst->ipproto == IPPROTO_UDP)) {
-			connection = fr_io_connection_alloc(inst, thread, client, -1, connection->address, connection);
-			client_expiry_timer(el, 0, connection->client);
+			fr_io_nak_insert(client->thread, &client->src_ipaddr, inst->nak_lifetime);
+		}
 
-			errno = ECONNREFUSED;
-			return -1;
+		if (!connection) {
+			talloc_free(client);
+			return buffer_len;
 		}
 
 		/*
-		 *	For connected TCP sockets, we just call the
-		 *	expiry timer, which will close and free the
-		 *	connection.
+		 *	Free pending packets and tracking table.
+		 *	The table is parented by connection->parent, so won't
+		 *	be auto-freed when connection->client is freed.
 		 */
-		client_expiry_timer(el, 0, client);
+		TALLOC_FREE(client->pending);
+		if (client->table) TALLOC_FREE(client->table);
+
+		/*
+		 *	Remove from parent's hash table so new packets won't
+		 *	be routed to this connection.
+		 */
+		pthread_mutex_lock(&connection->parent->mutex);
+		if (connection->in_parent_hash) {
+			connection->in_parent_hash = false;
+			(void) fr_hash_table_delete(connection->parent->ht, connection);
+		}
+		pthread_mutex_unlock(&connection->parent->mutex);
+
+		/*
+		 *	Tear down any sibling connections that were
+		 *	deferred waiting on this verification.
+		 */
+		fr_io_connection_deny(connection->parent);
+
+		/*
+		 *	Mark the connection as dead, then trigger the
+		 *	standard cleanup path via fr_network_listen_read().
+		 *	This calls mod_read(), which sees connection->dead,
+		 *	returns -1, and the network layer closes the
+		 *	connection through its normal error handling.
+		 */
+		connection->dead = true;
+		fr_network_listen_read(connection->nr, connection->inst);
+
 		return buffer_len;
 	}
 
@@ -2307,7 +2892,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		 *	for unconnected sockets.
 		 */
 		if (client->network.af != radclient->ipaddr.af) {
-			DEBUG("Client IP address %pV IP version does not match the source network %pV of the packet.",
+			DEBUG("Client IP address %pV IP family does not match the source network %pV of the packet.",
 			      fr_box_ipaddr(radclient->ipaddr), fr_box_ipaddr(client->network));
 			goto error;
 		}
@@ -2343,7 +2928,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		     (radclient->ipaddr.prefix != 32)) ||
 		    ((radclient->ipaddr.af == AF_INET6) &&
 		     (radclient->ipaddr.prefix != 128))) {
-			ERROR("prot_radius - Cannot define a dynamic client as a network");
+			ERROR("Cannot define a dynamic client as a network");
 
 		error:
 			talloc_free(radclient);
@@ -2357,28 +2942,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		}
 	}
 
-	/*
-	 *	The new client is mostly OK.  Copy the various fields
-	 *	over.
-	 */
-#define COPY_FIELD(_x) client->radclient->_x = radclient->_x
-#define DUP_FIELD(_x) client->radclient->_x = talloc_strdup(client->radclient, radclient->_x)
-
-	/*
-	 *	Only these two fields are set.  Other strings in
-	 *	radclient are copies of these ones.
-	 */
-	talloc_const_free(client->radclient->shortname);
-	talloc_const_free(client->radclient->secret);
-
-	DUP_FIELD(longname);
-	DUP_FIELD(shortname);
-	DUP_FIELD(secret);
-	DUP_FIELD(nas_type);
-
-	COPY_FIELD(ipaddr);
-	COPY_FIELD(message_authenticator);
-	COPY_FIELD(use_connected);
+	update_client(client, radclient);
 
 	// @todo - fill in other fields?
 
@@ -2387,7 +2951,6 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 	radclient = client->radclient; /* laziness */
 	radclient->server_cs = inst->server_cs;
 	radclient->server = cf_section_name2(inst->server_cs);
-	radclient->cs = NULL;
 
 	/*
 	 *	This is a connected socket, and it's just been
@@ -2399,29 +2962,21 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		fr_assert(connection->client == client);
 		fr_assert(client->connection != NULL);
 
-		client->state = PR_CLIENT_CONNECTED;
-
-		radclient->active = true;
-
 		/*
-		 *	Connections can't spawn new connections.
+		 *	Promote the parent and every sibling connection.
+		 *	This also promotes the current child.
 		 */
-		client->use_connected = radclient->use_connected = false;
+		fr_io_connection_allow(connection->parent, radclient);
 
-		/*
-		 *	If we were paused. resume reading from the
-		 *	connection.
-		 *
-		 *	Note that the event list doesn't like resuming
-		 *	a connection that isn't paused.  It just sets
-		 *	the read function to NULL.
-		 */
-		if (connection->paused) {
-			(void) fr_event_filter_update(el, child->fd,
-						      FR_EVENT_FILTER_IO, resume_read);
-		}
-
+		INFO("proto_%s - Verification succeeded for packet from dynamic client %pV - processing queued packets",
+		     inst->app_io->common.name,	fr_box_ipaddr(client->src_ipaddr));
 		goto finish;
+	} else {
+		/*
+		 *	Re-parent the conf section used to build this client
+		 *	so its lifetime is linked to the client
+		 */
+		talloc_steal(radclient, radclient->cs);
 	}
 
 	fr_assert(connection == NULL);
@@ -2432,7 +2987,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 	 */
 	if (radclient->use_connected && !inst->app_io->connection_set) {
 		DEBUG("proto_%s - cannot use connected sockets as underlying 'transport = %s' does not support it.",
-		      inst->app_io->name, inst->transport);
+		      inst->app_io->common.name, inst->submodule->module->exported->name);
 		goto error;
 	}
 
@@ -2464,6 +3019,10 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		 */
 		client->state = PR_CLIENT_DYNAMIC;
 		client->radclient->active = true;
+
+		INFO("proto_%s - Verification succeeded for packet from dynamic client %pV - processing %u queued packets",
+		     inst->app_io->common.name,	fr_box_ipaddr(client->src_ipaddr),
+		     fr_heap_num_elements(client->pending));
 	}
 
 	/*
@@ -2477,8 +3036,8 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 							   fr_io_client_t, pending_id, 0));
 	}
 
-	fr_assert(client->pending_id < 0);
-	(void) fr_heap_insert(thread->pending_clients, client);
+	fr_assert(!fr_heap_entry_inserted((client->pending_id)));
+	(void) fr_heap_insert(&thread->pending_clients, client);
 
 finish:
 	/*
@@ -2486,10 +3045,9 @@ finish:
 	 *	timed out, so there's nothing more to do.  In that case, set up the expiry timers.
 	 */
 	if (client->packets == 0) {
-		client_expiry_timer(el, 0, client);
+		client_expiry_timer(el->tl, fr_time_wrap(0), client);
 	}
 
-reread:
 	/*
 	 *	If there are pending packets (and there should be at
 	 *	least one), tell the network socket to call our read()
@@ -2497,9 +3055,9 @@ reread:
 	 */
 	if (fr_heap_num_elements(client->pending) > 0) {
 		if (connection) {
-			fr_network_listen_read(connection->nr, connection->listen);
+			fr_network_listen_read(connection->nr, connection->inst);
 		} else {
-			fr_network_listen_read(thread->nr, thread->listen);
+			fr_network_listen_read(thread->nr, thread->inst);
 		}
 	}
 
@@ -2509,11 +3067,11 @@ reread:
 /** Close the socket.
  *
  */
-static int mod_close(fr_listen_t *li)
+static int mod_close(fr_listen_instance_t *li)
 {
 	fr_io_instance_t const *inst;
 	fr_io_connection_t *connection;
-	fr_listen_t *child;
+	fr_listen_instance_t *child;
 
 	get_inst(li, &inst, NULL, &connection, &child);
 
@@ -2537,21 +3095,38 @@ static int mod_close(fr_listen_t *li)
 	if (connection->client->pending) {
 		TALLOC_FREE(connection->client->pending); /* for any pending packets */
 	}
-	talloc_free(connection->dl_inst);
+
+	/*
+	 *	Remove connection from parent hash table
+	 */
+	pthread_mutex_lock(&connection->parent->mutex);
+	if (connection->in_parent_hash) {
+		connection->in_parent_hash = false;
+		(void) fr_hash_table_delete(connection->parent->ht, connection);
+	}
+
+	/*
+	 *	If this is a dynamic client, and the parent has no more connections
+	 *	set up the timer to expire the dynamic client.
+	 */
+	if ((connection->parent->state == PR_CLIENT_DYNAMIC) &&
+	    ((!connection->parent->ht) || (fr_hash_table_num_elements(connection->parent->ht) == 0))) {
+		client_expiry_timer(connection->el->tl, fr_time_wrap(0), connection->parent);
+	}
+	pthread_mutex_unlock(&connection->parent->mutex);
+
+	talloc_free(connection->mi);
 
 	return 0;
 }
 
-
-static int mod_bootstrap(void *instance, CONF_SECTION *cs)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	fr_io_instance_t *inst = instance;
+	fr_io_instance_t *inst = mctx->mi->data;
+	CONF_SECTION *conf = mctx->mi->conf;
 
-	/*
-	 *	Find and bootstrap the application IO handler.
-	 */
-	inst->app_io = (fr_app_io_t const *) inst->submodule->module->common;
-
+	inst->mi = mctx->mi;
+	inst->app_io = (fr_app_io_t const *) inst->submodule->exported;
 	inst->app_io_conf = inst->submodule->conf;
 	inst->app_io_instance = inst->submodule->data;
 
@@ -2562,7 +3137,7 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 	 *	If we are tracking duplicates, then we must have a non-zero cleanup delay.
 	 */
 	if (!inst->app_io->track_duplicates) {
-		inst->cleanup_delay = 0;
+		inst->cleanup_delay = fr_time_delta_wrap(0);
 
 	} else {
 		FR_TIME_DELTA_BOUND_CHECK("cleanup_delay", inst->cleanup_delay, >=, fr_time_delta_from_sec(1));
@@ -2573,119 +3148,64 @@ static int mod_bootstrap(void *instance, CONF_SECTION *cs)
 		}
 	}
 
-	if (inst->app_io->bootstrap && (inst->app_io->bootstrap(inst->app_io_instance,
-								inst->app_io_conf) < 0)) {
-		cf_log_err(inst->app_io_conf, "Bootstrap failed for proto_%s", inst->app_io->name);
-		return -1;
-	}
-
 	/*
 	 *	Get various information after bootstrapping the
 	 *	application IO module.
 	 */
 	if (inst->app_io->network_get) {
-		inst->app_io->network_get(inst->app_io_instance, &inst->ipproto, &inst->dynamic_clients, &inst->networks);
+		inst->app_io->network_get(&inst->ipproto, &inst->dynamic_clients, &inst->networks, inst->app_io_instance);
+	}
+
+	if ((inst->ipproto == IPPROTO_TCP) && !inst->app_io->connection_set) {
+		cf_log_err(inst->app_io_conf, "Missing 'connection set' API for proto_%s", inst->app_io->common.name);
+		return -1;
 	}
 
 	/*
-	 *	The caller determines if we have dynamic clients.
+	 *	Ensure that the dynamic client sections exist
 	 */
 	if (inst->dynamic_clients) {
-		/*
-		 *	Load proto_dhcpv4_dynamic_client
-		 */
-		if (dl_module_instance(cs, &inst->dynamic_submodule,
-				cs, inst->dl_inst, "dynamic_client", DL_MODULE_TYPE_SUBMODULE) < 0) {
-			cf_log_err(cs, "Failed finding proto_%s_dynamic_client", inst->app->name);
+		CONF_SECTION *server = cf_item_to_section(cf_parent(conf));
+
+		if (!cf_section_find(server, "new", "client")) {
+			cf_log_err(conf, "Cannot use 'dynamic_clients = yes' as the virtual server has no 'new client { ... }' section defined.");
 			return -1;
 		}
 
-		fr_assert(inst->dynamic_submodule != NULL);
+		if (!cf_section_find(server, "add", "client")) {
+			cf_log_warn(conf, "No 'add client { ... }' section was defined.");
+		}
 
-		/*
-		 *	Don't bootstrap the dynamic submodule.  We're
-		 *	not even sure what that means...
-		 *
-		 *	@todo - maybe register the sections in
-		 *	app_process->compile_list?
-		 */
+		if (!cf_section_find(server, "deny", "client")) {
+			cf_log_warn(conf, "No 'deny client { ... }' section was defined.");
+		}
 	}
 
-	if (inst->ipproto && !inst->app_io->connection_set) {
-		cf_log_err(inst->app_io_conf, "Cannot set TCP for proto_%s - internal set error", inst->app_io->name);
-		return -1;
-	}
+	/*
+	 *	Create a list of client modules.
+	 *
+	 *	FIXME - Probably only want to do this for connected sockets?
+	 *
+	 *	FIXME - We probably want write protect enabled?
+	 */
+	inst->clients = module_list_alloc(inst, &module_list_type_thread_local, "clients", false);
+	module_list_mask_set(inst->clients, MODULE_INSTANCE_BOOTSTRAPPED);
 
 	return 0;
 }
 
 
-static char const *mod_name(fr_listen_t *li)
+static char const *mod_name(fr_listen_instance_t *li)
 {
 	fr_io_thread_t *thread;
 	fr_io_connection_t *connection;
-	fr_listen_t *child;
+	fr_listen_instance_t *child;
 	fr_io_instance_t const *inst;
 
 	get_inst(li, &inst, &thread, &connection, &child);
 
 	fr_assert(child != NULL);
-	return child->app_io->get_name(child);
-}
-
-
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
-{
-	fr_io_instance_t *inst = instance;
-
-	fr_assert(inst->app_io != NULL);
-
-	if (inst->app_io->instantiate &&
-	    (inst->app_io->instantiate(inst->app_io_instance,
-				       inst->app_io_conf) < 0)) {
-		cf_log_err(conf, "Instantiation failed for \"proto_%s\"", inst->app_io->name);
-		return -1;
-	}
-
-	/*
-	 *	Instantiate the dynamic client processor.
-	 */
-	if (inst->dynamic_clients) {
-		fr_app_worker_t const	*app_process;
-
-		if (!inst->dynamic_submodule) {
-			cf_log_err(conf, "Instantiation failed for \"proto_%s\" - there is no way to define dynamic clients", inst->app_io->name);
-			return -1;
-		}
-
-		app_process = (fr_app_worker_t const *) inst->dynamic_submodule->module->common;
-
-		/*
-		 *	Compile the processing sections if the compile
-		 *	list exists.
-		 *
-		 *	Note that we don't register these sections.
-		 *	Maybe we should?
-		 */
-		if (app_process->compile_list) {
-			tmpl_rules_t		parse_rules;
-
-			memset(&parse_rules, 0, sizeof(parse_rules));
-			parse_rules.dict_def = virtual_server_namespace(cf_section_name2(inst->server_cs));
-
-			if (virtual_server_compile_sections(inst->server_cs, app_process->compile_list,
-							    &parse_rules, inst->dynamic_submodule->data) < 0) {
-				return -1;
-			}
-		}
-
-		if (app_process->instantiate && (app_process->instantiate(inst->dynamic_submodule->data, conf) < 0)) {
-			cf_log_err(conf, "Instantiation failed for \"%s\"", app_process->name);
-			return -1;
-		}
-	}
-
-	return 0;
+	return child->listen->app_io->get_name(child);
 }
 
 /** Create a trie from arrays of allow / deny IP addresses
@@ -2715,7 +3235,7 @@ fr_trie_t *fr_master_io_network(TALLOC_CTX *ctx, int af, fr_ipaddr_t *allow, fr_
 		 *	Can't add v4 networks to a v6 socket, or vice versa.
 		 */
 		if (allow[i].af != af) {
-			fr_strerror_printf("Address family in entry %zd - 'allow = %pV' "
+			fr_strerror_printf("Address family in entry %zu - 'allow = %pV' "
 					   "does not match 'ipaddr'", i + 1, fr_box_ipaddr(allow[i]));
 			talloc_free(trie);
 			return NULL;
@@ -2784,7 +3304,7 @@ fr_trie_t *fr_master_io_network(TALLOC_CTX *ctx, int af, fr_ipaddr_t *allow, fr_
 		 *	Can't add v4 networks to a v6 socket, or vice versa.
 		 */
 		if (deny[i].af != af) {
-			fr_strerror_printf("Address family in entry %zd - 'deny = %pV' "
+			fr_strerror_printf("Address family in entry %zu - 'deny = %pV' "
 					   "does not match 'ipaddr'", i + 1, fr_box_ipaddr(deny[i]));
 			talloc_free(trie);
 			return NULL;
@@ -2807,7 +3327,7 @@ fr_trie_t *fr_master_io_network(TALLOC_CTX *ctx, int af, fr_ipaddr_t *allow, fr_
 		network = fr_trie_lookup_by_key(trie,
 					 &deny[i].addr, deny[i].prefix);
 		if (!network) {
-			fr_strerror_printf("The network in entry %zd - 'deny = %pV' is not "
+			fr_strerror_printf("The network in entry %zu - 'deny = %pV' is not "
 					   "contained within a previous 'allow'", i + 1, fr_box_ipaddr(deny[i]));
 			talloc_free(trie);
 			return NULL;
@@ -2819,7 +3339,7 @@ fr_trie_t *fr_master_io_network(TALLOC_CTX *ctx, int af, fr_ipaddr_t *allow, fr_
 		 *	adding a "deny" inside of a "deny".
 		 */
 		if (network->af != af) {
-			fr_strerror_printf("The network in entry %zd - 'deny = %pV' is overlaps "
+			fr_strerror_printf("The network in entry %zu - 'deny = %pV' is overlaps "
 					   "with another 'deny' rule", i + 1, fr_box_ipaddr(deny[i]));
 			talloc_free(trie);
 			return NULL;
@@ -2848,40 +3368,13 @@ fr_trie_t *fr_master_io_network(TALLOC_CTX *ctx, int af, fr_ipaddr_t *allow, fr_
 }
 
 
-static int _thread_io_free(fr_io_thread_t *thread)
-{
-	fr_io_client_t *client;
 
-	/*
-	 *	Each client is it's own talloc context, so we have to
-	 *	clean them up individually.
-	 *
-	 *	The client destructor will remove them from the heap,
-	 *	so we don't need to do that here.
-	 *
-	 *	Note that the clients *also* use thread->trie, so we
-	 *	have to free the clients *before* freeing thread->trie.
-	 */
-	while ((client = fr_heap_peek(thread->alive_clients)) != NULL) {
-		talloc_free(client);
-	}
-
-	return 0;
-}
-
-int fr_io_listen_free(fr_listen_t *li)
-{
-	if (!li->thread_instance) return 0;
-
-	talloc_free(li->thread_instance);
-	return 0;
-}
-
-int fr_master_io_listen(TALLOC_CTX *ctx, fr_io_instance_t *inst, fr_schedule_t *sc,
+int fr_master_io_listen(fr_io_instance_t *inst, fr_schedule_t *sc,
 			size_t default_message_size, size_t num_messages)
 {
-	fr_listen_t	*li, *child;
-	fr_io_thread_t	*thread;
+	fr_listen_instance_t	*li, *child;
+	fr_listen_t		*listen, *child_listen;
+	fr_io_thread_t		*thread;
 
 	/*
 	 *	No IO paths, so we don't initialize them.
@@ -2891,19 +3384,16 @@ int fr_master_io_listen(TALLOC_CTX *ctx, fr_io_instance_t *inst, fr_schedule_t *
 		return 0;
 	}
 
-	if (!inst->app_io->thread_inst_size) {
+	if (!inst->app_io->common.thread_inst_size) {
 		fr_strerror_const("IO modules MUST set 'thread_inst_size' when using the master IO handler.");
 		return -1;
 	}
 
 	/*
-	 *	Build the #fr_listen_t.  This describes the complete
+	 *	Build the #fr_listen_instance_t.  This describes the complete
 	 *	path data takes from the socket to the decoder and
 	 *	back again.
 	 */
-	MEM(li = talloc_zero(ctx, fr_listen_t));
-	talloc_set_destructor(li, fr_io_listen_free);
-
 	/*
 	 *	The first listener is the one for the application
 	 *	(e.g. RADIUS).  However, we mangle the IO path to
@@ -2916,39 +3406,42 @@ int fr_master_io_listen(TALLOC_CTX *ctx, fr_io_instance_t *inst, fr_schedule_t *
 	 *	which calls our trampoline functions to do the actual
 	 *	work.
 	 */
-	li->app = inst->app;
-	li->app_instance = inst->app_instance;
-	li->server_cs = inst->server_cs;
+	MEM(listen = fr_listen_alloc(NULL, inst->app_io_conf, inst->server_cs, inst->app, inst->app_instance,
+				     &fr_master_app_io, inst));
 
 	/*
 	 *	Set configurable parameters for message ring buffer.
 	 */
-	li->default_message_size = default_message_size;
-	li->num_messages = num_messages;
+	listen->default_message_size = default_message_size;
+	listen->num_messages = num_messages;
+	listen->track_duplicates = inst->app_io->track_duplicates;
 
 	/*
 	 *	Per-socket data lives here.
 	 */
 	thread = talloc_zero(NULL, fr_io_thread_t);
-	thread->listen = li;
 	thread->sc = sc;
 
-	talloc_set_destructor(thread, _thread_io_free);
-
 	/*
-	 *	Create the trie of clients for this socket.
+	 *	Create the trie of clients and NAK clients.
 	 */
 	MEM(thread->trie = fr_trie_alloc(thread, NULL, NULL));
-	MEM(thread->alive_clients = fr_heap_alloc(thread, alive_client_cmp,
-						   fr_io_client_t, alive_id, 0));
+	MEM(thread->nak_trie = fr_trie_alloc(thread, NULL, NULL));
+	fr_io_nak_list_init(&thread->nak_list);
+
+	if (inst->dynamic_clients) {
+		MEM(thread->alive_clients = fr_heap_alloc(thread, alive_client_cmp,
+							  fr_io_client_t, alive_id, 0));
+	}
 
 	/*
-	 *	Set the listener to call our master trampoline function.
+	 *	The socket of the listener the network reads.
 	 */
-	li->app_io = &fr_master_app_io;
+	MEM(li = fr_listen_instance_alloc(NULL, listen));
+	talloc_set_destructor(li, fr_io_listen_free);
 	li->thread_instance = thread;
-	li->app_io_instance = inst;
-	li->track_duplicates = inst->app_io->track_duplicates;
+	thread->inst = li;
+	if (inst->app_io->hexdump_set) inst->app_io->hexdump_set(li, inst->app_io_instance);
 
 	/*
 	 *	The child listener points to the *actual* IO path.
@@ -2960,33 +3453,26 @@ int fr_master_io_listen(TALLOC_CTX *ctx, fr_io_instance_t *inst, fr_schedule_t *
 	 *	Once the network side calls us, we will call the child
 	 *	listener to do the actual IO.
 	 */
-	child = thread->child = talloc_zero(li, fr_listen_t);
-	memcpy(child, li, sizeof(*child));
+	MEM(child_listen = fr_listen_alloc(listen, listen->cs, listen->server_cs, listen->app, listen->app_instance,
+					   inst->app_io, inst->app_io_instance));
+	child_listen->default_message_size = listen->default_message_size;
+	child_listen->num_messages = listen->num_messages;
+	child_listen->track_duplicates = inst->app_io->track_duplicates;
 
 	/*
-	 *	Reset these fields to point to the IO instance data.
+	 *	The socket of it which does the actual IO.
 	 */
-	child->app_io = inst->app_io;
-	child->track_duplicates = inst->app_io->track_duplicates;
+	MEM(child = thread->child_inst = fr_listen_instance_alloc(li, child_listen));
 
-	if (child->app_io->thread_inst_size > 0) {
+	if (inst->app_io->common.thread_inst_size > 0) {
 		child->thread_instance = talloc_zero_array(NULL, uint8_t,
-							   inst->app_io->thread_inst_size);
+							   inst->app_io->common.thread_inst_size);
 		talloc_set_destructor(child, fr_io_listen_free);
 
 		talloc_set_name(child->thread_instance, "proto_%s_thread_t",
-				inst->app_io->name);
-
-		/*
-		 *	This is "const", and the user can't
-		 *	touch it.  So we just re-use the same
-		 *	configuration everywhere.
-		 */
-		child->app_io_instance = inst->app_io_instance;
-
+				inst->app_io->common.name);
 	} else {
-		child->thread_instance = inst->app_io_instance;
-		child->app_io_instance = child->thread_instance;
+		child->thread_instance = UNCONST(void *, inst->app_io_instance);
 	}
 
 	/*
@@ -2995,17 +3481,16 @@ int fr_master_io_listen(TALLOC_CTX *ctx, fr_io_instance_t *inst, fr_schedule_t *
 	 *	socket for us.
 	 */
 	if (inst->app_io->open(child) < 0) {
-		cf_log_err(inst->app_io_conf, "Failed opening %s interface", inst->app_io->name);
 		talloc_free(li);
 		return -1;
 	}
 
 	li->fd = child->fd;	/* copy this back up */
 
-	if (!child->app_io->get_name) {
-		child->name = child->app_io->name;
+	if (!child->listen->app_io->get_name) {
+		child->name = child->listen->app_io->common.name;
 	} else {
-		child->name = child->app_io->get_name(child);
+		child->name = child->listen->app_io->get_name(child);
 	}
 	li->name = child->name;
 
@@ -3013,14 +3498,13 @@ int fr_master_io_listen(TALLOC_CTX *ctx, fr_io_instance_t *inst, fr_schedule_t *
 	 *	Record which socket we opened.
 	 */
 	if (child->app_io_addr) {
-		fr_listen_t *other;
+		fr_listen_instance_t *other;
 
-		other = listen_find_any(thread->child);
+		other = listen_find_any(thread->child_inst);
 		if (other) {
-			ERROR("Failed opening %s - that port is already in use by another listener in server %s { ... } - %s",
-			      child->name, cf_section_name2(other->server_cs), other->name);
-
-			ERROR("got socket %d %d\n", child->app_io_addr->inet.src_port, other->app_io_addr->inet.src_port);
+			cf_log_err(other->listen->cs, "Already opened socket %s", other->name);
+			cf_log_err(li->listen->cs, "Failed opening duplicate socket - cannot use the same "
+				   "configuration for two different listen sections");
 
 			talloc_free(li);
 			return -1;
@@ -3041,14 +3525,59 @@ int fr_master_io_listen(TALLOC_CTX *ctx, fr_io_instance_t *inst, fr_schedule_t *
 	return 0;
 }
 
+/*
+ *	Used to create a tracking structure for fr_network_sendto_worker()
+ */
+fr_io_track_t *fr_master_io_track_alloc(fr_listen_instance_t *li, fr_client_t *radclient, fr_ipaddr_t const *src_ipaddr,
+					int src_port, fr_ipaddr_t const *dst_ipaddr, int dst_port)
+{
+	fr_io_instance_t const	*inst;
+	fr_io_thread_t		*thread;
+	fr_io_connection_t	*connection;
+	fr_listen_instance_t	*child;
+	fr_io_track_t		*track;
+	fr_io_client_t		*client;
+	fr_io_address_t		*address;
+	fr_listen_instance_t	*parent = talloc_parent(li);
+
+	(void) talloc_get_type_abort(parent, fr_listen_instance_t);
+
+	get_inst(parent, &inst, &thread, &connection, &child);
+
+	fr_assert(child == li);
+
+	if (unlikely(!thread)) return NULL;
+	fr_assert(thread->trie != NULL);
+
+	client = fr_trie_lookup_by_key(thread->trie, &src_ipaddr->addr, src_ipaddr->prefix);
+	if (!client) {
+		MEM(client = client_alloc(thread, PR_CLIENT_STATIC, inst, thread, radclient, NULL));
+	}
+
+	MEM(track = talloc_zero_pooled_object(client->table, fr_io_track_t, 1, sizeof(*track) + sizeof(*track->address) + 64));
+	MEM(track->address = address = talloc_zero(track, fr_io_address_t));
+
+	track->li = li;
+	track->client = client;
+
+	address->socket.inet.src_port = src_port;
+	address->socket.inet.dst_port = dst_port;
+
+	address->socket.inet.src_ipaddr = *src_ipaddr;
+	address->socket.inet.dst_ipaddr = *dst_ipaddr;
+	address->radclient = radclient;
+
+	return track;
+}
+
 
 fr_app_io_t fr_master_app_io = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "radius_master_io",
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "radius_master_io",
 
-	.bootstrap		= mod_bootstrap,
-	.instantiate		= mod_instantiate,
-
+		.instantiate		= mod_instantiate,
+	},
 	.default_message_size	= 4096,
 	.track_duplicates	= true,
 

@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -24,19 +24,17 @@
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_unbound - "
+#define LOG_PREFIX mctx->mi->name
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
-#include <freeradius-devel/server/log.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/unlang/xlat_func.h>
 #include <fcntl.h>
 
 #include "io.h"
 #include "log.h"
 
 typedef struct {
-	char const	*name;
-
 	uint32_t	timeout;
 
 	char const	*filename;		//!< Unbound configuration file
@@ -51,11 +49,6 @@ typedef struct {
 } rlm_unbound_thread_t;
 
 typedef struct {
-	rlm_unbound_t		*inst;		//!< Instance data
-	rlm_unbound_thread_t	*t;		//!< Thread structure
-} unbound_xlat_thread_inst_t;
-
-typedef struct {
 	int			async_id;	//!< Id of async query
 	request_t		*request;	//!< Current request being processed
 	rlm_unbound_thread_t	*t;		//!< Thread running this request
@@ -67,17 +60,17 @@ typedef struct {
 	uint16_t		count;		//!< Number of results to return
 	fr_value_box_list_t	list;		//!< Where to put the parsed results
 	TALLOC_CTX		*out_ctx;	//!< CTX to allocate parsed results in
-	fr_event_timer_t const	*ev;		//!< Event for timeout
+	fr_timer_t	*ev;		//!< Event for timeout
 } unbound_request_t;
 
 /*
  *	A mapping of configuration file names to internal variables.
  */
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_INPUT | FR_TYPE_REQUIRED, rlm_unbound_t, filename), .dflt = "${modconfdir}/unbound/default.conf" },
-	{ FR_CONF_OFFSET("timeout", FR_TYPE_UINT32, rlm_unbound_t, timeout), .dflt = "3000" },
-	{ FR_CONF_OFFSET("resolvconf", FR_TYPE_FILE_INPUT, rlm_unbound_t, resolvconf) },
-	{ FR_CONF_OFFSET("hosts", FR_TYPE_FILE_INPUT, rlm_unbound_t, hosts) },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("filename", CONF_FLAG_FILE_READABLE, rlm_unbound_t, filename), .dflt = "${modconfdir}/unbound/default.conf" },
+	{ FR_CONF_OFFSET("timeout", rlm_unbound_t, timeout), .dflt = "3000" },
+	{ FR_CONF_OFFSET_FLAGS("resolvconf", CONF_FLAG_FILE_READABLE, rlm_unbound_t, resolvconf) },
+	{ FR_CONF_OFFSET_FLAGS("hosts", CONF_FLAG_FILE_READABLE, rlm_unbound_t, hosts) },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -102,7 +95,12 @@ static int _unbound_request_free(unbound_request_t *ur)
  * @param rate_limited	Was the request rate limited due to unbound workload
  */
 static void xlat_unbound_callback(void *mydata, int rcode, void *packet, int packet_len, int sec,
-				  char* why_bogus, UNUSED int rate_limited)
+				  char *why_bogus
+#if UNBOUND_VERSION_MAJOR > 1 || (UNBOUND_VERSION_MAJOR == 1 && UNBOUND_VERSION_MINOR > 7)
+				  , UNUSED int rate_limited
+#endif
+				  )
+
 {
 	unbound_request_t	*ur = talloc_get_type_abort(mydata, unbound_request_t);
 	request_t		*request = ur->request;
@@ -116,7 +114,7 @@ static void xlat_unbound_callback(void *mydata, int rcode, void *packet, int pac
 	 *	Request has completed remove timeout event and set
 	 *	async_id to 0 so ub_cancel() is not called when ur is freed
 	 */
-	if (ur->ev) (void)fr_event_timer_delete(&ur->ev);
+	FR_TIMER_DISARM(ur->ev);
 	ur->async_id = 0;
 
 	/*
@@ -197,20 +195,19 @@ static void xlat_unbound_callback(void *mydata, int rcode, void *packet, int pac
 		fr_dbuff_out(&rdlength, &dbuff);
 		RDEBUG4("RDLENGTH is %d", rdlength);
 
-		vb = fr_value_box_alloc_null(ur->out_ctx);
+		MEM(vb = fr_value_box_alloc_null(ur->out_ctx));
 		switch (ur->return_type) {
 		case FR_TYPE_IPV4_ADDR:
 		case FR_TYPE_IPV6_ADDR:
 		case FR_TYPE_OCTETS:
 			if (fr_value_box_from_network(ur->out_ctx, vb, ur->return_type, NULL,
-						      (uint8_t *)fr_dbuff_current(&dbuff), rdlength, true) < 0) {
+						      &dbuff, rdlength, true) < 0) {
 			error:
 				talloc_free(vb);
-				fr_dlist_talloc_free(&ur->list);
+				fr_value_box_list_talloc_free(&ur->list);
 				ur->done = -32;
 				goto resume;
 			}
-			fr_dbuff_advance(&dbuff, rdlength);
 			break;
 
 		case FR_TYPE_STRING:
@@ -221,22 +218,21 @@ static void xlat_unbound_callback(void *mydata, int rcode, void *packet, int pac
 				 */
 				fr_value_box_t	*priority_vb;
 				if (rdlength < 3) {
-					REDEBUG("%s - Invalid data returned", ur->t->inst->name);
+					REDEBUG("Invalid data returned");
 					goto error;
 				}
-				priority_vb = fr_value_box_alloc_null(ur->out_ctx);
+				MEM(priority_vb = fr_value_box_alloc_null(ur->out_ctx));
 				if (fr_value_box_from_network(ur->out_ctx, priority_vb, FR_TYPE_UINT16, NULL,
-							      (uint8_t *)fr_dbuff_current(&dbuff), 2, true) < 0) {
+							      &dbuff, 2, true) < 0) {
 					talloc_free(priority_vb);
 					goto error;
 				}
-				fr_dlist_insert_tail(&ur->list, priority_vb);
-				fr_dbuff_advance(&dbuff, 2);
+				fr_value_box_list_insert_tail(&ur->list, priority_vb);
 			}
 
 			/*	String types require decoding of dns format labels */
 			used = fr_dns_label_to_value_box(ur->out_ctx, vb, (uint8_t const *)packet, packet_len,
-							 (uint8_t const *)fr_dbuff_current(&dbuff), true);
+							 (uint8_t const *)fr_dbuff_current(&dbuff), true, NULL);
 			if (used < 0) goto error;
 			fr_dbuff_advance(&dbuff, (size_t)used);
 			break;
@@ -246,7 +242,7 @@ static void xlat_unbound_callback(void *mydata, int rcode, void *packet, int pac
 			goto error;
 		}
 
-		fr_dlist_insert_tail(&ur->list, vb);
+		fr_value_box_list_insert_tail(&ur->list, vb);
 
 	}
 
@@ -259,12 +255,12 @@ resume:
 /**	Callback from our timeout event to cancel a request
  *
  */
-static void xlat_unbound_timeout(UNUSED fr_event_list_t *el, UNUSED fr_time_t now, void *uctx)
+static void xlat_unbound_timeout(UNUSED fr_timer_list_t *el, UNUSED fr_time_t now, void *uctx)
 {
 	unbound_request_t	*ur = talloc_get_type_abort(uctx, unbound_request_t);
 	request_t		*request = ur->request;
 
-	REDEBUG("Timeout waiting for DNS resolution");;
+	REDEBUG("Timeout waiting for DNS resolution");
 	unlang_interpret_mark_runnable(request);
 
 	ur->timedout = true;
@@ -273,14 +269,11 @@ static void xlat_unbound_timeout(UNUSED fr_event_list_t *el, UNUSED fr_time_t no
 /*
  *	Xlat signal callback if an unbound request needs cancelling
  */
-static void xlat_unbound_signal(request_t *request, UNUSED void *instance, UNUSED void *thread,
-				void *rctx, fr_state_signal_t action)
+static void xlat_unbound_signal(xlat_ctx_t const *xctx, request_t *request, UNUSED fr_signal_t action)
 {
-	unbound_request_t	*ur = talloc_get_type_abort(rctx, unbound_request_t);
+	unbound_request_t	*ur = talloc_get_type_abort(xctx->rctx, unbound_request_t);
 
-	if (action != FR_SIGNAL_CANCEL) return;
-
-	if (ur->ev) (void)fr_event_timer_delete(&ur->ev);
+	FR_TIMER_DISARM(ur->ev);
 
 	RDEBUG2("Forcefully cancelling pending unbound request");
 }
@@ -289,12 +282,12 @@ static void xlat_unbound_signal(request_t *request, UNUSED void *instance, UNUSE
  *	Xlat resume callback after unbound has either returned or timed out
  *	Move the parsed results to the xlat output cursor
  */
-static xlat_action_t xlat_unbound_resume(UNUSED TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-					 UNUSED void const *xlat_inst, UNUSED void *xlat_thread_inst,
-					 UNUSED fr_value_box_list_t *in, void *rctx)
+static xlat_action_t xlat_unbound_resume(UNUSED TALLOC_CTX *ctx, fr_dcursor_t *out,
+					 xlat_ctx_t const *xctx,
+					 request_t *request, UNUSED fr_value_box_list_t *in)
 {
 	fr_value_box_t		*vb;
-	unbound_request_t	*ur = talloc_get_type_abort(rctx, unbound_request_t);
+	unbound_request_t	*ur = talloc_get_type_abort(xctx->rctx, unbound_request_t);
 
 	/*
 	 *	Request timed out
@@ -302,19 +295,13 @@ static xlat_action_t xlat_unbound_resume(UNUSED TALLOC_CTX *ctx, fr_dcursor_t *o
 	if (ur->timedout) return XLAT_ACTION_FAIL;
 
 #define RCODEERROR(_code, _message) case _code: \
-	REDEBUG(_message, ur->t->inst->name); \
+	REDEBUG(_message, xctx->mctx->mi->name); \
 	goto error
 
 	/*	Check for unbound errors */
 	switch (ur->done) {
 	case 1:
 		break;
-
-	default:
-		REDEBUG("%s - Unknown DNS error", ur->t->inst->name);
-	error:
-		talloc_free(ur);
-		return XLAT_ACTION_FAIL;
 
 	RCODEERROR(0, "%s - No result");
 	RCODEERROR(-1, "%s - Query format error");
@@ -324,12 +311,18 @@ static xlat_action_t xlat_unbound_resume(UNUSED TALLOC_CTX *ctx, fr_dcursor_t *o
 	RCODEERROR(-5, "%s - DNS server refused query");
 	RCODEERROR(-16, "%s - Bogus DNS response");
 	RCODEERROR(-32, "%s - Error parsing DNS response");
+
+	default:
+		REDEBUG("Unknown DNS error");
+	error:
+		talloc_free(ur);
+		return XLAT_ACTION_FAIL;
 	}
 
 	/*
 	 *	Move parsed results into xlat cursor
 	 */
-	while ((vb = fr_dlist_pop_head(&ur->list))) {
+	while ((vb = fr_value_box_list_pop_head(&ur->list))) {
 		fr_dcursor_append(out, vb);
 	}
 
@@ -349,17 +342,18 @@ static xlat_arg_parser_t const xlat_unbound_args[] = {
  *
  * @ingroup xlat_functions
  */
-static xlat_action_t xlat_unbound(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request,
-				  UNUSED void const *xlat_inst, void *xlat_thread_inst,
-				  fr_value_box_list_t *in)
+static xlat_action_t xlat_unbound(TALLOC_CTX *ctx, fr_dcursor_t *out,
+				  xlat_ctx_t const *xctx,
+				  request_t *request, fr_value_box_list_t *in)
 {
-	fr_value_box_t			*host_vb = fr_dlist_head(in);
-	fr_value_box_t			*query_vb = fr_dlist_next(in, host_vb);
-	fr_value_box_t			*count_vb = fr_dlist_next(in, query_vb);
-	unbound_xlat_thread_inst_t	*xt = talloc_get_type_abort(xlat_thread_inst, unbound_xlat_thread_inst_t);
+	rlm_unbound_t const		*inst = talloc_get_type_abort_const(xctx->mctx->mi->data, rlm_unbound_t);
+	rlm_unbound_thread_t		*t = talloc_get_type_abort(xctx->mctx->thread, rlm_unbound_thread_t);
+	fr_value_box_t			*host_vb = fr_value_box_list_head(in);
+	fr_value_box_t			*query_vb = fr_value_box_list_next(in, host_vb);
+	fr_value_box_t			*count_vb = fr_value_box_list_next(in, query_vb);
 	unbound_request_t		*ur;
 
-	if (host_vb->length == 0) {
+	if (host_vb->vb_length == 0) {
 		REDEBUG("Can't resolve zero length host");
 		return XLAT_ACTION_FAIL;
 	}
@@ -377,14 +371,14 @@ static xlat_action_t xlat_unbound(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t 
 	}
 
 	ur->request = request;
-	ur->t = xt->t;
+	ur->t = t;
 	ur->out_ctx = ctx;
 
 #define UB_QUERY(_record, _rrvalue, _return, _hasprio) \
 	if (strcmp(query_vb->vb_strvalue, _record) == 0) { \
 		ur->return_type = _return; \
 		ur->has_priority = _hasprio; \
-		ub_resolve_event(xt->t->ev_b->ub, host_vb->vb_strvalue, _rrvalue, 1, ur, \
+		ub_resolve_event(t->ev_b->ub, host_vb->vb_strvalue, _rrvalue, 1, ur, \
 				xlat_unbound_callback, &ur->async_id); \
 	}
 
@@ -404,38 +398,32 @@ static xlat_action_t xlat_unbound(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t 
 	 *	unbound returned before we yielded - run the callback
 	 *	This is when serving results from local data
 	 */
-	if (ur->async_id == 0) return xlat_unbound_resume(NULL, out, request, NULL, NULL, NULL, ur);
+	if (ur->async_id == 0) {
+		xlat_ctx_t our_xctx = *xctx;
 
-	if (fr_event_timer_in(ur, ur->t->ev_b->el, &ur->ev, fr_time_delta_from_msec(xt->inst->timeout),
-			      xlat_unbound_timeout, ur) < 0) {
+		our_xctx.rctx = ur;	/* Make the rctx available to the resume function */
+
+		return xlat_unbound_resume(ctx, out, &our_xctx, request, in);
+	}
+
+	if (fr_timer_in(ur, ur->t->ev_b->el->tl, &ur->ev, fr_time_delta_from_msec(inst->timeout),
+			false, xlat_unbound_timeout, ur) < 0) {
 		REDEBUG("Unable to attach unbound timeout_envent");
-		ub_cancel(xt->t->ev_b->ub, ur->async_id);
+		ub_cancel(t->ev_b->ub, ur->async_id);
 		return XLAT_ACTION_FAIL;
 	}
 
-	return unlang_xlat_yield(request, xlat_unbound_resume, xlat_unbound_signal, ur);
+	return unlang_xlat_yield(request, xlat_unbound_resume, xlat_unbound_signal, FR_SIGNAL_ALLOW(FR_SIGNAL_CANCEL), ur);
 }
 
-static int mod_xlat_thread_instantiate(UNUSED void *xlat_inst, void *xlat_thread_inst,
-				       UNUSED xlat_exp_t const *exp, void *uctx)
+static int mod_thread_instantiate(module_thread_inst_ctx_t const *mctx)
 {
-	rlm_unbound_t			*inst = talloc_get_type_abort(uctx, rlm_unbound_t);
-	unbound_xlat_thread_inst_t	*xt = talloc_get_type_abort(xlat_thread_inst, unbound_xlat_thread_inst_t);
-
-	xt->inst = inst;
-	xt->t = talloc_get_type_abort(module_thread_by_data(inst)->data, rlm_unbound_thread_t);
-
-	return 0;
-}
-
-static int mod_thread_instantiate(UNUSED CONF_SECTION const *cs, void *instance, fr_event_list_t *el, void *thread)
-{
-	rlm_unbound_t		*inst = talloc_get_type_abort(instance, rlm_unbound_t);
-	rlm_unbound_thread_t	*t = talloc_get_type_abort(thread, rlm_unbound_thread_t);
+	rlm_unbound_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_unbound_t);
+	rlm_unbound_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_unbound_thread_t);
 	int			res;
 
 	t->inst = inst;
-	if (unbound_io_init(t, &t->ev_b, el) < 0) {
+	if (unbound_io_init(t, &t->ev_b, mctx->el) < 0) {
 		PERROR("Unable to create unbound event base");
 		return -1;
 	}
@@ -447,6 +435,8 @@ static int mod_thread_instantiate(UNUSED CONF_SECTION const *cs, void *instance,
 	if (res) {
 	error:
 		PERROR("%s", ub_strerror(res));
+	free_error:
+		talloc_free(t->ev_b);
 		return -1;
 	}
 
@@ -458,7 +448,7 @@ static int mod_thread_instantiate(UNUSED CONF_SECTION const *cs, void *instance,
 
 	if (unbound_log_init(t, &t->u_log, t->ev_b->ub) < 0) {
 		PERROR("Failed to initialise unbound log");
-		return -1;
+		goto free_error;
 	}
 
 	/*
@@ -474,16 +464,16 @@ static int mod_thread_instantiate(UNUSED CONF_SECTION const *cs, void *instance,
 	/*
 	 *	The unbound context needs to be "finalised" to fix its settings.
 	 *	The API does not expose a method to do this, rather it happens on first
-	 *	use.  A quick workround is to delete data which won't be present
+	 *	use.  A quick workaround is to delete data which won't be present
 	 */
 	ub_ctx_data_remove(t->ev_b->ub, "notar33lsite.foo123.nottld A 127.0.0.1");
 
 	return 0;
 }
 
-static int mod_thread_detach(UNUSED fr_event_list_t *el, void *thread)
+static int mod_thread_detach(module_thread_inst_ctx_t const *mctx)
 {
-	rlm_unbound_thread_t	*t = talloc_get_type_abort(thread, rlm_unbound_thread_t);
+	rlm_unbound_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_unbound_thread_t);
 
 	talloc_free(t->u_log);
 	talloc_free(t->ev_b);
@@ -491,37 +481,34 @@ static int mod_thread_detach(UNUSED fr_event_list_t *el, void *thread)
 	return 0;
 }
 
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
+static int mod_bootstrap(module_inst_ctx_t const *mctx)
 {
-	rlm_unbound_t	*inst = instance;
-	xlat_t		*xlat;
-
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) inst->name = cf_section_name1(conf);
+	rlm_unbound_t const	*inst = talloc_get_type_abort(mctx->mi->data, rlm_unbound_t);
+	xlat_t			*xlat;
 
 	if (inst->timeout > 10000) {
-		cf_log_err(conf, "timeout must be 0 to 10000");
+		cf_log_err(mctx->mi->conf, "timeout must be 0 to 10000");
 		return -1;
 	}
 
-	if(!(xlat = xlat_register(NULL, inst->name, xlat_unbound, true))) return -1;
-	xlat_func_args(xlat, xlat_unbound_args);
-	xlat_async_thread_instantiate_set(xlat, mod_xlat_thread_instantiate, unbound_xlat_thread_inst_t, NULL, inst);
+	if(!(xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, NULL, xlat_unbound, FR_TYPE_VOID))) return -1;
+	xlat_func_args_set(xlat, xlat_unbound_args);
 
 	return 0;
 }
 
-extern module_t rlm_unbound;
-module_t rlm_unbound = {
-	.magic			= RLM_MODULE_INIT,
-	.name			= "unbound",
-	.type			= RLM_TYPE_THREAD_SAFE,
-	.inst_size		= sizeof(rlm_unbound_t),
-	.config			= module_config,
-	.bootstrap		= mod_bootstrap,
+extern module_rlm_t rlm_unbound;
+module_rlm_t rlm_unbound = {
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "unbound",
+		.inst_size		= sizeof(rlm_unbound_t),
+		.config			= module_config,
+		.bootstrap		= mod_bootstrap,
 
-	.thread_inst_size	= sizeof(rlm_unbound_thread_t),
-	.thread_inst_type	= "rlm_unbound_thread_t",
-	.thread_instantiate	= mod_thread_instantiate,
-	.thread_detach		= mod_thread_detach,
+		.thread_inst_size	= sizeof(rlm_unbound_thread_t),
+		.thread_inst_type	= "rlm_unbound_thread_t",
+		.thread_instantiate	= mod_thread_instantiate,
+		.thread_detach		= mod_thread_detach
+	}
 };

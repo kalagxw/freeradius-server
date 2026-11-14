@@ -33,10 +33,7 @@ extern "C" {
 #include <freeradius-devel/util/table.h>
 #include <freeradius-devel/util/talloc.h>
 
-#include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
-#include <string.h>
 
 extern FILE	*fr_log_fp;
 
@@ -51,7 +48,7 @@ extern bool	log_dates_utc;
 extern fr_table_num_ordered_t const fr_log_levels[];
 extern size_t fr_log_levels_len;
 
-typedef enum {
+typedef enum : uint8_t {
 	L_INFO = 3,				//!< Informational message.
 	L_ERR = 4,				//!< Error message.
 	L_WARN = 5,				//!< Warning.
@@ -64,7 +61,7 @@ typedef enum {
 	L_DBG_ERR_REQ = 21			//!< Less severe error only displayed when debugging is enabled.
 } fr_log_type_t;
 
-typedef enum {
+typedef enum : int8_t {
 	L_DBG_LVL_DISABLE = -1,			//!< Don't print messages.
 	L_DBG_LVL_OFF = 0,			//!< No debug messages.
 	L_DBG_LVL_1,				//!< Highest priority debug messages (-x).
@@ -74,24 +71,26 @@ typedef enum {
 	L_DBG_LVL_MAX				//!< Lowest priority debug messages (-xxxxx | -Xxxx).
 } fr_log_lvl_t;
 
-typedef enum {
+typedef enum : uint8_t {
 	L_DST_STDOUT = 0,			//!< Log to stdout.
 	L_DST_FILES,				//!< Log to a file on disk.
 	L_DST_SYSLOG,				//!< Log to syslog.
 	L_DST_STDERR,				//!< Log to stderr.
-	L_DST_EXTRA,				//!< Send log messages to a FILE*, via fopencookie()
+	L_DST_FUNC,				//!< Send log messages to a FILE*, via fopencookie()
 	L_DST_NULL,				//!< Discard log messages.
 	L_DST_NUM_DEST
 } fr_log_dst_t;
 
-typedef enum {
+typedef enum : uint8_t {
 	L_TIMESTAMP_AUTO = 0,			//!< Timestamp logging preference not specified. Do it based on
 						//!< debug level and destination.
 	L_TIMESTAMP_ON,				//!< Always log timestamps.
 	L_TIMESTAMP_OFF				//!< Never log timestamps.
 } fr_log_timestamp_t;
 
-typedef struct {
+typedef struct fr_log_s fr_log_t;
+
+struct fr_log_s {
 	fr_log_dst_t		dst;		//!< Log destination.
 
 	bool			line_number;	//!< Log src file and line number.
@@ -103,15 +102,21 @@ typedef struct {
 
 	bool			print_level;	//!< sometimes we don't want log levels printed
 
+	bool			suppress_secrets; //!< suppress secrets when printing to this destination
+
 	fr_log_timestamp_t	timestamp;	//!< Prefix log messages with timestamps.
 
 	int			fd;		//!< File descriptor to write messages to.
 	char const		*file;		//!< Path to log file.
 
 	void			*cookie;	//!< for fopencookie()
+	FILE			*handle;	//!< Path to log file.
 
 	ssize_t			(*cookie_write)(void *, char const *, size_t);	//!< write function
-} fr_log_t;
+	void			*uctx;		//!< User data associated with the fr_log_t.
+
+	fr_log_t		*parent;	//!< Log destination this was cloned from.
+};
 
 typedef struct {
 	char const		*first_prefix;	//!< Prefix for the first line printed.
@@ -134,7 +139,6 @@ typedef struct {
 extern fr_log_t default_log;
 extern bool fr_log_rate_limit;
 
-
 /** Whether rate limiting is enabled
  *
  */
@@ -145,23 +149,50 @@ static inline bool fr_rate_limit_enabled(void)
 	return false;
 }
 
-int	fr_log_init(fr_log_t *log, bool daemonize);
+int	fr_log_init_legacy(fr_log_t *log, bool daemonize);
 
-TALLOC_CTX	*fr_log_pool_init(void);
+void	fr_log_fd_event(UNUSED fr_event_list_t *el, int fd, UNUSED int flags, void *uctx);
 
-int	fr_vlog(fr_log_t const *log, fr_log_type_t lvl, char const *file, int line, char const *fmt, va_list ap)
-	CC_HINT(format (printf, 5, 0)) CC_HINT(nonnull (1,3));
+/** @name Send a log message to a destination, capturing substitution argument names
+ *
+ * The fr_log/fr_log_perror wrapper macros capture the source text of each
+ * fmt substitution argument with VA_STRINGIFY, and pass the strings to the
+ * underlying function as arg_names, a NULL terminated array parallel to the
+ * substitution arguments.  The fr_vlog/fr_vlog_perror wrappers pass NULL,
+ * as the expressions behind a va_list are not visible at the macro site.
+ *
+ * @{
+ */
+#define	fr_vlog(_log, _lvl, _file, _line, _fmt, _ap) \
+		_fr_vlog(_log, _lvl, _file, _line, NULL, _fmt, _ap)
+void	_fr_vlog(fr_log_t const *log, fr_log_type_t lvl, char const *file, int line,
+		 char const * const arg_names[], char const *fmt, va_list ap)
+	CC_HINT(format (printf, 6, 0)) CC_HINT(nonnull (1,3));
 
-int	fr_log(fr_log_t const *log, fr_log_type_t lvl, char const *file, int line, char const *fmt, ...)
-	CC_HINT(format (printf, 5, 6)) CC_HINT(nonnull (1,3));
+#define	fr_log(_log, _lvl, _file, _line, _fmt, ...) \
+		_fr_log(_log, _lvl, _file, _line, \
+			(char const * const []){ VA_STRINGIFY(__VA_ARGS__) __VA_OPT__(,) NULL }, \
+			_fmt, ##__VA_ARGS__)
+void	_fr_log(fr_log_t const *log, fr_log_type_t lvl, char const *file, int line,
+		char const * const arg_names[], char const *fmt, ...)
+	CC_HINT(format (printf, 6, 7)) CC_HINT(nonnull (1,3));
 
-int	fr_vlog_perror(fr_log_t const *log, fr_log_type_t type,
-		       char const *file, int line, fr_log_perror_format_t const *rules, char const *fmt, va_list ap)
-	CC_HINT(format (printf, 6, 0)) CC_HINT(nonnull (1));
+#define	fr_vlog_perror(_log, _type, _file, _line, _rules, _fmt, _ap) \
+		_fr_vlog_perror(_log, _type, _file, _line, _rules, NULL, _fmt, _ap)
+void	_fr_vlog_perror(fr_log_t const *log, fr_log_type_t type,
+			char const *file, int line, fr_log_perror_format_t const *rules,
+			char const * const arg_names[], char const *fmt, va_list ap)
+	CC_HINT(format (printf, 7, 0)) CC_HINT(nonnull (1));
 
-int	fr_log_perror(fr_log_t const *log, fr_log_type_t type,
-		      char const *file, int line, fr_log_perror_format_t const *rules, char const *fmt, ...)
-	CC_HINT(format (printf, 6, 7)) CC_HINT(nonnull (1));
+#define	fr_log_perror(_log, _type, _file, _line, _rules, _fmt, ...) \
+		_fr_log_perror(_log, _type, _file, _line, _rules, \
+			       (char const * const []){ VA_STRINGIFY(__VA_ARGS__) __VA_OPT__(,) NULL }, \
+			       _fmt, ##__VA_ARGS__)
+void	_fr_log_perror(fr_log_t const *log, fr_log_type_t type,
+		       char const *file, int line, fr_log_perror_format_t const *rules,
+		       char const * const arg_names[], char const *fmt, ...)
+	CC_HINT(format (printf, 7, 8)) CC_HINT(nonnull (1));
+/** @} */
 
 void	fr_log_marker(fr_log_t const *log, fr_log_type_t type, char const *file, int line,
 		      char const *str, size_t str_len,
@@ -177,7 +208,26 @@ void	fr_log_hex_marker(fr_log_t const *log, fr_log_type_t type, char const *file
 			  ssize_t marker_idx, char const *marker, char const *line_prefix_fmt, ...)
 			  CC_HINT(format (printf, 9, 10)) CC_HINT(nonnull (1, 3, 5, 8));
 
-void	fr_log_fd_event(UNUSED fr_event_list_t *el, int fd, UNUSED int flags, void *uctx);
+int	fr_log_init_std(fr_log_t *log, fr_log_dst_t dst_type) CC_HINT(nonnull);
+
+int	fr_log_init_file(fr_log_t *log, char const *file) CC_HINT(nonnull);
+
+int	fr_log_init_fp(fr_log_t *log, FILE *fp) CC_HINT(nonnull);
+
+int	fr_log_init_syslog(fr_log_t *log) CC_HINT(nonnull);
+
+int	fr_log_init_func(fr_log_t *log, cookie_write_function_t write, cookie_close_function_t close, void *uctx)
+	CC_HINT(nonnull(1,3));
+
+int	fr_log_close(fr_log_t *log) CC_HINT(nonnull);
+
+TALLOC_CTX *fr_log_pool_init(void);
+
+void	fr_log_disable_pools(void);
+
+int	fr_log_global_init(fr_event_list_t *el, bool daemonize)	CC_HINT(nonnull);
+
+void	fr_log_global_free(void);
 
 #ifdef __cplusplus
 }

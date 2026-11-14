@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -24,8 +24,7 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
-#include <freeradius-devel/radius/radius.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/util/debug.h>
 
 /*
@@ -39,16 +38,17 @@ typedef struct {
 	tmpl_t	*key;
 } rlm_sometimes_t;
 
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("rcode", FR_TYPE_STRING, rlm_sometimes_t, rcode_str), .dflt = "fail" },
-	{ FR_CONF_OFFSET("key", FR_TYPE_TMPL | FR_TYPE_ATTRIBUTE, rlm_sometimes_t, key), .dflt = "&User-Name", .quote = T_BARE_WORD },
-	{ FR_CONF_OFFSET("percentage", FR_TYPE_FLOAT32, rlm_sometimes_t, percentage), .dflt = "0" },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET("rcode", rlm_sometimes_t, rcode_str), .dflt = "fail" },
+	{ FR_CONF_OFFSET_FLAGS("key", CONF_FLAG_ATTRIBUTE, rlm_sometimes_t, key), .dflt = "User-Name", .quote = T_BARE_WORD },
+	{ FR_CONF_OFFSET("percentage", rlm_sometimes_t, percentage), .dflt = "0" },
 	CONF_PARSER_TERMINATOR
 };
 
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_sometimes_t *inst = instance;
+	rlm_sometimes_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_sometimes_t);
+	CONF_SECTION	*conf = mctx->mi->conf;
 
 	/*
 	 *	Convert the rcode string to an int, and get rid of it
@@ -70,24 +70,23 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 /*
  *	A lie!  It always returns!
  */
-static unlang_action_t sometimes_return(rlm_rcode_t *p_result, void const *instance, request_t *request,
-					fr_radius_packet_t *packet, fr_radius_packet_t *reply)
+static unlang_action_t sometimes_return(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request,
+					fr_packet_t *packet, fr_packet_t *reply)
 {
+	rlm_sometimes_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_sometimes_t);
 	uint32_t		hash;
-	rlm_sometimes_t const	*inst = talloc_get_type_abort_const(instance, rlm_sometimes_t);
 	fr_pair_t		*vp;
 	float			value;
 
 	/*
 	 *	Set it to NOOP and the module will always do nothing
 	 */
-	if (inst->rcode == RLM_MODULE_NOOP) RETURN_MODULE_RCODE(inst->rcode);
+	if (inst->rcode == RLM_MODULE_NOOP) RETURN_UNLANG_RCODE(inst->rcode);
 
 	/*
 	 *	Hash based on the given key.  Usually User-Name.
 	 */
-	tmpl_find_vp(&vp, request, inst->key);
-	if (!vp) RETURN_MODULE_NOOP;
+	if (tmpl_find_vp(&vp, request, inst->key) < 0) RETURN_UNLANG_NOOP;
 
 	switch (vp->vp_type) {
 	case FR_TYPE_OCTETS:
@@ -96,7 +95,7 @@ static unlang_action_t sometimes_return(rlm_rcode_t *p_result, void const *insta
 		break;
 
 	case FR_TYPE_STRUCTURAL:
-		RETURN_MODULE_FAIL;
+		RETURN_UNLANG_FAIL;
 
 	default:
 		hash = fr_hash(&vp->data.datum, fr_value_box_field_sizes[vp->vp_type]);
@@ -104,11 +103,11 @@ static unlang_action_t sometimes_return(rlm_rcode_t *p_result, void const *insta
 	}
 
 	hash &= 0xffff;		/* all we need are 2^16 bits of precision */
-	value = hash;
+	value = (float) hash;
 	value /= (1 << 16);
 	value *= 100;
 
-	if (value > inst->percentage) RETURN_MODULE_NOOP;
+	if (value > inst->percentage) RETURN_UNLANG_NOOP;
 
 	/*
 	 *	If we're returning "handled", then set the packet
@@ -139,31 +138,33 @@ static unlang_action_t sometimes_return(rlm_rcode_t *p_result, void const *insta
 		}
 	}
 
-	RETURN_MODULE_RCODE(inst->rcode);
+	RETURN_UNLANG_RCODE(inst->rcode);
 }
 
-static unlang_action_t CC_HINT(nonnull) mod_sometimes_packet(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_sometimes_packet(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	return sometimes_return(p_result, mctx->instance, request, request->packet, request->reply);
+	return sometimes_return(p_result, mctx, request, request->packet, request->reply);
 }
 
-static unlang_action_t CC_HINT(nonnull) mod_sometimes_reply(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_sometimes_reply(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	return sometimes_return(p_result, mctx->instance, request, request->reply, NULL);
+	return sometimes_return(p_result, mctx, request, request->reply, NULL);
 }
 
-extern module_t rlm_sometimes;
-module_t rlm_sometimes = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "sometimes",
-	.inst_size	= sizeof(rlm_sometimes_t),
-	.config		= module_config,
-	.instantiate	= mod_instantiate,
-	.methods = {
-		[MOD_AUTHENTICATE]	= mod_sometimes_packet,
-		[MOD_AUTHORIZE]		= mod_sometimes_packet,
-		[MOD_PREACCT]		= mod_sometimes_packet,
-		[MOD_ACCOUNTING]	= mod_sometimes_packet,
-		[MOD_POST_AUTH]		= mod_sometimes_reply,
+extern module_rlm_t rlm_sometimes;
+module_rlm_t rlm_sometimes = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "sometimes",
+		.inst_size	= sizeof(rlm_sometimes_t),
+		.config		= module_config,
+		.instantiate	= mod_instantiate
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("send", CF_IDENT_ANY), .method = mod_sometimes_reply },
+			{ .section = SECTION_NAME(CF_IDENT_ANY, CF_IDENT_ANY), .method = mod_sometimes_packet },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

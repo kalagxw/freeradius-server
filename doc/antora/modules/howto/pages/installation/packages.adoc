@@ -1,0 +1,34 @@
+= Install from Packages
+
+include::ROOT:partial$v3_warning.adoc[]
+
+https://www.inkbridgenetworks.com/[InkBridge Networks] provides
+pre-built binary packages of FreeRADIUS for common Linux
+distributions. This is the recommended installation method when
+packages are available for your system.
+
+The official https://packages.inkbridgenetworks.com/[InkBridge
+Networks packages] page contains the most recent FreeRADIUS packages
+and installation instructions.
+
+The current packages available include:
+
+* https://packages.inkbridgenetworks.com/#fr32-ubuntu[Ubuntu]
+* https://packages.inkbridgenetworks.com/#fr32-debian[Debian]
+* https://packages.inkbridgenetworks.com/#fr32-rocky[Rocky]
+* https://packages.inkbridgenetworks.com/#fr32-centos[Centos]
+* https://packages.inkbridgenetworks.com/#fr32-rhel[RHEL]
+
+== Distribution-supplied packages
+
+While many operating system distributions ship FreeRADIUS packages,
+the versions they include are often years out of date. As well as
+missing out on the latest bug fixes and features, this also means that
+it is very hard to know if an issue encountered is still a problem or
+if it is fixed in the latest release.
+
+Therefore, while the distribution-supplied packages can often be the
+most convenient to install, we do not usually recommend using them.
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

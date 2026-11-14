@@ -1,0 +1,581 @@
+name: Claude CI Failure Diagnosis
+
+#
+#  The workflow runs after 'CI Pipeline' finishes with a failure.  Claude reads
+#  the failed jobs, classifies each distinct failure and posts a single commit
+#  comment.  The workflow only diagnoses failures.  The workflow opens no pull
+#  requests, pushes no commits, and edits no files.
+#
+#  The pipeline is one workflow, so the diagnosis runs once per commit with
+#  every leg already finished.  The workflow has nothing to wait for and
+#  needs no gate step.
+#
+#  The diagnosis cannot be a job inside 'CI Pipeline'.  claude-code-action only
+#  accepts the event types listed in `src/github/context.ts` of
+#  claude-code-action, and `push` is not an accepted event type.  `workflow_run`
+#  is an accepted event type.
+#
+
+on:
+  workflow_run:
+    workflows:
+      - CI Pipeline
+    types: [completed]
+
+concurrency:
+  group: claude-ci-diagnosis-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  #
+  #  The `triage` job is a cheap first pass. Most failures that are not the
+  #  committer's fault look the same in the logs: a fetch that stalled, a
+  #  mirror that timed out, a runner that went away. Sonnet reads the failed
+  #  jobs and reports whether every failure is an infrastructure failure.
+  #  The expensive model then runs only on failures that might be real.
+  #
+  #  Skipping the expensive model needs an `infrastructure` verdict AND at
+  #  least 0.8 confidence AND no test failure line in any failed job's log.
+  #  Everything else falls through to the full diagnosis, including
+  #  `unknown` and a confident-sounding guess. A missed regression costs
+  #  far more than a wasted analysis.
+  #
+  #  An intermittent test failure is deliberately NOT `infrastructure`. A race
+  #  or a use-after-free presents exactly as an intermittent test failure,
+  #  and retrying the test until the test passes is how such a bug survives
+  #  for months.
+  #
+  triage:
+    #
+    #  The event and branch conditions enforce the workflow's security
+    #  model.  Every push to `master` or a `developer/` branch comes
+    #  from a writer, so three properties hold:
+    #    1. The actor who pushed always passes claude-code-action's
+    #       token exchange.
+    #    2. The logs that the models read come from maintainer pushes,
+    #       not from fork pull requests.
+    #    3. The `head_sha` that the jobs check out is a trusted ref.
+    #  Widening the conditions to pull requests breaks all three
+    #  properties at once.
+    #
+    if: |
+      github.repository == 'FreeRADIUS/freeradius-server' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'push' &&
+      (github.event.workflow_run.head_branch == 'master' ||
+       startsWith(github.event.workflow_run.head_branch, 'developer/'))
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read     # read failed-job logs
+      id-token: write
+
+    #
+    #  `fromJSON()` on an empty string is an error, and a `triage` step that
+    #  produced nothing must not fail the job.  Each output therefore guards
+    #  the `fromJSON()` call and falls back to a default.
+    #
+    outputs:
+      verdict: ${{ steps.triage.outputs.structured_output && fromJSON(steps.triage.outputs.structured_output).verdict || 'unknown' }}
+      confidence: ${{ steps.triage.outputs.structured_output && fromJSON(steps.triage.outputs.structured_output).confidence || 0 }}
+      reason: ${{ steps.triage.outputs.structured_output && fromJSON(steps.triage.outputs.structured_output).reason || 'triage produced no structured output' }}
+      fingerprints: ${{ steps.fp.outputs.fingerprints || '' }}
+      test_failure: ${{ steps.markers.outputs.test_failure }}
+
+    steps:
+      #  claude-code-action sets a git user name at startup, and setting the
+      #  name fails if no repository is checked out. `triage` only reads logs
+      #  with gh, so a shallow checkout without Git Large File Storage (LFS)
+      #  files is enough.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+          lfs: false
+
+      #
+      #  A `FAILED:` or make error line in a failed job's log means that a test
+      #  or build broke.  A broken test or build can never be a skippable
+      #  `infrastructure` verdict.  The check is a plain grep, so the model
+      #  cannot override the rule.
+      #
+      - name: Check the failed logs for test failure lines
+        id: markers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          found=false
+          for job in $(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
+                       --jq '.jobs[] | select(.conclusion == "failure") | .databaseId'); do
+            #
+            #  An unfetchable log cannot prove that no failure line
+            #  exists, so the step treats a failed fetch as a failure
+            #  line.  The diagnosis then runs even on a confident
+            #  `infrastructure` verdict.
+            #
+            if ! gh run view --job "$job" --repo "$REPO" --log > /tmp/job.log 2>/dev/null; then
+              found=true
+              echo "could not fetch the log of job $job, treating the log as holding a failure line"
+              continue
+            fi
+            if grep -q -E 'FAILED: |make(\[[0-9]+\])?: \*\*\*' /tmp/job.log; then
+              found=true
+              echo "grep found a test or build failure line in the log of job $job"
+            fi
+          done
+          echo "test_failure=$found" >> "$GITHUB_OUTPUT"
+
+      #  The action exits non-zero if the model returns no structured output.
+      #  Without `continue-on-error` the non-zero exit fails the job, and the
+      #  fallback values in the outputs above are never used.
+      - name: Run Claude Code triage
+        id: triage
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          anthropic_federation_rule_id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          anthropic_organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          anthropic_service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          anthropic_workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          show_full_output: true
+          additional_permissions: |
+            actions: read
+          claude_args: >-
+            --model sonnet
+            --max-budget-usd 0.50
+            --allowed-tools "Bash(gh run view:*),Bash(gh api:*)"
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["infrastructure","code","unknown"],"description":"Whether every failure lies outside the codebase"},"confidence":{"type":"number","minimum":0,"maximum":1,"description":"Confidence in the verdict"},"reason":{"type":"string","description":"One sentence naming the deciding log line"},"failing_targets":{"type":"array","items":{"type":"string"},"description":"every distinct failing test or build target, each copied exactly from its FAILED: or make error line"}},"required":["verdict","confidence","reason","failing_targets"],"additionalProperties":false}'
+          prompt: |
+            One or more legs of CI run ${{ github.event.workflow_run.id }} in ${{ github.repository }} failed. Decide only whether every failure is an infrastructure problem. Do not diagnose the code and do not post anything.
+
+            List the failed jobs and read their logs:
+
+              gh run view ${{ github.event.workflow_run.id }} --repo ${{ github.repository }} --json jobs \
+                --jq '.jobs[] | select(.conclusion == "failure") | {databaseId, name}'
+              gh run view --job "<job id>" --repo ${{ github.repository }} --log
+
+            Answer "infrastructure" only when EVERY failure is clearly one of:
+              - a network transfer that stalled, truncated or timed out (git fetch, apt, docker pull, artifact download)
+              - a package mirror or registry returning an error unrelated to what the commit changed
+              - a runner or container that died, was cancelled, or ran out of disk
+              - a dependency that failed to download rather than failed to build
+
+            Answer "code" when any failure could come from the tree: a compile or link error, a failing test, a missing dependency the commit introduced, a packaging rule that no longer resolves.
+
+            A log line starting "FAILED:" or "make: ***" names a test or build failure. When any failed job's log contains one, the verdict must not be "infrastructure".
+
+            A test that fails intermittently is "code". Intermittency is not evidence of an infrastructure problem; it is what a race, a use-after-free, a leaked fixture or an order-dependent test looks like from the outside. Only call a failure infrastructure when the log shows the machinery around the test breaking, never because the same test passed on a retry or on another leg.
+
+            Answer "unknown" when the logs do not settle it.
+
+            Give "confidence" as 0 to 1 for the verdict. Anything below 0.8 lets the full diagnosis run, so use the range honestly rather than rounding up: a wrong "infrastructure" buries a real bug, while a needless diagnosis costs only tokens.
+
+            Put a one-sentence justification in "reason", quoting the deciding log line verbatim. A reason that describes a line you cannot quote is a reason to answer "unknown" instead.
+
+            Also return "failing_targets": one entry per distinct failure, each the name of the failing test or build target copied character for character from the log. Take each from the FAILED: line, the make error line, or the file the toolchain names. Do not compose, summarise or reword an entry: the same failure on a later commit must produce the same string, and only a verbatim copy does. Several legs failing on the same target produce ONE entry. Examples of the shape:
+
+              test.multi-server.kafka-produce.short_ci
+              build/tests/bin/slab_tests
+              src/lib/util/dbuff.c
+              libluajit2-5.1-dev
+
+            Return an empty array only if the logs never name a target.
+
+      #
+      #  The model copies the failing targets verbatim. Everything that makes
+      #  the strings comparable across commits happens here, mechanically.
+      #  The step normalises each target into one fingerprint and removes
+      #  every space, so the output is a space-separated list.
+      #
+      - name: Normalise the fingerprints
+        id: fp
+        env:
+          STRUCTURED: ${{ steps.triage.outputs.structured_output }}
+        run: |
+          if [ -n "$STRUCTURED" ]; then
+            printf '%s' "$STRUCTURED" | jq -r '.failing_targets[]? // empty' \
+              | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9._\n-' '-' \
+              | sed -e 's/^-//' -e 's/-$//' -e '/^$/d' \
+              | awk '!seen[$0]++' > /tmp/fps
+          else
+            : > /tmp/fps
+          fi
+          fingerprints=$(tr '\n' ' ' < /tmp/fps | sed 's/ $//')
+          echo "fingerprints: ${fingerprints:-<none>}"
+          echo "fingerprints=$fingerprints" >> "$GITHUB_OUTPUT"
+
+      #
+      #  The verdict fields are model output quoting untrusted CI logs, so
+      #  the verdict fields reach the shell as environment values, never as
+      #  script text.  Interpolating the verdict fields into the script would
+      #  let a quoted log line terminate the quoting and execute whatever
+      #  follows.
+      #
+      - name: Record the verdict
+        env:
+          VERDICT: ${{ steps.triage.outputs.structured_output && fromJSON(steps.triage.outputs.structured_output).verdict || 'unavailable' }}
+          CONFIDENCE: ${{ steps.triage.outputs.structured_output && fromJSON(steps.triage.outputs.structured_output).confidence || 0 }}
+          FINGERPRINTS: ${{ steps.fp.outputs.fingerprints || 'none' }}
+          REASON: ${{ steps.triage.outputs.structured_output && fromJSON(steps.triage.outputs.structured_output).reason || 'triage produced no structured output; full diagnosis will run' }}
+          TEST_FAILURE: ${{ steps.markers.outputs.test_failure }}
+        run: |
+          {
+            echo "### CI failure triage"
+            echo
+            echo "verdict: \`${VERDICT}\` at \`${CONFIDENCE}\` confidence"
+            echo
+            echo "fingerprints: \`${FINGERPRINTS}\`"
+            echo
+            echo "${REASON}"
+            if [ "$TEST_FAILURE" = "true" ] && [ "$VERDICT" = "infrastructure" ]; then
+              echo
+              echo "overridden: grep found a test or build failure line in a failed job's log, so the diagnosis runs regardless of the verdict"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  #
+  #  Recurrence. A failure that the bot has already explained does not need
+  #  explaining twice, but the commit that hit the failure still receives the
+  #  explanation.  The job matches each failure by the failure's fingerprint
+  #  and finds the source comment where the analysis first appeared.  The job
+  #  copies only the matching failure's block out of the source comment and
+  #  links back to the source comment. No model runs here. The job only
+  #  matches strings and extracts blocks.
+  #
+  recurrence:
+    needs: triage
+    if: >-
+      ${{ !cancelled() && needs.triage.outputs.fingerprints != '' &&
+          !(needs.triage.outputs.verdict == 'infrastructure' &&
+            fromJSON(needs.triage.outputs.confidence) >= 0.8 &&
+            needs.triage.outputs.test_failure != 'true') }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write   # post commit comment via gh api
+
+    outputs:
+      matched: ${{ steps.copy.outputs.matched }}
+      known: ${{ steps.copy.outputs.known }}
+
+    steps:
+      - name: Copy previous diagnoses for the failures that are repeats
+        id: copy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          FAILING_SHA: ${{ github.event.workflow_run.head_sha }}
+          FINGERPRINTS: ${{ needs.triage.outputs.fingerprints }}
+        run: |
+          set -euo pipefail
+
+          #
+          #  The commit-comments endpoint ignores `sort` and returns oldest
+          #  first, so the recent comments are on the final pages. The `Link`
+          #  header is the only way to find the number of the last page.
+          #
+          last=$(gh api "repos/$REPO/comments?per_page=100" --include 2>/dev/null \
+                 | sed -n 's/.*[?&]page=\([0-9]*\)>; rel="last".*/\1/p' | head -1)
+          [ -n "$last" ] || last=1
+
+          : > /tmp/recent.json
+          for page in "$last" $(( last - 1 )); do
+            [ "$page" -ge 1 ] || continue
+            gh api "repos/$REPO/comments?per_page=100&page=$page" >> /tmp/recent.json || true
+          done
+
+          #
+          #  A near-miss should read as two visibly different strings, not
+          #  as a silent 'no previous diagnosis'.
+          #
+          echo "fingerprints in this run: $FINGERPRINTS"
+          echo "fingerprints seen in the scanned comments:"
+          jq -rs '[.[][] | .body | capture("claude-ci-finding: (?<f>[^ \n]+)")?.f]
+                  | group_by(.) | map("  \(length)x \(.[0])") | .[]' /tmp/recent.json || true
+
+          known=""
+          new=""
+          : > /tmp/blocks.md
+
+          for fp in $FINGERPRINTS; do
+            #
+            #  Copies carry the finding marker too, so counting matches
+            #  gives the occurrence number, but only an original analysis
+            #  may be the source of a copy. A copy of a copy stacks another
+            #  "diagnosed before" header on every occurrence. The
+            #  `claude-ci-fp-copy` marker in every copy excludes copies here.
+            #
+            #  Oldest-first ordering means that the last match is the most
+            #  recent original analysis of the fingerprint.
+            #
+            jq -s --arg fp "$fp" --arg sha "$FAILING_SHA" '
+              [ .[][] | select(.body | contains("claude-ci-finding: " + $fp))
+                      | select(.body | contains("claude-ci-fp-copy: " + $fp) | not)
+                      | select(.commit_id != $sha) ] | last // empty
+            ' /tmp/recent.json > /tmp/prev.json
+
+            if [ ! -s /tmp/prev.json ]; then
+              echo "queueing $fp for fresh diagnosis, no scanned comment holds a previous diagnosis"
+              new="$new $fp"
+              continue
+            fi
+
+            seen=$(jq -s --arg fp "$fp" \
+                   '[ .[][] | select(.body | contains("claude-ci-finding: " + $fp)) ] | length' \
+                   /tmp/recent.json)
+
+            #
+            #  A failure that keeps recurring stops being news. After five
+            #  occurrences the job records the recurrence in the job log
+            #  only.  The count only covers the scanned comment pages.  A
+            #  failure that still recurs after the old occurrences leave the
+            #  scanned pages therefore receives an occasional comment again
+            #  rather than permanent silence.
+            #
+            if [ "$seen" -ge 5 ]; then
+              echo "skipping the comment for $fp, the failure has recurred $seen times"
+              known="$known $fp"
+              continue
+            fi
+
+            #
+            #  Pull just the current fingerprint's block out of the source
+            #  comment.  The job treats a source comment without an
+            #  extractable block (the model omitted or mangled the markers)
+            #  as no previous diagnosis, so the `diagnose` job analyses the
+            #  failure afresh.
+            #
+            jq -r .body /tmp/prev.json > /tmp/prev_body.md
+            awk -v b="<!-- claude-ci-finding: $fp -->" -v e="<!-- claude-ci-finding-end: $fp -->" '
+              $0 == b {inblock=1}
+              inblock {print}
+              $0 == e {found=1; exit}
+              END {exit !found}
+            ' /tmp/prev_body.md > /tmp/block.md || {
+              echo "queueing $fp for fresh diagnosis, the source comment has no extractable block"
+              new="$new $fp"
+              continue
+            }
+
+            prev_sha=$(jq -r .commit_id /tmp/prev.json)
+            prev_url=$(jq -r .html_url /tmp/prev.json)
+            {
+              printf '### Recurring failure `%s` (occurrence %s)\n\n' "$fp" "$seen"
+              printf 'Diagnosed before at [%s](%s); the earlier analysis is reproduced below rather than repeated. It was written against a different commit, so file:line references and suggested diffs may have moved.\n' "${prev_sha:0:12}" "$prev_url"
+              printf '<!-- claude-ci-fp-copy: %s -->\n\n' "$fp"
+              cat /tmp/block.md
+              printf '\n\n'
+            } >> /tmp/blocks.md
+            known="$known $fp"
+            echo "copied diagnosis of $fp from $prev_sha (occurrence $seen)"
+          done
+
+          if [ -s /tmp/blocks.md ]; then
+            {
+              cat /tmp/blocks.md
+              printf -- '---\n_Posted automatically by Claude CI Failure Diagnosis._\n'
+            } > /tmp/comment.md
+            jq -Rs '{body: .}' < /tmp/comment.md > /tmp/comment.json
+            gh api -X POST "repos/$REPO/commits/$FAILING_SHA/comments" --input /tmp/comment.json >/dev/null
+          fi
+
+          #
+          #  `matched=true` means that every fingerprint is already explained
+          #  (by a copy just posted, or by the recurrence cap), so the
+          #  `diagnose` job has nothing left to analyse.
+          #
+          known="${known# }"
+          new="${new# }"
+          if [ -z "$new" ]; then
+            matched=true
+          else
+            matched=false
+          fi
+          echo "matched=$matched" >> "$GITHUB_OUTPUT"
+          echo "known=$known" >> "$GITHUB_OUTPUT"
+          echo "known: ${known:-<none>}, new: ${new:-<none>}"
+
+  #
+  #  Full diagnosis. The `diagnose` job does not run in exactly two cases:
+  #
+  #    1. `triage` returned a confident `infrastructure` verdict.
+  #    2. The `recurrence` job already explained every fingerprint.
+  #
+  #  An empty or malformed `triage` result matches neither case, so the
+  #  `diagnose` job runs.
+  #
+  diagnose:
+    needs: [triage, recurrence]
+    #
+    #  The `if:` condition of the `triage` job is the one copy of the pipeline
+    #  conditions, and `triage`
+    #  skips exactly when the conditions fail.  'not skipped' therefore
+    #  stands in for the whole condition list.  A `triage` job that errored
+    #  must not silently drop the diagnosis for a pipeline failure that
+    #  nobody has looked at.  The condition therefore uses `!cancelled()` and
+    #  accepts a failed `triage` result.
+    #
+    if: >-
+      ${{ !cancelled() && needs.triage.result != 'skipped' &&
+          needs.recurrence.outputs.matched != 'true' &&
+          !(needs.triage.outputs.verdict == 'infrastructure' &&
+            fromJSON(needs.triage.outputs.confidence) >= 0.8 &&
+            needs.triage.outputs.test_failure != 'true') }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    #
+    #  The model runs in the `diagnose` job, so the `diagnose` job holds
+    #  no write permission.  The `post` job posts the comment that the
+    #  `diagnose` job saves as an artifact.  A job token recovered
+    #  through prompt injection therefore grants read access to a public
+    #  repository and nothing else.
+    #
+    permissions:
+      contents: read
+      actions: read     # read failed-job logs
+      id-token: write
+
+    outputs:
+      comment: ${{ steps.comment.outputs.present }}
+
+    steps:
+      - name: Checkout failing commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 2
+
+      - name: Run Claude Code diagnosis
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          anthropic_federation_rule_id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          anthropic_organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          anthropic_service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          anthropic_workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          show_full_output: true
+          additional_permissions: |
+            actions: read
+          claude_args: >-
+            --model fable
+            --max-budget-usd 5.00
+            --allowed-tools
+            "Bash(gh run view:*),Bash(gh run download:*),Bash(gh api:*),Bash(gh issue view:*),Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git blame:*),Bash(jq:*),Read,Write,Grep,Glob"
+          prompt: |
+            One or more CI legs failed on ${{ github.event.workflow_run.head_branch }} at commit ${{ github.event.workflow_run.head_sha }}.
+
+            You run once for the whole pipeline, after every leg has finished, so you are seeing the complete picture and no other session is running against this commit. Diagnose every failure and write exactly ONE comment body covering all of them. Do not open a PR, do not push, and do not edit any file in the repo.
+
+            The pipeline run is ${{ github.event.workflow_run.html_url }}
+
+            Steps:
+
+            1. Every failed job is in this one run, so one call lists them:
+                 gh run view ${{ github.event.workflow_run.id }} --repo ${{ github.repository }} --json jobs \
+                   --jq '.jobs[] | select(.conclusion == "failure") | {databaseId, name}'
+               Then read each one:
+                 gh run view --job "<job id>" --repo ${{ github.repository }} --log
+
+            2. Group the failures. Several legs failing on the same underlying cause (one compile error breaking every build leg) is ONE finding, not one per leg. Only treat them separately when the root causes genuinely differ.
+
+               Each failure has a machine fingerprint derived from its failing target. The fingerprints for this run are:
+
+                 ${{ needs.triage.outputs.fingerprints }}
+
+               Of those, the following are already diagnosed, and a separate comment on this commit already reproduces their analyses, so do NOT analyse them again; cover only the remaining fingerprints (an empty list means every failure needs analysis):
+
+                 ${{ needs.recurrence.outputs.known }}
+
+            3. Inspect the commit under test:
+                 git show --stat ${{ github.event.workflow_run.head_sha }}
+                 git show ${{ github.event.workflow_run.head_sha }} -- <files of interest>
+
+            4. Classify each distinct failure as exactly one of:
+                 REGRESSION   - this commit (or one of its files) caused the failure; cite file:line.
+                 INTERMITTENT - an intermittent failure unrelated to the change. This is an undiagnosed bug (a race, a use-after-free, leaked state, an ordering assumption), never noise, and "flake" is a banned word.
+                 INFRA        - runner / mirror / image / dependency-fetch failure outside the codebase.
+                 UNKNOWN      - logs are insufficient to classify; say what's missing.
+
+            5. Write the comment body to /tmp/comment.md (keep under ~120 lines). Repeat the block once per distinct root cause, listing every leg that failure took down:
+
+                 <!-- claude-ci-finding: <fingerprint> -->
+                 **Classification:** <one of the four above>
+                 **Failed legs:** CI, CI DEB
+
+                 **Summary:** one or two sentences.
+
+                 **Evidence:** the smallest relevant log excerpt (fenced code block) plus file:line refs.
+
+                 **Suggested next step:** for REGRESSION, a minimal unified diff in a ```diff block if the fix is small and obvious; otherwise the area to investigate. For INTERMITTENT, where the diagnosis of the underlying bug would start: the shared state, the timing window, or the ordering the failure depends on. For INFRA, the indicator that justifies the label so a human can confirm.
+                 <!-- claude-ci-finding-end: <fingerprint> -->
+
+               End the comment, after the last block, with:
+
+                 ---
+                 _Posted automatically by Claude CI Failure Diagnosis._
+
+               The two marker lines are how a later run recognises the same failure and copies just that block forward instead of paying to work it out again. Substitute <fingerprint> with the fingerprint from the list in step 2 matching the failure the block explains, write each marker exactly as shown on its own line, and put nothing before the begin marker or after the end marker of a block. When one root cause covers several fingerprints, stack a begin marker line per fingerprint at the start of the block and an end marker line per fingerprint at the end. When no listed fingerprint matches the failure, omit the marker lines for that block.
+
+            6. Leave the finished body in /tmp/comment.md and post nothing yourself. A separate job posts the file with a write token; this session has read access only, and any attempt to post fails.
+
+            Do not speculate beyond what the logs support. UNKNOWN is a useful signal - prefer it over a guess.
+
+      - name: Check for a comment to post
+        id: comment
+        run: |
+          if [ -s /tmp/comment.md ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "the diagnosis produced no comment body"
+          fi
+
+      - name: Save the comment for the posting job
+        if: steps.comment.outputs.present == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-diagnosis-comment
+          path: /tmp/comment.md
+          retention-days: 1
+
+  #
+  #  The `post` job posts the comment.  The model writes the comment
+  #  body in the read-only `diagnose` job, and the `post` job posts
+  #  with a write-scoped token, so no model runs with write access.
+  #
+  post:
+    needs: diagnose
+    if: ${{ !cancelled() && needs.diagnose.outputs.comment == 'true' }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write   # post commit comment via gh api
+
+    steps:
+      - name: Fetch the comment
+        uses: actions/download-artifact@v8
+        with:
+          name: ci-diagnosis-comment
+          path: /tmp
+
+      #  jq -Rs is the safe way to escape multi-line bodies with backticks.
+      - name: Post the comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          FAILING_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          jq -Rs '{body: .}' < /tmp/comment.md > /tmp/comment.json
+          gh api -X POST "repos/$REPO/commits/$FAILING_SHA/comments" --input /tmp/comment.json >/dev/null

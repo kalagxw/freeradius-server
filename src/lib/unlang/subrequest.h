@@ -23,13 +23,14 @@
  * @copyright 2019 The FreeRADIUS server project
  * @copyright 2021 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #include <freeradius-devel/server/request.h>
 #include <freeradius-devel/server/rcode.h>
-#include <stdbool.h>
+#include <freeradius-devel/unlang/interpret.h>
 
 typedef struct {
 	bool		enable;				//!< Whether we should store/restore sessions.
@@ -41,11 +42,8 @@ request_t	*unlang_subrequest_alloc(request_t *parent, fr_dict_t const *namespace
 
 void		unlang_subrequest_detach_and_free(request_t **child);
 
-int		unlang_subrequest_lifetime_set(request_t *request);
-
-int		unlang_subrequest_child_push(rlm_rcode_t *out, request_t *child,
-					     unlang_subrequest_session_t const *session,
-					     bool free_child, bool top_frame);
+int		unlang_subrequest_child_push(unlang_result_t *p_result, request_t *child,
+					     void const *unique_session_ptr, bool free_child, bool top_frame);
 
 int		unlang_subrequest_child_push_and_detach(request_t *child);
 

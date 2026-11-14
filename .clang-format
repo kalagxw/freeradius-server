@@ -15,8 +15,8 @@ SortIncludes: false
 # Indents braced list initialisers correctly, with a space
 # after the opening brace, and before the closing brace.
 #
-# static CONF_PARSER group_config[] = {
-#	{ FR_CONF_OFFSET("filter", FR_TYPE_STRING, rlm_ldap_t, groupobj_filter) }
+# static conf_parser_t group_config[] = {
+#	{ FR_CONF_OFFSET("filter", rlm_ldap_t, groupobj_filter) }
 # };
 #
 ContinuationIndentWidth: 8
@@ -96,6 +96,14 @@ IndentCaseLabels: false
 #  #endif
 #
 IndentPPDirectives: AfterHash
+
+#
+#  Indent continued preprocessor directives with two spaces (rendered
+#  as spaces, not tabs, because PPIndentWidth is below TabWidth=8).
+#  Matches the established `#  include`, `#  ifdef`, `#  define` style
+#  used throughout the v4 headers.
+#
+PPIndentWidth: 2
 
 #
 #  Ensures pointers '*' are placed next to the variable name

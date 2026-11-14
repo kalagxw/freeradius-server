@@ -28,16 +28,17 @@ RCSIDH(radius_attrs_h, "$Id$")
 #include <freeradius-devel/util/dict.h>
 #include <freeradius-devel/radius/radius.h>
 
-extern fr_dict_t const *dict_freeradius;
-extern fr_dict_t const *dict_radius;
+extern HIDDEN fr_dict_t const *dict_freeradius;
+extern HIDDEN fr_dict_t const *dict_radius;
 
-extern fr_dict_attr_t const *attr_packet_type;
-extern fr_dict_attr_t const *attr_packet_authentication_vector;
-extern fr_dict_attr_t const *attr_raw_attribute;
-extern fr_dict_attr_t const *attr_chap_challenge;
-extern fr_dict_attr_t const *attr_chargeable_user_identity;
-extern fr_dict_attr_t const *attr_eap_message;
-extern fr_dict_attr_t const *attr_message_authenticator;
-extern fr_dict_attr_t const *attr_state;
-extern fr_dict_attr_t const *attr_vendor_specific;
-extern fr_dict_attr_t const *attr_nas_filter_rule;
+extern HIDDEN fr_dict_attr_t const *attr_packet_type;
+extern HIDDEN fr_dict_attr_t const *attr_packet_authentication_vector;
+extern HIDDEN fr_dict_attr_t const *attr_chap_challenge;
+extern HIDDEN fr_dict_attr_t const *attr_chargeable_user_identity;
+extern HIDDEN fr_dict_attr_t const *attr_eap_message;
+extern HIDDEN fr_dict_attr_t const *attr_message_authenticator;
+extern HIDDEN fr_dict_attr_t const *attr_state;
+extern HIDDEN fr_dict_attr_t const *attr_vendor_specific;
+extern HIDDEN fr_dict_attr_t const *attr_nas_filter_rule;
+
+extern HIDDEN const fr_radius_packet_code_t allowed_replies[FR_RADIUS_CODE_MAX];

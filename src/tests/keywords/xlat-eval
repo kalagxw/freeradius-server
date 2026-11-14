@@ -1,0 +1,63 @@
+request += {
+	Filter-Id  = 'foo'
+	Filter-Id  = 'bar'
+	NAS-Port = '4'
+	NAS-Port = '8'
+	NAS-Port = '1'
+
+	Reply-Message = '%{Filter-Id}'
+}
+
+#
+#  Verify non string types are treated as literals
+#
+if (!("%eval(%{NAS-Port})" == 4)) {
+	test_fail
+}
+
+if (!(%eval(%{NAS-Port[1]}) == 8)) {
+	test_fail
+}
+
+#
+#  Check double expansion works
+#
+if (!(%eval(%{Reply-Message}) == 'foo')) {
+	test_fail
+}
+
+#
+#  Using an attribute as a dynamic index for another attribute
+#
+if (!(%eval("\%{Filter-Id[%{NAS-Port[2]}]}") == 'bar')) {
+	test_fail
+}
+
+#
+#  Check yielding works (regression test?)
+#
+if ((time_delta)%reschedule() > 1s) {
+	test_fail
+}
+
+#
+#  Verify eval can find local attributes
+#
+group {
+	uint32 idx
+	string stackstr
+
+	idx := 1
+
+	if (!(%eval("\%{Filter-Id[%{idx}]}") == 'bar')) {
+		test_fail
+	}
+
+	stackstr := 'foo'
+
+	if (!(%eval("\%{stackstr}") == 'foo')) {
+		test_fail
+	}
+}
+
+success

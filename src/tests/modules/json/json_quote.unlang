@@ -1,0 +1,67 @@
+string test_string
+uint32 test_integer
+ipaddr test_ipaddr
+string dummy_string
+
+test_string := "Hello\n"
+if (!(%json.quote(%{test_string}) == "\"Hello\\n\"")) {
+	test_fail
+}
+
+test_string := "Hello\nbob"
+if (!(%json.quote(%{test_string}) == "\"Hello\\nbob\"")) {
+	test_fail
+}
+
+test_string := "\nHello\nbob"
+if (!(%json.quote(%{test_string}) == "\"\\nHello\\nbob\"")) {
+	test_fail
+}
+
+test_string := "Hello!"
+if (!(%json.quote(%{test_string}) == '"Hello!"')) {
+	test_fail
+}
+
+test_integer := 123456
+if (!(%json.quote(%{test_integer}) == '123456')) {
+	test_fail
+}
+
+test_ipaddr := 127.0.0.1
+if (!(%json.quote(%{test_ipaddr}) == '"127.0.0.1"')) {
+	test_fail
+}
+
+if (!(%json.quote(%{dummy_string}) == 'null')) {
+	test_fail
+}
+
+# Test calls in arguments as would be passed to REST module
+if (!(%test.passthrough("{\"messages\":[{\"attributes\":{\"acct_status_type\":%json.quote(%{Acct-Status-Type})}}]}") == '{"messages":[{"attributes":{"acct_status_type":null}}]}')) {
+	test_fail
+}
+
+#
+#  Test always_string using json_object_ex instance (always_string = yes)
+#
+
+# Integer should be quoted as a string
+test_integer := 123456
+if (!(%json_object_ex.quote(%{test_integer}) == '"123456"')) {
+	test_fail
+}
+
+# String should still work normally
+test_string := "Hello!"
+if (!(%json_object_ex.quote(%{test_string}) == '"Hello!"')) {
+	test_fail
+}
+
+# IP address is already quoted, should still work
+test_ipaddr := 192.168.1.1
+if (!(%json_object_ex.quote(%{test_ipaddr}) == '"192.168.1.1"')) {
+	test_fail
+}
+
+test_pass

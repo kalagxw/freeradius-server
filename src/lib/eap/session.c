@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -23,10 +23,10 @@
  */
 #include <freeradius-devel/server/pair.h>
 #include <freeradius-devel/radius/radius.h>
+#include <freeradius-devel/util/nbo.h>
 
 #include "attrs.h"
 #include "compose.h"
-#include "session.h"
 
 static int _eap_session_free(eap_session_t *eap_session)
 {
@@ -50,15 +50,40 @@ static int _eap_session_free(eap_session_t *eap_session)
 	 *	retransmit which nukes our ID, and therefore our state.
 	 */
 	if (((request && RDEBUG_ENABLED) || (!request && DEBUG_ENABLED)) &&
-	    (eap_session->tls && !eap_session->finished && ((fr_time() - eap_session->updated) > (((fr_time_t) 3) * NSEC)))) {
+	    (eap_session->tls && !eap_session->finished && fr_time_delta_gt(fr_time_sub(fr_time(), eap_session->updated), fr_time_delta_from_sec(3)))) {
 		ROPTIONAL(RWDEBUG, WARN, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
 		ROPTIONAL(RWDEBUG, WARN, "!! EAP session %016" PRIxPTR " did not finish!                   !!",
 			  (uintptr_t)eap_session);
-		ROPTIONAL(RWDEBUG, WARN, "!! See http://wiki.freeradius.org/guide/Certificate_Compatibility !!");
+		ROPTIONAL(RWDEBUG, WARN, "!! See https://www.freeradius.org/documentation/freeradius-server/4.0.0/trouble-shooting/client.html !!");
 		ROPTIONAL(RWDEBUG, WARN, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
 	}
 
 	ROPTIONAL(RDEBUG4, DEBUG4, "Freeing eap_session_t %p", eap_session);
+
+	/*
+	 *	Frozen state...
+	 */
+	if (!request) return 0;
+
+	/*
+	 *	Thawed state
+	 */
+#ifndef NDEBUG
+	{
+		eap_session_t *in_request;
+
+		in_request = request_data_get(request, NULL, REQUEST_DATA_EAP_SESSION);
+
+		/*
+		 *	Additional sanity check.  Either there's no eap_session
+		 *	associated with the request, or it matches the one we're
+		 *	about to free.
+		 */
+		fr_assert(!in_request || (eap_session == in_request));
+	}
+#else
+	(void) request_data_get(request, NULL, REQUEST_DATA_EAP_SESSION);
+#endif
 
 	return 0;
 }
@@ -81,7 +106,7 @@ static eap_session_t *eap_session_alloc(request_t *request)
 	eap_session_t	*eap_session;
 
 	eap_session = talloc_zero(NULL, eap_session_t);
-	if (!eap_session) {
+	if (unlikely(!eap_session)) {
 		ERROR("Failed allocating eap_session");
 		return NULL;
 	}
@@ -90,10 +115,26 @@ static eap_session_t *eap_session_alloc(request_t *request)
 
 	talloc_set_destructor(eap_session, _eap_session_free);
 
+	/*
+	 *	If the index is removed by something else
+	 *	like the state being cleaned up, then we
+	 *	still want the eap_session to be freed, which
+	 *	is why we set free_opaque to true.
+	 *
+	 *	We must pass a NULL pointer to associate the
+	 *	the EAP_SESSION data with, else we'll break
+	 *	tunneled EAP, where the inner EAP module is
+	 *	a different instance to the outer one.
+	 *
+	 *	We add this first so that eap_session_destroy
+	 */
+	request_data_talloc_add(request, NULL, REQUEST_DATA_EAP_SESSION, eap_session_t,
+				eap_session, true, true, true);
+
 	return eap_session;
 }
 
-/** 'destroy' an EAP session and dissasociate it from the current request
+/** 'destroy' an EAP session and disassociate it from the current request
  *
  * @note This could be done in the eap_session_t destructor (and was done previously)
  *	but this made the code too hard to follow, and too fragile.
@@ -108,29 +149,39 @@ void eap_session_destroy(eap_session_t **eap_session)
 {
 	if (!*eap_session) return;
 
-	if (!(*eap_session)->request) {
-		TALLOC_FREE(*eap_session);
-		return;
-	}
+	talloc_free(*eap_session);
+	*eap_session = NULL;
+}
 
-#ifndef NDEBUG
-	{
-		eap_session_t *in_request;
+/** discard and 'destroy' an EAP session and disassociate it from the current request
+ *
+ * @see eap_session_continue
+ * @see eap_session_freeze
+ * @see eap_session_thaw
+ *
+ * @param request to destroy (disassociate and free).
+ */
+void eap_session_discard(request_t *request)
+{
+	eap_session_t *eap_session;
 
-		in_request = request_data_get((*eap_session)->request, NULL, REQUEST_DATA_EAP_SESSION);
+	/*
+	 *	Unlink the request_data_t entry as we pull the
+	 *	eap_session out.  Using _reference here would leave
+	 *	the entry in place with rd->opaque pointing at the
+	 *	chunk we're about to free, and the destructor's
+	 *	own request_data_get cleanup is skipped when the
+	 *	session is frozen (request == NULL).
+	 */
+	eap_session = request_data_get(request, NULL, REQUEST_DATA_EAP_SESSION);
+	if (!eap_session) return;
 
-		/*
-		 *	Additional sanity check.  Either there's no eap_session
-		 *	associated with the request, or it matches the one we're
-		 *	about to free.
-		 */
-		fr_assert(!in_request || (*eap_session == in_request));
-	}
-#else
-	(void) request_data_get((*eap_session)->request, NULL, REQUEST_DATA_EAP_SESSION);
-#endif
+	/*
+	 *	Don't print "session didn't finish".
+	 */
+	eap_session->finished = true;
 
-	TALLOC_FREE(*eap_session);
+	eap_session_destroy(&eap_session);
 }
 
 /** Freeze an #eap_session_t so that it can continue later
@@ -157,6 +208,29 @@ void eap_session_freeze(eap_session_t **eap_session)
 	fr_assert((*eap_session)->request);
 	(*eap_session)->request = NULL;
 	*eap_session = NULL;
+}
+
+/** Check whether a request runs inside the tunnel of another EAP method
+ *
+ * A tunneled EAP method (PEAP, TTLS, FAST, TEAP) should not nest
+ * inside of another tunneled method.
+ *
+ * @param[in] request	to check.
+ * @return
+ *	- true if any ancestor has an #eap_session_t with #eap_session_t::tunnel set.
+ *	- false otherwise.
+ */
+bool eap_session_in_tunnel(request_t const *request)
+{
+	request_t	*parent;
+
+	for (parent = request->parent; parent; parent = parent->parent) {
+		eap_session_t *outer = eap_session_get(parent);
+
+		if (outer && outer->tunnel) return true;
+	}
+
+	return false;
 }
 
 /** Thaw an eap_session_t so it can be continued
@@ -209,14 +283,13 @@ eap_session_t *eap_session_thaw(request_t *request)
  */
 static char *eap_identity(request_t *request, eap_session_t *eap_session, eap_packet_raw_t *eap_packet)
 {
-	uint16_t 	len;
+	size_t 	len;
 
 	if (!eap_packet ||
 	    (eap_packet->code != FR_EAP_CODE_RESPONSE) ||
 	    (eap_packet->data[0] != FR_EAP_METHOD_IDENTITY)) return NULL;
 
-	memcpy(&len, eap_packet->length, sizeof(uint16_t));
-	len = ntohs(len);
+	len = talloc_array_length((uint8_t *) eap_packet);
 
 	/*
 	 *  Note: The minimum length here is 5.
@@ -233,20 +306,20 @@ static char *eap_identity(request_t *request, eap_session_t *eap_session, eap_pa
 	 *
 	 *  Code (1) + Identifier (1) + Length (2) + Type (1) = 5.
 	 *
-	 *  The maximum value is not bounded by the RFC. The eap_validation()
+	 *  The maximum value is not bounded by the RFC. The eap_is_valid()
 	 *  function called before eap_identity(), checks that the length
 	 *  field does not overrun the available data.
 	 *
 	 *  In some EAP methods, the identity may be encrypted, and padded
 	 *  out to the block size of the encryption method.  These identities
-	 *  may contain nuls, and made be much larger than humanly readable
-	 *  identiies.
+	 *  may contain nuls, and may be much larger than humanly readable
+	 *  identities.
 	 *
 	 *  The identity value *MUST NOT* be artificially limited or truncated
 	 *  here.
 	 */
-	if (len < sizeof(eap_packet_raw_t)) {
-		REDEBUG("EAP-Identity length field too short, expected >= 5, got %u", len);
+	if (len <= EAP_HEADER_LEN) {
+		REDEBUG("EAP-Identity length field too short, expected >= 5, got %zu", len);
 		return NULL;
 	}
 
@@ -283,7 +356,7 @@ static char *eap_identity(request_t *request, eap_session_t *eap_session, eap_pa
  *	  MUST be freed with #eap_session_destroy if being disposed of, OR
  *	  MUST be re-frozen with #eap_session_freeze if the authentication session will
  *	  continue when a future request is received.
- *	- NULL on error.
+ *	- NULL on error, any existing sessions will be destroyed.
  */
 eap_session_t *eap_session_continue(void const *instance, eap_packet_raw_t **eap_packet_p, request_t *request)
 {
@@ -307,7 +380,6 @@ eap_session_t *eap_session_continue(void const *instance, eap_packet_raw_t **eap
 	if (!eap_session) {
 		eap_session = eap_session_alloc(request);
 		if (!eap_session) {
-		error_round:
 			talloc_free(*eap_packet_p);
 			*eap_packet_p = NULL;
 			return NULL;
@@ -328,7 +400,11 @@ eap_session_t *eap_session_continue(void const *instance, eap_packet_raw_t **eap
 			eap_session->identity = eap_identity(request, eap_session, eap_packet);
 			if (!eap_session->identity) {
 				REDEBUG("Invalid identity response");
-				goto error_session;
+			error:
+				eap_session_destroy(&eap_session);
+				talloc_free(*eap_packet_p);
+				*eap_packet_p = NULL;
+				return NULL;
 			}
 
 			/*
@@ -336,18 +412,18 @@ eap_session_t *eap_session_continue(void const *instance, eap_packet_raw_t **eap
 			 *	random junk is coming from.
 			 */
 			RHEXDUMP3((uint8_t *const)eap_session->identity,
-				 talloc_array_length(eap_session->identity) - 1,
+				 talloc_strlen(eap_session->identity),
 				 "EAP Identity Response - \"%pV\"",
 				 fr_box_strvalue_len(eap_session->identity,
-						     talloc_array_length(eap_session->identity) - 1));
+						     talloc_strlen(eap_session->identity)));
 			break;
 
 		case FR_EAP_METHOD_INVALID:
 		case FR_EAP_METHOD_NOTIFICATION:
 		case FR_EAP_METHOD_NAK:
 			REDEBUG("Initial EAP method %s(%u) invalid",
-				eap_type2name(eap_packet->data[0]), eap_packet->data[0]);
-			goto error_session;
+				eap_type2name((eap_type_t)eap_packet->data[0]), eap_packet->data[0]);
+			goto error;
 
 		/*
 		 *	Initialise a zero length identity, as we've
@@ -358,21 +434,6 @@ eap_session_t *eap_session_continue(void const *instance, eap_packet_raw_t **eap
 			eap_session->identity = talloc_bstrndup(eap_session, "", 0);
 			break;
 		}
-
-		/*
-		 *	If the index is removed by something else
-		 *	like the state being cleaned up, then we
-		 *	still want the eap_session to be freed, which
-		 *	is why we set free_opaque to true.
-		 *
-		 *	We must pass a NULL pointer to associate the
-		 *	the EAP_SESSION data with, else we'll break
-		 *	tunneled EAP, where the inner EAP module is
-		 *	a different instance to the outer one.
-		 */
-		request_data_talloc_add(request, NULL, REQUEST_DATA_EAP_SESSION, eap_session_t,
-					eap_session, true, true, true);
-
 	/*
 	 *	Continue a previously started EAP-Session
 	 */
@@ -387,9 +448,7 @@ eap_session_t *eap_session_continue(void const *instance, eap_packet_raw_t **eap
 		eap_session->rounds++;
 		if (eap_session->rounds >= 50) {
 			RERROR("Failing EAP session due to too many round trips");
-		error_session:
-			eap_session_destroy(&eap_session);
-			goto error_round;
+			goto error;
 		}
 
 		/*
@@ -405,9 +464,9 @@ eap_session_t *eap_session_continue(void const *instance, eap_packet_raw_t **eap
 			RERROR("Response appears to match a previous request, but the EAP type is wrong");
 			RERROR("We expected EAP type %s, but received type %s",
 			       eap_type2name(eap_session->type),
-			       eap_type2name(eap_packet->data[0]));
+			       eap_type2name((eap_type_t)eap_packet->data[0]));
 			RERROR("Your Supplicant or NAS is probably broken");
-			goto error_round;
+			goto error;
 		}
 	}
 
@@ -420,7 +479,7 @@ eap_session_t *eap_session_continue(void const *instance, eap_packet_raw_t **eap
 	 *	Type-Data field of the EAP-Response/Identity in the User-Name
 	 *	attribute in every subsequent Access-Request.
 	 */
-	user = fr_pair_find_by_da(&request->request_pairs, attr_user_name, 0);
+	user = fr_pair_find_by_da(&request->request_pairs, NULL, attr_user_name);
 	if (!user) {
 		/*
 		 *	NAS did not set the User-Name
@@ -442,7 +501,7 @@ eap_session_t *eap_session_continue(void const *instance, eap_packet_raw_t **eap
 	 *	so if the EAP identity is longer than the max RADIUS attribute length
 	 *	then ignore mismatches.
 	 */
-	} else if ((talloc_array_length(eap_session->identity) - 1) <= RADIUS_MAX_STRING_LENGTH) {
+	} else if ((talloc_strlen(eap_session->identity)) <= RADIUS_MAX_STRING_LENGTH) {
 		/*
 		 *      A little more paranoia.  If the NAS
 		 *      *did* set the User-Name, and it doesn't
@@ -455,14 +514,14 @@ eap_session_t *eap_session_continue(void const *instance, eap_packet_raw_t **eap
 		if (talloc_memcmp_bstr(eap_session->identity, user->vp_strvalue) != 0) {
 			REDEBUG("Identity from EAP Identity-Response \"%s\" does not match User-Name attribute \"%s\"",
 				eap_session->identity, user->vp_strvalue);
-			goto error_round;
+			goto error;
 		}
 	}
 
 	eap_session->this_round = eap_round_build(eap_session, eap_packet_p);
 	if (!eap_session->this_round) {
 		REDEBUG("Failed allocating memory for round");
-		goto error_session;
+		goto error;
 	}
 
 	return eap_session;

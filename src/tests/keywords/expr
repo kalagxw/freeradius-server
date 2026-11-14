@@ -1,75 +1,141 @@
 #
-#  PRE: update if
+#  PRE: if
 #
+uint32 test_integer1
+uint32 test_integer2
+int64  test_integer
+string test_string
+date test_date
 
 #
 #  Simple
 #
-if ("%{expr: 1 + 2 + 3 + 4}" != 10) {
+if (!(%{1 + 2 + 3 + 4} == 10)) {
+	test_fail
+}
+if !(1 + 2 + 3 + 4 == 10) {
 	test_fail
 }
 
 #
 #  Precedence
 #
-if ("%{expr: 1 + 2 * 3 + 4}" != 11) {
+if (!(%{1 + 2 * 3 + 4} == 11)) {
+	test_fail
+}
+if !(1 + 2 * 3 + 4 == 11) {
 	test_fail
 }
 
 #
 #  attribute references
 #
-update request {
-	&Tmp-Integer-0 = 1
-	&Tmp-Integer-1 = 3
-	&Tmp-Integer-2 = 4
-	&Tmp-Date-0 = "%l"
-}
+test_integer1 := 3
+test_integer2 := 4
+test_date := %l
 
-if ("%{expr: 1 + 2 * &Tmp-Integer-1 + 4}" != 11) {
+if (!(%{ 1 + 2 * test_integer1 + 4} == 11)) {
+	test_fail
+}
+if !(1 + 2 * test_integer1 + 4 == 11) {
 	test_fail
 }
 
-if ("%{expr: 1 + 2 * (&Tmp-Integer-1 + 4)}" != 15) {
+
+if (!(%{ 1 + 2 * (test_integer1 + 4)} == 15)) {
+	test_fail
+}
+if !(1 + 2 * (test_integer1 + 4) == 15) {
 	test_fail
 }
 
-if ("%{expr: 1 + 2 * (&Tmp-Integer-1 + &Tmp-Integer-2)}" != 15) {
+if (!(%{ 1 + 2 * (test_integer1 + test_integer2)} == 15)) {
+	test_fail
+}
+if !(1 + 2 * (test_integer1 + test_integer2) == 15) {
 	test_fail
 }
 
-if ("%{expr: 1 & ~1}" != 0) {
+if (!(%{ 1 & ~1} == 0)) {
+	test_fail
+}
+if !((1 & ~1) == 0) {	# needs an extra () to resolve ambiguities and warnings
 	test_fail
 }
 
-if ("%{expr: 1 & ~2}" != 1) {
+if (!(%{ 1 & ~2} == 1)) {
+	test_fail
+}
+if !((1 & ~2) == 1) {	# needs an extra () to resolve ambiguities and warnings
 	test_fail
 }
 
-if ("%{expr: -1 * 2}" != -2) {
+if (!(%{ -1 * 2} == -2)) {
+	test_fail
+}
+if !(-1 * 2 == -2) {
 	test_fail
 }
 
-if ("%{expr: 2 - -1}" != 3) {
+if (!(%{ 11 % 2} == 1)) {
+	test_fail
+}
+if !(11 % 2 == 1) {
 	test_fail
 }
 
-if ("%{expr: 1 << 2 | 1}" != 5) {
+if (!(%{ 2 - -1} == 3)) {
+	test_fail
+}
+if !(2 - -1 == 3) {
 	test_fail
 }
 
-if ("%{expr: &Tmp-Date-0}" <= 0) {
+if (!(%{ 1 << 2 | 1} == 5)) {
+	test_fail
+}
+if !(((1 << 2) | 1) == 5) {	# needs extra () to resolve precedence
+	test_fail
+}
+
+if (test_date <= 0) {
 	test_fail
 }
 
 #
 #  Unary negation
 #
-if ("%{expr: 6 + -(1 + 3)}" != 2) {
+if (!(%{ 6 + -(1 + 3)} == 2)) {
+	test_fail
+}
+if !(6 + -(1 + 3) == 2) {
 	test_fail
 }
 
-if ("%{expr: 6 * -&Tmp-Integer-2}" != -24) {
+if (!(%{ 6 * -test_integer2} == -24)) {
+	test_fail
+}
+if !(6 * -test_integer2 == -24) {
+	test_fail
+}
+
+test_string = "%l"
+if (test_string !~ /^[0-9]+$/) {
+	test_fail
+}
+
+test_string = "%c"
+if (test_string !~ /^[0-9]+$/) {
+	test_fail
+}
+
+#
+#  %l is request receive time.  %c is wall-clock "now"
+#
+#  They should be reasonably close for the unit tests.
+#
+test_integer = %l - %c
+if ((test_integer < -2) || (test_integer > 2)) {
 	test_fail
 }
 

@@ -45,7 +45,7 @@ required for its proper operation:
 For a number of reasons, the debugging output is placed in an
 intermediate file, rather than being sent directly to standard output.
 In order to prevent this file from growing too large, the
-\fBraddebug\fP program is automatically terminated after 10 seconds.
+\fBraddebug\fP program is automatically terminated after 60 seconds.
 This timeout can be changed via the "-t" parameter.
 .PP
 When the script exits, debug mode in the server is disabled, and the
@@ -68,7 +68,7 @@ Show debug output for the client having the given IPv4 address.  This
 option is equivalent to using:
 .br
 .in +0.3i
--c '(Packet-Src-IP-Address == ipv4-address)'
+-c '(Net.Src.IP == ipv4-address)'
 .in -0.3i
 .IP "\-d \fIconfig directory\fP"
 The radius configuration directory, usually /etc/raddb.  See the
@@ -80,7 +80,7 @@ Show debug output for the client having the given IPv6 address.  This
 option is equivalent to using:
 .br
 .in +0.3i
--c '(Packet-Src-IPv6-Address == ipv6-address)'
+-c '(Net.Src.IPv6 == ipv6-address)'
 .in -0.3i
 .IP \-t\ \fItimeout\fP
 Stop printing debug output after "timeout" seconds.  The default

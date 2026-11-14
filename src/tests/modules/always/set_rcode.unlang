@@ -1,20 +1,19 @@
 #
 #  Set status to "notfound". xlat should expand to previous status, "alive"
 #
-if ("%(db_status:notfound)" != "alive") {
-	update reply {
-		&Reply-Message += "failed"
+if (%db_status('notfound') != "alive") {
+	reply += {
+		Reply-Message = "Failure in test at line %interpreter('...line')"
 	}
 }
-
 
 #
 #  Verify that the status was changed
 #
 db_status
 if (!notfound) {
-	update reply {
-		&Reply-Message += "failed"
+	reply += {
+		Reply-Message = "Failure in test at line %interpreter('...line')"
 	}
 }
 
@@ -22,9 +21,9 @@ if (!notfound) {
 #
 #  Fetch status using xlat without setting the status
 #
-if ("%(db_status:)" != "notfound") {
-	update reply {
-		&Reply-Message += "failed"
+if (%db_status() != "notfound") {
+	reply += {
+		Reply-Message = "Failure in test at line %interpreter('...line')"
 	}
 }
 
@@ -34,11 +33,9 @@ if ("%(db_status:)" != "notfound") {
 #
 db_status
 if (notfound) {
-	update reply {
-		&Reply-Message += "success"
+	reply += {
+		Reply-Message = "success"
 	}
 }
 
-update control {
-	&Password.Cleartext := "hello"
-}
+control.Password.Cleartext := "hello"

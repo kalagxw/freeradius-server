@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License, version 2 of the
  *   License as published by the Free Software Foundation.
  *
@@ -30,24 +30,18 @@
  */
 USES_APPLE_DEPRECATED_API
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/perm.h>
 
-#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
-#include <grp.h>
-#include <pwd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 
 #include <DirectoryService/DirectoryService.h>
 #include <membership.h>
 
 typedef struct {
-	char const		*name;		//!< Auth-Type value for this module instance.
-	fr_dict_enum_t		*auth_type;
+	fr_dict_enum_value_t const	*auth_type;
 } rlm_opendirectory_t;
 
 #ifndef HAVE_DECL_MBR_CHECK_SERVICE_MEMBERSHIP
@@ -68,7 +62,7 @@ extern fr_dict_autoload_t rlm_opendirectory_dict[];
 fr_dict_autoload_t rlm_opendirectory_dict[] = {
 	{ .out = &dict_freeradius, .proto = "freeradius" },
 	{ .out = &dict_radius, .proto = "radius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_auth_type;
@@ -80,7 +74,7 @@ fr_dict_attr_autoload_t rlm_opendirectory_dict_attr[] = {
 	{ .out = &attr_auth_type, .name = "Auth-Type", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
 	{ .out = &attr_user_name, .name = "User-Name", .type = FR_TYPE_STRING, .dict = &dict_radius },
 	{ .out = &attr_user_password, .name = "User-Password", .type = FR_TYPE_STRING, .dict = &dict_radius },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 /*
@@ -307,14 +301,14 @@ static long od_check_passwd(request_t *request, char const *uname, char const *p
  *	Check the users password against the standard UNIX
  *	password table.
  */
-static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_authenticate(unlang_result_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
 {
 	int		ret;
 	long		odResult = eDSAuthFailed;
 	fr_pair_t *username, *password;
 
-	username = fr_pair_find_by_da(&request->request_pairs, attr_user_name, 0);
-	password = fr_pair_find_by_da(&request->request_pairs, attr_user_password, 0);
+	username = fr_pair_find_by_da(&request->request_pairs, NULL, attr_user_name);
+	password = fr_pair_find_by_da(&request->request_pairs, NULL, attr_user_password);
 
 	/*
 	 *	We can only authenticate user requests which HAVE
@@ -322,12 +316,12 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	 */
 	if (!username) {
 		REDEBUG("Attribute \"User-Name\" is required for authentication");
-		RETURN_MODULE_INVALID;
+		RETURN_UNLANG_INVALID;
 	}
 
 	if (!password) {
 		REDEBUG("Attribute \"User-Password\" is required for authentication");
-		RETURN_MODULE_INVALID;
+		RETURN_UNLANG_INVALID;
 	}
 
 	/*
@@ -335,7 +329,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	 */
 	if (password->vp_length == 0) {
 		REDEBUG("User-Password must not be empty");
-		RETURN_MODULE_INVALID;
+		RETURN_UNLANG_INVALID;
 	}
 
 	/*
@@ -373,22 +367,22 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 
 	if (ret != RLM_MODULE_OK) {
 		RDEBUG2("Invalid password: %pV", &username->data);
-		return ret;
+		RETURN_UNLANG_RCODE(ret);
 	}
 
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
 
 /*
  *	member of the radius group?
  */
-static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_authorize(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_opendirectory_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_opendirectory_t);
+	rlm_opendirectory_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_opendirectory_t);
 	struct passwd			*userdata = NULL;
 	int				ismember = 0;
-	RADCLIENT			*client = NULL;
+	fr_client_t			*client = NULL;
 	uuid_t				uuid;
 	uuid_t				guid_sacl;
 	uuid_t				guid_nasgroup;
@@ -401,10 +395,10 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, mod
 	 *	We can only authenticate user requests which HAVE
 	 *	a User-Name attribute.
 	 */
-	username = fr_pair_find_by_da(&request->request_pairs, attr_user_name, 0);
+	username = fr_pair_find_by_da(&request->request_pairs, NULL, attr_user_name);
 	if (!username) {
 		RDEBUG2("OpenDirectory requires a User-Name attribute");
-		RETURN_MODULE_NOOP;
+		RETURN_UNLANG_NOOP;
 	}
 
 	/* resolve SACL */
@@ -416,7 +410,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, mod
 		err = mbr_gid_to_uuid(gid, guid_sacl);
 		if (err != 0) {
 			REDEBUG("The group \"%s\" does not have a GUID", kRadiusSACLName);
-			RETURN_MODULE_FAIL;
+			RETURN_UNLANG_FAIL;
 		}
 	}
 
@@ -435,12 +429,12 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, mod
 			groupdata = getgrnam(client->community);
 			if (!groupdata) {
 				REDEBUG("The group \"%s\" does not exist on this system", client->community);
-				RETURN_MODULE_FAIL;
+				RETURN_UNLANG_FAIL;
 			}
 			err = mbr_gid_to_uuid(groupdata->gr_gid, guid_nasgroup);
 			if (err != 0) {
 				REDEBUG("The group \"%s\" does not have a GUID", client->community);
-				RETURN_MODULE_FAIL;
+				RETURN_UNLANG_FAIL;
 			}
 		}
 	}
@@ -474,19 +468,19 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, mod
 
 	if (uuid_is_null(uuid)) {
 		REDEBUG("Could not get the user's uuid");
-		RETURN_MODULE_NOTFOUND;
+		RETURN_UNLANG_NOTFOUND;
 	}
 
 	if (!uuid_is_null(guid_sacl)) {
 		err = mbr_check_service_membership(uuid, kRadiusServiceName, &ismember);
 		if (err != 0) {
 			REDEBUG("Failed to check group membership");
-			RETURN_MODULE_FAIL;
+			RETURN_UNLANG_FAIL;
 		}
 
 		if (ismember == 0) {
 			REDEBUG("User is not authorized");
-			RETURN_MODULE_DISALLOW;
+			RETURN_UNLANG_DISALLOW;
 		}
 	}
 
@@ -494,61 +488,54 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, mod
 		err = mbr_check_membership_refresh(uuid, guid_nasgroup, &ismember);
 		if (err != 0) {
 			REDEBUG("Failed to check group membership");
-			RETURN_MODULE_FAIL;
+			RETURN_UNLANG_FAIL;
 		}
 
 		if (ismember == 0) {
 			REDEBUG("User is not authorized");
-			RETURN_MODULE_DISALLOW;
+			RETURN_UNLANG_DISALLOW;
 		}
 	}
 
 setup_auth_type:
 	if (!inst->auth_type) {
 		WARN("No 'authenticate %s {...}' section or 'Auth-Type = %s' set.  Cannot setup OpenDirectory authentication",
-		     inst->name, inst->name);
-		RETURN_MODULE_NOOP;
+		     mctx->mi->name, mctx->mi->name);
+		RETURN_UNLANG_NOOP;
 	}
 
-	if (!module_section_type_set(request, attr_auth_type, inst->auth_type)) RETURN_MODULE_NOOP;
+	if (!module_rlm_section_type_set(request, attr_auth_type, inst->auth_type)) RETURN_UNLANG_NOOP;
 
-	RETURN_MODULE_OK;
+	RETURN_UNLANG_OK;
 }
 
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_opendirectory_t	*inst = instance;
+	rlm_opendirectory_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_opendirectory_t);
 
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) inst->name = cf_section_name1(conf);
-
-	return 0;
-}
-
-static int mod_instantiate(void *instance, UNUSED CONF_SECTION *conf)
-{
-	rlm_opendirectory_t *inst = instance;
-
-	inst->auth_type = fr_dict_enum_by_name(attr_auth_type, inst->name, -1);
+	inst->auth_type = fr_dict_enum_by_name(attr_auth_type, mctx->mi->name, -1);
 	if (!inst->auth_type) {
 		WARN("Failed to find 'authenticate %s {...}' section.  OpenDirectory authentication will likely not work",
-		     inst->name);
+		     mctx->mi->name);
 	}
 
 	return 0;
 }
 
 /* globally exported name */
-extern module_t rlm_opendirectory;
-module_t rlm_opendirectory = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "opendirectory",
-	.inst_size	= sizeof(rlm_opendirectory_t),
-	.type		= RLM_TYPE_THREAD_SAFE,
-	.bootstrap	= mod_bootstrap,
-	.instantiate	= mod_instantiate,
-	.methods = {
-		[MOD_AUTHENTICATE]	= mod_authenticate,
-		[MOD_AUTHORIZE]		= mod_authorize
+extern module_rlm_t rlm_opendirectory;
+module_rlm_t rlm_opendirectory = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "opendirectory",
+		.inst_size	= sizeof(rlm_opendirectory_t),
+		.instantiate	= mod_instantiate
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("authenticate", CF_IDENT_ANY), .method = mod_authenticate },
+			{ .section = SECTION_NAME("recv", CF_IDENT_ANY), .method = mod_authorize },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

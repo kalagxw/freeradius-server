@@ -29,6 +29,7 @@ RCSIDH(eap_fast_h, "$Id$")
 
 #include <freeradius-devel/eap/tls.h>
 #include <freeradius-devel/radius/radius.h>
+#include <freeradius-devel/util/chap.h>
 
 #define EAP_FAST_VERSION			1
 
@@ -48,7 +49,7 @@ RCSIDH(eap_fast_h, "$Id$")
 #define EAP_FAST_TLV_RESULT_SUCCESS		1
 #define EAP_FAST_TLV_RESULT_FAILURE		2
 
-typedef enum {
+typedef enum : uint8_t {
 	EAP_FAST_TLS_SESSION_HANDSHAKE = 0,
 	EAP_FAST_AUTHENTICATION,
 	EAP_FAST_CRYPTOBIND_CHECK,
@@ -56,14 +57,14 @@ typedef enum {
 	EAP_FAST_COMPLETE
 } eap_fast_stage_t;
 
-typedef enum {
+typedef enum : uint8_t {
 	EAP_FAST_UNKNOWN = 0,
 	EAP_FAST_PROVISIONING_ANON,
 	EAP_FAST_PROVISIONING_AUTH,
 	EAP_FAST_NORMAL_AUTH
 } eap_fast_auth_type_t;
 
-typedef enum {
+typedef enum : uint8_t {
 	PAC_TYPE_TUNNEL = 1,	// 1
 	PAC_TYPE_MACHINE_AUTH,	// 2
 	PAC_TYPE_USER_AUTHZ,	// 3
@@ -150,7 +151,7 @@ typedef struct {
         uint8_t compound_mac[20];
 } CC_HINT(__packed__) eap_tlv_crypto_binding_tlv_t;
 
-typedef enum eap_fast_tlv_crypto_binding_tlv_subtype_t {
+typedef enum eap_fast_tlv_crypto_binding_tlv_subtype_t : uint8_t {
 	EAP_FAST_TLV_CRYPTO_BINDING_SUBTYPE_REQUEST = 0,	// 0
 	EAP_FAST_TLV_CRYPTO_BINDING_SUBTYPE_RESPONSE		// 1
 } eap_fast_tlv_crypto_binding_tlv_subtype_t;
@@ -158,12 +159,14 @@ typedef enum eap_fast_tlv_crypto_binding_tlv_subtype_t {
 /* RFC 5422: Section 3.3 - Key Derivations Used in the EAP-FAST Provisioning Exchange */
 typedef struct {
 	uint8_t	session_key_seed[EAP_FAST_SKS_LEN];
-	uint8_t	server_challenge[RADIUS_CHAP_CHALLENGE_LENGTH];
-	uint8_t	client_challenge[RADIUS_CHAP_CHALLENGE_LENGTH];
+	uint8_t	server_challenge[MD5_DIGEST_LENGTH];
+	uint8_t	client_challenge[MD5_DIGEST_LENGTH];
 } CC_HINT(__packed__) eap_fast_keyblock_t;
 
 typedef struct {
 	fr_pair_t		*username;
+
+	fr_pair_list_t		fast_vps;		//!< Pairs extracted from FAST data
 
 	bool			authenticated;
 
@@ -174,8 +177,8 @@ typedef struct {
 	uint8_t			*cmk;
 	int			imck_count;
 	struct {
-		uint8_t		mppe_send[RADIUS_CHAP_CHALLENGE_LENGTH];
-		uint8_t		mppe_recv[RADIUS_CHAP_CHALLENGE_LENGTH];
+		uint8_t		mppe_send[MD5_DIGEST_LENGTH];
+		uint8_t		mppe_recv[MD5_DIGEST_LENGTH];
 	} CC_HINT(__packed__)	isk;
 	uint8_t			*msk;
 	uint8_t			*emsk;
@@ -183,7 +186,7 @@ typedef struct {
 	int			default_method;
 	int			default_provisioning_method;
 
-	uint32_t		pac_lifetime;
+	fr_time_delta_t		pac_lifetime;
 	char const		*authority_identity;
 	uint8_t const 		*a_id;
 	uint8_t const 		*pac_opaque_key;
@@ -191,73 +194,12 @@ typedef struct {
 	struct {
 		uint8_t			*key;
 		eap_fast_pac_type_t	type;
-		uint32_t		expires;
+		fr_time_t		expires;
 		bool			expired;
 		bool			send;
 	}			pac;
 
 	bool			result_final;
 
-#ifdef WITH_PROXY
-	bool		proxy_tunneled_request_as_eap;	//!< Proxy tunneled session as EAP, or as de-capsulated
-							//!< protocol.
-#endif
-	char const	*virtual_server;
+	virtual_server_t	*virtual_server;	//!< To run inner tunnel authentication through
 } eap_fast_tunnel_t;
-
-extern fr_dict_attr_t const *attr_eap_tls_require_client_cert;
-extern fr_dict_attr_t const *attr_eap_type;
-extern fr_dict_attr_t const *attr_ms_chap_challenge;
-extern fr_dict_attr_t const *attr_ms_chap_peer_challenge;
-extern fr_dict_attr_t const *attr_proxy_to_realm;
-
-extern fr_dict_attr_t const *attr_eap_message;
-extern fr_dict_attr_t const *attr_eap_msk;
-extern fr_dict_attr_t const *attr_eap_emsk;
-extern fr_dict_attr_t const *attr_freeradius_proxied_to;
-extern fr_dict_attr_t const *attr_ms_mppe_send_key;
-extern fr_dict_attr_t const *attr_ms_mppe_recv_key;
-extern fr_dict_attr_t const *attr_user_name;
-extern fr_dict_attr_t const *attr_user_password;
-
-extern fr_dict_attr_t const *attr_eap_fast_crypto_binding;
-extern fr_dict_attr_t const *attr_eap_fast_eap_payload;
-extern fr_dict_attr_t const *attr_eap_fast_error;
-extern fr_dict_attr_t const *attr_eap_fast_intermediate_result;
-extern fr_dict_attr_t const *attr_eap_fast_nak;
-extern fr_dict_attr_t const *attr_eap_fast_pac_a_id;
-extern fr_dict_attr_t const *attr_eap_fast_pac_a_id_info;
-extern fr_dict_attr_t const *attr_eap_fast_pac_acknowledge;
-extern fr_dict_attr_t const *attr_eap_fast_pac_i_id;
-extern fr_dict_attr_t const *attr_eap_fast_pac_info_a_id;
-extern fr_dict_attr_t const *attr_eap_fast_pac_info_a_id_info;
-extern fr_dict_attr_t const *attr_eap_fast_pac_info_i_id;
-extern fr_dict_attr_t const *attr_eap_fast_pac_info_pac_lifetime;
-extern fr_dict_attr_t const *attr_eap_fast_pac_info_pac_type;
-extern fr_dict_attr_t const *attr_eap_fast_pac_info_tlv;
-extern fr_dict_attr_t const *attr_eap_fast_pac_key;
-extern fr_dict_attr_t const *attr_eap_fast_pac_lifetime;
-extern fr_dict_attr_t const *attr_eap_fast_pac_opaque_i_id;
-extern fr_dict_attr_t const *attr_eap_fast_pac_opaque_pac_key;
-extern fr_dict_attr_t const *attr_eap_fast_pac_opaque_pac_lifetime;
-extern fr_dict_attr_t const *attr_eap_fast_pac_opaque_pac_type;
-extern fr_dict_attr_t const *attr_eap_fast_pac_opaque_tlv;
-extern fr_dict_attr_t const *attr_eap_fast_pac_tlv;
-extern fr_dict_attr_t const *attr_eap_fast_pac_type;
-extern fr_dict_attr_t const *attr_eap_fast_result;
-extern fr_dict_attr_t const *attr_eap_fast_tlv;
-extern fr_dict_attr_t const *attr_eap_fast_vendor_specific;
-
-/*
- *	Process the FAST portion of an EAP-FAST request.
- */
-void eap_fast_tlv_append(fr_tls_session_t *tls_session, fr_dict_attr_t const *da, bool mandatory,
-			 int length, const void *data) CC_HINT(nonnull);
-fr_radius_packet_code_t eap_fast_process(request_t *request, eap_session_t *eap_session, fr_tls_session_t *tls_session) CC_HINT(nonnull);
-
-/*
- *	A bunch of EAP-FAST helper functions.
- */
-ssize_t		eap_fast_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr_t const *parent,
-			     	     uint8_t const *data, size_t data_len,
-			     	     UNUSED void *decode_ctx);

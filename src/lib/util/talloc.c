@@ -23,16 +23,14 @@
  */
 RCSID("$Id$")
 
+#include <freeradius-devel/util/atexit.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/dlist.h>
-#include <freeradius-devel/util/misc.h>
-#include <freeradius-devel/util/strerror.h>
-#include <freeradius-devel/util/talloc.h>
-#include <freeradius-devel/util/atexit.h>
+#include <freeradius-devel/util/syserror.h>
 
-#include <string.h>
-#include <unistd.h>
+#ifndef TALLOC_EXTENSIONS
 
+static TALLOC_CTX *global_ctx;
 static _Thread_local TALLOC_CTX *thread_local_ctx;
 
 /** A wrapper that can be passed to tree or hash alloc functions that take a #fr_free_t
@@ -106,7 +104,7 @@ fr_talloc_destructor_t *talloc_destructor_add(TALLOC_CTX *fire_ctx, TALLOC_CTX *
 		return NULL;
 	}
 
-	d = talloc(fire_ctx, fr_talloc_destructor_t);
+	d = talloc_zero(fire_ctx, fr_talloc_destructor_t);
 	if (!d) {
 	oom:
 		fr_strerror_const("Out of Memory");
@@ -219,6 +217,73 @@ TALLOC_CTX *talloc_aligned_array(TALLOC_CTX *ctx, void **start, size_t alignment
 	return array;
 }
 
+/** How big the chunk header is
+ *
+ * Non-zero portion will always fit in a uint8_t, so we don't need to worry about atomicity.
+ */
+static size_t		t_hdr_size;
+
+/** Calculate the size of talloc chunk headers, once, on startup
+ *
+ */
+static void _talloc_hdr_size(void)
+{
+	TALLOC_CTX	*pool;
+	void		*chunk;
+
+	pool = talloc_pool(NULL, 1024);	/* Allocate 1k of memory, this will always be bigger than the chunk header */
+	if (unlikely(pool == NULL)) {
+	oom:
+		fr_strerror_const("Out of memory");
+		return;
+	}
+	chunk = talloc_size(pool, 1);	/* Get the starting address */
+	if (unlikely(chunk == NULL)) goto oom;
+
+	/*
+	 *	Sanity check... make sure the chunk is within the pool
+	 *	if it's not, we're in trouble.
+	 */
+	if (!fr_cond_assert((chunk > pool) && ((uintptr_t)chunk < ((uintptr_t)pool + 1024)))) {
+		fr_strerror_const("Initial allocation outside of pool memory");
+		return;
+	}
+
+	/*
+	 *	Talloc returns the address after the chunk header, so
+	 *	the address of the pool is <malloc address> + <hdr_size>.
+	 *
+	 *	If we allocate a chunk inside the pool, then the address
+	 *	of the chunk will be <malloc address> + <hdr_size> + <hdr_size>.
+	 *	If we subtrace the chunk from the pool address, we get
+	 *	the size of the talloc header.
+	 */
+	t_hdr_size = (uintptr_t)chunk - (uintptr_t)pool;
+
+	talloc_free(pool); /* Free the memory we used */
+}
+
+/** Calculate the size of the talloc chunk header
+ *
+ * @return
+ *	- >0 the size of the talloc chunk header.
+ *	- -1 on error.
+ */
+ssize_t talloc_hdr_size(void)
+{
+	static pthread_once_t once_control = PTHREAD_ONCE_INIT;
+
+	if (t_hdr_size > 0) return t_hdr_size;	/* We've already calculated it */
+
+	if (pthread_once(&once_control, _talloc_hdr_size) != 0) {
+		fr_strerror_printf("pthread_once failed: %s", fr_syserror(errno));
+		return -1;
+	}
+	if (t_hdr_size == 0) return -1; /* Callback should set error */
+
+	return t_hdr_size;
+}
+
 /** Return a page aligned talloc memory pool
  *
  * Because we can't intercept talloc's malloc() calls, we need to do some tricks
@@ -234,67 +299,212 @@ TALLOC_CTX *talloc_aligned_array(TALLOC_CTX *ctx, void **start, size_t alignment
  * @param[in] ctx	to allocate pool memory in.
  * @param[out] start	A page aligned address within the pool.  This can be passed
  *			to mprotect().
- * @param[out] end	of the pages that should be protected.
+ * @param[out] end_len	how many bytes to protect.
+ * @param[in] headers	how much room we should allocate for talloc headers.
+ *			This value should usually be >= 1.
  * @param[in] size	How big to make the pool.  Will be corrected to a multiple
  *			of the page size.  The actual pool size will be size
  *			rounded to a multiple of the (page_size), + page_size
  */
-TALLOC_CTX *talloc_page_aligned_pool(TALLOC_CTX *ctx, void **start, void **end, size_t size)
+TALLOC_CTX *talloc_page_aligned_pool(TALLOC_CTX *ctx, void **start, size_t *end_len, unsigned int headers, size_t size)
 {
-	size_t		rounded, page_size = (size_t)getpagesize();
-	size_t		hdr_size, pool_size;
-	void		*next, *chunk;
+	size_t		rounded, alloced, page_size = (size_t)getpagesize();
+	ssize_t		hdr_size;
+	void		*next;
 	TALLOC_CTX	*pool;
 
-	rounded = ROUND_UP(size, page_size);			/* Round up to a multiple of the page size */
-	if (rounded == 0) rounded = page_size;
+	hdr_size = talloc_hdr_size();
+	if (hdr_size < 0) return NULL;
 
-	pool_size = rounded + page_size;
-	pool = talloc_pool(ctx, pool_size);			/* Over allocate */
+	size += (hdr_size * headers);	/* Add more space for the chunks headers of the pool's children */
+	size += hdr_size;		/* Add one more header to the pool for the padding allocation */
+
+	/*
+	 *  Allocate enough space for the padding header the other headers
+	 *  and the actual data, and sure it's a multiple of the page_size.
+	 *
+	 *   |<--- page_size --->|<-- page_size -->|
+	 *   |<-- hdr_size -->|<-- size -->|
+	 */
+	if (size % page_size == 0) {
+		rounded = size;
+	} else {
+		rounded = ROUND_UP(size, page_size);
+	}
+
+	/*
+	 *  Add another page, so that we can align the first allocation in
+	 *  the pool to a page boundary.  We have no idea what chunk malloc
+	 *  will give to talloc, and what the first address after adding the
+	 *  pools header will be
+	 */
+	alloced = rounded + page_size;
+	pool = talloc_pool(ctx, alloced);
 	if (!pool) {
 		fr_strerror_const("Out of memory");
 		return NULL;
 	}
 
-	chunk = talloc_size(pool, 1);				/* Get the starting address */
-	if (!fr_cond_assert((chunk > pool) && ((uintptr_t)chunk < ((uintptr_t)pool + rounded)))) {
-		fr_strerror_const("Initial allocation outside of pool memory");
-	error:
-		talloc_free(pool);
-		return NULL;
-	}
-	hdr_size = (uintptr_t)chunk - (uintptr_t)pool;
-
-	next = (void *)ROUND_UP((uintptr_t)chunk, page_size);	/* Round up address to the next page */
-
 	/*
-	 *	Depending on how talloc allocates the chunk headers,
-	 *	the memory allocated here might not align to a page
-	 *	boundary, but that's ok, we just need future allocations
-	 *	to occur on or after 'next'.
+	 *  If we didn't get lucky, and the first address in the pool is
+	 *  not the start of a page, we need to allocate some padding to
+	 *  get the first allocation in the pool to be on or after the
+	 *  start of the next page.
 	 */
-	if (((uintptr_t)next - (uintptr_t)chunk) > 0) {
+	if ((uintptr_t)pool % page_size != 0) {
 		size_t	pad_size;
 		void	*padding;
 
-		pad_size = ((uintptr_t)next - (uintptr_t)chunk);
-		if (pad_size > hdr_size) {
+		next = (void *)ROUND_UP((uintptr_t)pool, page_size);	/* Round up address to the next page */
+
+		/*
+		 *	We don't care if the first address if on a page
+		 *	boundary, just that it comes after one.
+		 */
+		pad_size = ((uintptr_t)next - (uintptr_t)pool);
+		if (pad_size > (size_t) hdr_size) {
 			pad_size -= hdr_size;			/* Save ~111 bytes by not over-padding */
 		} else {
-			pad_size = 1;
+			pad_size = 0;				/* Allocate as few bytes as possible */
 		}
 
 		padding = talloc_size(pool, pad_size);
 		if (!fr_cond_assert(((uintptr_t)padding + (uintptr_t)pad_size) >= (uintptr_t)next)) {
 			fr_strerror_const("Failed padding pool memory");
-			goto error;
+			return NULL;
 		}
+	} else {
+		next = pool;
 	}
 
-	*start = next;						/* This is the address we feed into mprotect */
-	*end = (void *)((uintptr_t)next + (uintptr_t)rounded);
+	*start = next;			/* This is the address we feed into mprotect */
+	*end_len = rounded;		/* This is how much memory we protect */
+
+	/*
+	 *	Start address must be page aligned
+	 */
+	fr_assert(((uintptr_t)*start % page_size) == 0);
+
+	/*
+	 *	For our sanity, length must be a multiple of the page size.
+	 *	mprotect will silently protect an entire additional page
+	 *	if length is not a multiple of page size.
+	 */
+	fr_assert(((uintptr_t)*end_len % page_size) == 0);
+
+	/*
+	 *	We can't protect pages before the pool
+	 */
+	fr_assert(*start >= pool);
+
+	/*
+	 *	We can't protect pages after the pool
+	 */
+	fr_assert(((uintptr_t)*start + *end_len) <= ((uintptr_t)pool + alloced));
 
 	return pool;
+}
+
+/** Address range of a talloc pool, the bytes used and live, and whether the pool overflowed
+ */
+typedef struct {
+	uint8_t const	*start;			//!< First byte of the pool.
+	uint8_t const	*end;			//!< First byte after the pool.
+	size_t		hdr;			//!< Size of a talloc chunk header, from talloc_hdr_size().
+	size_t		used;			//!< Bytes from start to the end of the highest chunk found so far.
+	size_t		live;			//!< Bytes of the pool that the live chunks found so far take up.
+	bool		overflowed;		//!< A chunk under the pool, in the talloc hierarchy, lies outside the
+						///< pool's address range.
+} talloc_pool_walk_t;
+
+/** Record the end of a chunk inside the pool, or record that a chunk is outside the pool
+ *
+ */
+static void _talloc_pool_chunk_walk(void const *ptr, int depth, UNUSED int max_depth, int is_ref, void *uctx)
+{
+	talloc_pool_walk_t	*walk = uctx;
+	uint8_t const		*chunk = ptr;
+	size_t			used, footprint;
+
+	/*
+	 *	Depth 0 is the pool itself, which is not a chunk in the pool.
+	 */
+	if (is_ref || (depth == 0)) return;
+
+	if ((chunk < walk->start) || (chunk >= walk->end)) {
+		walk->overflowed = true;
+		return;
+	}
+
+	/*
+	 *	talloc places each chunk's header directly before the chunk,
+	 *	and rounds the header and the chunk up to 16 bytes together.
+	 */
+	footprint = ROUND_UP_POW2(walk->hdr + talloc_get_size(ptr), 16);
+	walk->live += footprint;
+
+	used = (size_t)(chunk - walk->start) - walk->hdr + footprint;
+	if (used > walk->used) walk->used = used;
+}
+
+/** Measure how many bytes of a talloc pool are used and live, and whether the pool overflowed
+ *
+ * @param[out] overflowed	true if a chunk under the pool lies outside the pool.
+ * @param[out] live		Bytes of the pool that the live chunks take up, each chunk with
+ *				its talloc header, rounded up to 16 bytes.  used - live is the
+ *				space freed below the highest live chunk.
+ * @param[in] pool		returned by talloc_pool().
+ * @param[in] pool_size		passed to talloc_pool().
+ * @return Bytes from the start of the pool to the end of the highest live
+ *	   chunk in the pool
+ */
+size_t talloc_pool_used(bool *overflowed, size_t *live, TALLOC_CTX const *pool, size_t pool_size)
+{
+	ssize_t			hdr = talloc_hdr_size();
+	talloc_pool_walk_t	walk = {
+		.start = (uint8_t const *)pool,
+		.end = (uint8_t const *)pool + pool_size
+	};
+
+	/*
+	 *	talloc_hdr_size() only fails if it cannot allocate a small pool.
+	 */
+	if (!fr_cond_assert_msg(hdr > 0, "Failed finding the talloc header size")) hdr = 0;
+	walk.hdr = (size_t)hdr;
+
+	talloc_report_depth_cb(pool, 0, -1, _talloc_pool_chunk_walk, &walk);
+
+	*overflowed = walk.overflowed;
+	*live = walk.live;
+
+	return walk.used;
+}
+
+/** Version of talloc_realloc which zeroes out freshly allocated memory
+ *
+ * @param[in] ctx	talloc ctx to allocate in.
+ * @param[in] ptr	the pointer to the old memory.
+ * @param[in] elem_size	the size of each element in the array.
+ * @param[in] count	the number of elements in the array.
+ * @param[in] name	the name of the new chunk.
+ * @return
+ *	- A pointer to the new memory.
+ *	- NULL on error.
+ */
+void *_talloc_realloc_zero(const void *ctx, void *ptr, size_t elem_size, unsigned count, const char *name)
+{
+    size_t old_size = talloc_get_size(ptr);
+    size_t new_size;
+
+    void *new = _talloc_realloc_array(ctx, ptr, elem_size, count, name);
+    if (!new) return NULL;
+
+    new_size = talloc_array_length((uint8_t *) new);
+    if (new_size > old_size) {
+        memset((uint8_t *)new + old_size, 0, new_size - old_size);
+    }
+
+    return new;
 }
 
 /** Call talloc_memdup, setting the type on the new chunk correctly
@@ -337,7 +547,59 @@ char *talloc_typed_strdup(TALLOC_CTX *ctx, char const *p)
 {
 	char *n;
 
+#undef talloc_strdup
 	n = talloc_strdup(ctx, p);
+	if (unlikely(!n)) return NULL;
+	talloc_set_type(n, char);
+
+	return n;
+}
+
+/** Call talloc_strndup, setting the type on the new chunk correctly
+ *
+ * This function is similar to talloc_typed_strdup but gets the chunk
+ * length using talloc functions.
+ *
+ * @param[in] ctx	The talloc context to hang the result off.
+ * @param[in] p		The string you want to duplicate.
+ * @return
+ *	- Duplicated string.
+ *	- NULL on error.
+ *
+ * @hidecallergraph
+ */
+char *talloc_typed_strdup_buffer(TALLOC_CTX *ctx, char const *p)
+{
+	char *n;
+
+	n = talloc_strndup(ctx, p, talloc_strlen(p));
+	if (unlikely(!n)) return NULL;
+	talloc_set_type(n, char);
+
+	return n;
+}
+
+/** Call talloc_strndup, setting the type on the new chunk correctly
+ *
+ * For some bizarre reason the talloc string functions don't set the
+ * memory chunk type to char, which causes all kinds of issues with
+ * verifying fr_pair_ts.
+ *
+ * @param[in] ctx	The talloc context to hang the result off.
+ * @param[in] p		The string you want to duplicate.
+ * @param[in] len      	The length of the string
+ * @return
+ *	- Duplicated string.
+ *	- NULL on error.
+ *
+ * @hidecallergraph
+ */
+char *talloc_typed_strndup(TALLOC_CTX *ctx, char const *p, size_t len)
+{
+	char *n;
+
+#undef talloc_strndup
+	n = talloc_strndup(ctx, p, len);
 	if (unlikely(!n)) return NULL;
 	talloc_set_type(n, char);
 
@@ -396,7 +658,7 @@ char *talloc_typed_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 
 /** Binary safe strdup function
  *
- * @param[in] ctx 	he talloc context to allocate new buffer in.
+ * @param[in] ctx 	the talloc context to allocate new buffer in.
  * @param[in] in	String to dup, may contain embedded '\0'.
  * @return duped string.
  */
@@ -497,7 +759,8 @@ char *talloc_bstr_realloc(TALLOC_CTX *ctx, char *in, size_t inlen)
 	char *n;
 
 	if (!in) {
-		n = talloc_array(ctx, char, inlen);
+		n = talloc_array(ctx, char, inlen + 1);
+		if (!n) return NULL;
 		n[0] = '\0';
 		return n;
 	}
@@ -509,39 +772,6 @@ char *talloc_bstr_realloc(TALLOC_CTX *ctx, char *in, size_t inlen)
 	talloc_set_type(n, char);
 
 	return n;
-}
-
-/** Concatenate to + from
- *
- * @param[in] ctx	to allocate realloced buffer in.
- * @param[in] to	talloc string buffer to append to.
- * @param[in] from	talloc string buffer to append.
- * @return
- *	- NULL if to or from are NULL or if the realloc fails.
- *	  Note: You'll still need to free to if this function
- *	  returns NULL.
- *	- The concatenation of to + from.  After this function
- *	  returns to may point to invalid memory and should
- *	  not be used.
- */
-char *talloc_buffer_append_buffer(TALLOC_CTX *ctx, char *to, char const *from)
-{
-	size_t to_len, from_len, total_len;
-	char *out;
-
-	if (!to || !from) return NULL;
-
-	to_len = talloc_array_length(to);
-	from_len = talloc_array_length(from);
-	total_len = to_len + (from_len - 1);
-
-	out = talloc_realloc(ctx, to, char, total_len);
-	if (!out) return NULL;
-
-	memcpy(out + (to_len - 1), from, from_len);
-	out[total_len - 1] = '\0';
-
-	return out;
 }
 
 /** Concatenate to + ...
@@ -573,7 +803,7 @@ char *talloc_buffer_append_variadic_buffer(TALLOC_CTX *ctx, char *to, int argc, 
 	va_start(ap_val, argc);
 	va_copy(ap_len, ap_val);
 
-	total_len += to_len = talloc_array_length(to) - 1;
+	total_len += to_len = talloc_strlen(to);
 
 	/*
 	 *	Figure out how much we need to realloc
@@ -584,7 +814,7 @@ char *talloc_buffer_append_variadic_buffer(TALLOC_CTX *ctx, char *to, int argc, 
 		arg = va_arg(ap_len, char *);
 		if (!arg) continue;
 
-		total_len += (talloc_array_length(arg) - 1);
+		total_len += (talloc_strlen(arg));
 	}
 
 	/*
@@ -611,7 +841,7 @@ char *talloc_buffer_append_variadic_buffer(TALLOC_CTX *ctx, char *to, int argc, 
 		arg = va_arg(ap_val, char *);
 		if (!arg) continue;
 
-		len = talloc_array_length(arg) - 1;
+		len = talloc_strlen(arg);
 
 		memcpy(p, arg, len);
 		p += len;
@@ -623,30 +853,6 @@ finish:
 	va_end(ap_len);
 
 	return out;
-}
-
-/** Compares two talloced uint8_t arrays with memcmp
- *
- * Talloc arrays carry their length as part of the structure, so can be passed to a generic
- * comparison function.
- *
- * @param a	Pointer to first array.
- * @param b	Pointer to second array.
- * @return
- *	- 0 if the arrays match.
- *	- a positive or negative integer otherwise.
- */
-int talloc_memcmp_array(uint8_t const *a, uint8_t const *b)
-{
-	size_t a_len, b_len;
-
-	a_len = talloc_array_length(a);
-	b_len = talloc_array_length(b);
-
-	if (a_len > b_len) return +1;
-	if (a_len < b_len) return -1;
-
-	return memcmp(a, b, a_len);
 }
 
 /** Compares two talloced char arrays with memcmp
@@ -698,9 +904,10 @@ int talloc_decrease_ref_count(void const *ptr)
 		talloc_free(to_free);
 	} else {
 		talloc_unlink(talloc_parent(ptr), to_free);
+		if (talloc_reference_count(to_free) == 0) talloc_free(to_free);
 	}
 
-	return ref_count;
+	return (int)ref_count;
 }
 
 /** Add a NULL pointer to an array of pointers
@@ -721,13 +928,15 @@ void **talloc_array_null_terminate(void **array)
 	size_t		len;
 	TALLOC_CTX	*ctx;
 	void		**new;
+	size_t		size;
 
 	if (!array) return NULL;
 
 	len = talloc_array_length(array);
 	ctx = talloc_parent(array);
+	size = talloc_get_size(array) / talloc_array_length(array);
 
-	new = talloc_realloc_fn(ctx, array, len + 1);
+	new = _talloc_realloc_array(ctx, array, size, len + 1, talloc_get_name(array));
 	if (!new) return NULL;
 
 	new[len] = NULL;
@@ -735,51 +944,138 @@ void **talloc_array_null_terminate(void **array)
 	return new;
 }
 
-/** Remove a NULL termination pointer from an array of pointers
+/** Allocate a list to hold num strings of strings_len total length
  *
- * If the end of the array is not NULL, NULL will be returned (error).
+ * Where talloc_pooled_object is available and strings_len is not zero,
+ * the list, the pointer array and the appended strings are all drawn
+ * from a single talloc pool, so building the list costs one malloc.
  *
- * @param[in] array to null strip.  Will be invalidated (realloced).
+ * @param[in] ctx		to allocate the list in.
+ * @param[in] num		How many strings the list is expected to hold.
+ * @param[in] strings_len	Total length of the strings which will be
+ *				appended, including their NUL bytes.  May be
+ *				zero if the total is not known, in which case
+ *				no pool is used.
  * @return
- *	- NULL if array is NULL, if terminating element is not NULL, or reallocation fails.
- *	- A realloced version of array without the terminating NULL element.
+ *	- A new string list.
+ *	- NULL on allocation failure.
  */
-void **talloc_array_null_strip(void **array)
+talloc_str_list_t *talloc_str_list_alloc(TALLOC_CTX *ctx, size_t num, size_t strings_len)
 {
-	size_t		len;
-	TALLOC_CTX	*ctx;
-	void		**new;
+	talloc_str_list_t *list;
 
-	if (!array) return NULL;
+	if (strings_len > 0) {
+		list = talloc_zero_pooled_object(ctx, talloc_str_list_t, num + 1,
+						 (sizeof(char const *) * (num + 1)) + strings_len);
+	} else {
+		list = talloc_zero(ctx, talloc_str_list_t);
+	}
+	if (unlikely(!list)) return NULL;
 
-	len = talloc_array_length(array);
-	ctx = talloc_parent(array);
+	list->strings = talloc_zero_array(list, char const *, num + 1);
+	if (unlikely(!list->strings)) {
+		talloc_free(list);
+		return NULL;
+	}
+	list->p = list->strings;
+	list->end = list->strings + num;
 
-	if ((len - 1) == 0) return NULL;
-
-	if (array[len - 1] != NULL) return NULL;
-
-	new = talloc_realloc_fn(ctx, array, len - 1);
-	if (!new) return NULL;
-
-	return new;
+	return list;
 }
 
-/** Callback to free the autofree ctx on thread exit
+/** Extend a string list to hold additional strings
+ *
+ * Grows the pointer array once for a batch of talloc_str_list_append
+ * calls.  The list itself never moves, only the array inside it.
+ *
+ * @param[in] list	to extend.
+ * @param[in] extra	How many additional strings the list must be able
+ *			to hold.
+ * @return
+ *	- 0 on success.
+ *	- -1 on allocation failure, the list is not modified.
+ */
+int talloc_str_list_realloc(talloc_str_list_t *list, size_t extra)
+{
+	char const	**strings;
+	size_t		num = talloc_str_list_num(list);
+
+	if ((size_t)(list->end - list->p) >= extra) return 0;
+
+	strings = talloc_realloc(list, list->strings, char const *, num + extra + 1);
+	if (unlikely(!strings)) return -1;
+	memset(&strings[num], 0, sizeof(char const *) * (extra + 1));
+
+	list->strings = strings;
+	list->p = strings + num;
+	list->end = strings + num + extra;
+
+	return 0;
+}
+
+/** Append a copy of a string to a string list
+ *
+ * The list must have room for the new string, extend it with
+ * talloc_str_list_realloc before a batch of appends.  The copy is
+ * parented by the list.
+ *
+ * @param[in] list	to append to.
+ * @param[in] str	to copy into the list.
+ * @param[in] len	Length of str.
+ * @return
+ *	- The copy written into the list.
+ *	- NULL on allocation failure.
+ */
+char const *talloc_str_list_append(talloc_str_list_t *list, char const *str, size_t len)
+{
+	fr_assert(list->p < list->end);
+
+	*list->p = talloc_bstrndup(list, str, len);
+	if (unlikely(!*list->p)) return NULL;
+
+	return *(list->p++);
+}
+
+/** Callback to free the autofree ctx on global exit
  *
  */
-static void _autofree_on_thread_exit(void *af)
+static int _autofree_on_exit(void *af)
 {
 	talloc_set_destructor(af, NULL);
-	talloc_free(af);
+	return talloc_free(af);
 }
 
 /** Ensures in the autofree ctx is manually freed, things don't explode atexit
  *
  */
-static int _autofree_destructor(TALLOC_CTX *af)
+static int _autofree_global_destructor(TALLOC_CTX *af)
 {
-	return fr_atexit_thread_local_disarm(_autofree_on_thread_exit, af);
+	return fr_atexit_global_disarm(true, _autofree_on_exit, af);
+}
+
+TALLOC_CTX *talloc_autofree_context_global(void)
+{
+	TALLOC_CTX *af = global_ctx;
+
+	if (!af) {
+		af = talloc_init_const("global_autofree_context");
+		if (unlikely(!af)) return NULL;
+
+		talloc_set_destructor(af, _autofree_global_destructor);
+
+		fr_atexit_global(_autofree_on_exit, af);
+		global_ctx = af;
+	}
+
+	return af;
+}
+
+/** Ensures in the autofree ctx is manually freed, things don't explode atexit
+ *
+ */
+static int _autofree_thread_local_destructor(TALLOC_CTX *af)
+{
+	return fr_atexit_thread_local_disarm(true, _autofree_on_exit, af);
 }
 
 /** Get a thread-safe autofreed ctx that will be freed when the thread or process exits
@@ -795,71 +1091,13 @@ TALLOC_CTX *talloc_autofree_context_thread_local(void)
 
 	if (!af) {
 		af = talloc_init_const("thread_local_autofree_context");
-		talloc_set_destructor(af, _autofree_destructor);
 		if (unlikely(!af)) return NULL;
 
-		fr_atexit_thread_local(thread_local_ctx, _autofree_on_thread_exit, af);
+		talloc_set_destructor(af, _autofree_thread_local_destructor);
+
+		fr_atexit_thread_local(thread_local_ctx, _autofree_on_exit, af);
 	}
 
 	return af;
 }
-
-struct talloc_child_ctx_s {
-	struct talloc_child_ctx_s *next;
-};
-
-static int _child_ctx_free(TALLOC_CHILD_CTX *list)
-{
-	while (list->next != NULL) {
-		TALLOC_CHILD_CTX *entry = list->next;
-		TALLOC_CHILD_CTX *next = entry->next;
-
-		if (talloc_free(entry) < 0) return -1;
-
-		list->next = next;
-	}
-
-	return 0;
-}
-
-/** Allocate and initialize a TALLOC_CHILD_CTX
- *
- *  The TALLOC_CHILD_CTX ensures ordering for allocators and
- *  destructors.  When a TALLOC_CHILD_CTX is created, it is added to
- *  parent, in LIFO order.  In contrast, the basic talloc operations
- *  do not guarantee any kind of order.
- *
- *  When the TALLOC_CHILD_CTX is freed, the children are freed in FILO
- *  order.  That process ensures that the children are freed before
- *  the parent, and that the younger siblings are freed before the
- *  older siblings.
- *
- *  The idea is that if we have an initializer for A, which in turn
- *  initializes B and C.  When the memory is freed, we should do the
- *  operations in the reverse order.
- */
-TALLOC_CHILD_CTX *talloc_child_ctx_init(TALLOC_CTX *ctx)
-{
-	TALLOC_CHILD_CTX *child;
-
-	child = talloc_zero(ctx, TALLOC_CHILD_CTX);
-	if (!child) return NULL;
-
-	talloc_set_destructor(child, _child_ctx_free);
-	return child;
-}
-
-/** Allocate a TALLOC_CHILD_CTX from a parent.
- *
- */
-TALLOC_CHILD_CTX *talloc_child_ctx_alloc(TALLOC_CHILD_CTX *parent)
-{
-	TALLOC_CHILD_CTX *child;
-
-	child = talloc(parent, TALLOC_CHILD_CTX);
-	if (!child) return NULL;
-
-	child->next = parent->next;
-	parent->next = child;
-	return child;
-}
+#endif

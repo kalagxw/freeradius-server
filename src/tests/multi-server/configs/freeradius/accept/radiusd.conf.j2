@@ -1,0 +1,62 @@
+name       = freeradius
+
+raddbdir   = /etc/freeradius
+confdir    = ${raddbdir}
+modconfdir = ${confdir}/mods-config
+logdir     = /var/log/freeradius
+radacctdir = ${logdir}/radacct
+
+security {
+	allow_core_dumps = yes
+}
+
+modules {
+
+	# Common always module configuration, required for the control policy
+	{% include "freeradius/common/mods-available/always" %}
+
+}
+
+policy {
+	# Common control policy configuration, needed for accept action
+	{% include "freeradius/common/policy.d/control" %}
+}
+
+server freeradius {
+
+	namespace = radius
+
+	# proto_load listen config
+	{% include "freeradius/common/listen/load" %}
+
+	listen authentication {
+		type = Access-Request
+		transport = udp
+		require_message_authenticator = yes
+		limit_proxy_state = auto
+
+		udp {
+			ipaddr = *
+			port = 1812
+		}
+	}
+
+	client localhost {
+		shortname = client-localhost
+		ipaddr = *
+		secret = testing123
+	}
+
+	recv Access-Request {
+		accept
+	}
+
+	send Access-Accept {
+
+	}
+
+	send Access-Reject {
+
+	}
+
+}

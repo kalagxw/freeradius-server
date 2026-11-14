@@ -1,5 +1,5 @@
 # -*- text -*-
-# Copyright (C) 2021 The FreeRADIUS Server project and contributors
+# Copyright (C) 2023 The FreeRADIUS Server project and contributors
 # This work is licensed under CC-BY version 4.0 https://creativecommons.org/licenses/by/4.0
 # Version $Id$
 #
@@ -12,14 +12,14 @@
 VENDOR		Avaya-Cajun-p330		2167
 BEGIN-VENDOR	Avaya-Cajun-p330
 
-ATTRIBUTE	Cajun-Service-Type			1	integer
+ATTRIBUTE	Cajun-Service-Type			1	uint32
 
 VALUE	Cajun-Service-Type		Cajun-Read-Only-User	1
 VALUE	Cajun-Service-Type		Cajun-Read-Write-User	2
 VALUE	Cajun-Service-Type		Cajun-Admin-User	3
 
 ATTRIBUTE	StaticVlan-Type				12	string
-ATTRIBUTE	PortPriority-Type			13	integer
+ATTRIBUTE	PortPriority-Type			13	uint32
 
 VALUE	PortPriority-Type		Type-0			0
 VALUE	PortPriority-Type		Type-1			1
@@ -31,3 +31,4 @@ VALUE	PortPriority-Type		Type-6			6
 VALUE	PortPriority-Type		Type-7			7
 
 END-VENDOR	Avaya-Cajun-p330
+ALIAS		Avaya-Cajun-p330			Vendor-Specific.Avaya-Cajun-p330

@@ -1,0 +1,5 @@
+#
+#  We only care if this crashes or not.
+#
+Filter-Id := "%{1 + 1} %str.lower('1')"
+success

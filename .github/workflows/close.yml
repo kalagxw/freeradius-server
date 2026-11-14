@@ -1,13 +1,25 @@
+name: Close support questions
+
+#
+#  The issue tracker is for bugs.  Support questions go to the mailing
+#  lists, so triage labels a support question 'close'.  This workflow then
+#  closes the issue with a pointer to the mailing lists.  This workflow
+#  runs on the `labeled` trigger, because the label arrives after the
+#  issue is opened, not with the issue.
+#
 on:
   issues:
-    types: [opened]
+    types: [opened, labeled]
+
 jobs:
-  titlePrefixCheck:
+  close-support-questions:
+    name: Close support questions
+    if: contains(github.event.issue.labels.*.name, 'close')
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
     steps:
-      - if: contains(github.event.pull_request.labels.*.name, 'close')
-        name: Close Issue
-        uses: peter-evans/close-issue@v1
+      - name: Close Issue
+        uses: peter-evans/close-issue@v3.0.2
         with:
           comment: Direct questions about server operation or development to the FreeRADIUS mailing lists https://freeradius.org/support/.
-            

@@ -71,14 +71,12 @@ subreply  Password.Cleartext := "testing123"
 
 filterreply  Password.Cleartext := "testing123"
              Reply-Message := "success1",
-             Reply-Message += "success2",
-             Fall-Through = yes
-
-filterreply  Password.Cleartext := "testing123"
-             Reply-Message !* ANY
+             Reply-Message += "success2"
 
 overwritereply  Password.Cleartext := "testing123"
-                Reply-Message := "firstpass",
+                Reply-Message := "firstpass1",
+                Reply-Message += "firstpass2",
+                Reply-Message += "firstpass3",
                 Fall-Through = yes
 
 overwritereply  Password.Cleartext := "testing123"
@@ -107,6 +105,7 @@ greaterthanreply  Password.Cleartext := "testing123"
 #  Note: Filtering "!*" does not apply to control items as this would overload
 #        the operator syntax since "!*" checks that no such attribute in the
 #        request.
+#
 
 addcontrol  Password.Cleartext := "testing123", Reply-Message := "success1"
             Fall-Through = yes
@@ -115,3 +114,75 @@ addcontrol  Reply-Message += "success2"
 
 regex	NAS-Identifier =~ /der/, Password.Cleartext := "testing123"
 	Reply-Message := "wonderful"
+
+regex	NAS-Identifier !~ /der/, NAS-Identifier !~ /foo/, Password.Cleartext := "testing123"
+	Reply-Message := "totally amazing"
+
+vendor	Password.Cleartext := "we_are_so_smart"
+	Cisco.AVPair := "1",
+	Cisco.AVPair += "2"
+
+#
+#  Compare attribute references
+#
+attrref	Password.Cleartext := "hopefully"
+	Reply-Message := request.Filter-Id,
+	control.Filter-Id := "foo"
+
+xlat	Password.Cleartext := "open"
+	Reply-Message := "Hello, %{User-Name}"
+
+#
+#  Inter-attribute comparisons and xlats for comparisons
+#
+attrref_check Filter-Id == NAS-Identifier, NAS-IP-Address == "%{Calling-Station-Id}", Password.Cleartext := "whoops"
+	      Reply-Message := "success"
+
+digest	Password.Cleartext := "woo"
+	Digest-Attributes := 'Nonce = "dcd98b7102dd2f0e8b11d0f600bfb0c093", Method = "Invite", URI = "sip:bob@biloxi.com"'
+
+DEFAULT	User-Name == "cmp_eq",  Password.Cleartext := "hopping"
+	Reply-Message := "success-cmp_eq"
+
+#
+#  Do something, and then undo it
+#
+undo	Password.Cleartext := "hello"
+	Reply-Message := "hello %{User-Name}",
+	Fall-Through := yes
+
+#
+#  This should fail, which means that the previous Reply-Message
+#  gets deleted as part of the "undo" operation.
+#
+#  Note that the contents of the RHS have to be expanded at run-time,
+#  otherwise it's a compile-time error.
+#
+undo
+	Framed-IP-Address := "hello %hash.md5('foo')"
+
+#
+#  Test where additional checks uses the [*] filter
+#
+any	Realm[*] == "two", Password.Cleartext := "ofcourse"
+	Reply-Message := "success-any"
+
+$INCLUDE cmp
+
+DEFAULT	Password.Cleartext := "stuffnsuch"
+	Reply-Message := "success-default"
+
+#
+#  These just have to parse, they don't (yet) have tests
+#
+notyet	Password.Cleartext := "hello"
+	Vendor-Specific = {},
+	.Cisco = {},
+	.AVPair += "Hello"
+
+notyet	Password.Cleartext := "hello"
+	Vendor-Specific = {},
+	.Cisco = {},
+	.AVPair += "Hello",
+	..HP = {},
+	.Privilege-Level += 1

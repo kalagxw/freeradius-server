@@ -1,0 +1,282 @@
+name: Multi-Server CI Tests
+
+on:
+  #
+  #  `ci-pipeline.yml` calls the 'Multi-Server CI Tests' workflow on two
+  #  events:
+  #
+  #    `push`: A push starts a run for the pushed commit.  The run builds
+  #    the 'radenv' and 'radenv-profiling' images from the checked-out
+  #    commit, so the tests run the radiusd built from the pushed code.
+  #    The run pulls only the toolchain layers ('crossbuild' and
+  #    'radenv-profiling-deps') from the internal registry.
+  #    `common_vars.yml` picks the tag of the toolchain layers from the
+  #    pushed ref.  `docker-freeradius-images-refresh.yml` refreshes the
+  #    toolchain layers in the registry.  A `push` run runs the CI subset
+  #    of the tests (`test.multi-server.ci` or
+  #    `test.multi-server.profiling.ci`).
+  #
+  #    `schedule`: The cron schedule in `ci-pipeline.yml` starts a nightly
+  #    run of every test suite.  The run rebuilds a toolchain layer
+  #    locally if the registry no longer holds the layer.
+  #
+  workflow_call:
+
+jobs:
+  #
+  #  The `common_vars` job emits different values depending on whether the run
+  #  is occurring in the FreeRADIUS organisation or in a fork.  See
+  #  `.github/workflows/common_vars.yml`.
+  #
+  common_vars:
+    name: Common vars
+    uses: ./.github/workflows/common_vars.yml
+
+  multi-server-tests:
+    needs: common_vars
+    runs-on: self-hosted
+    if: github.repository_owner == 'FreeRADIUS'
+
+    #  The `profiling` leg requests a GitHub OpenID Connect (OIDC) token to
+    #  authenticate the upload of the profiling results, so the job needs
+    #  `id-token: write`.  When a `permissions` block lists any permission,
+    #  GitHub grants only the listed permissions.  The block therefore also
+    #  lists `contents: read`, which the checkout step needs.
+    permissions:
+      contents: read
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [service, profiling]
+
+    services:
+      dind:
+        #
+        #  Custom Docker-in-Docker (dind) image. The `/etc/docker/daemon.json`
+        #  inside the image points at the internal NetworkRADIUS registry as
+        #  a Docker Hub pull-through mirror.  The image trusts the internal
+        #  certificate authority (CA).
+        #  `docker-ci-images-refresh.yml` builds the image from
+        #  `scripts/ci/docker/Dockerfile.docker-dind`.
+        #
+        image: ${{ needs.common_vars.outputs.image_prefix }}self-hosted-docker-dind:${{ needs.common_vars.outputs.image_tag }}
+        options: --privileged
+        env:
+          DOCKER_TLS_CERTDIR: ""
+          #  Bypass the squid proxy for internal registry access.
+          NO_PROXY: "*.networkradius.com,127.0.0.1"
+          #  Fix the network pool so `TEST_SUBNET` is predictable.
+          DOCKER_OPTS: "--default-address-pool base=172.16.0.0/12,size=24"
+        #
+        #  Share the runner's workspace with dind so that docker
+        #  compose bind-mounts (`radiusd.conf`, `env-setup.sh`, the
+        #  listener directories) resolve to real files inside the
+        #  dind daemon.
+        #
+        #  `github.workspace` is the HOST path to the workspace.
+        #  The runner mounts the workspace into the job container
+        #  at a different path (`/__w/...`), so we use a fixed mount
+        #  point (`/workspace`) that both containers share.
+        #
+        volumes:
+          - ${{ github.workspace }}:/workspace
+
+    container:
+      #
+      #  Custom CI image with the docker CLI, buildx and m4 added on
+      #  top of the 'self-hosted' base image.
+      #  `docker-ci-images-refresh.yml` builds the image from
+      #  `scripts/ci/docker/Dockerfile.docker-cli`.
+      #
+      image: ${{ needs.common_vars.outputs.image_prefix }}self-hosted-docker-cli:${{ needs.common_vars.outputs.image_tag }}
+      #  The Samba install needs `privileged`
+      #  `memory-swap -1` enables full use of host swap and may stop
+      #    containers from randomly quitting with "The operation was
+      #    canceled"
+      options: >-
+        --privileged
+        --memory-swap -1
+      env:
+        DOCKER_HOST: tcp://dind:2375
+        NO_PROXY: dind,*.networkradius.com,127.0.0.1
+      #
+      #  The CA certificate mount lets apt and curl inside the
+      #  container reach the internal registry over HTTPS. The job
+      #  container shares the workspace volume with dind (see the
+      #  dind `volumes` comment above).
+      #
+      volumes:
+        - /usr/local/share/ca-certificates/networkradius.com.crt:/usr/local/share/ca-certificates/networkradius.com.crt:ro
+        - ${{ github.workspace }}:/workspace
+
+    defaults:
+      run:
+        working-directory: /workspace
+
+    steps:
+
+      - uses: actions/checkout@v6
+        id: checkout
+        with:
+          lfs: false
+
+      - name: setup-dind
+        uses: ./.github/actions/setup-dind
+
+      #
+      #  Authenticate dind to Docker Hub. 'self-hosted-docker-dind'
+      #  lists the internal registry in `registry-mirrors`, but the
+      #  internal registry is not actually a Hub pull-through cache
+      #  (the internal registry returns 404 for Hub paths such as
+      #  `library/kafka`).  dockerd therefore falls back to 'docker.io',
+      #  and we hit anonymous rate limits during compose pulls.
+      #  Docker Hub allows 5000 authenticated pulls per day.
+      #
+      - name: Login to Docker Hub (via dind)
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_READ_USER }}
+          password: ${{ secrets.DOCKERHUB_READ_KEY }}
+
+      #
+      #  The dind sidecar runs a separate dockerd. The runner's `job-started`
+      #  hook passes credentials to the host dockerd only, so the dind dockerd
+      #  does not receive the credentials. Once the registry challenges for
+      #  authentication, the Docker client does not send a request without
+      #  credentials, so dind logs in as the public `anonymous` account. The
+      #  registry serves the `freeradius-server/` images to the `anonymous`
+      #  account, and requires a real account for every other path and for
+      #  every write. The steps below pull 'freeradius4-*' images from
+      #  `freeradius-server/`, so the `anonymous` account can pull the
+      #  images. A pull request from a fork does not receive any secrets
+      #  from GitHub, so a pull request from a fork also logs in as the
+      #  `anonymous` account.
+      #
+      - name: Login to internal Docker registry (via dind)
+        run: |
+          echo anonymous | docker login -u anonymous --password-stdin https://${{ needs.common_vars.outputs.docker_registry }}/
+
+      #
+      #  Build the FreeRADIUS image for the matrix leg.  The `service` leg
+      #  uses the 'radenv' image, a developer build of FreeRADIUS.  The
+      #  `profiling` leg uses the 'radenv-profiling' image, which compiles
+      #  FreeRADIUS with the callgrind `CFLAGS` from
+      #  `scripts/docker/m4/common.radenv-profiling-flags.m4`.
+      #
+      #  Both images must hold the radiusd built from the checked-out
+      #  commit.  An image built from an older commit would make the tests
+      #  run the code of the older commit.
+      #
+      #  `DOCKER_REGISTRY` tells `scripts/docker/docker.mk` to try pulling
+      #  `freeradius4-<type>/<image>:<tag>` from the internal registry
+      #  before building locally, and to retag a pulled image as `:<sha>`.
+      #  The pull serves the toolchain layers ('crossbuild' and
+      #  'radenv-profiling-deps').  The 'radenv' and 'radenv-profiling'
+      #  images build on the toolchain layers, and
+      #  `docker-freeradius-images-refresh.yml` publishes the toolchain
+      #  layers.  A build of either image from the pulled layers compiles
+      #  the checkout and does not fetch anything from a package mirror.
+      #
+      #  No workflow publishes a 'radenv' or 'radenv-profiling' image to the
+      #  internal registry, so the pull of either image fails and
+      #  `docker.mk` builds the image from the checkout.
+      #
+      - name: Build FreeRADIUS image (${{ matrix.mode }})
+        env:
+          DOCKER_REGISTRY: ${{ needs.common_vars.outputs.docker_registry }}
+          DOCKER_REMOTE_PREFIX: ${{ needs.common_vars.outputs.image_prefix }}
+          DOCKER_REMOTE_TAG: ${{ needs.common_vars.outputs.image_tag }}
+        run: |
+          case "${{ matrix.mode }}" in
+            service)
+              make docker.radenv.ubuntu24
+              ;;
+            profiling)
+              make docker.radenv-profiling.ubuntu24
+              ;;
+          esac
+
+      - name: Show docker build logs
+        if: failure()
+        run: |
+          for type in crossbuild radenv radenv-profiling-deps radenv-profiling; do
+            log="build/docker/build.ubuntu24.$type"
+            if [ -f "$log" ]; then
+              echo "===== $log ====="
+              cat "$log"
+            fi
+          done
+
+      #
+      #  `schedule` runs the full test set, and a `push` runs the CI
+      #  subset.  `github.event_name` is the caller's event, so the
+      #  pipeline's nightly run selects the full set here without an
+      #  extra input.
+      #
+      - name: Run multi-server tests (${{ matrix.mode }})
+        env:
+          PROFILING_RUN_INDEX: ${{ github.run_number }}
+        run: |
+          case "${{ matrix.mode }}-${{ github.event_name }}" in
+            service-schedule)
+              make -j$(nproc) test.multi-server
+              ;;
+            service-*)
+              make -j$(nproc) test.multi-server.ci
+              ;;
+            profiling-schedule)
+              make -j$(nproc) test.multi-server.profiling
+              ;;
+            profiling-*)
+              make -j$(nproc) test.multi-server.profiling.ci
+              ;;
+          esac
+
+      #  The collect step runs before both uploads below.  The step's
+      #  `move: true` option moves a core out of `prof-results/`, so a core
+      #  is uploaded once and does not inflate the `prof-results` artifact or
+      #  the store publish.
+      #  The `checkout` step writes the `collect-core-dumps` action into the
+      #  workspace, so the step runs only when the `checkout` step succeeds.
+      - name: Collect core dumps
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        uses: ./.github/actions/collect-core-dumps
+        with:
+          name: ${{ matrix.mode }}-${{ github.sha }}
+          move: "true"
+
+      #
+      #  Upload callgrind output as a workflow artifact in `profiling`
+      #  mode. `service` mode produces nothing to upload, so the step
+      #  does not run in `service` mode.
+      #
+      - name: Upload profiling results
+        id: upload-prof-results
+        if: ${{ matrix.mode == 'profiling' && always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: prof-results-${{ github.sha }}
+          path: prof-results/
+          if-no-files-found: ignore
+
+      #
+      #  Publish the same `prof-results/` tree to the durable store. The script
+      #  tars the tree and POSTs the tar, with a GitHub OIDC token, to the
+      #  given URL (see the script header). The step does not run when the
+      #  artifact step found no files (empty `artifact-id`).
+      #
+      - name: Publish profiling results to the prof-results store
+        if: ${{ matrix.mode == 'profiling' && always() && steps.upload-prof-results.outputs.artifact-id != '' }}
+        run: scripts/ci/publish-profiling-results.sh "https://cinfra-ca.inkbridge.io/profiling/data"
+
+      #
+      #  If the CI has failed and the branch is `ci-debug` then the workflow starts
+      #  a tmate session.  See the tmate comment in `ci.yml` for the walkthrough.
+      #
+      - name: "Debug: Start tmate"
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+        if: ${{ github.ref == 'refs/heads/ci-debug' && failure() }}

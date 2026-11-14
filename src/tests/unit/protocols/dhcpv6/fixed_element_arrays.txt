@@ -7,6 +7,7 @@
 
 proto dhcpv6
 proto-dictionary dhcpv6
+fuzzer-out dhcpv6
 
 #
 #  Array of 16bit integers
@@ -15,7 +16,7 @@ encode-pair Client-Arch-Type = x86-BIOS, Client-Arch-Type = ARM-64-Uboot
 match 00 3d 00 04 00 00 00 16
 
 decode-pair -
-match Client-Arch-Type = x86-BIOS, Client-Arch-Type = ARM-64-Uboot
+match Client-Arch-Type = ::x86-BIOS, Client-Arch-Type = ::ARM-64-Uboot
 
 #
 #  Two different arrays of 16bit integers
@@ -24,7 +25,7 @@ encode-pair Client-Arch-Type = x86-BIOS, Client-Arch-Type = ARM-64-Uboot, S46-Pr
 match 00 3d 00 04 00 00 00 16 00 6f 00 04 00 40 00 5e
 
 decode-pair -
-match Client-Arch-Type = x86-BIOS, Client-Arch-Type = ARM-64-Uboot, S46-Priority = DS-Lite, S46-Priority = MAP-E
+match Client-Arch-Type = ::x86-BIOS, Client-Arch-Type = ::ARM-64-Uboot, S46-Priority = ::DS-Lite, S46-Priority = ::MAP-E
 
 #
 #  Array type with one element
@@ -33,7 +34,7 @@ encode-pair Client-Arch-Type = x86-BIOS
 match 00 3d 00 02 00 00
 
 decode-pair -
-match Client-Arch-Type = x86-BIOS
+match Client-Arch-Type = ::x86-BIOS
 
 #
 #  Array of IPv6 addresses
@@ -45,4 +46,4 @@ decode-pair -
 match SIP-Server-Address = 2001:db8:85a3::8a2e:370:7334, SIP-Server-Address = 2001:db8:85a3::8a2e:370:7335, SIP-Server-Address = 2001:4860:4860::8888
 
 count
-match 18
+match 19

@@ -1,0 +1,59 @@
+string test_string1
+string test_string2
+string test_string3
+
+control.Exec-Export := 'PATH="$ENV{PATH}:/bin:/usr/bin:/opt/bin:/usr/local/bin"'
+
+#
+#  Remove old log files
+#
+%file.rm("$ENV{MODULE_TEST_DIR}/test_xlat.log")
+
+if (%linelog_fmt_delim_xlat('bob') != 5) {
+	test_fail
+}
+test_string1 := %file.tail("$ENV{MODULE_TEST_DIR}/test_xlat.log")
+
+if (test_string1 == 'bob, ') {
+	test_pass
+}
+else {
+	test_fail
+}
+
+test_string2 := 'more'
+test_string3 := 'bob'
+
+if (%linelog_fmt_delim_xlat("%{test_string2}%{test_string3}") != 9) {
+	test_fail
+}
+test_string1 := %file.tail("$ENV{MODULE_TEST_DIR}/test_xlat.log")
+if (test_string1 == 'bob, morebob, ') {
+	test_pass
+}
+else {
+	test_fail
+}
+
+#  Remove the file
+%file.rm("$ENV{MODULE_TEST_DIR}/test_xlat.log")
+
+# Try with some handcrafted JSON
+
+if (%linelog_fmt_delim_xlat("{ \"foo\" : \"bar\", \"baz\" : \"boink\" }") == 36) {
+	test_pass
+} else {
+	test_fail
+}
+
+test_string1 := %file.tail("$ENV{MODULE_TEST_DIR}/test_xlat.log")
+
+if (test_string1 == '{ "foo" : "bar", "baz" : "boink" }, ') {
+	test_pass
+}
+else {
+	test_fail
+}
+
+#  Remove the file
+%file.rm("$ENV{MODULE_TEST_DIR}/test_xlat.log")

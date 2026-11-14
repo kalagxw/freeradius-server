@@ -37,11 +37,16 @@ extern "C" {
  *
  */
 typedef struct log_dst log_dst_t;
+typedef struct rindent_s {
+	uint8_t			unlang;		//!< By how much to indent log messages. uin8_t so it's obvious
+						//!< when a request has been exdented too much.
+	uint8_t			module;		//!< Indentation after the module prefix name.
+} rindent_t;
 
 #include <freeradius-devel/server/request.h>
 #include <freeradius-devel/util/log.h>
 #include <freeradius-devel/util/event.h>
-#include <freeradius-devel/util/pair.h>
+#include <freeradius-devel/util/packet.h>
 
 /** Logging callback to write log messages to a destination
  *
@@ -65,6 +70,7 @@ typedef	void (*log_func_t)(fr_log_type_t type, fr_log_lvl_t lvl, request_t *requ
 struct log_dst {
 	log_func_t	func;		//!< Function to call to log to this destination.
 	void		*uctx;		//!< Context to pass to the logging function.
+	fr_log_lvl_t	lvl;		//!< Log messages with lvl >= to this should be logged.
 	log_dst_t	*next;		//!< Next logging destination.
 };
 
@@ -92,8 +98,8 @@ extern fr_table_num_sorted_t const syslog_facility_table[];
 extern size_t syslog_facility_table_len;
 extern fr_table_num_sorted_t const syslog_severity_table[];
 extern size_t syslog_severity_table_len;
-extern fr_table_num_sorted_t const log_str2dst[];
-extern size_t log_str2dst_len;
+extern fr_table_num_sorted_t const log_destination_table[];
+extern size_t log_destination_table_len;
 
 #define debug_enabled(_type, _lvl) (((_type & L_DBG) != 0) && (_lvl <= fr_debug_lvl))
 
@@ -109,12 +115,6 @@ void	log_request(fr_log_type_t type, fr_log_lvl_t lvl, request_t *request,
 		    char const *fmt, ...)
 		    CC_HINT(format (printf, 6, 7)) CC_HINT(nonnull (3, 6));
 
-void	log_module_failure_msg(request_t *request, char const *fmt, ...)
-	CC_HINT(format (printf, 2, 3));
-
-void	vlog_module_failure_msg(request_t *request, char const *fmt, va_list ap)
-	CC_HINT(format (printf, 2, 0));
-
 void	log_request_error(fr_log_type_t type, fr_log_lvl_t lvl, request_t *request,
 			  char const *file, int line,
 			  char const *fmt, ...)
@@ -126,6 +126,11 @@ void	log_request_perror(fr_log_type_t type, fr_log_lvl_t lvl, request_t *request
 
 void	log_request_pair(fr_log_lvl_t lvl, request_t *request,
 			 fr_pair_t const *parent, fr_pair_t const *vp, char const *prefix) CC_HINT(nonnull(2));
+
+void	log_request_packet(request_t *request, fr_packet_t *packet, fr_pair_list_t *list,
+			   fr_dict_attr_t const *type_da, bool received, bool id) CC_HINT(nonnull);
+
+#define LOG_PACKET_DEBUG(_request, ...) if (RDEBUG_ENABLED) log_request_packet(_request, ## __VA_ARGS__)
 
 void	log_request_pair_list(fr_log_lvl_t lvl, request_t *request,
 			      fr_pair_t const *parent, fr_pair_list_t const *vps, char const *prefix)
@@ -149,6 +154,11 @@ void	log_request_fd_event(UNUSED fr_event_list_t *el, int fd, UNUSED int flags, 
 void	log_fatal(fr_log_t const *log, char const *file, int line, char const *fmt, ...)
 	CC_HINT(format (printf, 4, 5)) CC_HINT(noreturn);
 
+typedef struct cf_section CONF_SECTION;
+int	log_parse_section(CONF_SECTION *cs);
+
+fr_log_t *log_dst_by_name(char const *name);
+
 int	log_global_init(fr_log_t *log, bool daemonize);
 
 void	log_global_free(void);
@@ -170,7 +180,6 @@ void	log_global_free(void);
  * @param[in] _str_len		length of subject string. May be SIZE_MAX
  *				to print the entire string.
  * @param[in] _marker_idx	Where to place the marker.  May be negative.
- * @param[in] _marker		text to print at marker_marker_idx.
  * @param[in] _line_prefix_fmt	Prefix to add to all log lines.
  * @param[in] ...		Arguments for _line_prefix_fmt.
  */
@@ -183,19 +192,16 @@ void	log_global_free(void);
  *  The prefix is set with LOG_PREFIX, and arguments may
  *  be passed with LOG_PREFIX_ARGS
  */
-#ifndef LOG_PREFIX
-#  define LOG_PREFIX ""
-#endif
-#ifdef LOG_PREFIX_ARGS
-#  define _FR_LOG_PREFIX(_lvl, _fmt, ...) _FR_LOG_DST(_lvl, LOG_PREFIX _fmt, LOG_PREFIX_ARGS, ## __VA_ARGS__)
-#  define _FR_LOG_PREFIX_PERROR(_lvl, _fmt, ...) _FR_LOG_DST_PERROR(_lvl, LOG_PREFIX _fmt, LOG_PREFIX_ARGS, ## __VA_ARGS__)
-#  define _FR_LOG_PREFIX_FATAL(_fmt, ...) _FR_LOG_DST_FATAL(LOG_PREFIX _fmt, LOG_PREFIX_ARGS, ## __VA_ARGS__)
-#  define _FR_LOG_PREFIX_MARKER(_lvl, _str, _str_len, _marker_idx, _marker) _FR_LOG_DST_MARKER(_lvl, _str, _str_len, _marker_idx, _marker, LOG_PREFIX, LOG_PREFIX_ARGS)
+#ifdef LOG_PREFIX
+#  define _FR_LOG_PREFIX(_lvl, _fmt, ...) _FR_LOG_DST(_lvl, "%s - " _fmt, LOG_PREFIX, ## __VA_ARGS__)
+#  define _FR_LOG_PREFIX_PERROR(_lvl, _fmt, ...) _FR_LOG_DST_PERROR(_lvl, "%s - " _fmt, LOG_PREFIX, ## __VA_ARGS__)
+#  define _FR_LOG_PREFIX_FATAL(_fmt, ...) _FR_LOG_DST_FATAL("%s - " _fmt, LOG_PREFIX, ## __VA_ARGS__)
+#  define _FR_LOG_PREFIX_MARKER(_lvl, _str, _str_len, _marker_idx, _marker) _FR_LOG_DST_MARKER(_lvl, _str, _str_len, _marker_idx, _marker, "%s - ", LOG_PREFIX)
 #else
-#  define _FR_LOG_PREFIX(_lvl, _fmt, ...) _FR_LOG_DST(_lvl, LOG_PREFIX _fmt, ## __VA_ARGS__)
-#  define _FR_LOG_PREFIX_PERROR(_lvl, _fmt, ...) _FR_LOG_DST_PERROR(_lvl, LOG_PREFIX _fmt, ## __VA_ARGS__)
-#  define _FR_LOG_PREFIX_FATAL(_fmt, ...) _FR_LOG_DST_FATAL(LOG_PREFIX _fmt, ## __VA_ARGS__)
-#  define _FR_LOG_PREFIX_MARKER(_lvl, _str, _str_len, _marker_idx, _marker) _FR_LOG_DST_MARKER(_lvl, _str, _str_len, _marker_idx, _marker, LOG_PREFIX)
+#  define _FR_LOG_PREFIX(_lvl, _fmt, ...) _FR_LOG_DST(_lvl, _fmt, ## __VA_ARGS__)
+#  define _FR_LOG_PREFIX_PERROR(_lvl, _fmt, ...) _FR_LOG_DST_PERROR(_lvl, _fmt, ## __VA_ARGS__)
+#  define _FR_LOG_PREFIX_FATAL(_fmt, ...) _FR_LOG_DST_FATAL(_fmt, ## __VA_ARGS__)
+#  define _FR_LOG_PREFIX_MARKER(_lvl, _str, _str_len, _marker_idx, _marker) _FR_LOG_DST_MARKER(_lvl, _str, _str_len, _marker_idx, _marker, "")
 #endif
 
 /** @name Log global messages
@@ -256,7 +262,7 @@ void	log_global_free(void);
 #define DEBUG_ENABLED		debug_enabled(L_DBG, L_DBG_LVL_1)			//!< True if global debug level 1 messages are enabled
 #define DEBUG_ENABLED2		debug_enabled(L_DBG, L_DBG_LVL_2)			//!< True if global debug level 1-2 messages are enabled
 #define DEBUG_ENABLED3		debug_enabled(L_DBG, L_DBG_LVL_3)			//!< True if global debug level 1-3 messages are enabled
-#define DEBUG_ENABLED4		debug_enabled(L_DBG, L_DBG_LVL_4)			//!< True if global debug level 1-3 messages are enabled
+#define DEBUG_ENABLED4		debug_enabled(L_DBG, L_DBG_LVL_4)			//!< True if global debug level 1-4 messages are enabled
 #define DEBUG_ENABLED5		debug_enabled(L_DBG, L_DBG_LVL_MAX)			//!< True if global debug level 1-5 messages are enabled
 
 #define _DEBUG_LOG(_type, _lvl, _fmt, ...)	if (fr_debug_lvl >= _lvl) _FR_LOG_PREFIX(_type, _fmt, ## __VA_ARGS__)
@@ -272,6 +278,18 @@ void	log_global_free(void);
 #define PDEBUG3(_fmt, ...)		_PDEBUG_LOG(L_DBG, L_DBG_LVL_3, _fmt, ## __VA_ARGS__)
 #define PDEBUG4(_fmt, ...)		_PDEBUG_LOG(L_DBG, L_DBG_LVL_MAX, _fmt, ## __VA_ARGS__)
 #define PDEBUGX(_lvl, _fmt, ...)	_PDEBUG_LOG(L_DBG, _lvl, _fmt, ## __VA_ARGS__)
+
+#define WDEBUG(_fmt, ...)		_DEBUG_LOG(L_DBG_WARN, L_DBG_LVL_1, _fmt, ## __VA_ARGS__)
+#define WDEBUG2(_fmt, ...)		_DEBUG_LOG(L_DBG_WARN, L_DBG_LVL_2, _fmt, ## __VA_ARGS__)
+#define WDEBUG3(_fmt, ...)		_DEBUG_LOG(L_DBG_WARN, L_DBG_LVL_3, _fmt, ## __VA_ARGS__)
+#define WDEBUG4(_fmt, ...)		_DEBUG_LOG(L_DBG_WARN, L_DBG_LVL_MAX, _fmt, ## __VA_ARGS__)
+#define WDEBUGX(_lvl, _fmt, ...)       	_DEBUG_LOG(L_DBG_WARN, _lvl, _fmt, ## __VA_ARGS__)
+
+#define EDEBUG(_fmt, ...)		_DEBUG_LOG(L_DBG_ERR, L_DBG_LVL_1, _fmt, ## __VA_ARGS__)
+#define EDEBUG2(_fmt, ...)		_DEBUG_LOG(L_DBG_ERR, L_DBG_LVL_2, _fmt, ## __VA_ARGS__)
+#define EDEBUG3(_fmt, ...)		_DEBUG_LOG(L_DBG_ERR, L_DBG_LVL_3, _fmt, ## __VA_ARGS__)
+#define EDEBUG4(_fmt, ...)		_DEBUG_LOG(L_DBG_ERR, L_DBG_LVL_MAX, _fmt, ## __VA_ARGS__)
+#define EDEBUGX(_lvl, _fmt, ...)       	_DEBUG_LOG(L_DBG_ERR, _lvl, _fmt, ## __VA_ARGS__)
 /** @} */
 
 /** @name Log request-specific messages (R*)
@@ -378,6 +396,20 @@ void	log_global_free(void);
 #define RPEDEBUG4(fmt, ...)	log_request_perror(L_DBG_ERR, L_DBG_LVL_MAX, request, __FILE__, __LINE__, fmt, ## __VA_ARGS__)
 /** @} */
 
+/** Save indentation for later restoral.
+ *
+ *  This call avoids the need to manually REXDENT on error paths.  We
+ *  can just restore and return.
+ *
+ */
+#define RINDENT_SAVE(_x, _request) do { \
+		(_x)->indent = request->log.indent; \
+	} while (0)
+
+#define RINDENT_RESTORE(_request, _x) do { \
+		request->log.indent = (_x)->indent; \
+	} while (0)
+
 #ifdef DEBUG_INDENT
 /** Indent R* messages by one level
  *
@@ -385,12 +417,12 @@ void	log_global_free(void);
  *	 only RINFO, RWARN, RERROR etc...
  */
 #  define RINDENT() do {\
-	RDEBUG4(">> (%i)", request->log.unlang_indent); \
 	if (request->module) {\
 		request->log.module_indent += 2;\
 	} else {\
 		request->log.unlang_indent += 2;\
 	}\
+	RDEBUG4(">> (%i) %s[%u]", request->log.unlang_indent, __FILE__, __LINE__); \
 } while(0)
 
 /** Exdent (unindent) R* messages by one level
@@ -399,12 +431,12 @@ void	log_global_free(void);
  *	 only RINFO, RWARN, RERROR etc...
  */
 #  define REXDENT() do {\
+	RDEBUG4("<< (%i) %s[%u]", request->log.unlang_indent, __FILE__, __LINE__); \
 	if (request->module) {\
 		request->log.module_indent -= 2;\
 	} else {\
 		request->log.unlang_indent -= 2;\
 	}\
-	RDEBUG4("<< (%i)", request->log.unlang_indent); \
 } while(0)
 #else
 /** Indent R* messages by one level
@@ -414,9 +446,9 @@ void	log_global_free(void);
  */
 #  define RINDENT() do {\
 	if (request->module) {\
-		request->log.module_indent += 2;\
+		request->log.indent.module += 2;\
 	} else {\
-		request->log.unlang_indent += 2;\
+		request->log.indent.unlang += 2;\
 	}\
 } while(0)
 
@@ -427,9 +459,9 @@ void	log_global_free(void);
  */
 #  define REXDENT() do {\
 	if (request->module) {\
-		request->log.module_indent -= 2;\
+		request->log.indent.module -= 2;\
 	} else {\
-		request->log.unlang_indent -= 2;\
+		request->log.indent.unlang -= 2;\
 	}\
 } while(0)
 #endif
@@ -458,7 +490,9 @@ void	log_global_free(void);
 #else
 #define RMARKER(_type, _lvl, _str, _marker_idx, _marker, ...) do { \
 		RDEBUG4("== (0) at %s[%u]", __FILE__, __LINE__); \
-		log_request_marker(_type, _lvl, request, __FILE__, __LINE__, _str, _marker_idx, _marker, ## __VA_ARGS__); \
+		log_request_marker(_type, _lvl, request, \
+				   __FILE__, __LINE__, \
+				   _str, SIZE_MAX, _marker_idx, _marker, ## __VA_ARGS__); \
 	} while (0)
 #endif
 
@@ -517,6 +551,13 @@ do {\
  	}\
 } while (0)
 
+/** Check if a debug level is set by the request (if !NULL) or by the global log
+ *
+ * @param[in] _e_request	Enabled macro to use for requests.
+ * @param[in] _e_global		Enabled macro to use for global.
+ */
+#define ROPTIONAL_ENABLED(_e_request, _e_global) ((request && _e_request) || _e_global)
+
 /** Track when a log message was last repeated
  *
  */
@@ -546,13 +587,14 @@ typedef struct {
 do {\
 	if (fr_rate_limit_enabled()) {\
 		(_entry)->now = fr_time();\
-		if ((_entry)->now != (_entry)->last_complained) {\
-			(_entry)->last_complained = (_entry)->now;\
-			if (((_entry)->repeated > 0) && (((_entry)->now - (_entry)->last_complained) == 1)) { \
+		if (!fr_time_ispos((_entry)->last_complained) || \
+		    (fr_time_to_sec((_entry)->now) != fr_time_to_sec((_entry)->last_complained))) {\
+			if (((_entry)->repeated > 0) && (fr_time_delta_to_sec(fr_time_sub((_entry)->now, (_entry)->last_complained)) == 1)) { \
 				_log(_fmt " - repeated %u time(s)", ##__VA_ARGS__, (_entry)->repeated); \
 			} else { \
 				_log(_fmt, ##__VA_ARGS__); \
 			}\
+			(_entry)->last_complained = (_entry)->now;\
 			(_entry)->repeated = 0; \
 		} else { \
 			(_entry)->repeated++; \
@@ -583,13 +625,14 @@ do {\
 do {\
 	if (fr_rate_limit_enabled()) {\
 		(_entry)->now = fr_time();\
-		if ((_entry)->now != (_entry)->last_complained) {\
-			(_entry)->last_complained = (_entry)->now;\
-			if (((_entry)->repeated > 0) && (((_entry)->now - (_entry)->last_complained) == 1)) { \
+		if (!fr_time_ispos((_entry)->last_complained) || \
+		    (fr_time_to_sec((_entry)->now) != fr_time_to_sec((_entry)->last_complained))) {\
+			if (((_entry)->repeated > 0) && (fr_time_delta_to_sec(fr_time_sub((_entry)->now, (_entry)->last_complained)) == 1)) { \
 				ROPTIONAL(_l_request, _l_global, _fmt " - repeated %u time(s)", ##__VA_ARGS__, (_entry)->repeated); \
 			} else { \
 				ROPTIONAL(_l_request, _l_global, _fmt, ##__VA_ARGS__); \
 			}\
+			(_entry)->last_complained = (_entry)->now;\
 			(_entry)->repeated = 0; \
 		} else { \
 			(_entry)->repeated++; \
@@ -653,9 +696,9 @@ do {\
  * @param[in] ...	Additional arguments to print.
  */
 #define _RHEXDUMP_INLINE(_lvl, _data, _len, _fmt, ...) \
-	if (log_rdebug_enabled(_lvl, request)) { \
+	if (log_rdebug_enabled(_lvl, request)) do { \
 		log_request(L_DBG, _lvl, request, __FILE__, __LINE__, _fmt " 0x%pH", ## __VA_ARGS__, fr_box_octets(_data, _len)); \
-	}
+	} while (0)
 
 #define RHEXDUMP_INLINE1(_data, _len, _fmt, ...) _RHEXDUMP_INLINE(L_DBG_LVL_1, _data, _len, _fmt, ## __VA_ARGS__)
 #define RHEXDUMP_INLINE2(_data, _len, _fmt, ...) _RHEXDUMP_INLINE(L_DBG_LVL_2, _data, _len, _fmt, ## __VA_ARGS__)
@@ -718,3 +761,16 @@ do {\
 #define HEX_MARKER2(_data, _len, _slen, _error, _fmt, ...) _HEX_MARKER(L_DBG_LVL_2, _data, _len, _slen, _error, _fmt, ## __VA_ARGS__)
 #define HEX_MARKER3(_data, _len, _slen, _error, _fmt, ...) _HEX_MARKER(L_DBG_LVL_3, _data, _len, _slen, _error, _fmt, ## __VA_ARGS__)
 #define HEX_MARKER4(_data, _len, _slen, _error, _fmt, ...) _HEX_MARKER(L_DBG_LVL_4, _data, _len, _slen, _error, _fmt, ## __VA_ARGS__)
+
+/** Iterate over the contents of a log_dst_t
+ *
+ * The macro is "safe", in that the current iterator variable can be deleted.
+ *
+ * The iterators can be nested, so long as the _iter variable names are different.
+ *
+ * @param[in] _head		to iterate over.
+ * @param[in] _iter		Name of iteration variable.
+ *				Will be declared in the scope of the loop.
+ */
+#define log_dst_foreach(_head, _iter) \
+	for (log_dst_t *JOIN(_next,_iter), *_iter = _head; JOIN(_next,_iter) = (_iter ? _iter->next : NULL), _iter != NULL; _iter = JOIN(_next,_iter))

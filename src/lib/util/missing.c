@@ -26,7 +26,6 @@ RCSID("$Id$")
 
 #include <ctype.h>
 #include <pthread.h>
-#include <stdbool.h>
 
 #if !defined(HAVE_CLOCK_GETTIME) && defined(__MACH__)
 #  include <mach/mach_time.h>
@@ -181,9 +180,14 @@ struct tm *localtime_r(time_t const *l_clock, struct tm *result)
  */
 char *ctime_r(time_t const *l_clock, char *l_buf)
 {
-  strcpy(l_buf, ctime(l_clock));
+	char *p;
 
-  return l_buf;
+	p = ctime(l_clock);
+	if (!p) return NULL;
+
+	strcpy(l_buf, p);
+
+	return l_buf;
 }
 #endif
 
@@ -207,7 +211,7 @@ struct tm *gmtime_r(time_t const *l_clock, struct tm *result)
 #endif
 
 #ifndef HAVE_VDPRINTF
-int vdprintf (int fd, char const *format, va_list args)
+int vdprintf(int fd, char const *format, va_list args)
 {
 	int     ret;
 	FILE    *fp;
@@ -216,7 +220,7 @@ int vdprintf (int fd, char const *format, va_list args)
 	dup_fd = dup(fd);
 	if (dup_fd < 0) return -1;
 
-	fp = fdopen(fd, "w");
+	fp = fdopen(dup_fd, "w");
 	if (!fp) {
 		close(dup_fd);
 		return -1;
@@ -463,14 +467,14 @@ char const *inet_ntop(int af, void const *src, char *dst, size_t cnt)
 		if (cnt <= INET6_ADDRSTRLEN) return NULL;
 
 		snprintf(dst, cnt, "%x:%x:%x:%x:%x:%x:%x:%x",
-			 (ipaddr->s6_addr[0] << 8) | ipaddr->s6_addr[1],
-			 (ipaddr->s6_addr[2] << 8) | ipaddr->s6_addr[3],
-			 (ipaddr->s6_addr[4] << 8) | ipaddr->s6_addr[5],
-			 (ipaddr->s6_addr[6] << 8) | ipaddr->s6_addr[7],
-			 (ipaddr->s6_addr[8] << 8) | ipaddr->s6_addr[9],
-			 (ipaddr->s6_addr[10] << 8) | ipaddr->s6_addr[11],
-			 (ipaddr->s6_addr[12] << 8) | ipaddr->s6_addr[13],
-			 (ipaddr->s6_addr[14] << 8) | ipaddr->s6_addr[15]);
+			 fr_nbo_to_uint16(ipaddr->a6_addr),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 2),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 4),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 6),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 8),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 10),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 12),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 14));
 		return dst;
 	}
 
@@ -523,6 +527,90 @@ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)
 }
 #endif
 
+#ifndef HAVE_RECVMMSG
+/** Emulates the real recvmmsg in userland
+ *
+ * The proper recvmmsg in FreeBSD and Linux receives multiple datagram
+ * messages using a single system call.
+ *
+ * This function doesn't achieve that, but it does reduce ifdefs elsewhere
+ * and means we can batch receiving/decoding operations.
+ *
+ * @param[in] sockfd	to read packets from.
+ * @param[in] msgvec	a pointer to an array of mmsghdr structures.
+ *			The size of this array is specified in vlen.
+ * @param[in] vlen	Length of msgvec.
+ * @param[in] flags	same as for recvmsg(2).
+ * @param[in] timeout	ignored.  Each recvmsg blocks or not as the socket
+ *			does, so only use this on a non-blocking socket.
+ * @return
+ *	- >= 0 The number of messages received.  Check against vlen to determine
+ *	  if overall operation was successful.
+ *	- < 0 on error.  Only returned if first operation errors.
+ */
+int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags, UNUSED struct timespec *timeout)
+{
+	unsigned int i;
+
+	for (i = 0; i < vlen; i++) {
+		ssize_t slen;
+
+		slen = recvmsg(sockfd, &msgvec[i].msg_hdr, flags);
+		if (slen < 0) {
+			msgvec[i].msg_len = 0;
+
+			/*
+			 * man recvmmsg - An error is returned only if no
+			 * datagrams could be received.  See also BUGS.
+			 */
+			if (i == 0) return -1;
+			return i;
+		}
+		msgvec[i].msg_len = (unsigned int)slen;	/* Number of bytes received */
+	}
+
+	return i;
+}
+#endif
+
+#ifndef HAVE_MEMFD_CREATE
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <freeradius-devel/util/rand.h>
+
+/** Emulates memfd_create with a named shared memory object
+ *
+ * A memfd is an anonymous shared memory object which lives as long as a
+ * descriptor or mapping refers to it.  The nearest portable thing is a
+ * named object which is unlinked as soon as it has been opened.  The
+ * name is only there to create it, so it is the caller's name with a
+ * random suffix, and only its first characters are kept as macOS limits
+ * the whole name to 31 characters.
+ *
+ * @param[in] name	for debugging, as for the real call.
+ * @param[in] flags	only MFD_CLOEXEC is honoured.
+ * @return
+ *	- The descriptor.
+ *	- -1 on error, with errno set as for shm_open.
+ */
+int memfd_create(char const *name, unsigned int flags)
+{
+	char	path[32];
+	int	fd;
+
+	snprintf(path, sizeof(path), "/%.6s_%08" PRIx32 "%08" PRIx32, name, fr_rand(), fr_rand());
+
+	fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+	if (fd < 0) return -1;
+
+	(void) shm_unlink(path);
+	if (flags & MFD_CLOEXEC) (void) fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+	return fd;
+}
+#endif
+
 /*
  *	So we don't have ifdef's in the rest of the code
  */
@@ -548,7 +636,7 @@ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)
 #  endif
 #endif
 
-int closefrom(int fd)
+void closefrom(int fd)
 {
 	int i;
 	int maxfd = 256;
@@ -557,7 +645,7 @@ int closefrom(int fd)
 #  endif
 
 #ifdef F_CLOSEM
-	if (fcntl(fd, F_CLOSEM) == 0) return 0;
+	if (fcntl(fd, F_CLOSEM) == 0) return;
 #  endif
 
 #  ifdef F_MAXFD
@@ -595,7 +683,7 @@ int closefrom(int fd)
 			}
 		}
 		(void) closedir(dir);
-		return 0;
+		return;
 	}
 #  endif
 
@@ -603,7 +691,7 @@ int closefrom(int fd)
 do_close:
 #  endif
 
-	if (fd > maxfd) return 0;
+	if (fd > maxfd) return;
 
 	/*
 	 *	FIXME: return EINTR?
@@ -612,6 +700,33 @@ do_close:
 		close(i);
 	}
 
-	return 0;
+	return;
+}
+#endif
+
+#ifndef HAVE_MEMSET_EXPLICIT
+void *memset_explicit(void *ptr,
+#ifdef HAVE_EXPLICIT_BZERO
+		      UNUSED
+#endif
+		      int ch,
+		      size_t len)
+{
+	if (!len) return ptr;
+
+#ifdef HAVE_EXPLICIT_BZERO
+	explicit_bzero(ptr, len);
+#else
+	{
+		volatile unsigned char *volatile p =  (volatile unsigned char *volatile) ptr;
+		size_t i = len;
+
+		while (i--) {
+			*(p++) = ch;
+		}
+	}
+#endif
+
+	return ptr;
 }
 #endif

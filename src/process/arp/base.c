@@ -19,20 +19,18 @@
  * @file src/process/arp/base.c
  * @brief ARP processing.
  *
- * @copyright 2020 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2020 Network RADIUS SAS (legal@networkradius.com)
  */
-#include <freeradius-devel/server/protocol.h>
-#include <freeradius-devel/unlang/base.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/arp/arp.h>
-#include <freeradius-devel/protocol/arp/rfc826.h>
+#include <freeradius-devel/unlang/interpret.h>
 
 static fr_dict_t const *dict_arp;
 
 extern fr_dict_autoload_t process_arp_dict[];
 fr_dict_autoload_t process_arp_dict[] = {
 	{ .out = &dict_arp, .proto = "arp" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_packet_type;
@@ -40,7 +38,7 @@ static fr_dict_attr_t const *attr_packet_type;
 extern fr_dict_attr_autoload_t process_arp_dict_attr[];
 fr_dict_attr_autoload_t process_arp_dict_attr[] = {
 	{ .out = &attr_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_arp},
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 typedef struct {
@@ -55,15 +53,17 @@ typedef struct {
 } process_arp_sections_t;
 
 typedef struct {
-	bool		test;
+	process_arp_sections_t	sections;	//!< First, as the state machine finds them by offset.
 
-	process_arp_sections_t	sections;
+	bool		test;
 } process_arp_t;
+
+#define FR_ARP_PROCESS_CODE_VALID(_x) (FR_ARP_PACKET_CODE_VALID(_x) || (_x == FR_ARP_DO_NOT_RESPOND))
 
 #define PROCESS_PACKET_TYPE		fr_arp_packet_code_t
 #define PROCESS_CODE_MAX		FR_ARP_CODE_MAX
 #define PROCESS_CODE_DO_NOT_RESPOND	FR_ARP_DO_NOT_RESPOND
-#define PROCESS_PACKET_CODE_VALID	FR_ARP_PACKET_CODE_VALID
+#define PROCESS_PACKET_CODE_VALID	FR_ARP_PROCESS_CODE_VALID
 #define PROCESS_INST			process_arp_t
 #include <freeradius-devel/server/process.h>
 
@@ -79,8 +79,9 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_INVALID] =	FR_ARP_DO_NOT_RESPOND,
 			[RLM_MODULE_DISALLOW] =	FR_ARP_DO_NOT_RESPOND,
 			[RLM_MODULE_NOTFOUND] =	FR_ARP_DO_NOT_RESPOND,
+			[RLM_MODULE_TIMEOUT] =  FR_ARP_DO_NOT_RESPOND
 		},
-		.rcode = RLM_MODULE_NOOP,
+		.default_rcode = RLM_MODULE_NOOP,
 		.recv = recv_generic,
 		.resume = resume_recv_generic,
 		.section_offset = PROCESS_CONF_OFFSET(request),
@@ -96,8 +97,10 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_INVALID] =	FR_ARP_DO_NOT_RESPOND,
 			[RLM_MODULE_DISALLOW] =	FR_ARP_DO_NOT_RESPOND,
 			[RLM_MODULE_NOTFOUND] =	FR_ARP_DO_NOT_RESPOND,
+			[RLM_MODULE_TIMEOUT] =  FR_ARP_DO_NOT_RESPOND
 		},
-		.rcode = RLM_MODULE_NOOP,
+		.default_rcode = RLM_MODULE_NOOP,
+		.result_rcode = RLM_MODULE_OK,
 		.send = send_generic,
 		.resume = resume_send_generic,
 		.section_offset = PROCESS_CONF_OFFSET(reply),
@@ -114,8 +117,9 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_INVALID] =	FR_ARP_DO_NOT_RESPOND,
 			[RLM_MODULE_DISALLOW] =	FR_ARP_DO_NOT_RESPOND,
 			[RLM_MODULE_NOTFOUND] =	FR_ARP_DO_NOT_RESPOND,
+			[RLM_MODULE_TIMEOUT] =  FR_ARP_DO_NOT_RESPOND
 		},
-		.rcode = RLM_MODULE_NOOP,
+		.default_rcode = RLM_MODULE_NOOP,
 		.recv = recv_generic,
 		.resume = resume_recv_generic,
 		.section_offset = PROCESS_CONF_OFFSET(reverse_request),
@@ -131,8 +135,10 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_INVALID] =	FR_ARP_DO_NOT_RESPOND,
 			[RLM_MODULE_DISALLOW] =	FR_ARP_DO_NOT_RESPOND,
 			[RLM_MODULE_NOTFOUND] =	FR_ARP_DO_NOT_RESPOND,
+			[RLM_MODULE_TIMEOUT] =  FR_ARP_DO_NOT_RESPOND
 		},
-		.rcode = RLM_MODULE_NOOP,
+		.default_rcode = RLM_MODULE_NOOP,
+		.result_rcode = RLM_MODULE_OK,
 		.send = send_generic,
 		.resume = resume_send_generic,
 		.section_offset = PROCESS_CONF_OFFSET(reverse_reply),
@@ -151,49 +157,35 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_INVALID] =	FR_ARP_DO_NOT_RESPOND,
 			[RLM_MODULE_DISALLOW] =	FR_ARP_DO_NOT_RESPOND,
 			[RLM_MODULE_NOTFOUND] =	FR_ARP_DO_NOT_RESPOND,
+			[RLM_MODULE_TIMEOUT] =  FR_ARP_DO_NOT_RESPOND
 		},
-		.rcode = RLM_MODULE_NOOP,
+		.default_rcode = RLM_MODULE_NOOP,
+		.result_rcode = RLM_MODULE_HANDLED,
 		.send = send_generic,
 		.resume = resume_send_generic,
 		.section_offset = PROCESS_CONF_OFFSET(do_not_respond),
 	},
 };
 
-/*
- *	Debug the packet if requested.
- */
-static void arp_packet_debug(request_t *request, fr_radius_packet_t const *packet, fr_pair_list_t const *list, bool received)
-{
-	if (!packet) return;
-	if (!RDEBUG_ENABLED) return;
-
-	log_request(L_DBG, L_DBG_LVL_1, request, __FILE__, __LINE__, "%s %s",
-		    received ? "Received" : "Sending",
-		    fr_arp_packet_codes[packet->code]);
-
-	if (received || request->parent) {
-		log_request_pair_list(L_DBG_LVL_1, request, NULL, list, NULL);
-	} else {
-		log_request_proto_pair_list(L_DBG_LVL_1, request, NULL, list, NULL);
-	}
-}
-
-static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t mod_process(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
 	fr_process_state_t const *state;
 
 	PROCESS_TRACE;
 
-	(void)talloc_get_type_abort_const(mctx->instance, process_arp_t);
+	(void)talloc_get_type_abort_const(mctx->mi->data, process_arp_t);
 	fr_assert(PROCESS_PACKET_CODE_VALID(request->packet->code));
 
 	request->component = "arp";
 	request->module = NULL;
-	fr_assert(request->dict == dict_arp);
+	fr_assert(request->proto_dict == dict_arp);
 
 	UPDATE_STATE(packet);
 
-	arp_packet_debug(request, request->packet, &request->request_pairs, true);
+	if (!state->recv) {
+		REDEBUG("Invalid packet type (%u)", request->packet->code);
+		RETURN_UNLANG_FAIL;
+	}
 
 	return state->recv(p_result, mctx, request);
 }
@@ -201,53 +193,49 @@ static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mc
 
 static const virtual_server_compile_t compile_list[] = {
 	{
-		.name = "recv",
-		.name2 = "Request",
-		.component = MOD_POST_AUTH,
+		.section = SECTION_NAME("recv", "Request"),
+		.actions = &mod_actions_postauth,
 		.offset = PROCESS_CONF_OFFSET(request),
 	},
 	{
-		.name = "send",
-		.name2 = "Reply",
-		.component = MOD_POST_AUTH,
+		.section = SECTION_NAME("send", "Reply"),
+		.actions = &mod_actions_postauth,
 		.offset = PROCESS_CONF_OFFSET(reply),
 	},
 	{			/* we can listen for others ARP replies, too */
-		.name = "recv",
-		.name2 = "Reply",
-		.component = MOD_POST_AUTH,
+		.section = SECTION_NAME("recv", "Reply"),
+		.actions = &mod_actions_postauth,
 		.offset = PROCESS_CONF_OFFSET(recv_reply),
 	},
 	{
-		.name = "recv",
-		.name2 = "Reverse-Request",
-		.component = MOD_POST_AUTH,
+		.section = SECTION_NAME("recv", "Reverse-Request"),
+		.actions = &mod_actions_postauth,
 		.offset = PROCESS_CONF_OFFSET(reverse_request),
 	},
-
 	{
-		.name = "send",
-		.name2 = "Reverse-Reply",
-		.component = MOD_POST_AUTH,
+		.section = SECTION_NAME("send", "Reverse-Reply"),
+		.actions = &mod_actions_postauth,
 		.offset = PROCESS_CONF_OFFSET(reverse_reply),
 	},
 	{
-		.name = "send",
-		.name2 = "Do-Not-Respond",
-		.component = MOD_POST_AUTH,
+		.section = SECTION_NAME("send", "Do-Not-Respond"),
+		.actions = &mod_actions_postauth,
 		.offset = PROCESS_CONF_OFFSET(do_not_respond),
 	},
-
 	COMPILE_TERMINATOR
 };
 
 
 extern fr_process_module_t process_arp;
 fr_process_module_t process_arp = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "process_arp",
-	.inst_size	= sizeof(process_arp_t),
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "arp",
+		MODULE_INST(process_arp_t),
+		MODULE_RCTX(process_rctx_t)
+	},
 	.process	= mod_process,
 	.compile_list	= compile_list,
 	.dict		= &dict_arp,
+	.packet_type	= &attr_packet_type
 };

@@ -1,5 +1,5 @@
 /*
- * @copyright (c) 2016, Network RADIUS SARL (license@networkradius.com)
+ * @copyright (c) 2016, Network RADIUS SAS (license@networkradius.com)
  *  All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -9,7 +9,7 @@
  *    * Redistributions in binary form must reproduce the above copyright
  *      notice, this list of conditions and the following disclaimer in the
  *      documentation and/or other materials provided with the distribution.
- *    * Neither the name of Network RADIUS SARL nor the
+ *    * Neither the name of Network RADIUS SAS nor the
  *      names of its contributors may be used to endorse or promote products
  *      derived from this software without specific prior written permission.
  *
@@ -32,9 +32,9 @@
  *
  * @author Arran Cudbard-Bell
  *
- * @copyright 2016 Network RADIUS SARL (license@networkradius.com)
+ * @copyright 2016 Network RADIUS SAS (license@networkradius.com)
  */
-#define LOG_PREFIX "rlm_sigtran - osmocom thread - "
+#define LOG_PREFIX "sigtran - osmocom thread"
 
 #include <osmocom/core/talloc.h>
 
@@ -58,7 +58,7 @@ static uint32_t	txn_tree_inst = 0;
 /** Compare rounds of a transaction
  *
  */
-static int sigtran_txn_cmp(void const *one, void const *two)
+static fr_cmp_ret_t sigtran_txn_cmp(void const *one, void const *two)
 {
 	sigtran_transaction_t const *a = one;	/* May be stack allocated */
 	sigtran_transaction_t const *b = two;	/* May be stack allocated */
@@ -77,7 +77,7 @@ static void sigtran_tcap_timeout(void *data)
 	/*
 	 *	Remove the outstanding transaction
 	 */
-	if (!fr_rb_delete(txn_tree, txn)) ERROR("Transaction removed before timeout");
+	if (fr_rb_delete(txn_tree, txn) != 0) ERROR("Transaction removed before timeout");
 
 	txn->response.type = SIGTRAN_RESPONSE_FAIL;
 
@@ -182,7 +182,7 @@ int sigtran_tcap_outgoing(UNUSED struct msgb *msg_in, void *ctx, sigtran_transac
 	txn->ctx.invoke_id &= 0x7f;					/* Invoke ID is 7bits */
 	DEBUG2("Sending request with OTID %u Invoke ID %u", txn->ctx.otid, txn->ctx.invoke_id);
 
-	if (!fr_rb_insert(txn_tree, txn)) {
+	if (fr_rb_insert(txn_tree, txn) != 0) {
 		ERROR("Failed inserting transaction, maybe at txn limit?");
 
 		msgb_free(msg);
@@ -244,7 +244,7 @@ static int sigtran_tcap_incoming(struct msgb *msg, UNUSED unsigned int length, U
 	/*
 	 *	Lookup the transaction in our tree of outstanding transactions
 	 */
-	found = fr_rb_find(txn_tree, &find);
+	fr_rb_find((void **)&found, txn_tree, &find);
 	if (!found) {
 		/*
 		 *	Not an error, could be a retransmission
@@ -252,7 +252,7 @@ static int sigtran_tcap_incoming(struct msgb *msg, UNUSED unsigned int length, U
 		ERROR("No outstanding transaction with DTID %u Invoke ID %u", find.ctx.otid, find.ctx.invoke_id);
 		return 0;
 	}
-	if (!fr_rb_delete(txn_tree, found)) {		/* Remove the outstanding transaction */
+	if (fr_rb_delete(txn_tree, found) != 0) {	/* Remove the outstanding transaction */
 		ERROR("Failed removing transaction");
 		fr_assert(0);
 	}
@@ -375,7 +375,7 @@ int sigtran_sccp_global_init(void)
 		return 0;
 	}
 
-	txn_tree = fr_rb_inline_talloc_alloc(NULL, sigtran_transaction_t, node, sigtran_txn_cmp, false);
+	txn_tree = fr_rb_inline_talloc_alloc(NULL, sigtran_transaction_t, node, sigtran_txn_cmp, NULL);
 	if (!txn_tree) return -1;
 
 	txn_tree_inst++;

@@ -25,12 +25,15 @@
  */
 RCSIDH(radclient_h, "$Id$")
 
-#include <freeradius-devel/util/base.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#include <freeradius-devel/util/dlist.h>
+#include <freeradius-devel/util/rb.h>
+#include <freeradius-devel/util/pair.h>
+#include <freeradius-devel/util/packet.h>
+#include <freeradius-devel/radius/defs.h>
 /*
  *	Logging macros
  */
@@ -54,45 +57,57 @@ typedef struct {
 	uint64_t accepted;			//!< Requests to which we received a accept
 	uint64_t rejected;			//!< Requests to which we received a reject
 	uint64_t lost;				//!< Requests to which we received no response
+	uint64_t error;				//!< Requests which received a Protocol-Error response
 	uint64_t passed;			//!< Requests which passed a filter
-	uint64_t failed;			//!< Requests which failed a fitler
+	uint64_t failed;			//!< Requests which failed a filter
 } rc_stats_t;
 
 typedef struct {
-	fr_rb_node_t		node;		//!< rbtree node data.
+	fr_dlist_t		entry;		//!< for linked list
 	char const		*packets;	//!< The file containing the request packet
 	char const		*filters;	//!< The file containing the definition of the
 						//!< packet we want to match.
+	char const		*coa_filter;	//!< file containing the CoA filter we want to match
+	char const		*coa_reply;	//!< file containing the CoA reply we want to send
 } rc_file_pair_t;
 
 typedef struct rc_request rc_request_t;
+FR_DLIST_TYPES(rc_request_list)
 
 struct rc_request {
-	uint64_t		num;		//!< The number (within the file) of the request were reading.
+	FR_DLIST_ENTRY(rc_request_list) entry;		//!< Entry in the list of requests.
 
-	rc_request_t		*prev;
-	rc_request_t		*next;
+	uint64_t		num;			//!< The number (within the file) of the request were reading.
 
-	rc_file_pair_t		*files;		//!< Request and response file names.
+	rc_file_pair_t		*files;			//!< Request and response file names.
 
-	fr_pair_t		*password;	//!< Password.Cleartext
-	fr_time_delta_t		timestamp;
+	rc_request_t		*coa;			//!< CoA filter and reply
+	fr_rb_node_t		node;			//!< rbtree node data for CoA
 
-	fr_radius_packet_t	*packet;	//!< The outgoing request.
-	fr_radius_packet_t	*reply;		//!< The incoming response.
+	fr_pair_t		*password;		//!< Password.Cleartext
+	fr_time_t		timestamp;
 
-	fr_pair_list_t		request_list;
-	fr_pair_list_t		reply_list;
+	fr_packet_t		*packet;		//!< The outgoing request.
+	fr_packet_t		*reply;			//!< The incoming response.
 
-	fr_pair_list_t		filter;		//!< If the reply passes the filter, then the request passes.
-	fr_radius_packet_code_t	filter_code;	//!< Expected code of the response packet.
+	fr_pair_list_t		request_pairs;
+	fr_pair_list_t		reply_pairs;
+
+	fr_pair_list_t		filter;			//!< If the reply passes the filter, then the request passes.
+	fr_radius_packet_code_t	filter_code;		//!< Expected code of the response packet.
 
 	int			resend;
 	int			tries;
-	bool			done;		//!< Whether the request is complete.
 
-	char const		*name;		//!< Test name (as specified in the request).
+	bool			done;			//!< Whether the request is complete.
+
+	char const		*name;			//!< Test name (as specified in the request).
 };
+
+FR_DLIST_FUNCS(rc_request_list, rc_request_t, entry)
+
+#define rc_request_list_foreach(_list_head, _iter) \
+	fr_dlist_foreach(rc_request_list_dlist_head(_list_head), rc_request_t, _iter)
 
 #ifdef __cplusplus
 }

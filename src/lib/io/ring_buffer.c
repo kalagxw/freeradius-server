@@ -27,7 +27,6 @@ RCSID("$Id$")
 #include <freeradius-devel/io/ring_buffer.h>
 #include <freeradius-devel/util/strerror.h>
 #include <freeradius-devel/util/debug.h>
-#include <string.h>
 
 /*
  *	Ring buffers are allocated in a block.
@@ -40,7 +39,8 @@ struct fr_ring_buffer_s {
 	size_t		data_end;	//!< end of used portion of the buffer
 
 	size_t		write_offset;	//!< where writes are done
-	size_t		reserved;	//!< amount of reserved data at write_offset
+	size_t		reserved_offset;	//!< where the reservation starts.
+	size_t		reserved;	//!< amount of reserved data at reserved_offset
 
 	bool		closed;		//!< whether allocations are closed
 };
@@ -134,6 +134,7 @@ uint8_t *fr_ring_buffer_reserve(fr_ring_buffer_t *rb, size_t size)
 	if (rb->write_offset < rb->data_start) {
 		if ((rb->write_offset + size) < rb->data_start) {
 			rb->reserved = size;
+			rb->reserved_offset = rb->write_offset;
 			return rb->buffer + rb->write_offset;
 		}
 
@@ -150,6 +151,7 @@ uint8_t *fr_ring_buffer_reserve(fr_ring_buffer_t *rb, size_t size)
 	 */
 	if ((rb->write_offset + size) <= rb->size) {
 		rb->reserved = size;
+		rb->reserved_offset = rb->write_offset;
 		return rb->buffer + rb->write_offset;
 	}
 
@@ -163,6 +165,7 @@ uint8_t *fr_ring_buffer_reserve(fr_ring_buffer_t *rb, size_t size)
 	if (size < rb->data_start) {
 		rb->write_offset = 0;
 		rb->reserved = size;
+		rb->reserved_offset = rb->write_offset;
 		return rb->buffer;
 	}
 
@@ -206,13 +209,16 @@ uint8_t *fr_ring_buffer_alloc(fr_ring_buffer_t *rb, size_t size)
 		return NULL;
 	}
 
-	/*
-	 *	Shrink the "reserved" portion of the buffer by the
-	 *	allocated size.
-	 */
-	if (rb->reserved >= size) {
-		rb->reserved -= size;
-	} else {
+	if (rb->reserved > 0) {
+		if (!rb->data_start && !rb->data_end) {
+			/*
+			 *	If, between reservation and allocation all entries are
+			 *	freed, then data_start and data_end will be zero.
+			 *	Set all the offsets to reserved_offset, so we
+			 *	return the previously reserved chunk.
+			 */
+			rb->write_offset = rb->data_start = rb->data_end = rb->reserved_offset;
+		}
 		rb->reserved = 0;
 	}
 
@@ -284,95 +290,6 @@ uint8_t *fr_ring_buffer_alloc(fr_ring_buffer_t *rb, size_t size)
 #endif
 	return NULL;
 }
-
-
-/** Split an existing reservation into two.
- *
- *  For protocols like TCP, there may sometimes be a partial packet at
- *  the end of the ring buffer.  We would like to pass a *complete*
- *  packet around instead of a partial one.  In that case, the partial
- *  packet at the end of the buffer should be copied to a reservation
- *  in a new ring buffer.
- *
- *  i.e. the application uses fr_ring_buffer_reserve() to reserve 32K
- *  of room.  He then reads 32K of data into that buffer.  This data
- *  comprises 3 full packets of 10K, and one partial packet of 10K.
- *  The application then calls fr_ring_buffer_alloc() three times, to
- *  consume those packets.  (Note that the caller doesn't really need
- *  to do 3 calls to fr_ring_buffer_alloc().  The ring buffer does not
- *  keep track of individual allocations).
- *
- *  The application then calls fr_ring_buffer_reserve() to reserve
- *  another 32K of room, while leaving 2K of data in the ring buffer.
- *  If that reservation succeeds, great.  Everything proceeds as
- *  before.  (Note that the application has to remember how much data
- *  was in the ring buffer, and do it's reading there, instead of to
- *  the pointer returned from fr_ring_buffer_reserve()).
- *
- *  If that call fails, there is 2K of partial data in the buffer
- *  which needs to be moved.  The application should allocate a new
- *  ring buffer, and then call this function to move the data to the
- *  new ring buffer.  The application then uses the new reservation to
- *  read data.
- *
- * @param[in] dst ring buffer where the reservation will be made
- * @param[in] reserve_size size of the new reservation
- * @param[in] src ring buffer where the data is sitting.
- * @param[in] move_size of data to move from the tail of the buffer to the start.
- * @return
- *	- NULL on error.
- *      - pointer to data on success
- */
-uint8_t *fr_ring_buffer_reserve_split(fr_ring_buffer_t *dst, size_t reserve_size,
-				      fr_ring_buffer_t *src, size_t move_size)
-{
-	uint8_t *p;
-
-	(void) talloc_get_type_abort(src, fr_ring_buffer_t);
-	(void) talloc_get_type_abort(dst, fr_ring_buffer_t);
-
-	if (dst->closed) {
-		fr_strerror_const("Allocation request after ring buffer is closed");
-		return NULL;
-	}
-
-	/*
-	 *	The application hasn't reserved enough space, so we can't
-	 *	split the reservation.
-	 */
-	if (src->reserved < move_size) {
-		fr_strerror_const("Cannot move more data than was reserved.");
-		return NULL;
-	}
-
-	/*
-	 *	Create a new reservation.
-	 */
-	p = fr_ring_buffer_reserve(dst, reserve_size);
-	if (!p) return NULL;
-
-	/*
-	 *	Alloc and reserve in the same ring buffer.  Maybe
-	 *	there's no need to memcpy() the data?
-	 */
-	if ((src == dst) && (p == (src->buffer + src->write_offset))) {
-		return 0;
-	}
-
-	/*
-	 *	Copy the data from the old buffer to the new one.
-	 */
-	memcpy(p, src->buffer + src->write_offset, move_size);
-
-	/*
-	 *	We now have no data reserved here.  All bets are
-	 *	off...
-	 */
-	src->reserved = 0;
-
-	return p;
-}
-
 
 /** Mark data as free,
  *
@@ -557,7 +474,7 @@ int fr_ring_buffer_start(fr_ring_buffer_t *rb, uint8_t **p_start, size_t *p_size
 	*p_start = rb->buffer + rb->data_start;
 
 	if (rb->write_offset < rb->data_start) {
-		*p_size = rb->write_offset;
+		*p_size = rb->data_end - rb->data_start;
 		return 0;
 	}
 
@@ -571,7 +488,7 @@ int fr_ring_buffer_start(fr_ring_buffer_t *rb, uint8_t **p_start, size_t *p_size
  * @param[in] rb the ring buffer
  * @param[in] fp the FILE where the messages are printed.
  */
-void fr_ring_buffer_debug(fr_ring_buffer_t *rb, FILE *fp)
+void fr_ring_buffer_debug(FILE *fp, fr_ring_buffer_t *rb)
 {
 	fprintf(fp, "Buffer %p, write_offset %zu, data_start %zu, data_end %zu\n",
 		rb->buffer, rb->write_offset, rb->data_start, rb->data_end);

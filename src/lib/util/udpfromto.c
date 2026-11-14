@@ -30,14 +30,11 @@ RCSID("$Id$")
 #ifdef HAVE_SYS_UIO_H
 #  include <sys/uio.h>
 #endif
+#ifdef HAVE_NET_IF_DL_H
+#  include <net/if_dl.h>
+#endif
 
-#include <errno.h>
 #include <fcntl.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <time.h>
-#include <unistd.h>
 
 /*
  *	More portability idiocy
@@ -95,27 +92,32 @@ RCSID("$Id$")
 #  endif
 #endif
 
-int udpfromto_init(int s)
+int udpfromto_init(int s, int af)
 {
-	int proto, flag = 0, opt = 1;
-	struct sockaddr_storage si;
-	socklen_t si_len = sizeof(si);
+	int proto = 0, flag = 0, opt = 1;
 
 	errno = ENOSYS;
 
-	/*
-	 *	Clang analyzer doesn't see that getsockname initialises
-	 *	the memory passed to it.
-	 */
-#ifdef __clang_analyzer__
-	memset(&si, 0, sizeof(si));
+	if (af == AF_UNSPEC) {
+		struct sockaddr_storage si;
+		socklen_t si_len = sizeof(si);
+
+		/*
+		 *	Static analyzer doesn't see that getsockname initialises
+		 *	the memory passed to it.
+		 */
+#ifdef STATIC_ANALYZER
+		memset(&si, 0, sizeof(si));
 #endif
 
-	if (getsockname(s, (struct sockaddr *) &si, &si_len) < 0) {
-		return -1;
+		if (getsockname(s, (struct sockaddr *) &si, &si_len) < 0) {
+			return -1;
+		}
+
+		af = si.ss_family;
 	}
 
-	if (si.ss_family == AF_INET) {
+	if (af == AF_INET) {
 #ifdef HAVE_IP_PKTINFO
 		/*
 		 *	Linux
@@ -131,13 +133,21 @@ int udpfromto_init(int s)
 		 */
 		proto = IPPROTO_IP;
 		flag = IP_RECVDSTADDR;
+
+		/*
+		 *	Where Linux uses IP_PKTINFO for both IP and interface
+		 *	information, BSD uses IP_RECVDSTADDR and IP_RECVIF
+		 */
+#    ifdef IP_RECVIF
+		if (setsockopt(s, proto, IP_RECVIF, &opt, sizeof(opt)) != 0) return -1;
+#    endif
 #  else
 		return -1;
 #  endif
 #endif
 
 #if defined(AF_INET6) && defined(IPV6_PKTINFO)
-	} else if (si.ss_family == AF_INET6) {
+	} else if (af == AF_INET6) {
 		/*
 		 *	This should actually be standard IPv6
 		 */
@@ -189,17 +199,17 @@ int udpfromto_init(int s)
  *	- 0 on success.
  *	- -1 on failure.
  */
-int recvfromto(int fd, void *buf, size_t len, int flags,
-	       int *ifindex,
-	       struct sockaddr *from, socklen_t *from_len,
-	       struct sockaddr *to, socklen_t *to_len,
-	       fr_time_t *when)
+ssize_t recvfromto(int fd, void *buf, size_t len, int flags,
+		   int *ifindex,
+		   struct sockaddr *from, socklen_t *from_len,
+		   struct sockaddr *to, socklen_t *to_len,
+		   fr_time_t *when)
 {
 	struct msghdr		msgh;
 	struct cmsghdr		*cmsg;
 	struct iovec		iov;
 	char			cbuf[256];
-	int			ret;
+	ssize_t			ret;
 	struct sockaddr_storage	si;
 	socklen_t		si_len = sizeof(si);
 
@@ -208,7 +218,7 @@ int recvfromto(int fd, void *buf, size_t len, int flags,
 	 *	If the recvmsg() flags aren't defined, fall back to
 	 *	using recvfrom().
 	 */
-	to = NULL:
+	to = NULL;
 #endif
 
 	/*
@@ -220,10 +230,10 @@ int recvfromto(int fd, void *buf, size_t len, int flags,
 	}
 
 	/*
-	 *	Clang analyzer doesn't see that getsockname initialises
+	 *	Static analyzer doesn't see that getsockname initialises
 	 *	the memory passed to it.
 	 */
-#ifdef __clang_analyzer__
+#ifdef STATIC_ANALYZER
 	memset(&si, 0, sizeof(si));
 #endif
 
@@ -300,12 +310,17 @@ int recvfromto(int fd, void *buf, size_t len, int flags,
 	if (from_len) *from_len = msgh.msg_namelen;
 
 	if (ifindex) *ifindex = 0;
-	if (when) *when = 0;
+	if (when) *when = fr_time_wrap(0);
 
+/*
+ *	Needed for emscripten, seems to be an issue in CMSG_NXTHDR
+ */
+DIAG_OFF(sign-compare)
 	/* Process auxiliary received data in msgh */
 	for (cmsg = CMSG_FIRSTHDR(&msgh);
 	     cmsg != NULL;
 	     cmsg = CMSG_NXTHDR(&msgh, cmsg)) {
+DIAG_ON(sign-compare)
 
 #ifdef IP_PKTINFO
 		if ((cmsg->cmsg_level == SOL_IP) &&
@@ -330,7 +345,26 @@ int recvfromto(int fd, void *buf, size_t len, int flags,
 
 			*to_len = sizeof(struct sockaddr_in);
 
+#ifdef   IP_RECVIF
+			continue;
+#else
 			break;
+#endif
+		}
+#endif
+
+#ifdef IP_RECVIF
+		if ((cmsg->cmsg_level == IPPROTO_IP) &&
+		    (cmsg->cmsg_type == IP_RECVIF)) {
+			struct sockaddr_dl *sd = (struct sockaddr_dl *) CMSG_DATA(cmsg);
+
+			if (ifindex) *ifindex = sd->sdl_index;
+
+#ifdef   IP_RECVDSTADDR
+			continue;
+#else
+			break;
+#endif
 		}
 #endif
 
@@ -353,9 +387,15 @@ int recvfromto(int fd, void *buf, size_t len, int flags,
 			*when = fr_time_from_timeval((struct timeval *)CMSG_DATA(cmsg));
 		}
 #endif
+
+#ifdef SO_TIMESTAMPNS
+		if (when && (cmsg->cmsg_level == SOL_IP) && (cmsg->cmsg_type == SO_TIMESTAMPNS)) {
+			*when = fr_time_from_timespec((struct timespec *)CMSG_DATA(cmsg));
+		}
+#endif
 	}
 
-	if (when && !*when) *when = fr_time();
+	if (when && fr_time_eq(*when, fr_time_wrap(0))) *when = fr_time();
 
 	return ret;
 }
@@ -378,10 +418,10 @@ int recvfromto(int fd, void *buf, size_t len, int flags,
  *	- 0 on success.
  *	- -1 on failure.
  */
-int sendfromto(int fd, void *buf, size_t len, int flags,
-	       int ifindex,
-	       struct sockaddr *from, socklen_t from_len,
-	       struct sockaddr *to, socklen_t to_len)
+ssize_t sendfromto(int fd, void *buf, size_t len, int flags,
+		   int ifindex,
+		   struct sockaddr *from, socklen_t from_len,
+		   struct sockaddr *to, socklen_t to_len)
 {
 	struct msghdr	msgh;
 	struct iovec	iov;
@@ -402,14 +442,15 @@ int sendfromto(int fd, void *buf, size_t len, int flags,
 	 *	with a socket which is bound to something other than
 	 *	INADDR_ANY
 	 */
-	struct sockaddr bound;
+	{
+	struct sockaddr_storage bound;
 	socklen_t bound_len = sizeof(bound);
 
-	if (getsockname(fd, &bound, &bound_len) < 0) {
+	if (getsockname(fd, (struct sockaddr *) &bound, &bound_len) < 0) {
 		return -1;
 	}
 
-	switch (bound.sa_family) {
+	switch (bound.ss_family) {
 	case AF_INET:
 		if (((struct sockaddr_in *) &bound)->sin_addr.s_addr != INADDR_ANY) {
 			from = NULL;
@@ -421,6 +462,7 @@ int sendfromto(int fd, void *buf, size_t len, int flags,
 			from = NULL;
 		}
 		break;
+	}
 	}
 #endif	/* !__FreeBSD__ */
 
@@ -439,9 +481,17 @@ int sendfromto(int fd, void *buf, size_t len, int flags,
 #  endif
 
 	/*
-	 *	No "from", just use regular sendto.
+	 *	No "from" or "from" is 0.0.0.0 or ::/0, and there's no
+	 *	interface binding, just use regular sendto.
 	 */
-	if (!from || (from_len == 0)) return sendto(fd, buf, len, flags, to, to_len);
+	if (!from || (from_len == 0) ||
+		((ifindex == 0) &&
+		((from->sa_family == AF_INET &&
+			(((struct sockaddr_in *) from)->sin_addr.s_addr == INADDR_ANY)) ||
+		(from->sa_family == AF_INET6 &&
+			IN6_IS_ADDR_UNSPECIFIED(&((struct sockaddr_in6 *) from)->sin6_addr))))) {
+		return sendto(fd, buf, len, flags, to, to_len);
+	}
 
 	/* Set up control buffer iov and msgh structures. */
 	memset(&cbuf, 0, sizeof(cbuf));
@@ -568,7 +618,7 @@ int main(int argc, char **argv)
 
 	/* parent: server */
 	server_socket = socket(PF_INET, SOCK_DGRAM, 0);
-	if (udpfromto_init(server_socket) != 0) {
+	if (udpfromto_init(server_socket, AF_INET) != 0) {
 		perror("udpfromto_init\n");
 		waitpid(pid, NULL, WNOHANG);
 		return 0;
@@ -610,7 +660,7 @@ int main(int argc, char **argv)
 client:
 	close(server_socket);
 	client_socket = socket(PF_INET, SOCK_DGRAM, 0);
-	fr_assert_fatal_msg(udpfromto_init(client_socket) != 0, "udpfromto_init - %s", fr_syserror(errno));
+	fr_assert_fatal_msg(udpfromto_init(client_socket, AF_INET) != 0, "udpfromto_init - %s", fr_syserror(errno));
 
 	/* bind client on different port */
 	in.sin_port = htons(port+1);

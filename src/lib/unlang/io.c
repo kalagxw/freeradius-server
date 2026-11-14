@@ -39,13 +39,21 @@ RCSID("$Id$")
 request_t *unlang_io_subrequest_alloc(request_t *parent, fr_dict_t const *namespace, bool detachable)
 {
 	request_t		*child;
+	char const		*server;
 
-	child = request_alloc_internal(detachable ? NULL : parent,
-				       (&(request_init_args_t){
+	if (!namespace) namespace = parent->proto_dict;
+
+	/*
+	 *	A child cannot refer to local variables in the parent context.
+	 */
+	fr_assert(fr_dict_proto_dict(namespace) == namespace);
+
+	child = request_local_alloc_internal(detachable ? NULL : parent,
+					     (&(request_init_args_t){
 						.parent = parent,
 						.namespace = namespace,
 						.detachable = detachable
-				       }));
+					     }));
 	if (!child) return NULL;
 
 	/*
@@ -54,9 +62,9 @@ request_t *unlang_io_subrequest_alloc(request_t *parent, fr_dict_t const *namesp
 	((unlang_stack_t *)child->stack)->intp = ((unlang_stack_t *)parent->stack)->intp;
 
 	/*
-	 *	Push the child, and set it's top frame to be true.
+	 *	Push the child, and set its top frame to be true.
 	 */
-	child->log.unlang_indent = parent->log.unlang_indent;
+	child->log.indent.unlang = parent->log.indent.unlang;
 
 	/*
 	 *	Initialize some basic information for the child.
@@ -67,10 +75,20 @@ request_t *unlang_io_subrequest_alloc(request_t *parent, fr_dict_t const *namesp
 	 *	Initialize all of the async fields.
 	 */
 	child->async = talloc_zero(child, fr_async_t);
+	child->async->request = child;
 
 #define COPY_FIELD(_x) child->async->_x = parent->async->_x
 	COPY_FIELD(recv_time);
 	fr_assert(request_is_internal(child));
+
+	server = unlang_interpret_virtual_server(parent);
+	if (server) {
+		child->packet->socket = (fr_socket_t) {
+			.af = AF_FR_VIRTUAL_SERVER,
+			.virtual.server = server,
+		};
+		child->reply->socket = child->packet->socket;
+	}
 
 	REQUEST_VERIFY(child);
 

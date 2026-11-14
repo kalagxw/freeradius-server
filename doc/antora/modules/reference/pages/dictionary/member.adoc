@@ -1,0 +1,78 @@
+= The MEMBER keyword
+
+.Syntax
+----
+MEMBER <name> <type> [<flags>]
+----
+
+.Description
+
+The `MEMBER` keyword defines a name and data type mapping for fields
+of a `struct` data type.
+
+<name>:: The name of the attribute.  The name can contain alphanumeric
+characters, `-`, and `_`.  The name should be short and descriptive.
++
+The name of this `MEMBER` is defined only within the context of its
+parent `struct`.
+
+<type>:: A xref:type/index.adoc[data type], or the special type `bit`.
++
+A few data types can be marked up as being fixed size, by adding an
+"array-style" suffix, such as with `bit[3]`.  See below for details.
+
+NOTE: Only `MEMBER` definitions can contain `bit` fields.  While `bit`
+fields do not have to start and end on byte boundaries, changing from
+a non-`bit` type to a `bit` type (and vice-versa) can only be done on
+a byte boundary.
+
+<flags>:: The flag field is optional, and is usually
+protocol-specific.  See the xref:dictionary/flags.adoc[FLAGS] page for
+definitions of common flags.
++
+Please see the protocol dictionaries for examples of these flags. Only
+the flags which are used in a protocol dictionary are valid, and those
+flags are only valid for that protocol dictionary.
++
+The `key` flag can only be used for ``MEMBER``s where the data type is
+`uint8`, `uint16`, or `uint32`.
+
+Common flags and meanings
+[options="header"]
+[cols="30%,70%"]
+|=====
+| Name         | Description
+| `array`      | For fixed-size types, declare that the contents of the packet can have an array of this value.
+| `enum=...`   | For "leaf" types, copy xref:dictionary/value.adoc[VALUE]s from an `xref:dictionary/enum.adoc[ENUM].
+| `clone=...`  | For `tlv` types, clone (or copy) child definitions from another attribute of the same type
+| `key`        | This member is a "key" type.  The structure can have different children of type `union`, depending on the value of the key.
+|=====
+
+See the xref:dictionary/reference.adoc[reference] page for the syntax
+of references in the dictionary.
+
+.Examples
+----
+ATTRIBUTE Foo 1 struct
+MEMBER Bar  bit[3]
+MEMBER Baz  bit[5]
+MEMBER Name string
+----
+
+== Fixed Size Data types
+
+The following data types can be marked up as having fixed size, by
+using an array suffix, e.g. `octets[14]`.
+
+Fixed Size types and meanings
+[options="header"]
+[cols="30%,70%"]
+|=====
+| Keyword | Description
+| `bit[n]`     | Declare that this attribute uses `n` bits, treated as an unsigned integer
+| `octets[n]`  | Declare that this attribute uses `n` bytes of `octets` data
+| `string[n]`  | Declare that this attribute uses `n` bytes of `string` data
+|=====
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

@@ -26,6 +26,213 @@ RCSID("$Id$")
 #include <freeradius-devel/util/types.h>
 #include <freeradius-devel/util/value.h>
 
+/** Map data types to names representing those types
+ */
+fr_table_num_ordered_t const fr_type_table[] = {
+	{ L("null"),		FR_TYPE_NULL		},
+	{ L("string"),		FR_TYPE_STRING		},
+	{ L("octets"),		FR_TYPE_OCTETS		},
+
+	{ L("ipaddr"),		FR_TYPE_IPV4_ADDR	},
+	{ L("ipv4addr"),	FR_TYPE_IPV4_ADDR	},
+	{ L("ipv4prefix"),	FR_TYPE_IPV4_PREFIX	},
+	{ L("ipv6addr"),	FR_TYPE_IPV6_ADDR	},
+	{ L("ipv6prefix"),	FR_TYPE_IPV6_PREFIX	},
+	{ L("ifid"),		FR_TYPE_IFID		},
+	{ L("combo-ip"),	FR_TYPE_COMBO_IP_ADDR	},
+	{ L("combo-prefix"),	FR_TYPE_COMBO_IP_PREFIX	},
+	{ L("ether"),		FR_TYPE_ETHERNET	},
+
+	{ L("bool"),		FR_TYPE_BOOL		},
+
+	{ L("uint8"),        	FR_TYPE_UINT8		},
+	{ L("uint16"),        	FR_TYPE_UINT16		},
+	{ L("uint32"),		FR_TYPE_UINT32		},
+	{ L("uint64"),		FR_TYPE_UINT64		},
+
+	{ L("int8"),		FR_TYPE_INT8 		},
+	{ L("int16"),		FR_TYPE_INT16		},
+	{ L("int32"),         	FR_TYPE_INT32		},
+	{ L("int64"),		FR_TYPE_INT64		},
+
+	{ L("float32"),		FR_TYPE_FLOAT32		},
+	{ L("float64"),		FR_TYPE_FLOAT64		},
+
+	{ L("date"),		FR_TYPE_DATE		},
+	{ L("time_delta"),	FR_TYPE_TIME_DELTA	},
+
+	{ L("size"),		FR_TYPE_SIZE		},
+
+	{ L("tlv"),		FR_TYPE_TLV		},
+	{ L("struct"),        	FR_TYPE_STRUCT		},
+
+	{ L("vsa"),          	FR_TYPE_VSA		},
+	{ L("vendor"),        	FR_TYPE_VENDOR		},
+	{ L("group"),        	FR_TYPE_GROUP		},
+	{ L("union"),        	FR_TYPE_UNION		},
+
+	{ L("attribute"),	FR_TYPE_ATTR		},
+
+	/*
+	 *	Alternative names
+	 */
+	{ L("cidr"),         	FR_TYPE_IPV4_PREFIX	},
+	{ L("byte"),		FR_TYPE_UINT8		},
+	{ L("short"),		FR_TYPE_UINT16		},
+	{ L("integer"),		FR_TYPE_UINT32		},
+	{ L("integer64"),	FR_TYPE_UINT64		},
+	{ L("decimal"),		FR_TYPE_FLOAT64		},
+	{ L("signed"),        	FR_TYPE_INT32		}
+};
+size_t fr_type_table_len = NUM_ELEMENTS(fr_type_table);
+
+/** Map each `fr_type_t` to the C identifier of its enum constant.
+ *
+ * The complement of fr_type_table - that one maps to the short
+ * "string", "ipv4addr", "uint32" names used in dictionaries and conf
+ * files; this maps to the source-identical FR_TYPE_STRING /
+ * FR_TYPE_IPV4_ADDR / FR_TYPE_UINT32 forms, for tooling that wants
+ * to grep the v4 source tree by enum name (radmod2json, etc.).
+ *
+ * Stored as `fr_table_num_indexed_t` so fr_table_str_by_value() can
+ * do the value->name look-up through v4's standard table machinery;
+ * the table is indexed directly by `fr_type_t` value (gaps return
+ * the default).
+ */
+static fr_table_num_indexed_t const fr_type_to_enum_str_table[] = {
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_NULL),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_STRING),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_OCTETS),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_IPV4_ADDR),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_IPV4_PREFIX),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_IPV6_ADDR),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_IPV6_PREFIX),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_IFID),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_COMBO_IP_ADDR),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_COMBO_IP_PREFIX),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_ETHERNET),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_BOOL),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_UINT8),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_UINT16),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_UINT32),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_UINT64),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_INT8),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_INT16),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_INT32),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_INT64),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_FLOAT32),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_FLOAT64),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_DATE),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_TIME_DELTA),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_SIZE),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_TLV),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_STRUCT),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_VSA),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_VENDOR),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_GROUP),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_UNION),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_VALUE_BOX),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_ATTR),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_VOID),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_VALUE_BOX_CURSOR),
+	FR_TABLE_INDEXED_ENTRY(FR_TYPE_PAIR_CURSOR),
+};
+static size_t fr_type_to_enum_str_table_len = NUM_ELEMENTS(fr_type_to_enum_str_table);
+
+char const *fr_type_to_enum_str(fr_type_t t)
+{
+	return fr_table_str_by_value(fr_type_to_enum_str_table, t, "FR_TYPE_NULL");
+}
+
+/** Table of all the direct mappings between types and C types
+ *
+ * Useful for setting talloc types correctly.
+ */
+static char const *fr_type_to_c_type[] = {
+	[FR_TYPE_STRING]			= "char *",
+	[FR_TYPE_OCTETS]			= "uint8_t *",
+
+	[FR_TYPE_IPV4_ADDR]			= "fr_ipaddr_t",
+	[FR_TYPE_IPV4_PREFIX]			= "fr_ipaddr_t",
+	[FR_TYPE_IPV6_ADDR]			= "fr_ipaddr_t",
+	[FR_TYPE_IPV6_PREFIX]			= "fr_ipaddr_t",
+	[FR_TYPE_COMBO_IP_ADDR]			= "fr_ipaddr_t",
+	[FR_TYPE_COMBO_IP_PREFIX]	       	= "fr_ipaddr_t",
+	[FR_TYPE_IFID]				= "fr_ifid_t",
+	[FR_TYPE_ETHERNET]			= "fr_ethernet_t",
+
+	[FR_TYPE_BOOL]				= "bool",
+	[FR_TYPE_UINT8]				= "uint8_t",
+	[FR_TYPE_UINT16]			= "uint16_t",
+	[FR_TYPE_UINT32]			= "uint32_t",
+	[FR_TYPE_UINT64]			= "uint64_t",
+
+	[FR_TYPE_INT8]				= "int8_t",
+	[FR_TYPE_INT16]				= "int16_t",
+	[FR_TYPE_INT32]				= "int32_t",
+	[FR_TYPE_INT64]				= "int64_t",
+
+	[FR_TYPE_FLOAT32]			= "float",
+	[FR_TYPE_FLOAT64]			= "double",
+
+	[FR_TYPE_DATE]				= "fr_unix_time_t",
+
+	[FR_TYPE_TIME_DELTA]			= "fr_time_delta_t",
+	[FR_TYPE_SIZE]				= "size_t",
+	[FR_TYPE_VALUE_BOX]			= "fr_value_box_t",
+	[FR_TYPE_ATTR]				= "fr_dict_attr_t *",
+	[FR_TYPE_VOID]				= "void *",
+
+	[FR_TYPE_VALUE_BOX_CURSOR]    		= "fr_dcursor_t *",
+	[FR_TYPE_PAIR_CURSOR]			= "fr_dcursor_t *",
+
+	[FR_TYPE_MAX]				= 0	//!< Ensure array covers all types.
+};
+
+/** Table of all the direct mappings between types and C type sizes
+ *
+ */
+static size_t const fr_type_to_c_size[] = {
+	[FR_TYPE_STRING]			= sizeof(char *),
+	[FR_TYPE_OCTETS]			= sizeof(uint8_t *),
+
+	[FR_TYPE_IPV4_ADDR]			= sizeof(fr_ipaddr_t),
+	[FR_TYPE_IPV4_PREFIX]			= sizeof(fr_ipaddr_t),
+	[FR_TYPE_IPV6_ADDR]			= sizeof(fr_ipaddr_t),
+	[FR_TYPE_IPV6_PREFIX]			= sizeof(fr_ipaddr_t),
+	[FR_TYPE_COMBO_IP_ADDR]			= sizeof(fr_ipaddr_t),
+	[FR_TYPE_COMBO_IP_PREFIX]	       	= sizeof(fr_ipaddr_t),
+	[FR_TYPE_IFID]				= sizeof(fr_ifid_t),
+	[FR_TYPE_ETHERNET]			= sizeof(fr_ethernet_t),
+
+	[FR_TYPE_BOOL]				= sizeof(bool),
+	[FR_TYPE_UINT8]				= sizeof(uint8_t),
+	[FR_TYPE_UINT16]			= sizeof(uint16_t),
+	[FR_TYPE_UINT32]			= sizeof(uint32_t),
+	[FR_TYPE_UINT64]			= sizeof(uint64_t),
+
+	[FR_TYPE_INT8]				= sizeof(int8_t),
+	[FR_TYPE_INT16]				= sizeof(int16_t),
+	[FR_TYPE_INT32]				= sizeof(int32_t),
+	[FR_TYPE_INT64]				= sizeof(int64_t),
+
+	[FR_TYPE_FLOAT32]			= sizeof(float),
+	[FR_TYPE_FLOAT64]			= sizeof(double),
+
+	[FR_TYPE_DATE]				= sizeof(fr_unix_time_t),
+
+	[FR_TYPE_TIME_DELTA]			= sizeof(fr_time_delta_t),
+	[FR_TYPE_SIZE]				= sizeof(size_t),
+	[FR_TYPE_VALUE_BOX]			= sizeof(fr_value_box_t),
+	[FR_TYPE_ATTR]				= sizeof(fr_dict_attr_t *),
+	[FR_TYPE_VOID]				= sizeof(void *),
+
+	[FR_TYPE_VALUE_BOX_CURSOR]     		= sizeof(void *),
+	[FR_TYPE_PAIR_CURSOR]	       		= sizeof(void *),
+
+	[FR_TYPE_MAX]				= 0	//!< Ensure array covers all types.
+};
+
 #define ARRAY_BEG(_type)	{ [_type] = true,
 #define ARRAY_MID(_type)	[_type] = true,
 #define ARRAY_END(_type)	[_type] = true }
@@ -33,6 +240,7 @@ RCSID("$Id$")
 bool const fr_type_integer_except_bool[FR_TYPE_MAX + 1] = FR_TYPE_INTEGER_EXCEPT_BOOL_DEF(ARRAY_BEG, ARRAY_MID, ARRAY_END);
 bool const fr_type_integer[FR_TYPE_MAX + 1] = FR_TYPE_INTEGER_DEF(ARRAY_BEG, ARRAY_MID, ARRAY_END);
 bool const fr_type_numeric[FR_TYPE_MAX + 1] = FR_TYPE_NUMERIC_DEF(ARRAY_BEG, ARRAY_MID, ARRAY_END);
+bool const fr_type_signed[FR_TYPE_MAX + 1] = FR_TYPE_SIGNED_DEF(ARRAY_BEG, ARRAY_MID, ARRAY_END);
 
 bool const fr_type_ip[FR_TYPE_MAX + 1] = FR_TYPE_IP_DEF(ARRAY_BEG, ARRAY_MID, ARRAY_END);
 
@@ -57,18 +265,40 @@ static const bool type_cast_table[FR_TYPE_MAX][FR_TYPE_MAX] = {
 		O(IPV4_PREFIX),
 		O(IPV6_ADDR),
 		O(IPV6_PREFIX),
-		O(UINT32), /* ipv4 addresses are uint32 */
+		O(COMBO_IP_ADDR),
+		O(COMBO_IP_PREFIX),
+		O(UINT32), 		/* ipv4 addresses are uint32 */
 	},
 	[FR_TYPE_IPV4_PREFIX] = {
-		O(IPV4_ADDR),	/* if the prefix is /32 */
+		O(IPV4_ADDR),		/* if the prefix is /32 */
 		O(IPV6_ADDR),
 		O(IPV6_PREFIX),
+		O(COMBO_IP_ADDR),
+		O(COMBO_IP_PREFIX)
 	},
 	[FR_TYPE_IPV6_ADDR] = {
 		O(IPV6_PREFIX),
+		O(COMBO_IP_ADDR),
+		O(COMBO_IP_PREFIX)
 	},
 	[FR_TYPE_IPV6_PREFIX] = {
-		O(IPV6_ADDR),	/* if the prefix is /128 */
+		O(IPV6_ADDR),		/* if the prefix is /128 */
+		O(COMBO_IP_ADDR),
+		O(COMBO_IP_PREFIX)
+	},
+	[FR_TYPE_COMBO_IP_ADDR] = {
+		O(IPV4_ADDR),
+		O(IPV4_PREFIX),
+		O(IPV6_ADDR),
+		O(IPV6_PREFIX),
+		O(COMBO_IP_PREFIX)
+	},
+	[FR_TYPE_COMBO_IP_PREFIX] = {
+		O(IPV4_ADDR),
+		O(IPV4_PREFIX),
+		O(IPV6_ADDR),
+		O(IPV6_PREFIX),
+		O(COMBO_IP_ADDR)	/* if the prefix is /128 or /32 */
 	},
 
 	[FR_TYPE_ETHERNET] = {
@@ -410,24 +640,7 @@ static fr_type_t type_promote_table[FR_TYPE_MAX][FR_TYPE_MAX] = {
  */
 fr_type_t fr_type_promote(fr_type_t a, fr_type_t b)
 {
-	/*
-	 *	Invalid types
-	 */
-	switch (a) {
-	case FR_TYPE_NON_LEAF:
-		return FR_TYPE_NULL;
-
-	default:
-		break;
-	}
-
-	switch (b) {
-	case FR_TYPE_NON_LEAF:
-		return FR_TYPE_NULL;
-
-	default:
-		break;
-	}
+	if (!fr_type_is_leaf(a) || !fr_type_is_leaf(b)) return FR_TYPE_NULL;
 
 	if (a == b) return a;
 
@@ -454,16 +667,16 @@ fr_type_t fr_type_promote(fr_type_t a, fr_type_t b)
 	 */
 	if (unlikely(type_promote_table[a][b] != type_promote_table[b][a])) {
 		fr_strerror_printf("Inverse type mapping inconsistent for a = %s, b = %s",
-				   fr_table_str_by_value(fr_value_box_type_table, a, "<INVALID>"),
-				   fr_table_str_by_value(fr_value_box_type_table, b, "<INVALID>"));
+				   fr_type_to_str(a),
+				   fr_type_to_str(b));
 
 		return FR_TYPE_NULL;
 	}
 
 	if (unlikely(type_promote_table[a][b] == FR_TYPE_NULL)) {
 		fr_strerror_printf("No type promotions for a = %s, b = %s",
-				   fr_table_str_by_value(fr_value_box_type_table, a, "<INVALID>"),
-				   fr_table_str_by_value(fr_value_box_type_table, b, "<INVALID>"));
+				   fr_type_to_str(a),
+				   fr_type_to_str(b));
 		return FR_TYPE_NULL;
 	}
 
@@ -474,3 +687,25 @@ fr_type_t fr_type_promote(fr_type_t a, fr_type_t b)
 	 */
 	return type_promote_table[a][b];
 }
+
+/** Allocate an array of a given type
+ *
+ * @param[in] ctx	to allocate array in.
+ * @param[in] type	array to allocate.
+ * @param[in] count	The number of elements to allocate.
+ * @return
+ *	- NULL on error.
+ *	- A new talloc array.
+ */
+void **fr_type_array_alloc(TALLOC_CTX *ctx, fr_type_t type, size_t count)
+{
+	char const *c_type;
+
+	c_type = fr_type_to_c_type[type];
+	if (c_type == NULL) {
+		fr_strerror_printf("Type %s does not have a C type equivalent", fr_type_to_str(type));
+		return NULL;
+	}
+
+	return _talloc_zero_array(ctx, fr_type_to_c_size[type], count, c_type);
+ }

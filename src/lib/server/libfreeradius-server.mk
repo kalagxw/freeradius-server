@@ -1,4 +1,5 @@
-TARGET		:= libfreeradius-server.a
+TARGET		:= libfreeradius-server$(L)
+TGT_CATEGORY	:= lib-util
 
 SOURCES	:= \
 	auth.c \
@@ -8,22 +9,22 @@ SOURCES	:= \
 	cf_util.c \
 	client.c \
 	command.c \
-	cond_eval.c \
-	cond_tokenize.c \
 	connection.c \
 	dependency.c \
 	dl_module.c \
 	exec.c \
 	exec_legacy.c \
 	exfile.c \
+	global_lib.c \
 	log.c \
 	main_config.c \
 	main_loop.c \
 	map.c \
-	map_async.c \
 	map_proc.c \
-	method.c \
 	module.c \
+	module_method.c \
+	module_rlm.c \
+	packet.c \
 	paircmp.c \
 	pairmove.c \
 	password.c \
@@ -32,11 +33,14 @@ SOURCES	:= \
 	regex.c \
 	request.c \
 	request_data.c \
+	section.c \
 	snmp.c \
 	state.c \
 	stats.c \
+	tmpl_dcursor.c \
 	tmpl_eval.c \
 	tmpl_tokenize.c \
+	time_tracking.c \
 	trigger.c \
 	trunk.c \
 	users_file.c \
@@ -50,11 +54,29 @@ TGT_LDLIBS	:= $(LIBS) $(SYSTEMD_LIBS) $(GPERFTOOLS_LIBS) $(LCRYPT)
 TGT_LDFLAGS	:= $(LDFLAGS) $(SYSTEMD_LDFLAGS) $(GPERFTOOLS_LDFLAGS)
 
 ifneq ($(OPENSSL_LIBS),)
-TGT_PREREQS	:= libfreeradius-tls.a
+TGT_PREREQS	:= libfreeradius-tls$(L)
 endif
 
-TGT_PREREQS	+= libfreeradius-util.a
+# RADIUS linkage is only required because we don't have a protocol agnostic
+# way of building clients.  Once that's fixed we can remove the dependency.
+TGT_PREREQS	+= $(LIBFREERADIUS_UTIL) libfreeradius-radius$(L)
 
-ifneq ($(MAKECMDGOALS),scan)
-SRC_CFLAGS	+= -DBUILT_WITH_CPPFLAGS=\"$(CPPFLAGS)\" -DBUILT_WITH_CFLAGS=\"$(CFLAGS)\" -DBUILT_WITH_LDFLAGS=\"$(LDFLAGS)\" -DBUILT_WITH_LIBS=\"$(LIBS)\"
-endif
+SRC_CFLAGS	+= $(call SHELL_QUOTE,-DBUILT_WITH_CPPFLAGS="$(CPPFLAGS)") \
+		   $(call SHELL_QUOTE,-DBUILT_WITH_CFLAGS="$(CFLAGS)") \
+		   $(call SHELL_QUOTE,-DBUILT_WITH_LDFLAGS="$(LDFLAGS)") \
+		   $(call SHELL_QUOTE,-DBUILT_WITH_LIBS="$(LIBS)")
+
+# ID of this library
+LOG_ID_LIB	:= 1
+
+# different pieces of this library
+$(call DEFINE_LOG_ID_SECTION,config,	1,cf_file.c cf_parse.c cf_util.c)
+# 2 was the old conditions
+$(call DEFINE_LOG_ID_SECTION,exec,	3,exec.c exec_legacy.c)
+$(call DEFINE_LOG_ID_SECTION,modules,	4,dl_module.c module.c module_rlm.c method.c)
+$(call DEFINE_LOG_ID_SECTION,map,	5,map.c map_proc.c map_async.c)
+$(call DEFINE_LOG_ID_SECTION,snmp,	6,snmp.c)
+$(call DEFINE_LOG_ID_SECTION,templates,	7,tmpl_eval.c tmpl_tokenize.c)
+$(call DEFINE_LOG_ID_SECTION,triggers,	8,trigger.c)
+$(call DEFINE_LOG_ID_SECTION,trunk,	9,trunk.c)
+$(call DEFINE_LOG_ID_SECTION,virtual_servers,10,virtual_servers.c)

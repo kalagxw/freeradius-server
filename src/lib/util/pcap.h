@@ -35,7 +35,6 @@ extern "C" {
 #include <freeradius-devel/util/net.h>
 
 #include <pcap.h>
-#include <stdbool.h>
 #include <sys/types.h>
 
 #define SNAPLEN ETHER_HDR_LEN + IP_HDR_LEN + sizeof(udp_header_t) + MAX_RADIUS_LEN
@@ -60,7 +59,7 @@ extern "C" {
 #  define PCAP_NETMASK_UNKNOWN 0
 #endif
 
-typedef enum {
+typedef enum : uint8_t {
 	PCAP_INVALID = 0,
 	PCAP_INTERFACE_IN,
 	PCAP_FILE_IN,

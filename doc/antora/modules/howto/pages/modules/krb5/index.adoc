@@ -1,4 +1,4 @@
-= Kerberos 5 (krb5)
+= KRB5
 
 The `rlm_krb5` FreeRADIUS module enables the use of Kerberos 5 for
 authentication.
@@ -12,13 +12,13 @@ The `rlm_krb5` module, by default, presumes you have the MIT Kerberos
 
 On linux, you may have to change:
 
-```
+----
 deplibs_test_method="pass_all"
-```
+----
 
 in `../libtool`
 
-Otherwise, it complains if the krb5 libs aren’t shared.
+Otherwise, it complains if the krb5 libs aren't shared.
 
 === Heimdal libraries
 
@@ -29,7 +29,7 @@ If you are using the Heimdal Kerberos 5 distribution, pass an
 
 You can configure the module with the following parameters:
 
-```
+----
 krb5 {
     # Keytab containing the key used by rlm_krb5
     keytab = /path/to/keytab
@@ -37,15 +37,17 @@ krb5 {
     # Principal that is used by rlm_krb5
     service_principal = radius/some.host.com
 }
-```
+----
 
 Make sure the keytab is readable by the user that is used to run
 `radiusd` and that your authorization configuration really uses
 `rlm_krb5` to do the authentication. You will need to add the
 following to the `authenticate` section of your radiusd.conf file:
 
-```
+----
 Auth-Type Kerberos {
     krb5
 }
-```
+----
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

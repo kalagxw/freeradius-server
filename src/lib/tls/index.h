@@ -22,6 +22,7 @@
  * @brief Structures and prototypes for TLS wrappers
  *
  * @copyright 2021 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2026 Network RADIUS SAS (legal@networkradius.com)
  */
 RCSIDH(index_h, "$Id$")
 
@@ -29,14 +30,36 @@ RCSIDH(index_h, "$Id$")
 extern "C" {
 #endif
 
-#define FR_TLS_EX_INDEX_EAP_SESSION 	(10)
-#define FR_TLS_EX_INDEX_CONF		(11)
-#define FR_TLS_EX_INDEX_REQUEST		(12)
-#define FR_TLS_EX_INDEX_IDENTITY	(13)
-#define FR_TLS_EX_INDEX_STORE		(14)
-#define FR_TLS_EX_INDEX_TLS_SESSION	(15)
-#define FR_TLS_EX_INDEX_TALLOC		(16)
+#define FR_TLS_EX_INDEX_EAP_SESSION 		(10)
+#define FR_TLS_EX_INDEX_CONF			(11)
+#define FR_TLS_EX_INDEX_REQUEST			(12)
+#define FR_TLS_EX_INDEX_IDENTITY		(13)
+#define FR_TLS_EX_INDEX_OCSP_STORE		(14)
+#define FR_TLS_EX_INDEX_TLS_SESSION		(16)
 
+/** ex_data index for the #fr_tls_session_t which owns an SSL_SESSION
+ *
+ * The indices above are hard-coded, because their information is
+ * never duplicated.  However, OpenSSL does duplicate an SSL_SESSION.
+ * A TLS 1.3 client does this for every NewSessionTicket that it
+ * receives.  This duplication copies the ex_data, but OpenSSL doesn't
+ * know about the index, and therefore can't duplicate the data.
+ *
+ * Therefore, an index used on an SSL_SESSION has to one assigned by
+ * OpenSSL.  The namespace is per object type, so this is a different
+ * index from the ones above even though hold the same pointer.
+ *
+ * Allocated by fr_openssl_init().
+ */
+extern int fr_tls_session_ex_index;
+
+/*
+ *	Attached to an SSL_CTX, which OpenSSL never duplicates, so a
+ *	hard-coded index is safe here.
+ */
+#define FR_TLS_EX_CTX_INDEX_VERIFY_STORE	(20)
+
+#define FR_TLS_EX_INDEX_CURL_CONF		(30)
 #ifdef __cplusplus
 }
 #endif

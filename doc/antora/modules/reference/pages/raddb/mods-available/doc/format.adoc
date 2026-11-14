@@ -1,0 +1,10 @@
+= Formatting and Conversion Modules
+
+The modules allow the server to read and write data in different formats and storage types.
+
+The Formatting and Conversions modules available are:
+
+include::partial$formatconvert_table.adoc[]
+
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

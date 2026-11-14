@@ -1,9 +1,7 @@
-update {
-        &request.Packet-Type !* ANY
-}
+request -= Packet-Type
 
-foreach &Filter-Id {
-	update reply {
-	       &Called-Station-Id += "%{Foreach-Variable-0}"
+foreach thing (Filter-Id) {
+	reply += {
+		Called-Station-Id = thing
 	}
 }

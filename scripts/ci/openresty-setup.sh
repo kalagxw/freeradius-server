@@ -1,16 +1,29 @@
 #!/bin/sh -e
 #
-# ### This is a script to setup an openresty web server for testing rlm_smtp
+# ### This is a script to setup an openresty web server for testing rlm_rest
 #
+
+# on macOS brew tap openresty/brew && brew install openresty
 
 #
 # Declare the important path variables
 #
+PATH="/opt/homebrew/opt/openresty/bin:/usr/sbin:${PATH}"
+
+# Use openresty if available (macOS dev), otherwise fall back to stock nginx
+if command -v openresty > /dev/null 2>&1; then
+	NGINX_BIN="openresty"
+	LOAD_LUA_MODULE=""
+else
+	NGINX_BIN="nginx"
+	LOAD_LUA_MODULE="load_module /usr/lib/nginx/modules/ngx_http_lua_module.so;"
+fi
 
 # Base Directories
 BASEDIR=$(git rev-parse --show-toplevel)
-BUILDDIR="${BASEDIR}/build/ci/openresty"
 CIDIR="${BASEDIR}/scripts/ci"
+
+BUILDDIR="${BASEDIR}/build/ci/openresty"
 
 # Directories for openresty processes
 ROOTDIR="${BUILDDIR}/html"
@@ -19,9 +32,20 @@ LOGDIR="${BUILDDIR}/logs"
 CERTDIR="${BUILDDIR}/certs"
 CERTSRCDIR="${BASEDIR}/raddb/certs"
 PASSWORD="whatever"
+HTTP_PORT=8080
+HTTPS_PORT=8443
 
 # Important files for running openresty
 CONF="${BUILDDIR}/nginx.conf"
+
+# Find the mime.types file
+MIME_TYPES_LOCATIONS="/usr/local/openresty/nginx/conf/mime.types /usr/local/etc/openresty/mime.types /opt/homebrew/etc/openresty/mime.types /usr/local/etc/nginx/mime.types /etc/nginx/mime.types"
+for i in ${MIME_TYPES_LOCATIONS}; do
+	if [ -e "${i}" ]; then
+		MIME_TYPES="${i}"
+		break
+	fi
+done
 
 #
 # Prepare the directories and files needed for running openresty
@@ -32,7 +56,7 @@ echo "Checking for a running openresty instance"
 if [ -e "${LOGDIR}/nginx.pid" ]
 then
 	echo "Stopping the current openresty instance"
-	kill "$(cat ${LOGDIR}/nginx.pid)"
+	kill "$(cat ${LOGDIR}/nginx.pid)" || true
 	rm -r "${BUILDDIR}"
 fi
 
@@ -50,7 +74,7 @@ touch "${CONF}"
 
 # Build nginx.conf
 echo "
-#
+${LOAD_LUA_MODULE}
 worker_processes  1;
 error_log  ${LOGDIR}/error.log;
 pid        ${LOGDIR}/nginx.pid;
@@ -60,13 +84,13 @@ events {
 }
 
 http {
-    include       /usr/local/openresty/nginx/conf/mime.types;
+    include       ${MIME_TYPES};
     default_type  text/plain;
 
     sendfile      on;
 
     server {
-        listen       8080;
+        listen       ${HTTP_PORT};
 	server_name  localhost;
 
 	location / {
@@ -83,10 +107,18 @@ http {
 	location ~ ^/post(.*)$ {
 	    content_by_lua_file  ${APIDIR}/post-api.lua;
 	}
+
+	location ~ ^/delay(.*)$ {
+	    content_by_lua_file  ${APIDIR}/delay-api.lua;
+	}
+
+	location ~ ^/fail(.*)$ {
+	    content_by_lua_file  ${APIDIR}/fail.lua;
+	}
     }
 
     server {
-        listen       8443 ssl;
+        listen       ${HTTPS_PORT} ssl;
 	server_name  localhost;
 
 	ssl_certificate      ${CERTDIR}/server.pem;
@@ -109,6 +141,16 @@ http {
 	    content_by_lua_file  ${APIDIR}/json-api.lua;
 	}
 
+        location ~ ^/delay/([0-9]*)$ {
+	    default_type 'application/json';
+	    add_header   'Content-Type' 'application/json';
+            content_by_lua_block {
+                local t0 = ngx.now()
+                ngx.sleep(tonumber(ngx.var[1]))
+                ngx.say('{\"delay_us\":' .. math.floor((ngx.now() - t0) * 1000000) .. '}')
+            }
+	}
+
 	location ~ ^/post(.*)$ {
 	    content_by_lua_file  ${APIDIR}/post-api.lua;
 	}
@@ -127,7 +169,7 @@ echo "Copy lua scripts into place"
 cp ${CIDIR}/openresty/*.lua "${APIDIR}"
 
 echo "Copy sample data into place"
-cp "${CIDIR}/openresty/test.txt" "${ROOTDIR}"
+cp ${CIDIR}/openresty/test.* "${ROOTDIR}"
 
 echo "Copy htpasswd into place"
 cp "${CIDIR}/openresty/.htpasswd" "${BUILDDIR}"
@@ -135,6 +177,11 @@ cp "${CIDIR}/openresty/.htpasswd" "${BUILDDIR}"
 #
 # Run the openresty instance
 #
-echo "Starting openresty"
-openresty -c ${CONF} -p ${BUILDDIR}
-echo "Running openresty on port 8080 and 8443, accepting all local connections"
+echo "Starting ${NGINX_BIN}"
+${NGINX_BIN} -c ${CONF} -p ${BUILDDIR}
+echo "Running openresty on port ${HTTP_PORT} and ${HTTPS_PORT}, accepting all local connections"
+cat << EOF
+export REST_TEST_SERVER=127.0.0.1
+export REST_TEST_SERVER_PORT=${HTTP_PORT}
+export REST_TEST_SERVER_SSL_PORT=${HTTPS_PORT}
+EOF

@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -26,6 +26,7 @@
 
 #ifdef HAVE_COLLECTDC_H
 #include <collectd/client.h>
+#include <freeradius-devel/util/syserror.h>
 #include "radsniff.h"
 
 /** Copy a 64bit unsigned integer into a double
@@ -60,7 +61,7 @@ static void _copy_double_to_double(UNUSED rs_t *conf, rs_stats_value_tmpl_t *tmp
 }
 
 
-/** Allocates a stats template which describes a single guage/counter
+/** Allocates a stats template which describes a single gauge/counter
  *
  * This is just intended to simplify allocating a fairly complex memory structure
  * src and dst pointers must be set
@@ -69,7 +70,7 @@ static void _copy_double_to_double(UNUSED rs_t *conf, rs_stats_value_tmpl_t *tmp
  * @param conf Radsniff configuration.
  * @param plugin_instance usually the type of packet (in our case).
  * @param type string, the name of a collection of stats e.g. exchange
- * @param type_instance the name of the counter/guage within the collection e.g. latency.
+ * @param type_instance the name of the counter/gauge within the collection e.g. latency.
  * @param stats structure to derive statistics from.
  * @param values Value templates used to populate lcc_value_list.
  * @return
@@ -96,7 +97,7 @@ static rs_stats_tmpl_t *rs_stats_collectd_init(TALLOC_CTX *ctx, rs_t *conf,
 	assert(type);
 	assert(type_instance);
 
-	for (len = 0; values[len].src; len++) {} ;
+	for (len = 0; values[len].src; len++) {}
 	assert(len > 0);
 
 	/*
@@ -239,11 +240,9 @@ error:
 rs_stats_tmpl_t *rs_stats_collectd_init_latency(TALLOC_CTX *ctx, rs_stats_tmpl_t **out, rs_t *conf,
 						char const *type, rs_latency_t *stats, fr_radius_packet_code_t code)
 {
-	rs_stats_tmpl_t **tmpl, *last;
+	rs_stats_tmpl_t **tmpl = out, *last;
 	char *p;
 	char buffer[LCC_NAME_LEN];
-	tmpl = out;
-
 	rs_stats_value_tmpl_t rtx[(RS_RETRANSMIT_MAX + 1) + 1 + 1];	// RTX bins + 0 bin + lost + NULL
 	int i;
 
@@ -265,15 +264,15 @@ rs_stats_tmpl_t *rs_stats_collectd_init_latency(TALLOC_CTX *ctx, rs_stats_tmpl_t
 	};
 
 #define INIT_STATS(_ti, _v) do {\
-		strlcpy(buffer, fr_packet_codes[code], sizeof(buffer)); \
-		for (p = buffer; *p; ++p) *p = tolower(*p);\
+		strlcpy(buffer, fr_radius_packet_name[code], sizeof(buffer)); \
+		for (p = buffer; *p; ++p) *p = tolower((uint8_t) *p);\
 		last = *tmpl = rs_stats_collectd_init(ctx, conf, type, _ti, buffer, stats, _v);\
 		if (!*tmpl) {\
 			TALLOC_FREE(*out);\
 			return NULL;\
 		}\
 		tmpl = &(*tmpl)->next;\
-		ctx = *tmpl;\
+		ctx = last;\
 		} while (0)
 
 
@@ -316,7 +315,7 @@ void rs_stats_collectd_do_stats(rs_t *conf, rs_stats_tmpl_t *tmpls, struct timev
 			tmpl->value_tmpl[i].cb(conf, &tmpl->value_tmpl[i]);
 		}
 
-		tmpl->value->time = now->tv_sec;
+		tmpl->value->time = (double) now->tv_sec;
 
 		lcc_identifier_to_string(conf->stats.handle, identifier, sizeof(identifier), &tmpl->value->identifier);
 
@@ -374,9 +373,9 @@ int rs_stats_collectd_open(rs_t *conf)
  */
 int rs_stats_collectd_close(rs_t *conf)
 {
-	assert(conf->stats.collectd);
-
 	int ret = 0;
+
+	assert(conf->stats.collectd);
 
 	if (conf->stats.handle) {
 		ret = lcc_disconnect(conf->stats.handle);

@@ -26,11 +26,10 @@ RCSID("$Id$")
 
 #include "base32.h"
 
-#include <freeradius-devel/util/strerror.h>
 #include <freeradius-devel/util/value.h>
 #define us(x) (uint8_t) x
 
-char const fr_base32_alphabet_encode[UINT8_MAX] = {
+char const fr_base32_alphabet_encode[SBUFF_CHAR_CLASS] = {
 	[26] = '2',
 	[27] = '3',
 	[28] = '4',
@@ -65,7 +64,7 @@ char const fr_base32_alphabet_encode[UINT8_MAX] = {
 	[25] = 'Z',
 };
 
-uint8_t const fr_base32_alphabet_decode[UINT8_MAX] = {
+uint8_t const fr_base32_alphabet_decode[SBUFF_CHAR_CLASS] = {
 	F32(0, UINT8_MAX), F16(32, UINT8_MAX), F2(48, UINT8_MAX),
 	['2'] = 26,
 	['3'] = 27,
@@ -103,7 +102,7 @@ uint8_t const fr_base32_alphabet_decode[UINT8_MAX] = {
 	F128(91, UINT8_MAX), F32(219, UINT8_MAX), F4(251, UINT8_MAX)
 };
 
-char const fr_base32_hex_alphabet_encode[UINT8_MAX] = {
+char const fr_base32_hex_alphabet_encode[SBUFF_CHAR_CLASS] = {
 	[0] = '0',
 	[1] = '1',
 	[2] = '2',
@@ -138,7 +137,7 @@ char const fr_base32_hex_alphabet_encode[UINT8_MAX] = {
 	[31] = 'V',
 };
 
-uint8_t const fr_base32_hex_alphabet_decode[UINT8_MAX] = {
+uint8_t const fr_base32_hex_alphabet_decode[SBUFF_CHAR_CLASS] = {
 	F32(0, UINT8_MAX), F16(32, UINT8_MAX),
 	['0'] = 0,
 	['1'] = 1,
@@ -176,9 +175,9 @@ uint8_t const fr_base32_hex_alphabet_decode[UINT8_MAX] = {
 	F128(87, UINT8_MAX), F32(215, UINT8_MAX), F8(247, UINT8_MAX)
 };
 
-/** Base 64 encode binary data
+/** Base 32 encode binary data
  *
- * base32 encode in bytes to base32, writing to out.
+ * base32 encode in bytes, writing to out.
  *
  * @param[out] out		Where to write base32 string.
  * @param[in] in		Data to encode.
@@ -189,9 +188,9 @@ uint8_t const fr_base32_hex_alphabet_decode[UINT8_MAX] = {
  *	- <0 the number of bytes we would have needed in the ouput buffer.
  */
 ssize_t fr_base32_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in,
-			      bool add_padding, char const alphabet[static UINT8_MAX])
+			      bool add_padding, char const alphabet[static SBUFF_CHAR_CLASS])
 {
-	fr_sbuff_t		our_out = FR_SBUFF_NO_ADVANCE(out);
+	fr_sbuff_t		our_out = FR_SBUFF(out);
 	fr_dbuff_t		our_in = FR_DBUFF(in);
 
 	fr_strerror_const("Insufficient buffer space");
@@ -295,7 +294,7 @@ ssize_t fr_base32_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in,
 
 	fr_sbuff_terminate(&our_out);	/* Ensure this is terminated, even on zero length input */
 	fr_dbuff_set(in, &our_in);
-	return fr_sbuff_set(out, &our_out);
+	FR_SBUFF_SET_RETURN(out, &our_out);
 }
 
 /* Decode base32 encoded input
@@ -310,13 +309,13 @@ ssize_t fr_base32_encode_nstd(fr_sbuff_t *out, fr_dbuff_t *in,
  *				at the end of the string.
  * @param[in] alphabet		to use for decoding.
  * @return
- *	- <= 0 on failure.  The offset where the decoding error occurred as a negative integer.
+ *	- < 0 on failure.  The offset where the decoding error occurred as a negative integer.
  *	- Length of decoded data.
  */
-ssize_t fr_base32_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_sbuff_t *in,
-			      bool expect_padding, bool no_trailing, uint8_t const alphabet[static UINT8_MAX])
+fr_slen_t fr_base32_decode_nstd(fr_sbuff_err_t *err, fr_dbuff_t *out, fr_sbuff_t *in,
+				bool expect_padding, bool no_trailing, uint8_t const alphabet[static SBUFF_CHAR_CLASS])
 {
-	fr_sbuff_t		our_in = FR_SBUFF_NO_ADVANCE(in);
+	fr_sbuff_t		our_in = FR_SBUFF(in);
 	fr_dbuff_t		our_out = FR_DBUFF(out);
 	fr_sbuff_marker_t	m_final;
 	size_t			len;
@@ -347,9 +346,9 @@ ssize_t fr_base32_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_s
 			fr_strerror_printf("Output buffer too small, needed at least %zu bytes",
 					   fr_dbuff_used(&our_out) + 1);
 
-			if (err) *err = FR_SBUFF_PARSE_ERROR_OUT_OF_SPACE;
+			if (err) *err = FR_SBUFF_ERR_NO_SPACE;
 
-			return -fr_sbuff_used(&our_in);
+			FR_SBUFF_ERROR_RETURN(&our_in);
 		}
 
 		fr_sbuff_advance(&our_in, 8);
@@ -360,7 +359,7 @@ ssize_t fr_base32_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_s
 	/*
 	 *	Find the first non-base32 char
 	 */
-	while (fr_sbuff_extend(&our_in) && fr_is_base32_nstd(*fr_sbuff_current(&our_in), alphabet)) {
+	while (fr_sbuff_extend(&our_in) && fr_is_base32_nstd(fr_sbuff_char(&our_in, '\0'), alphabet)) {
 		fr_sbuff_advance(&our_in, 1);
 	}
 
@@ -422,9 +421,9 @@ ssize_t fr_base32_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_s
 		fr_strerror_printf("Invalid base32 final quantum length (%zu)", len);
 
 	bad_format:
-		if (err) *err = FR_SBUFF_PARSE_ERROR_FORMAT;
+		if (err) *err = FR_SBUFF_ERR_FORMAT;
 
-		return -fr_sbuff_used(&our_in);
+		FR_SBUFF_ERROR_RETURN(&our_in);
 	}
 
 	if (expect_padding) {
@@ -434,15 +433,15 @@ ssize_t fr_base32_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_s
 				fr_strerror_printf("Missing padding '=' at end of base32 string.  "
 						   "Expected %u padding char(s)", pad);
 
-				if (err) *err = FR_SBUFF_PARSE_ERROR_FORMAT;
+				if (err) *err = FR_SBUFF_ERR_FORMAT;
 
 				goto bad_format;
 			}
 			if (!fr_sbuff_next_if_char(&our_in, '=')) {
 				fr_strerror_printf("Found non-padding char '%c' at end of base32 string",
-						   *fr_sbuff_current(&our_in));
+						   fr_sbuff_char(&our_in, '\0'));
 
-				if (err) *err = FR_SBUFF_PARSE_ERROR_FORMAT;
+				if (err) *err = FR_SBUFF_ERR_FORMAT;
 
 				goto bad_format;
 			}
@@ -451,14 +450,14 @@ ssize_t fr_base32_decode_nstd(fr_sbuff_parse_error_t *err, fr_dbuff_t *out, fr_s
 
 	if (no_trailing && fr_sbuff_extend(&our_in)) {
 		fr_strerror_printf("Found trailing garbage '%c' at end of base32 string",
-				   *fr_sbuff_current(&our_in));
+				   fr_sbuff_char(&our_in, '\0'));
 
-		if (err) *err = FR_SBUFF_PARSE_ERROR_TRAILING;
+		if (err) *err = FR_SBUFF_ERR_TRAILING;
 
-		return -fr_sbuff_used(&our_in);
+		FR_SBUFF_ERROR_RETURN(&our_in);
 	}
 
-	if (err) *err = FR_SBUFF_PARSE_OK;
+	if (err) *err = FR_SBUFF_OK;
 
 	fr_sbuff_set(in, &our_in);
 	return fr_dbuff_set(out, &our_out);

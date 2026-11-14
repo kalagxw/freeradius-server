@@ -33,7 +33,7 @@ RCSIDH(lib_eap_types, "$Id$")
 /* Code (1) + Identifier (1) + Length (2) */
 #define EAP_HEADER_LEN 		4
 
-typedef enum eap_code {
+typedef enum eap_code : uint8_t {
 	FR_EAP_CODE_REQUEST = 1,
 	FR_EAP_CODE_RESPONSE,
 	FR_EAP_CODE_SUCCESS,
@@ -41,7 +41,7 @@ typedef enum eap_code {
 	FR_EAP_CODE_MAX
 } eap_code_t;
 
-typedef enum eap_type {
+typedef enum eap_type : uint8_t {
 	FR_EAP_METHOD_INVALID = 0,		/* 0 */
 	FR_EAP_METHOD_IDENTITY,			/* 1 */
 	FR_EAP_METHOD_NOTIFICATION,		/* 2 */
@@ -122,8 +122,18 @@ typedef struct CC_HINT(__packed__) {
 	uint8_t		code;
 	uint8_t		id;
 	uint8_t		length[2];
-	uint8_t		data[1];
+	uint8_t		data[];
 } eap_packet_raw_t;
+
+/**  When we need to create a base EAP packet.
+ * 
+ */
+typedef struct CC_HINT(__packed__) {
+	uint8_t		code;
+	uint8_t		id;
+	uint8_t		length[2];
+	uint8_t		data[1];
+} eap_packet_hdr_t;
 
 eap_type_t	eap_name2type(char const *name);
 char const	*eap_type2name(eap_type_t method);

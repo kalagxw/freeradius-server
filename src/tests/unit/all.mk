@@ -10,7 +10,7 @@ TEST := test.unit
 #
 #  Get all .txt files
 #
-FILES  := $(call FIND_FILES_SUFFIX,$(DIR),*.txt)
+FILES  := $(filter-out $(DIR)/files/%,$(call FIND_FILES_SUFFIX,$(DIR),*.txt))
 
 #
 #  If we don't have OpenSSL, filter out tests which need TLS.
@@ -44,26 +44,70 @@ $(FILES.$(TEST)): export TZ = GMT
 #
 PROTOCOLS := $(subst $(DIR)/protocols/,,$(wildcard $(DIR)/protocols/*))
 define UNIT_TEST_PROTOCOLS
-$(addprefix $(OUTPUT)/,$(filter protocols/${1}/%.txt,$(FILES))): $(wildcard $(top_srcdir)/share/dictionary/${1}/dictionary*) $(BUILD_DIR)/lib/libfreeradius-${1}.la
+ifneq "${1}" "dict"
+$(addprefix $(OUTPUT)/,$(filter protocols/${1}/%.txt,$(FILES))): $(wildcard $(top_srcdir)/share/dictionary/${1}/dictionary* $(top_srcdir)/src/tests/unit/protocols/${1}/dictionary*) $(BUILD_DIR)/lib/local/libfreeradius-${1}.la $(BUILD_DIR)/lib/libfreeradius-${1}.la
+test.unit.${1}: $(BUILD_DIR)/lib/libfreeradius-${1}.la $(BUILD_DIR)/lib/local/libfreeradius-${1}.la
+else
+$(addprefix $(OUTPUT)/,$(filter protocols/${1}/%.txt,$(FILES))): $(wildcard $(top_srcdir)/src/tests/unit/protocols/${1}/*.dict)
+endif
 
-test.unit.${1}: $(addprefix $(OUTPUT)/,$(filter protocols/${1}/%.txt,$(FILES))) $(BUILD_DIR)/lib/libfreeradius-${1}.la
+ifeq "${1}" "eap"
+$(addprefix $(OUTPUT)/,$(filter protocols/${1}/%.txt,$(FILES))): $(wildcard $(top_srcdir)/share/dictionary/${1}/dictionary*) $(BUILD_DIR)/lib/local/libfreeradius-${1}.la $(BUILD_DIR)/lib/libfreeradius-eap-aka-sim.la
+endif
+
+test.unit.${1}: $(addprefix $(OUTPUT)/,$(filter protocols/${1}/%.txt,$(FILES)))
+
+.PHONY: clean.test.unit.${1}
+clean.test.unit.${1}:
+	@rm -f $(addprefix $(OUTPUT)/,$(filter protocols/${1}/%.txt,$(FILES)))
+
+test.unit.help: TEST_UNIT_HELP += test.unit.${1}
 endef
 $(foreach x,$(PROTOCOLS),$(eval $(call UNIT_TEST_PROTOCOLS,$x)))
 
-#  This is useful, too
+test.unit.xlat: $(addprefix $(OUTPUT)/,$(filter xlat/%.txt,$(FILES))) $(BUILD_DIR)/lib/libfreeradius-unlang.la
+
+test.unit.purify: $(addprefix $(OUTPUT)/,$(filter purify/%.txt,$(FILES))) $(BUILD_DIR)/lib/libfreeradius-unlang.la
+
 test.unit.condition: $(addprefix $(OUTPUT)/,$(filter condition/%.txt,$(FILES))) $(BUILD_DIR)/lib/libfreeradius-server.la
+
+test.unit.tmpl: $(addprefix $(OUTPUT)/,$(filter tmpl/%.txt,$(FILES))) $(BUILD_DIR)/lib/libfreeradius-server.la
+
+test.unit.help: TEST_UNIT_HELP += test.unit.xlat
+
+#
+#  Add special command-line flag for purify tests.
+#
+$(filter $(BUILD_DIR)/tests/unit/purify/%,$(FILES.$(TEST))): PURIFY=-p
+
+#
+#  For automatically fixing the tests when only the output has changed
+#
+#  The unit_test_attribute program will copy the inputs to the outputs, and rewrite the "expected" output
+#  with the "actual" output.  But only for the "match" command.  Everything is including comments and blank
+#  lines is copied verbatim.
+#
+#REWRITE_FLAGS = -w $(BUILD_DIR)/tmp
 
 #
 #  And the actual script to run each test.
 #
+UNIT_TEST_ARGS = \
+	$(PURIFY) \
+	-F ./src/tests/fuzzer-corpus \
+	-D ./share/dictionary \
+	-d ${top_srcdir}/src/tests/unit \
+	-o $(call SHELL_QUOTE,$@)
+
 $(OUTPUT)/%: $(DIR)/% $(TEST_BIN_DIR)/unit_test_attribute
-	$(eval DIR:=${top_srcdir}/src/tests/unit)
-	@echo "UNIT-TEST $(lastword $(subst /, ,$(dir $@))) $(basename $(notdir $@))"
-	${Q}if ! $(TEST_BIN)/unit_test_attribute -D ./share/dictionary -d $(DIR) -r "$@" $<; then \
-		echo "$(TEST_BIN)/unit_test_attribute -D ./share/dictionary -d $(DIR) -r \"$@\" $<"; \
-		rm -f $(BUILD_DIR)/tests/test.unit; \
-		exit 1; \
-	fi
+	${Q}$(TEST_BIN)/unit_test_attribute \
+		$(UNIT_TEST_ARGS) \
+		$(REWRITE_FLAGS) \
+		-m $(call SHELL_QUOTE,TZ=GMT $(TEST_BIN_NO_TIMEOUT)/unit_test_attribute $(UNIT_TEST_ARGS)) \
+		$(call SHELL_QUOTE,$<)
 
 $(TEST):
 	@touch $(BUILD_DIR)/tests/$@
+
+$(TEST).help:
+	@echo make $(TEST_UNIT_HELP)

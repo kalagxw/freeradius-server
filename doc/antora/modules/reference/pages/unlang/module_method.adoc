@@ -6,10 +6,10 @@
 <module>.<method>
 ----
 
-This variant of xref:unlang/module.adoc[<module>] is used in one processing
-section. It calls a module using the method of another processing
-section. For example, it can be used to call a module's `recv
-Access-Request` method while processing the `send Access-Accept`
+This variant of xref:unlang/module.adoc[<module>] is used in one
+processing section. It calls a module using the method of another
+processing section. For example, it can be used to call a module's
+`recv Access-Request` method while processing the `send Access-Accept`
 section.
 
 The `<module>` portion must refer to an existing module; the
@@ -24,5 +24,5 @@ sql.recv.Accounting-Request
 files.recv.Access-Request
 ----
 
-// Copyright (C) 2021 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
-// Development of this documentation was sponsored by Network RADIUS SAS.
+// Copyright (C) 2026 Network RADIUS SAS.  Licenced under CC-by-NC 4.0.
+// This documentation was developed by Network RADIUS SAS.

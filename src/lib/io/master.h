@@ -39,7 +39,8 @@ typedef struct fr_io_client_s fr_io_client_t;
 
 typedef struct fr_io_track_s {
 	fr_rb_node_t			node;		//!< rbtree node in the tracking tree.
-	fr_event_timer_t const		*ev;		//!< when we clean up this tracking entry
+	fr_listen_instance_t const		*li;		//!< listener associated with this tracking structure
+	fr_timer_t			*ev;		//!< when we clean up this tracking entry
 	fr_time_t			timestamp;	//!< when this packet was received
 	fr_time_t			expires;	//!< when this packet expires
 	int				packets;     	//!< number of packets using this entry
@@ -50,13 +51,6 @@ typedef struct fr_io_track_s {
 	bool				do_not_respond;	//!< don't respond
 	bool				finished;	//!< are we finished the request?
 
-	/*
-	 *	We can't set the "process" function here, because a
-	 *	second (conflicting) packet may arrive while we're
-	 *	processing this one.  Instead, set the timestamp of
-	 *	the packet which creates the dynamic client
-	 *	definition.
-	 */
 	fr_time_t			dynamic;	//!< timestamp for packet doing dynamic client definition
 	fr_io_address_t const  		*address;	//!< of this packet.. shared between multiple packets
 	fr_io_client_t			*client;	//!< client handling this packet.
@@ -77,26 +71,34 @@ typedef struct fr_io_track_s {
  *  creates the listener, and adds it to the scheduler.
  */
 typedef struct {
-	dl_module_inst_t const   	*dl_inst;			//!< our parent dl_inst
+	module_instance_t 	  	*mi;				//!< our parent mi
+	module_list_t			*clients;			//!< Holds client modules created to represent
+									///< sockets created as clients connect to the
+									///< listener.
 
 	uint32_t			max_connections;		//!< maximum number of connections to allow
 	uint32_t			max_clients;			//!< maximum number of dynamic clients to allow
 	uint32_t			max_pending_packets;		//!< maximum number of pending packets
 
 	fr_time_delta_t			cleanup_delay;			//!< for Access-Request packets
-	fr_time_delta_t			idle_timeout;			//!< for dynamic clients
+	fr_time_delta_t			idle_timeout;			//!< for connected clients
+	fr_time_delta_t			dynamic_timeout;		//!< for dynamic clients
 	fr_time_delta_t			nak_lifetime;			//!< lifetime of NAKed clients
 	fr_time_delta_t			check_interval;			//!< polling for closed sockets
 
 	bool				dynamic_clients;		//!< do we have dynamic clients.
+	bool				log_ignored_clients;		//!< Whether we emit log messages when we ignore
+									///< a client because it's unknown, or outside
+									///< of the allowed networks.  This is here for
+									///< people who expose their RADIUS servers to
+									///< the internet, and don't want their logs filling
+									///< up with random connection attempts.
 
 	CONF_SECTION			*server_cs;			//!< server CS for this listener
 
-	dl_module_inst_t		*submodule;			//!< As provided by the transport_parse
+	module_instance_t		*submodule;			//!< As provided by the transport_parse
 									///< callback.  Broken out into the
 									///< app_io_* fields below for convenience.
-	dl_module_inst_t		*dynamic_submodule;		//!< for dynamically defined clients
-
 	fr_app_t			*app;				//!< main protocol handler
 	void				*app_instance;			//!< instance data for main protocol handler
 
@@ -105,16 +107,16 @@ typedef struct {
 	CONF_SECTION			*app_io_conf;			//!< Easy access to the app_io's config section.
 
 	int				ipproto;			//!< IP proto by number
-	char const			*transport;			//!< transport, typically name of IP proto
-
 	fr_trie_t const			*networks;     			//!< trie of allowed networks
 } fr_io_instance_t;
 
 extern fr_app_io_t fr_master_app_io;
 
 fr_trie_t *fr_master_io_network(TALLOC_CTX *ctx, int af, fr_ipaddr_t *allow, fr_ipaddr_t *deny);
-int fr_master_io_listen(TALLOC_CTX *ctx, fr_io_instance_t *io, fr_schedule_t *sc,
+int fr_master_io_listen(fr_io_instance_t *io, fr_schedule_t *sc,
 			size_t default_message_size, size_t num_messages) CC_HINT(nonnull);
+fr_io_track_t *fr_master_io_track_alloc(fr_listen_instance_t *li, fr_client_t *client, fr_ipaddr_t const *src_ipaddr,
+					int src_port, fr_ipaddr_t const *dst_ipaddr, int dst_port);
 
 #ifdef __cplusplus
 }

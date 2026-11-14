@@ -1,8 +1,7 @@
 #
 #  Stand-alone dictionaries to see if the dictionary parser works
 #
-PROTOCOL	TEST		254
-BEGIN-PROTOCOL	TEST
+BEGIN PROTOCOL	TEST		254
 
 ATTRIBUTE	Base-String				1	string
 ATTRIBUTE	Base-Integer				2	integer
@@ -20,15 +19,30 @@ ATTRIBUTE	Base-Short				11	short
 ATTRIBUTE	Base-Ether				12	ether
 ATTRIBUTE	Base-Signed				13	signed
 
+END-PROTOCOL TEST
+
+# Test re-entering the protocol section
+
+BEGIN-PROTOCOL TEST
 # Ignore comb-ipaddr for now.
 
 ATTRIBUTE	Base-TLV				15	tlv
 
 # Ignore extended and evs
 
-ATTRIBUTE	Base-Integer64				19	integer64
+#
+#  Define an ENUM
+#
+ENUM base-enum-uint64	uint64
+VALUE base-enum-uint64 one	1
+VALUE base-enum-uint64 two	2
+VALUE base-enum-uint64 three	3
+
+ATTRIBUTE	Base-Integer64				19	uint64 enum=.base-enum-uint64
 ATTRIBUTE	Base-IPv4-Prefix			20	ipv4prefix
 
-# Ignore VSA, VENDOR, timeval, boolean, combo-ip-prefix, decimal... for now
+#  and this casting should work
+ATTRIBUTE	Base-Integer32				21	uint32	enum=.base-enum-uint64
 
+# Ignore VSA, VENDOR, timeval, boolean, combo-ip-prefix, decimal... for now
 END-PROTOCOL TEST

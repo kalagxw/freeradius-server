@@ -49,16 +49,46 @@ struct fr_dlist_s {
  * like at which offset the next/prev pointers can be found.
  */
 typedef struct {
-	size_t		offset;		//!< Positive offset from start of structure to #fr_dlist_t.
+	fr_dlist_t	entry;		//!< Struct holding the head and tail of the list.
+					///< First for efficient traversal.
+
+	unsigned int	offset;		//!< Positive offset from start of structure to #fr_dlist_t.
+					///< Yes, this should really be size_t, but we shave 8 bytes
+					///< off each head structure by making it unsigned int.
+
+	unsigned int	num_elements;	//!< Number of elements contained within the dlist.
+
 	char const	*type;		//!< of items contained within the list.  Used for talloc
 					///< validation.
-	fr_dlist_t	entry;		//!< Struct holding the head and tail of the list.
-	unsigned int	num_elements;	//!< Number of elements contained within the dlist.
 } fr_dlist_head_t;
 
 static_assert(sizeof(unsigned int) >= 4, "Unsigned integer too small on this platform");
 
+/** Static initialiser for entries
+ *
+ @code {.c}
+   fr_dlist_entry_t my_entry = FR_DLIST_INITIALISER(my_entry)
+ @endcode
+ *
+ * @param[in] _entry	what's being initialised.
+ */
+#define FR_DLIST_ENTRY_INITIALISER(_entry) { .next = &_entry, .prev = &_entry }
+
+/** Static initialiser for list heads
+ *
+ @code {.c}
+   fr_dlist_head_t my_head = FR_DLIST_INITIALISER(my_head)
+ @endcode
+ *
+ * @param[in] _head	what's being initialised.
+ */
+#define FR_DLIST_HEAD_INITIALISER(_head) { .entry = FR_DLIST_ENTRY_INITIALISER((_head).entry) }
+
 /** Iterate over the contents of a list
+ *
+ * The macro is "safe", in that the current iterator variable can be deleted.
+ *
+ * The iterators can be nested, so long as the _iter variable names are different.
  *
  * @param[in] _list_head	to iterate over.
  * @param[in] _type		of item the list contains.
@@ -66,30 +96,7 @@ static_assert(sizeof(unsigned int) >= 4, "Unsigned integer too small on this pla
  *				Will be declared in the scope of the loop.
  */
 #define fr_dlist_foreach(_list_head, _type, _iter) \
-	for (_type *_iter = fr_dlist_head(_list_head); _iter; _iter = fr_dlist_next(_list_head, _iter))
-
-/** Iterate over the contents of a list allowing for removals
- *
- * @note foreach block must end with double curlybrace `}}`.
- *	 We need to use another scoping section as we can't declare variables of multiple
- *	 types within the initialiser of a for loop.
- *
- * @param[in] _list_head	to iterate over.
- * @param[in] _type		of item the list contains.
- * @param[in] _iter		Name of iteration variable.
- *				Will be declared in the scope of the loop.
- * @param[in] _tmp		A fr_dlist_t to hold the iteration state.
- */
-#define fr_dlist_foreach_safe(_list_head, _type, _iter) \
-{ \
-	_type *_iter; \
-	fr_dlist_t _tmp; \
-	for (_iter = fr_dlist_head(_list_head), \
-	     _tmp = fr_dlist_head(_list_head) ? *fr_dlist_item_to_entry((_list_head)->offset, fr_dlist_head(_list_head)) : (fr_dlist_t){ .prev = NULL, .next = NULL }; \
-	     _iter; \
-	     _iter = _tmp.next && (_tmp.next != &(_list_head)->entry) ? fr_dlist_entry_to_item((_list_head)->offset, _tmp.next) : NULL, \
-	     _tmp = _tmp.next && (_tmp.next != &(_list_head)->entry) ? *_tmp.next : (fr_dlist_t){ .prev = NULL, .next = NULL })
-
+	for (_type *JOIN(_next,_iter), *_iter = fr_dlist_head(_list_head); JOIN(_next,_iter) = fr_dlist_next(_list_head, _iter), _iter != NULL; _iter = JOIN(_next,_iter))
 
 /** Find the dlist pointers within a list item
  *
@@ -255,6 +262,8 @@ static inline CC_HINT(nonnull) void fr_dlist_entry_replace(fr_dlist_t *entry, fr
  */
 static inline void _fr_dlist_init(fr_dlist_head_t *list_head, size_t offset, char const *type)
 {
+	fr_assert(offset < (1 << 20)); /* list_head->offset is `unsigned int`, and 1G structs are stupid. */
+
 	fr_dlist_entry_init(&list_head->entry);
 	list_head->offset = offset;
 	list_head->type = type;
@@ -275,10 +284,27 @@ static inline void fr_dlist_clear(fr_dlist_head_t *list_head)
  *
  */
 #define CHECK_ELEMENT_COUNT(_head, _add) \
-	if (unlikely((_head)->num_elements > (UINT_MAX - (_add)))) { \
+	if (unlikely((_head)->num_elements > (UINT_MAX - (_add)))) do { \
 		fr_strerror_const("Maximum elements in list"); \
 		return -1; \
-	}
+	} while (0)
+
+/** Check if a list entry is part of a list
+ *
+ * This works because the fr_dlist_head_t has an entry in the list.
+ * So if next and prev both point to the entry for the object being
+ * passed in, then it can't be part of a list with a fr_dlist_head_t.
+ *
+ * @return
+ *	- True if in a list.
+ *	- False otherwise.
+ */
+static inline CC_HINT(nonnull) bool fr_dlist_in_list(fr_dlist_head_t *list_head, void *ptr)
+{
+	fr_dlist_t *entry = fr_dlist_item_to_entry(list_head->offset, ptr);
+
+	return fr_dlist_entry_in_list(entry);
+}
 
 /** Insert an item into the head of a list
  *
@@ -328,6 +354,8 @@ static inline CC_HINT(nonnull) int fr_dlist_insert_head(fr_dlist_head_t *list_he
  * @return
  * 	- 0 on success.
  *	- -1 on failure.
+ *
+ * @hidecallergraph
  */
 static inline CC_HINT(nonnull) int fr_dlist_insert_tail(fr_dlist_head_t *list_head, void *ptr)
 {
@@ -434,6 +462,8 @@ static inline CC_HINT(nonnull(1,3)) int fr_dlist_insert_before(fr_dlist_head_t *
  * @return
  *	- The HEAD item.
  *	- NULL if no items exist in the list.
+ *
+ * @hidecallergraph
  */
 static inline CC_HINT(nonnull) void *fr_dlist_head(fr_dlist_head_t const *list_head)
 {
@@ -502,6 +532,7 @@ static inline CC_HINT(nonnull) void *fr_dlist_tail(fr_dlist_head_t const *list_h
  *	- The next item in the list if ptr is not NULL.
  *	- The head of the list if ptr is NULL.
  *	- NULL if ptr is the tail of the list (no more items).
+ * @hidecallergraph
  */
 static inline CC_HINT(nonnull(1)) void *fr_dlist_next(fr_dlist_head_t const *list_head, void const *ptr)
 {
@@ -583,6 +614,8 @@ static inline CC_HINT(nonnull(1)) void *fr_dlist_prev(fr_dlist_head_t const *lis
  * @return
  *	- The previous item in the list (makes iteration easier).
  *	- NULL if we just removed the head of the list.
+ *
+ * @hidecallergraph
  */
 static inline CC_HINT(nonnull(1)) void *fr_dlist_remove(fr_dlist_head_t *list_head, void *ptr)
 {
@@ -681,14 +714,13 @@ static inline void *fr_dlist_replace(fr_dlist_head_t *list_head, void *item, voi
  * Does nothing if the list was not initialised with #fr_dlist_talloc_init.
  */
 #ifndef TALLOC_GET_TYPE_ABORT_NOOP
-static inline CC_HINT(nonnull) void fr_dlist_verify(char const *file, int line, fr_dlist_head_t const *list_head)
+static inline CC_HINT(nonnull) void _fr_dlist_verify(NDEBUG_UNUSED char const *file, NDEBUG_UNUSED int line, fr_dlist_head_t const *list_head)
 {
 	void *item;
 
 	if (!list_head->type) return;
 
-	fr_assert_msg(fr_dlist_initialised(list_head), "CONSISTENCY CHECK FAILED %s[%i]: dlist not initialised",
-		      file, line);
+	fr_assert_msg(fr_dlist_initialised(list_head), "CONSISTENCY CHECK FAILED %s[%i]: dlist not initialised", file, line);
 
 	for (item = fr_dlist_head(list_head);
 	     item;
@@ -696,12 +728,13 @@ static inline CC_HINT(nonnull) void fr_dlist_verify(char const *file, int line, 
 	     item = _talloc_get_type_abort(item, list_head->type, __location__);
 	}
 }
-#  define FR_DLIST_VERIFY(_head) fr_dlist_verify(__FILE__, __LINE__, _head)
-#elif !defined(NDEBUG)
-#  define FR_DLIST_VERIFY(_head) fr_assert(_head)
 #else
-#  define FR_DLIST_VERIFY(_head)
+static inline void _fr_dlist_verify(UNUSED char const *file, UNUSED int line, fr_dlist_head_t const *list_head)
+{
+	if (!fr_cond_assert(list_head != NULL)) return;
+}
 #endif
+#define fr_dlist_verify(_head) _fr_dlist_verify(__FILE__, __LINE__, _head)
 
 /** Merge two lists, inserting the source at the tail of the destination
  *
@@ -799,19 +832,21 @@ static inline CC_HINT(nonnull) int fr_dlist_move_head(fr_dlist_head_t *list_dst,
 /** Free the first item in the list
  *
  * @param[in] list_head		to free head item in.
+ * @return result of talloc_free
  */
-static inline void fr_dlist_talloc_free_head(fr_dlist_head_t *list_head)
+static inline int fr_dlist_talloc_free_head(fr_dlist_head_t *list_head)
 {
-	talloc_free(fr_dlist_pop_head(list_head));
+	return talloc_free(fr_dlist_pop_head(list_head));
 }
 
 /** Free the last item in the list
  *
  * @param[in] list_head		to free tail item in.
+ * @return result of talloc_free
  */
-static inline void fr_dlist_talloc_free_tail(fr_dlist_head_t *list_head)
+static inline int fr_dlist_talloc_free_tail(fr_dlist_head_t *list_head)
 {
-	talloc_free(fr_dlist_pop_head(list_head));
+	return talloc_free(fr_dlist_pop_tail(list_head));
 }
 
 /** Free the item specified
@@ -830,18 +865,36 @@ static inline void *fr_dlist_talloc_free_item(fr_dlist_head_t *list_head, void *
 	return prev;
 }
 
+/** Free items in a doubly linked list (with talloc)
+ *
+ * @param[in] head	of list to free.
+ * @param[in] ptr	remove and free from this to the tail.
+ */
+static inline void fr_dlist_talloc_free_to_tail(fr_dlist_head_t *head, void *ptr)
+{
+	void *e = ptr, *p;
+
+	if (!ptr) return;	/* NULL means don't do anything */
+
+	while (e) {
+		p = fr_dlist_next(head, e);
+		(void) fr_dlist_remove(head, e);
+		talloc_free(e);
+		e = p;
+	}
+}
+
+
 /** Free all items in a doubly linked list (with talloc)
  *
  * @param[in] head of list to free.
  */
 static inline void fr_dlist_talloc_free(fr_dlist_head_t *head)
 {
-	void *e = NULL, *p;
+	void *e;
 
-	while ((e = fr_dlist_next(head, e))) {
-		p = fr_dlist_remove(head, e);
+	while ((e = fr_dlist_pop_head(head)) != NULL) {
 		talloc_free(e);
-		e = p;
 	}
 }
 
@@ -922,40 +975,62 @@ static inline void fr_dlist_sort_split(fr_dlist_head_t *head, void **source, voi
  *
  * @note Only to be used within a merge sort
  *
+ * @param[out] merged	first item in the merged list
  * @param[in] head	of the original list being sorted
  * @param[in] a		first element of first list being merged
  * @param[in] b		first element of second list being merged
  * @param[in] cmp	comparison function for the sort
- * @returns pointer to first item in merged list
+ * @return
+ *	- 0 on success.
+ *	- -1 on comparator error.
  */
-static inline void *fr_dlist_sort_merge(fr_dlist_head_t *head, void **a, void **b, fr_cmp_t cmp)
+static inline int fr_dlist_sort_merge(void **merged, fr_dlist_head_t *head, void **a, void **b, fr_cmp_t cmp)
 {
 	void *result = NULL;
 	void *next;
 	fr_dlist_t *result_entry;
 	fr_dlist_t *next_entry;
+	fr_cmp_ret_t c;
+	int ret = 0;
 
-	if (!*a) return *b;
-	if (!*b) return *a;
+	if (!*a) {
+		*merged = *b;
+		return 0;
+	}
+	if (!*b) {
+		*merged = *a;
+		return 0;
+	}
 
 	/*
-	 *	Compare entries in the lists
+	 *	Compare entries in the lists.
+	 *
+	 *	On comparator error keep merging so every node is relinked:
+	 *	the list stays intact, only the order is undefined.  Sibling
+	 *	recursion levels may still call the comparator after an error;
+	 *	the error is accumulated through the return values.
 	 */
-	if (cmp(*a, *b) <= 0) {
+	c = cmp(*a, *b);
+	if (unlikely(c == CMP_ERR)) {
+		ret = -1;
+		c = CMP_EQ;
+	}
+	if (c != CMP_GT) {
 		result = *a;
 		next = fr_dlist_next(head, *a);
-		next = fr_dlist_sort_merge(head, &next, b, cmp);
+		if (unlikely(fr_dlist_sort_merge(&next, head, &next, b, cmp) < 0)) ret = -1;
 	} else {
 		result = *b;
 		next = fr_dlist_next(head, *b);
-		next = fr_dlist_sort_merge(head, a, &next, cmp);
+		if (unlikely(fr_dlist_sort_merge(&next, head, a, &next, cmp) < 0)) ret = -1;
 	}
 
 	result_entry = fr_dlist_item_to_entry(head->offset, result);
-	next_entry = fr_dlist_item_to_entry(head->offset, next);
+	next_entry = next ? fr_dlist_item_to_entry(head->offset, next) : NULL;
 	result_entry->next = next_entry;
 
-	return result;
+	*merged = result;
+	return ret;
 }
 
 /** Recursive sort routine for dlist
@@ -963,24 +1038,30 @@ static inline void *fr_dlist_sort_merge(fr_dlist_head_t *head, void **a, void **
  * @param[in] head	of the list being sorted
  * @param[in,out] ptr	to the first item in the current section of the list being sorted.
  * @param[in] cmp	comparison function to sort with
+ * @return
+ *	- 0 on success.
+ *	- -1 on comparator error.
  */
-static inline void fr_dlist_recursive_sort(fr_dlist_head_t *head, void **ptr, fr_cmp_t cmp)
+static inline int fr_dlist_recursive_sort(fr_dlist_head_t *head, void **ptr, fr_cmp_t cmp)
 {
 	void *a;
 	void *b;
 	fr_dlist_t *entry = NULL;
+	int ret = 0;
 
 	if (*ptr) entry = fr_dlist_item_to_entry(head->offset, *ptr);
 
-	if (!*ptr || (!entry->next)) return;
-	fr_dlist_sort_split(head, ptr, &a, &b);		/* Split into sublists */
-	fr_dlist_recursive_sort(head, &a, cmp);		/* Traverse left */
-	fr_dlist_recursive_sort(head, &b, cmp);		/* Traverse right */
+	if (!*ptr || (!entry->next)) return 0;
+	fr_dlist_sort_split(head, ptr, &a, &b);				/* Split into sublists */
+	if (unlikely(fr_dlist_recursive_sort(head, &a, cmp) < 0)) ret = -1;	/* Traverse left */
+	if (unlikely(fr_dlist_recursive_sort(head, &b, cmp) < 0)) ret = -1;	/* Traverse right */
 
 	/*
 	 *	merge the two sorted lists together
 	 */
-	*ptr = fr_dlist_sort_merge(head, &a, &b, cmp);
+	if (unlikely(fr_dlist_sort_merge(ptr, head, &a, &b, cmp) < 0)) ret = -1;
+
+	return ret;
 }
 
 /** Sort a dlist using merge sort
@@ -989,22 +1070,31 @@ static inline void fr_dlist_recursive_sort(fr_dlist_head_t *head, void **ptr, fr
  *
  * @param[in,out] list	to sort
  * @param[in] cmp	comparison function to sort with
+ * @return
+ *	- 0 on success.
+ *	- -1 on comparator error, retrieve the error with fr_strerror.  The list is
+ *	  intact but its order is undefined.
  */
-static inline void fr_dlist_sort(fr_dlist_head_t *list, fr_cmp_t cmp)
+static inline int fr_dlist_sort(fr_dlist_head_t *list, fr_cmp_t cmp)
 {
 	void *head;
 	fr_dlist_t *entry;
+	int ret;
 
-	if (fr_dlist_num_elements(list) <= 1) return;
+	if (fr_dlist_num_elements(list) <= 1) return 0;
 
 	head = fr_dlist_head(list);
+#ifdef __clang_analyzer__
+	if (!fr_cond_assert(head)) return -1;	/* The element count and the entry pointers agree */
+#endif
+
 	/* NULL terminate existing list */
 	list->entry.prev->next = NULL;
 
 	/*
 	 *	Call the recursive sort routine
 	 */
-	fr_dlist_recursive_sort(list, &head, cmp);
+	ret = fr_dlist_recursive_sort(list, &head, cmp);
 
 	/*
 	 *	Reset "prev" pointers broken during sort
@@ -1029,7 +1119,170 @@ static inline void fr_dlist_sort(fr_dlist_head_t *list, fr_cmp_t cmp)
 		}
 		head = fr_dlist_next(list, head);
 	}
+
+	return ret;
 }
+
+static inline void fr_dlist_noop(void)
+{
+	return;
+}
+
+/** Expands to the type name used for the entry wrapper structure
+ *
+ * @param[in] _name	Prefix we add to type-specific structures.
+ * @return fr_dlist_<name>_entry_t
+ */
+#define FR_DLIST_ENTRY(_name) _name ## _entry_t
+
+/** Expands to the type name used for the head wrapper structure
+ *
+ * @param[in] _name	Prefix we add to type-specific structures.
+ * @return fr_dlist_<name>_head_t
+ */
+#define FR_DLIST_HEAD(_name) _name ## _head_t
+
+/** Define type specific wrapper structs for dlists
+ *
+ * @note This macro should be used inside the header for the area of code
+ * which will use type specific functions.
+ */
+#define FR_DLIST_TYPES(_name) \
+	typedef struct { fr_dlist_t entry; } FR_DLIST_ENTRY(_name); \
+	typedef struct { fr_dlist_head_t head; } FR_DLIST_HEAD(_name); \
+
+/** Define friendly names for type specific dlist head and entry structures
+ *
+ * @param[in] _name	Prefix we add to type-specific structures.
+ * @param[in] _head	Name to use for head structure.
+ * @param[in] _entry	Name to use for entry structure.
+*/
+#define FR_DLIST_TYPEDEFS(_name, _head, _entry) \
+	typedef FR_DLIST_HEAD(_name) _head; \
+	typedef FR_DLIST_ENTRY(_name) _entry;
+
+/** Define type specific wrapper functions for dlists
+ *
+ * @note This macro should be used inside the source file that will use
+ * the type specific functions.
+ *
+ * @param[in] _name		Prefix we add to type-specific dlist functions.
+ * @param[in] _element_type	Type of structure that'll be inserted into the dlist.
+ * @param[in] _element_entry	Field in the _element_type that holds the dlist entry information.
+ */
+#define FR_DLIST_FUNCS(_name, _element_type, _element_entry) \
+DIAG_OFF(unused-function) \
+	_Static_assert(IS_FIELD_COMPATIBLE(_element_type, _element_entry, FR_DLIST_ENTRY(_name)) == 1, "Bad dlist entry field type");\
+	static inline	fr_dlist_head_t *_name ## _dlist_head(FR_DLIST_HEAD(_name) const *list) \
+		{ return	UNCONST(fr_dlist_head_t *, &list->head); } \
+\
+	static inline	fr_dlist_t *_name ## _dlist_entry(FR_DLIST_ENTRY(_name) const *entry) \
+		{ return	UNCONST(fr_dlist_t *, &entry->entry ); } \
+\
+	static inline	void _name ## _entry_init(_element_type *entry) \
+		{ \
+			_Generic((&entry->_element_entry), \
+				 FR_DLIST_ENTRY(_name) *: fr_dlist_entry_init(UNCONST(fr_dlist_t *, &entry->_element_entry.entry)), \
+				 FR_DLIST_ENTRY(_name) const *: fr_dlist_noop()\
+			); \
+		} \
+\
+	static inline	void _name ## _init(FR_DLIST_HEAD(_name) *list) \
+		{		_fr_dlist_init(&list->head, offsetof(_element_type, _element_entry), NULL); } \
+\
+	static inline	void _name ## _talloc_init(FR_DLIST_HEAD(_name) *list) \
+		{		_fr_dlist_init(&list->head, offsetof(_element_type, _element_entry), #_element_type); } \
+\
+	static inline	void _name ## _clear(FR_DLIST_HEAD(_name) *list) \
+		{		fr_dlist_clear(&list->head); } \
+\
+	static inline	bool _name ## _in_list(FR_DLIST_HEAD(_name) *list, _element_type *ptr) \
+		{ return	fr_dlist_in_list(&list->head, ptr); } \
+\
+	static inline	int _name ## _insert_head(FR_DLIST_HEAD(_name) *list, _element_type *ptr) \
+		{ return	fr_dlist_insert_head(&list->head, ptr); } \
+\
+	static inline	int _name ## _insert_tail(FR_DLIST_HEAD(_name) *list, _element_type *ptr) \
+		{ return	fr_dlist_insert_tail(&list->head, ptr); } \
+\
+	static inline	int _name ## _insert_after(FR_DLIST_HEAD(_name) *list, _element_type *pos, _element_type *ptr) \
+		{ return	fr_dlist_insert_after(&list->head, pos, ptr); } \
+\
+	static inline	int _name ## _insert_before(FR_DLIST_HEAD(_name) *list, _element_type *pos, _element_type *ptr) \
+		{ return	fr_dlist_insert_before(&list->head, pos, ptr); } \
+\
+	static inline	_element_type *_name ## _head(FR_DLIST_HEAD(_name) const *list) \
+		{ return	fr_dlist_head(&list->head); } \
+\
+	static inline	bool _name ## _empty(FR_DLIST_HEAD(_name) const *list) \
+		{ return	fr_dlist_empty(&list->head); } \
+\
+	static inline	bool _name ## _initialised(FR_DLIST_HEAD(_name) const *list) \
+		{ return	fr_dlist_initialised(&list->head); } \
+\
+	static inline	_element_type *_name ## _tail(FR_DLIST_HEAD(_name) const *list) \
+		{ return	fr_dlist_tail(&list->head); } \
+\
+	static inline _element_type *_name ## _next(FR_DLIST_HEAD(_name) const *list, _element_type const *ptr) \
+		{ return	fr_dlist_next(&list->head, ptr); } \
+\
+	static inline	_element_type *_name ## _prev(FR_DLIST_HEAD(_name) const *list, _element_type const *ptr) \
+		{ return	fr_dlist_prev(&list->head, ptr); } \
+\
+	static inline	_element_type *_name ## _remove(FR_DLIST_HEAD(_name) *list, _element_type *ptr) \
+		{ return	fr_dlist_remove(&list->head, ptr); } \
+\
+	static inline	_element_type *_name ## _pop_head(FR_DLIST_HEAD(_name) *list) \
+		{ return	fr_dlist_pop_head(&list->head); } \
+\
+	static inline	_element_type *_name ## _pop_tail(FR_DLIST_HEAD(_name) *list) \
+		{ return	fr_dlist_pop_tail(&list->head); } \
+\
+	static inline	_element_type *_name ## _replace(FR_DLIST_HEAD(_name) *list, _element_type *item, _element_type *ptr) \
+		{ return	fr_dlist_replace(&list->head, item, ptr); } \
+\
+	static inline	void _##_name ## _verify(char const *file, int line, FR_DLIST_HEAD(_name) const *list_head) \
+		{		_fr_dlist_verify(file, line, UNCONST(fr_dlist_head_t *, &list_head->head)); } \
+\
+	static inline	int _name ## _move(FR_DLIST_HEAD(_name) *dst, FR_DLIST_HEAD(_name) *src) \
+		{ return	fr_dlist_move(&dst->head, &src->head); } \
+\
+	static inline	int _name ## _move_head(FR_DLIST_HEAD(_name) *dst, FR_DLIST_HEAD(_name) *src) \
+		{ return	fr_dlist_move_head(&dst->head, &src->head); } \
+\
+	static inline	void _name ## _talloc_free_head(FR_DLIST_HEAD(_name) *list) \
+		{		fr_dlist_talloc_free_head(&list->head); } \
+\
+	static inline	void _name ## _talloc_free_tail(FR_DLIST_HEAD(_name) *list) \
+		{		fr_dlist_talloc_free_tail(&list->head); } \
+\
+	static inline	_element_type * _name ## _talloc_free_item(FR_DLIST_HEAD(_name) *list, _element_type *ptr) \
+		{return		fr_dlist_talloc_free_item(&list->head, ptr); } \
+\
+	static inline	void _name ## _talloc_free(FR_DLIST_HEAD(_name) *list) \
+		{		fr_dlist_talloc_free(&list->head); } \
+\
+	static inline	void _name ## _talloc_free_to_tail(FR_DLIST_HEAD(_name) *list, _element_type *ptr) \
+		{		fr_dlist_talloc_free_to_tail(&list->head, ptr); } \
+\
+	static inline	void _name ## _talloc_reverse_free(FR_DLIST_HEAD(_name) *list) \
+		{		fr_dlist_talloc_reverse_free(&list->head); } \
+\
+	static inline	unsigned int _name ## _num_elements(FR_DLIST_HEAD(_name) const *list) \
+		{ return	fr_dlist_num_elements(&list->head); } \
+\
+	static inline	int _name ## _sort(FR_DLIST_HEAD(_name) *list, fr_cmp_t cmp) \
+		{ return	fr_dlist_sort(&list->head, cmp); } \
+DIAG_ON(unused-function)
+
+/*
+ *  In addition to the above call to FR_DLIST_FUNCS two additional macros should be defined
+ *
+ *  Unfortunately as there's no way to dynamically define macro names these need to be done manually.
+ *
+ *  #define <name>_foreach(_list_head, _iter) fr_dlist_foreach(<name>_dlist_head(_list_head), <element_type>, _iter)
+ *  #define <name>_verify(_list_head) _<name>_verify(__FILE__, __LINE__, _list_head)
+ */
 
 #ifdef __cplusplus
 }

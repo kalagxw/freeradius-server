@@ -36,9 +36,6 @@ extern "C" {
 #include <freeradius-devel/util/inet.h>
 #include <freeradius-devel/util/time.h>
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <string.h>
 #include <sys/time.h>
 
 #ifdef HAVE_SYS_UN_H
@@ -64,18 +61,27 @@ typedef struct {
 	union {
 		struct {
 			int		ifindex;	//!< Source interface to bind to or originate the packet from.
-			fr_ipaddr_t	src_ipaddr;	//!< IP address to bind to, or originate the packet from.
 			uint16_t	src_port;	//!< Port to bind to, or originate the packet from.
-
-			fr_ipaddr_t	dst_ipaddr;	//!< IP address to connect to, or send the packet to.
 			uint16_t	dst_port;	//!< Port to connect to or send the packet to.
+
+			fr_ipaddr_t	src_ipaddr;	//!< IP address to bind to, or originate the packet from.
+			fr_ipaddr_t	dst_ipaddr;	//!< IP address to connect to, or send the packet to.
 		} inet;
 
 		struct {
-			char const *path;		//!< Unix socket path.
+			char const	*path;		//!< Unix socket path.
 		} unix;
+
+		struct {
+			char const	*path;		//!< Filename
+		} file;
+
+		struct {
+			char const	*server;       	//!< Virtual server filename
+		} virtual;
 	};
-	int proto;		//!< Protocol.
+	int af;			//!< AF_INET, AF_INET6, or AF_UNIX
+	int type;		//!< SOCK_STREAM, SOCK_DGRAM, etc.
 
 	int fd;			//!< File descriptor if this is a live socket.
 } fr_socket_t;
@@ -87,7 +93,7 @@ typedef struct {
  *	- true if it is.
  *	- false if it's not.
  */
-static inline bool fr_socket_is_inet(int proto)
+static inline bool fr_socket_proto_is_known(int proto)
 {
 	/*
 	 *	Check the protocol is sane
@@ -123,21 +129,10 @@ static inline void fr_socket_addr_swap(fr_socket_t *dst, fr_socket_t const *src)
 
 	if (dst != src) *dst = tmp;	/* copy non-address fields over */
 
-	switch (src->proto) {
-	case IPPROTO_UDP:
-	case IPPROTO_TCP:
-#ifdef IPPROTO_SCTP
-	case IPPROTO_SCTP:
-#endif
-		dst->inet.dst_ipaddr = tmp.inet.src_ipaddr;
-		dst->inet.dst_port = tmp.inet.src_port;
-		dst->inet.src_ipaddr = tmp.inet.dst_ipaddr;
-		dst->inet.src_port = tmp.inet.dst_port;
-		break;
-
-	default:
-		return;
-	}
+	dst->inet.dst_ipaddr = tmp.inet.src_ipaddr;
+	dst->inet.dst_port = tmp.inet.src_port;
+	dst->inet.src_ipaddr = tmp.inet.dst_ipaddr;
+	dst->inet.src_port = tmp.inet.dst_port;
 }
 
 /** Initialise a fr_socket_t for connecting to a remote host using a specific src interface, address and port
@@ -163,10 +158,11 @@ static inline fr_socket_t *fr_socket_addr_init_inet(fr_socket_t *addr,
 						    int ifindex, fr_ipaddr_t const *src_ipaddr, int src_port,
 						    fr_ipaddr_t const *dst_ipaddr, int dst_port)
 {
-	if (!fr_socket_is_inet(proto)) return NULL;
+	if (!fr_socket_proto_is_known(proto)) return NULL;
 
 	*addr = (fr_socket_t){
-		.proto = proto,
+		.af = src_ipaddr->af,
+		.type = (proto == IPPROTO_TCP) ? SOCK_STREAM : SOCK_DGRAM,
 		.inet = {
 			.ifindex = ifindex,
 			.src_ipaddr = *src_ipaddr,
@@ -222,10 +218,11 @@ static inline fr_socket_t *fr_socket_addr_alloc_inet(TALLOC_CTX *ctx, int proto,
 static inline fr_socket_t *fr_socket_addr_init_inet_src(fr_socket_t *addr,
 							int proto, int ifindex, fr_ipaddr_t const *ipaddr, int port)
 {
-	if (!fr_socket_is_inet(proto)) return NULL;
+	if (!fr_socket_proto_is_known(proto)) return NULL;
 
 	*addr = (fr_socket_t){
-		.proto = proto,
+		.af = ipaddr->af,
+		.type = (proto == IPPROTO_TCP) ? SOCK_STREAM : SOCK_DGRAM,
 		.inet = {
 			.ifindex = ifindex,
 			.src_ipaddr = *ipaddr,
@@ -267,10 +264,11 @@ static inline fr_socket_t *fr_socket_addr_alloc_inet_src(TALLOC_CTX *ctx, int pr
  */
 static inline fr_socket_t *fr_socket_addr_init_inet_dst(fr_socket_t *addr, int proto, fr_ipaddr_t const *ipaddr, int port)
 {
-	if (!fr_socket_is_inet(proto)) return NULL;
+	if (!fr_socket_proto_is_known(proto)) return NULL;
 
 	*addr = (fr_socket_t){
-		.proto = proto,
+		.af = ipaddr->af,
+		.type = (proto == IPPROTO_TCP) ? SOCK_STREAM : SOCK_DGRAM,
 		.inet = {
 			.dst_ipaddr = *ipaddr,
 			.dst_port = port
@@ -299,18 +297,21 @@ static inline fr_socket_t *fr_socket_addr_alloc_inet_dst(TALLOC_CTX *ctx, int pr
 
 int		fr_socket_client_unix(char const *path, bool async);
 
-int		fr_socket_client_udp(fr_ipaddr_t *src_ipaddr, uint16_t *src_port, fr_ipaddr_t const *dst_ipaddr,
-				     uint16_t dst_port, bool async);
+int		fr_socket_client_udp(char const *ifname, fr_ipaddr_t *src_ipaddr, uint16_t *src_port,
+				     fr_ipaddr_t const *dst_ipaddr, uint16_t dst_port, bool async);
 
-int		fr_socket_client_tcp(fr_ipaddr_t const *src_ipaddr, fr_ipaddr_t const *dst_ipaddr,
-				     uint16_t dst_port, bool async);
+int		fr_socket_client_tcp(char const *ifname, fr_ipaddr_t *src_ipaddr,
+				     fr_ipaddr_t const *dst_ipaddr, uint16_t dst_port, bool async);
 int		fr_socket_wait_for_connect(int sockfd, fr_time_delta_t timeout);
 
 int		fr_socket_server_udp(fr_ipaddr_t const *ipaddr, uint16_t *port, char const *port_name, bool async);
 
 int		fr_socket_server_tcp(fr_ipaddr_t const *ipaddr, uint16_t *port, char const *port_name, bool async);
 
-int		fr_socket_bind(int sockfd, fr_ipaddr_t const *ipaddr, uint16_t *port, char const *interface);
+int		fr_socket_bind(int sockfd, char const *ifname, fr_ipaddr_t *src_ipaddr, uint16_t *src_port);
+
+ssize_t		fr_socket_to_str(char *out, size_t outlen, fr_socket_t const *sock, bool received) CC_HINT(nonnull);
+
 
 #ifdef __cplusplus
 }

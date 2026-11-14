@@ -1,0 +1,219 @@
+name: CI-Sanitizers
+
+on:
+  workflow_call:
+
+env:
+  ASAN_OPTIONS: symbolize=1 detect_leaks=1 detect_stack_use_after_return=1
+  LSAN_OPTIONS: fast_unwind_on_malloc=0:malloc_context_size=50
+  UBSAN_OPTIONS: print_stacktrace=1
+  M_PERTURB: "0x42"
+  PANIC_ACTION: "gdb -batch -x raddb/panic.gdb %e %p"
+# `DEBUGGER_ATTACHED` stops the utilities from forking on every call to check
+# whether the utilities are running under GDB/LLDB
+  DEBUGGER_ATTACHED: no
+  ANALYZE_C_DUMP: 1
+  FR_GLOBAL_POOL: 4M
+  TEST_CERTS: yes
+  NO_PERFORMANCE_TESTS: yes
+  DO_BUILD: yes
+  HOSTAPD_BUILD_DIR: eapol_test.ci
+  HOSTAPD_GIT_TAG: hostap_2_12
+  DEBIAN_FRONTEND: noninteractive
+  CI: 1
+  GH_ACTIONS: 1
+
+jobs:
+  #
+  #  The `common_vars` job emits different values depending on whether the run
+  #  is occurring in the FreeRADIUS organisation or in a fork.  See
+  #  `.github/workflows/common_vars.yml`.
+  #
+  common_vars:
+    name: Common vars
+    uses: ./.github/workflows/common_vars.yml
+
+  ci-sanitizers:
+    needs: common_vars
+    timeout-minutes: 150
+
+    runs-on: ${{ matrix.os.runs_on }}
+
+    container:
+      image: ${{ matrix.os.docker }}
+      #  The Samba install needs `privileged`
+      #  `memory-swap -1` enables full use of host swap and may stop
+      #    containers from randomly quitting with "The operation was
+      #    canceled"
+      options: >-
+        --privileged
+        --memory-swap -1
+
+    strategy:
+      fail-fast: false
+      matrix:
+        #  runs_on   - where GitHub will start the runner, either
+        #              `self-hosted`, or the name of a GitHub virtual
+        #              machine (VM) image e.g. `ubuntu-24.04` or `ubuntu-latest`
+        #              see: https://github.com/actions/runner-images
+        #  code      - the name/version of the OS (for step evaluations below)
+        #  docker    - the docker image name, if containers are being used
+        #  name      - appears in the job name only
+        os:
+          - runs_on: "${{ needs.common_vars.outputs.selfhosted == '1' && 'self-hosted' || 'ubuntu-24.04' }}"
+            docker: "${{ needs.common_vars.outputs.image_prefix }}self-hosted:${{ needs.common_vars.outputs.image_tag }}"
+            name: "${{ needs.common_vars.outputs.selfhosted == '1' && 'self' || 'gh' }}-ubuntu24"
+            code: "ubuntu2404"
+            imageos: "ubuntu24"
+
+        env:
+          - { CC: clang, BUILD_CFLAGS: "",         LIBS_OPTIONAL: no,  LIBS_ALT: no,  TEST_TYPE: fixtures, NAME: linux-clang-lean    }
+          - { CC: clang, BUILD_CFLAGS: "",         LIBS_OPTIONAL: yes, LIBS_ALT: no,  TEST_TYPE: fixtures, NAME: linux-clang         }
+          - { CC: clang, BUILD_CFLAGS: "-O2 -g3",  LIBS_OPTIONAL: yes, LIBS_ALT: no,  TEST_TYPE: fixtures, NAME: linux-clang-O2-g3   }
+          - { CC: clang, BUILD_CFLAGS: "-DNDEBUG", LIBS_OPTIONAL: yes, LIBS_ALT: no,  TEST_TYPE: fixtures, NAME: linux-clang-ndebug  }
+          - { CC: clang, BUILD_CFLAGS: "",         LIBS_OPTIONAL: yes, LIBS_ALT: yes, TEST_TYPE: fixtures, NAME: linux-clang-altlibs }
+
+    env: ${{ matrix.env }}
+
+    #  If branch protection has status checks enabled, update the required
+    #  check names when you add new matrix entries or change the name
+    #  format.
+    name: "master-${{ matrix.os.name }}-${{ matrix.env.NAME}}"
+
+    #  The standard GitHub environment contains PostgreSQL and
+    #  MySQL already. However, when the job runs on hosted GitHub
+    #  runners, we need to run separate database containers to
+    #  provide PostgreSQL and MySQL.
+    services:
+      mariadb:
+        image: ${{ needs.common_vars.outputs.docker_prefix }}mariadb
+        env:
+          MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: yes
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mariadb-admin ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      postgres:
+        image: ${{ needs.common_vars.outputs.docker_prefix }}postgres
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      threeds:
+        image: ${{ needs.common_vars.outputs.docker_prefix }}4teamwork/389ds
+        ports:
+          - 3389:3389
+          - 3636:3636
+        options: >-
+          -e SUFFIX_NAME=dc=example,dc=com
+          -e DS_DM_PASSWORD=secret123
+          --health-cmd "dsctl localhost healthcheck --check backends:localhost:search"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      #
+      #  No redpanda service container. seastar exits `EINVAL` on the
+      #  CI runners with the default command, and GitHub Actions
+      #  services do not let us override the command.  We skip Kafka module
+      #  tests here, and use the multi-server `kafka-produce` tests to
+      #  provide test coverage for the kafka produce path.
+      #
+
+    steps:
+      # Checkout, but defer pulling Git Large File Storage (LFS) objects until we have restored the cache
+      - uses: actions/checkout@v6
+        id: checkout
+        with:
+          lfs: false
+
+      #  The Docker image does not have the same environment as the
+      #  standard GitHub Actions image.  The `runner-prep` action
+      #  therefore makes the Docker image environment match the
+      #  GitHub Actions image environment.
+      - name: Prepare the runner
+        uses: ./.github/actions/runner-prep
+        with:
+          selfhosted: ${{ needs.common_vars.outputs.selfhosted }}
+          packaging_changed: ${{ needs.common_vars.outputs.images_changed }}
+          use_docker: true
+          cc: ${{ matrix.env.CC }}
+          llvm_ver: ${{ needs.common_vars.outputs.llvm_version }}
+          gcc_ver: ${{ needs.common_vars.outputs.gcc_version }}
+
+      - name: Install alternative dependencies
+        if: ${{ matrix.env.LIBS_ALT == 'yes' }}
+        uses: ./.github/actions/freeradius-alt-deps
+
+      - name: Build FreeRADIUS
+        uses: ./.github/actions/build-freeradius
+        with:
+          use_sanitizers: true
+          cc: ${{ matrix.env.CC }}
+          test_type: ${{ matrix.env.TEST_TYPE }}
+          platform: ${{ matrix.os.imageos }}
+
+      - name: Run main CI tests
+        uses: ./.github/actions/ci-tests
+        if: ${{ matrix.env.TEST_TYPE == 'fixtures' }}
+        with:
+          use_docker: true
+          sql_mysql_test_server: mariadb
+          sql_postgresql_test_server: postgres
+          redis_test_server: 127.0.0.1
+          ldap_test_server: 127.0.0.1
+          ldap_test_server_port: 3890
+          ldaps_test_server_port: 6361
+          ldap389_test_server: threeds
+          ldap389_test_server_port: 3389
+          active_directory_test_server: 127.0.0.1
+          rest_test_server: 127.0.0.1
+          rest_test_port: 8080
+          rest_test_ssl_port: 8443
+          imap_test_server: 127.0.0.1
+          imap_test_server_port: 1430
+          imap_test_server_ssl_port: 1432
+          smtp_test_server: 127.0.0.1
+          smtp_test_server_port: 2525
+
+      #  The `checkout` step writes the `collect-core-dumps` action into the
+      #  workspace, so the step runs only when the `checkout` step succeeds.
+      - name: Collect core dumps
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        uses: ./.github/actions/collect-core-dumps
+        with:
+          name: ${{ matrix.os.name }}-${{ matrix.env.NAME }}
+
+      #
+      #  If the CI has failed and the branch is `ci-debug` then the workflow starts
+      #  a tmate session to provide interactive shell access to the runner.
+      #
+      #  tmate prints the Secure Shell (SSH) rendezvous point continuously in the
+      #  job output:
+      #
+      #      SSH: ssh VfuX8SrNuU5pGPMyZcz7TpJTa@sfo2.tmate.io
+      #
+      #  To use the session:
+      #
+      #    1. Push the failing commit: `git push origin ci-debug --force`
+      #    2. Open the job output in https://github.com/FreeRADIUS/freeradius-server/actions
+      #    3. Run the ssh command from the job output.
+      #
+      #  Access requires that you have the private key corresponding to the
+      #  public key of the GitHub user that initiated the job.
+      #
+      - name: "Debug: Start tmate"
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+        if: ${{ github.ref == 'refs/heads/ci-debug' && failure() }}

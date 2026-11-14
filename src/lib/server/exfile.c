@@ -23,17 +23,33 @@
  * @author Alan DeKok (aland@freeradius.org)
  * @copyright 2014 The FreeRADIUS server project
  */
+#define _EXFILE_PRIVATE 1
 #include <freeradius-devel/protocol/freeradius/freeradius.internal.h>
-#include <freeradius-devel/server/base.h>
 #include <freeradius-devel/server/exfile.h>
+#include <freeradius-devel/server/trigger.h>
 
 #include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/file.h>
 #include <freeradius-devel/util/misc.h>
 #include <freeradius-devel/util/perm.h>
 #include <freeradius-devel/util/syserror.h>
 
-#include <sys/stat.h>
 #include <fcntl.h>
+
+typedef enum : uint8_t {
+	EXFILE_TRIGGER_OPEN = 0,
+	EXFILE_TRIGGER_CLOSE,
+	EXFILE_TRIGGER_RESERVE,
+	EXFILE_TRIGGER_RELEASE,
+	EXFILE_TRIGGER_MAX
+} exfile_trigger_t;
+
+static const char * exfile_trigger_names[EXFILE_TRIGGER_MAX] = {
+	"open",
+	"close",
+	"reserve",
+	"release"
+};
 
 typedef struct {
 	int			fd;			//!< File descriptor associated with an entry.
@@ -47,7 +63,9 @@ typedef struct {
 
 struct exfile_s {
 	uint32_t		max_entries;		//!< How many file descriptors we keep track of.
-	uint32_t		max_idle;		//!< Maximum idle time for a descriptor.
+	fr_time_delta_t		max_idle;		//!< Maximum idle time for a descriptor.
+							///< If this is zero, the descriptor will be closed
+							///< immediately after it is unlocked.
 	fr_time_t      		last_cleaned;
 	pthread_mutex_t		mutex;
 	exfile_entry_t		*entries;
@@ -55,6 +73,8 @@ struct exfile_s {
 	CONF_SECTION		*conf;			//!< Conf section to search for triggers.
 	char const		*trigger_prefix;	//!< Trigger path in the global trigger section.
 	fr_pair_list_t		trigger_args;		//!< Arguments to pass to trigger.
+	bool			trigger_undef[EXFILE_TRIGGER_MAX];	//!< Is the trigger undefined
+	CONF_PAIR		*trigger_cp[EXFILE_TRIGGER_MAX];	//!< Cache of trigger CONF_PAIRs
 };
 
 #define MAX_TRY_LOCK 4			//!< How many times we attempt to acquire a lock
@@ -63,46 +83,45 @@ struct exfile_s {
 /** Send an exfile trigger.
  *
  * @param[in] ef to send trigger for.
- * @param[in] request The current request.
  * @param[in] entry for the file that the event occurred on.
- * @param[in] name_suffix trigger name suffix.
+ * @param[in] ex_trigger to fire.
  */
-static inline void exfile_trigger_exec(exfile_t *ef, request_t *request, exfile_entry_t *entry, char const *name_suffix)
+static inline void exfile_trigger(exfile_t *ef, exfile_entry_t *entry, exfile_trigger_t ex_trigger)
 {
 	char			name[128];
 	fr_pair_t		*vp;
 	fr_pair_list_t		args;
 	fr_dict_attr_t const	*da;
-	fr_dcursor_t		cursor;
+
+	if (ef->trigger_undef[ex_trigger]) return;
 
 	fr_pair_list_init(&args);
 	fr_assert(ef != NULL);
-	fr_assert(name_suffix != NULL);
+	fr_assert(ex_trigger < EXFILE_TRIGGER_MAX);
 
 	if (!ef->trigger_prefix) return;
 
 	da = fr_dict_attr_child_by_num(fr_dict_root(fr_dict_internal()), FR_EXFILE_NAME);
 	if (!da) {
-		ROPTIONAL(RERROR, ERROR, "Incomplete internal dictionary: Missing definition for \"Exfile-Name\"");
+	        ERROR("Incomplete internal dictionary: Missing definition for \"Exfile-Name\"");
 		return;
 	}
 
-	fr_pair_list_copy(request ? request->request_ctx : NULL, &args, &ef->trigger_args);
-	fr_dcursor_init(&cursor, &args);
+	(void) fr_pair_list_copy(NULL, &args, &ef->trigger_args);
 
-	MEM(vp = fr_pair_afrom_da(NULL, da));
-	fr_pair_value_strdup(vp, entry->filename);
+	fr_pair_list_prepend_by_da_len(NULL, vp, &args, da, entry->filename,
+				       talloc_strlen(entry->filename), false);
 
-	fr_dcursor_prepend(&cursor, vp);
-
-	snprintf(name, sizeof(name), "%s.%s", ef->trigger_prefix, name_suffix);
-	trigger_exec(unlang_interpret_get_thread_default(), request, ef->conf, name, false, &args);
+	snprintf(name, sizeof(name), "%s.%s", ef->trigger_prefix, exfile_trigger_names[ex_trigger]);
+	if (trigger(unlang_interpret_get_thread_default(), ef->conf, &ef->trigger_cp[ex_trigger], name, false, &args, NULL) == -1) {
+		ef->trigger_undef[ex_trigger] = true;
+	}
 
 	fr_pair_list_free(&args);
 }
 
 
-static void exfile_cleanup_entry(exfile_t *ef, request_t *request, exfile_entry_t *entry)
+static void exfile_cleanup_entry(exfile_t *ef, exfile_entry_t *entry)
 {
 	if (entry->fd >= 0) close(entry->fd);
 
@@ -112,7 +131,7 @@ static void exfile_cleanup_entry(exfile_t *ef, request_t *request, exfile_entry_
 	/*
 	 *	Issue close trigger *after* we've closed the fd
 	 */
-	exfile_trigger_exec(ef, request, entry, "close");
+	exfile_trigger(ef, entry, EXFILE_TRIGGER_CLOSE);
 
 	/*
 	 *	Trigger still needs access to filename to populate Exfile-Name
@@ -130,7 +149,7 @@ static int _exfile_free(exfile_t *ef)
 	for (i = 0; i < ef->max_entries; i++) {
 		if (!ef->entries[i].filename) continue;
 
-		exfile_cleanup_entry(ef, NULL, &ef->entries[i]);
+		exfile_cleanup_entry(ef, &ef->entries[i]);
 	}
 
 	pthread_mutex_unlock(&ef->mutex);
@@ -149,7 +168,7 @@ static int _exfile_free(exfile_t *ef)
  *	- new context.
  *	- NULL on error.
  */
-exfile_t *exfile_init(TALLOC_CTX *ctx, uint32_t max_entries, uint32_t max_idle, bool locking)
+exfile_t *exfile_init(TALLOC_CTX *ctx, uint32_t max_entries, fr_time_delta_t max_idle, bool locking)
 {
 	exfile_t *ef;
 
@@ -200,7 +219,7 @@ exfile_t *exfile_init(TALLOC_CTX *ctx, uint32_t max_entries, uint32_t max_idle, 
 void exfile_enable_triggers(exfile_t *ef, CONF_SECTION *conf, char const *trigger_prefix, fr_pair_list_t *trigger_args)
 {
 	talloc_const_free(ef->trigger_prefix);
-	MEM(ef->trigger_prefix = trigger_prefix ? talloc_typed_strdup(ef, trigger_prefix) : "");
+	MEM(ef->trigger_prefix = trigger_prefix ? talloc_strdup(ef, trigger_prefix) : talloc_strdup(ef, ""));
 
 	fr_pair_list_free(&ef->trigger_args);
 
@@ -216,12 +235,13 @@ void exfile_enable_triggers(exfile_t *ef, CONF_SECTION *conf, char const *trigge
  *	Try to open the file. It it doesn't exist, try to
  *	create it's parent directories.
  */
-static int exfile_open_mkdir(exfile_t *ef, char const *filename, mode_t permissions)
+static int exfile_open_mkdir(char const *filename, mode_t permissions, int flags)
 {
 	int fd;
 
-	fd = open(filename, O_RDWR | O_CREAT, permissions);
+	fd = open(filename, O_RDWR | O_CREAT | flags, permissions);
 	if (fd < 0) {
+		int dirfd;
 		mode_t dirperm;
 		char *p, *dir;
 
@@ -229,7 +249,7 @@ static int exfile_open_mkdir(exfile_t *ef, char const *filename, mode_t permissi
 		 *	Maybe the directory doesn't exist.  Try to
 		 *	create it.
 		 */
-		dir = talloc_typed_strdup(ef, filename);
+		dir = talloc_strdup(NULL, filename);
 		if (!dir) return -1;
 		p = strrchr(dir, FR_DIR_SEP);
 		if (!p) {
@@ -248,14 +268,16 @@ static int exfile_open_mkdir(exfile_t *ef, char const *filename, mode_t permissi
 		if ((dirperm & 0060) != 0) dirperm |= 0010;
 		if ((dirperm & 0006) != 0) dirperm |= 0001;
 
-		if (fr_mkdir(NULL, dir, -1, dirperm, NULL, NULL) < 0) {
+		if (fr_mkdir(&dirfd, dir, -1, dirperm, NULL, NULL) < 0) {
 			fr_strerror_printf("Failed to create directory %s: %s", dir, fr_syserror(errno));
 			talloc_free(dir);
 			return -1;
 		}
-		talloc_free(dir);
 
-		fd = open(filename, O_RDWR | O_CREAT, permissions);
+		fd = openat(dirfd, p+1, O_RDWR | O_CREAT | flags, permissions);
+		talloc_free(dir);
+		close(dirfd);
+
 		if (fd < 0) {
 			fr_strerror_printf("Failed to open file %s: %s", filename, fr_syserror(errno));
 			return -1;
@@ -265,40 +287,20 @@ static int exfile_open_mkdir(exfile_t *ef, char const *filename, mode_t permissi
 	return fd;
 }
 
-
-/** Open a new log file, or maybe an existing one.
- *
- * When multithreaded, the FD is locked via a mutex.  This way we're
- * sure that no other thread is writing to the file.
- *
- * @param ef The logfile context returned from exfile_init().
- * @param request The current request.
- * @param filename the file to open.
- * @param permissions to use.
- * @return
- *	- FD used to write to the file.
- *	- -1 on failure.
+/*
+ * exfile_open() calls exfile_open_lock() when ef->locking is true.
+ * exfile_open_lock() returns holding ef->mutex on success, and returns
+ * without holding ef->mutex on failure.  exfile.h gives Coverity the
+ * same contract at each call site.
  */
-int exfile_open(exfile_t *ef, request_t *request, char const *filename, mode_t permissions)
+static int exfile_open_lock(exfile_t *ef, char const *filename, mode_t permissions, int flags, off_t *offset)
 {
 	int i, tries, unused = -1, found = -1, oldest = -1;
 	bool do_cleanup = false;
 	uint32_t hash;
 	fr_time_t now;
 	struct stat st;
-
-	if (!ef || !filename) return -1;
-
-	/*
-	 *	No locking: just return a new FD.
-	 */
-	if (!ef->locking) {
-		found = exfile_open_mkdir(ef, filename, permissions);
-		if (found < 0) return -1;
-
-		(void) lseek(found, 0, SEEK_END);
-		return found;
-	}
+	off_t real_offset;
 
 	/*
 	 *	It's faster to do hash comparisons of a string than
@@ -310,7 +312,7 @@ int exfile_open(exfile_t *ef, request_t *request, char const *filename, mode_t p
 
 	pthread_mutex_lock(&ef->mutex);
 
-	if (now > (ef->last_cleaned + 1)) do_cleanup = true;
+	if (fr_time_gt(now, fr_time_add(ef->last_cleaned, fr_time_delta_from_sec(1)))) do_cleanup = true;
 
 	/*
 	 *	Find the matching entry, or an unused one.
@@ -325,7 +327,7 @@ int exfile_open(exfile_t *ef, request_t *request, char const *filename, mode_t p
 		}
 
 		if ((oldest < 0) ||
-		    (ef->entries[i].last_used < ef->entries[oldest].last_used)) {
+		    (fr_time_lt(ef->entries[i].last_used, ef->entries[oldest].last_used))) {
 			oldest = i;
 		}
 
@@ -354,9 +356,9 @@ int exfile_open(exfile_t *ef, request_t *request, char const *filename, mode_t p
 			 *	do so now.
 			 */
 		} else if (do_cleanup) {
-			if ((ef->entries[i].last_used + ef->max_idle) >= now) continue;
+			if (fr_time_gteq(fr_time_add(ef->entries[i].last_used, ef->max_idle), now)) continue;
 
-			exfile_cleanup_entry(ef, request, &ef->entries[i]);
+			exfile_cleanup_entry(ef, &ef->entries[i]);
 		}
 	}
 
@@ -374,13 +376,14 @@ int exfile_open(exfile_t *ef, request_t *request, char const *filename, mode_t p
 		 *	and re-open the file.
 		 */
 		if (stat(ef->entries[i].filename, &st) < 0) {
-			goto reopen;
+			goto close_reopen;
 		}
 
 		if ((st.st_dev != ef->entries[i].st_dev) ||
 		    (st.st_ino != ef->entries[i].st_ino)) {
+		close_reopen:
 			close(ef->entries[i].fd);
-			goto reopen;
+			goto reopen_reset;
 		}
 
 		goto try_lock;
@@ -390,7 +393,7 @@ int exfile_open(exfile_t *ef, request_t *request, char const *filename, mode_t p
 	 *	There are no unused entries, free the oldest one.
 	 */
 	if (unused < 0) {
-		exfile_cleanup_entry(ef, request, &ef->entries[oldest]);
+		exfile_cleanup_entry(ef, &ef->entries[oldest]);
 		unused = oldest;
 	}
 
@@ -400,14 +403,15 @@ int exfile_open(exfile_t *ef, request_t *request, char const *filename, mode_t p
 	i = unused;
 
 	ef->entries[i].hash = hash;
-	ef->entries[i].filename = talloc_typed_strdup(ef->entries, filename);
+	ef->entries[i].filename = talloc_strdup(ef->entries, filename);
+
+reopen_reset:
 	ef->entries[i].fd = -1;
 
-reopen:
-	ef->entries[i].fd = exfile_open_mkdir(ef, filename, permissions);
+	ef->entries[i].fd = exfile_open_mkdir(filename, permissions, flags);
 	if (ef->entries[i].fd < 0) goto error;
 
-	exfile_trigger_exec(ef, request, &ef->entries[i], "open");
+	exfile_trigger(ef, &ef->entries[i], EXFILE_TRIGGER_OPEN);
 
 try_lock:
 	/*
@@ -417,7 +421,7 @@ try_lock:
 		fr_strerror_printf("Failed to seek in file %s: %s", filename, fr_syserror(errno));
 
 	error:
-		exfile_cleanup_entry(ef, request, &ef->entries[i]);
+		exfile_cleanup_entry(ef, &ef->entries[i]);
 		pthread_mutex_unlock(&(ef->mutex));
 		return -1;
 	}
@@ -437,7 +441,7 @@ try_lock:
 		}
 
 		close(ef->entries[i].fd);
-		ef->entries[i].fd = open(filename, O_RDWR | O_CREAT, permissions);
+		ef->entries[i].fd = open(filename, O_RDWR | O_CREAT | flags, permissions);
 		if (ef->entries[i].fd < 0) {
 			fr_strerror_printf("Failed to open file %s: %s", filename, fr_syserror(errno));
 			goto error;
@@ -453,15 +457,9 @@ try_lock:
 	 *	Maybe someone deleted the file while we were waiting
 	 *	for the lock.  If so, re-open it.
 	 */
-	if (fstat(ef->entries[i].fd, &st) < 0) {
-		fr_strerror_printf("Failed to stat file %s: %s", filename, fr_syserror(errno));
-		goto reopen;
-	}
+	if (fstat(ef->entries[i].fd, &st) < 0) goto close_reopen;
 
-	if (st.st_nlink == 0) {
-		close(ef->entries[i].fd);
-		goto reopen;
-	}
+	if (st.st_nlink == 0) goto close_reopen;
 
 	/*
 	 *	Remember which device and inode this file is
@@ -501,43 +499,84 @@ try_lock:
 	 *	Seek to the end of the file before returning the FD to
 	 *	the caller.
 	 */
-	(void) lseek(ef->entries[i].fd, 0, SEEK_END);
+	real_offset = lseek(ef->entries[i].fd, 0, SEEK_END);
+	if (offset) *offset = real_offset;
 
 	/*
 	 *	Return holding the mutex for the entry.
 	 */
 	ef->entries[i].last_used = now;
 
-	exfile_trigger_exec(ef, request, &ef->entries[i], "reserve");
+	exfile_trigger(ef, &ef->entries[i], EXFILE_TRIGGER_RESERVE);
 
-	/* coverity[missing_unlock] */
+	/*
+	 *	Every path here called lseek() on the fd at try_lock, which
+	 *	fails for an invalid fd and goes to error, so the fd is valid,
+	 *	and the caller only ever holds the mutex with an fd >= 0.
+	 */
+	fr_assert(ef->entries[i].fd >= 0);
+
+#ifdef __COVERITY__
+	/*
+	 *	The caller holds ef->mutex until exfile_close().  The
+	 *	macros in exfile.h tell Coverity about the lock at the call
+	 *	site.  Here Coverity must see ef->mutex released.
+	 */
+	__coverity_exclusive_lock_release__(&ef->mutex);
+#endif
 	return ef->entries[i].fd;
 }
 
-/** Close the log file.  Really just return it to the pool.
+/** Open a new log file, or maybe an existing one.
  *
- * When multithreaded, the FD is locked via a mutex. This way we're sure that no other thread is
- * writing to the file. This function will unlock the mutex, so that other threads can write to
- * the file.
+ * When multithreaded, the FD is locked via a mutex.  This way we're
+ * sure that no other thread is writing to the file.
  *
- * @param ef The logfile context returned from #exfile_init.
- * @param request The current request.
- * @param fd the FD to close (i.e. return to the pool).
+ * On success the mutex is held until exfile_close() is called.  On
+ * failure the mutex is not held.
+ *
+ * @param ef The logfile context returned from exfile_init().
+ * @param filename the file to open.
+ * @param permissions to use.
+ * @param flags flags to pass to open.
+ * @param offset Optional pointer to store offset in when seeking the end of file.
  * @return
- *	- 0 on success.
+ *	- FD used to write to the file.
  *	- -1 on failure.
  */
-int exfile_close(exfile_t *ef, request_t *request, int fd)
+int exfile_open(exfile_t *ef, char const *filename, mode_t permissions, int flags, off_t *offset)
+{
+	if (!ef || !filename) return -1;
+
+	if (!ef->locking) {
+		int found = exfile_open_mkdir(filename, permissions, flags);
+		off_t real_offset;
+
+		if (found < 0) return -1;
+		real_offset = lseek(found, 0, SEEK_END);
+		if (offset) *offset = real_offset;
+		return found;
+	}
+
+	return exfile_open_lock(ef, filename, permissions, flags, offset);
+}
+
+/*
+ * exfile_close() calls exfile_close_lock() when ef->locking is true.
+ * exfile_close_lock() releases ef->mutex on every return path.
+ */
+static int exfile_close_lock(exfile_t *ef, int fd)
 {
 	uint32_t i;
 
+#ifdef __COVERITY__
 	/*
-	 *	No locking: just close the file.
+	 *	The caller has held ef->mutex since exfile_open().  The
+	 *	macros in exfile.h tell Coverity about the lock at the call
+	 *	site.  Here Coverity must see ef->mutex taken.
 	 */
-	if (!ef->locking) {
-		close(fd);
-		return 0;
-	}
+	__coverity_exclusive_lock_acquire__(&ef->mutex);
+#endif
 
 	/*
 	 *	Unlock the bytes that we had previously locked.
@@ -547,9 +586,20 @@ int exfile_close(exfile_t *ef, request_t *request, int fd)
 
 		(void) lseek(ef->entries[i].fd, 0, SEEK_SET);
 		(void) rad_unlockfd(ef->entries[i].fd, 0);
+
+		/*
+		 *	If max idle is 0, then clean up the file immediately
+		 *	this is mostly used for testing.
+		 */
+		if (fr_time_delta_eq(ef->max_idle, fr_time_delta_from_sec(0))) {
+			exfile_cleanup_entry(ef, &ef->entries[i]);
+			pthread_mutex_unlock(&(ef->mutex));
+			return 0;
+		}
+
 		pthread_mutex_unlock(&(ef->mutex));
 
-		exfile_trigger_exec(ef, request, &ef->entries[i], "release");
+		exfile_trigger(ef, &ef->entries[i], EXFILE_TRIGGER_RELEASE);
 		return 0;
 	}
 
@@ -557,4 +607,28 @@ int exfile_close(exfile_t *ef, request_t *request, int fd)
 
 	fr_strerror_const("Attempt to unlock file which is not tracked");
 	return -1;
+}
+
+/** Close the log file.  Really just return it to the pool.
+ *
+ * When multithreaded, the FD is locked via a mutex. This way we're sure that no other thread is
+ * writing to the file. This function will unlock the mutex, so that other threads can write to
+ * the file.
+ *
+ * @param ef The logfile context returned from #exfile_init.
+ * @param fd the FD to close (i.e. return to the pool).
+ * @return
+ *	- 0 on success.
+ *	- -1 on failure.
+ */
+int exfile_close(exfile_t *ef, int fd)
+{
+	if (!ef->locking) {
+		/*
+		 *	No locking: just close the file.
+		 */
+		close(fd);
+		return 0;
+	}
+	return exfile_close_lock(ef, fd);
 }

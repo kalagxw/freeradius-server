@@ -20,7 +20,7 @@
  * @brief Load generation algorithms
  * @file io/load.c
  *
- * @copyright 2019 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2019 Network RADIUS SAS (legal@networkradius.com)
  */
 RCSID("$Id$")
 
@@ -37,11 +37,25 @@ RCSID("$Id$")
 #define IBETA (4)
 #define IALPHA (8)
 
-#define DIFF(_rtt, _t) (_rtt < _t ? (_t - _rtt) : (_rtt - _t))
-#define RTTVAR(_rtt, _rttvar, _t) ((((IBETA - 1) * _rttvar) + DIFF(_rtt, _t)) / IBETA)
-#define RTT(_old, _new) ((_new + ((IALPHA - 1) * _old)) / IALPHA)
+#define DIFF(_rtt, _t) \
+	(\
+		fr_time_delta_lt(_rtt, _t) ? \
+			fr_time_delta_sub(_t, _rtt) : \
+			fr_time_delta_sub(_rtt, _t)\
+	)
 
-typedef enum {
+#define RTTVAR(_rtt, _rttvar, _t) \
+	fr_time_delta_div(\
+		fr_time_delta_add(\
+			fr_time_delta_mul(_rttvar, IBETA - 1), \
+			DIFF(_rtt, _t)\
+		), \
+		fr_time_delta_wrap(IBETA)\
+	)
+
+#define RTT(_old, _new) fr_time_delta_wrap((fr_time_delta_unwrap(_new) + (fr_time_delta_unwrap(_old) * (IALPHA - 1))) / IALPHA)
+
+typedef enum : uint8_t {
 	FR_LOAD_STATE_INIT = 0,
 	FR_LOAD_STATE_SENDING,
 	FR_LOAD_STATE_GATED,
@@ -53,12 +67,15 @@ struct fr_load_s {
 	fr_event_list_t		*el;
 	fr_load_config_t const *config;
 	fr_load_callback_t	callback;
+	fr_load_done_callback_t	done;
 	void			*uctx;
 
 	fr_load_stats_t		stats;			//!< sending statistics
 	fr_time_t		step_start;		//!< when the current step started
 	fr_time_t		step_end;		//!< when the current step will end
 	int			step_received;
+	int			sent_base;		//!< stats.sent when this run started, so that
+							///< max_requests counts per-run, not cumulatively
 
 	uint32_t		pps;
 	fr_time_delta_t		delta;			//!< between packets
@@ -67,11 +84,12 @@ struct fr_load_s {
 	bool			header;			//!< for printing statistics
 
 	fr_time_t		next;			//!< The next time we're supposed to send a packet
-	fr_event_timer_t const	*ev;
+	fr_timer_t		*ev;
 };
 
 fr_load_t *fr_load_generator_create(TALLOC_CTX *ctx, fr_event_list_t *el, fr_load_config_t *config,
-				    fr_load_callback_t callback, void *uctx)
+				    fr_load_callback_t callback, fr_load_done_callback_t done,
+				    void *uctx)
 {
 	fr_load_t *l;
 
@@ -85,6 +103,7 @@ fr_load_t *fr_load_generator_create(TALLOC_CTX *ctx, fr_event_list_t *el, fr_loa
 	l->el = el;
 	l->config = config;
 	l->callback = callback;
+	l->done = done;
 	l->uctx = uctx;
 
 	return l;
@@ -108,15 +127,31 @@ static void fr_load_generator_send(fr_load_t *l, fr_time_t now, int count)
 	 *	it more likely that the next timer fires on time.
 	 */
 	for (i = 0; i < count; i++) {
-		l->callback(now + i, l->uctx);
+		l->callback(fr_time_add(now, fr_time_delta_from_nsec(i)), l->uctx);
 	}
 }
 
-static void load_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
+/** Stop sending new packets, and wait for outstanding replies.
+ *
+ *  If every reply has already arrived then the test is complete right
+ *  now, so run the "done" callback.  Otherwise completion is signalled
+ *  by fr_load_generator_have_reply() when the last reply comes in.
+ */
+static void load_drain(fr_load_t *l, fr_time_t now)
+{
+	l->state = FR_LOAD_STATE_DRAINING;
+
+	if (l->stats.received >= l->stats.sent) {
+		l->stats.end = now;
+		if (l->done) l->done(l->uctx);
+	}
+}
+
+static void load_timer(fr_timer_list_t *tl, fr_time_t now, void *uctx)
 {
 	fr_load_t *l = uctx;
-	fr_time_t delta;
-	int count;
+	fr_time_delta_t delta;
+	uint32_t count;
 
 	/*
 	 *	Keep track of the overall maximum backlog for the
@@ -128,23 +163,32 @@ static void load_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
 	/*
 	 *	If we're done this step, go to the next one.
 	 */
-	if (l->next >= l->step_end) {
+	if (fr_time_gteq(l->next, l->step_end)) {
 		l->step_start = l->next;
-		l->step_end = l->next + ((uint64_t) l->config->duration) * NSEC;
+		l->step_end = fr_time_add(l->next, l->config->duration);
 		l->step_received = l->stats.received;
 		l->pps += l->config->step;
-		l->stats.pps = l->pps;
-		l->stats.skipped = 0;
-		l->delta = (NSEC * ((uint64_t) l->config->parallel)) / l->pps;
+		if (l->pps > (UINT32_MAX / l->config->milliseconds)) l->pps = UINT32_MAX / l->config->milliseconds;
 
 		/*
-		 *	Stop at max PPS, if it's set.  Otherwise
-		 *	continue without limit.
+		 *	The ramp-up has passed max_pps.  If there's no
+		 *	reason to keep sending, stop and drain.
+		 *	Otherwise hold the rate at max_pps, until
+		 *	max_requests packets have been sent (checked
+		 *	below), or forever for "unlimited".
 		 */
 		if (l->config->max_pps && (l->pps > l->config->max_pps)) {
-			l->state = FR_LOAD_STATE_DRAINING;
-			return;
+			if (!l->config->max_requests && !l->config->unlimited) {
+				load_drain(l, now);
+				return;
+			}
+
+			l->pps = l->config->max_pps;
 		}
+
+		l->stats.pps = l->pps;
+		l->stats.skipped = 0;
+		l->delta = fr_time_delta_div(fr_time_delta_from_sec(l->config->parallel), fr_time_delta_wrap(l->pps));
 	}
 
 	/*
@@ -158,18 +202,20 @@ static void load_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
 	 *	Otherwise, switch to a gated mode where we only send
 	 *	new packets once a reply comes in.
 	 */
-	if (((uint32_t) l->stats.backlog * 1000) < (l->pps * l->config->milliseconds)) {
+	if (((size_t) l->stats.backlog * 1000) < ((size_t) l->pps * l->config->milliseconds)) {
+		uint32_t capacity;
+
 		l->state = FR_LOAD_STATE_SENDING;
 		l->stats.blocked = false;
 		count = l->config->parallel;
 		l->stats.skipped = 0;
 
+		capacity = ((l->pps * l->config->milliseconds) / 1000) - l->stats.backlog;
+
 		/*
-		 *	Limit "count" so that it doesn't over-run backlog.
+		 *	Limit "count" so that it doesn't overflow.
 		 */
-		if (((uint32_t) ((count + l->stats.backlog) * 1000)) > (l->pps * l->config->milliseconds)) {
-			count = (count + l->stats.backlog) - ((l->pps * l->config->milliseconds) / 1000);
-		}
+		if (count > capacity) count = capacity;
 
 	} else {
 
@@ -187,22 +233,37 @@ static void load_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
 	}
 
 	/*
+	 *	Stop after max_requests packets, if it's set.  Packets
+	 *	sent by a previous run of the generator don't count.
+	 */
+	if (l->config->max_requests) {
+		uint32_t sent = (uint32_t) (l->stats.sent - l->sent_base);
+
+		if (sent >= l->config->max_requests) {
+			load_drain(l, now);
+			return;
+		}
+
+		if (count > (l->config->max_requests - sent)) count = l->config->max_requests - sent;
+	}
+
+	/*
 	 *	Skip timers if we're too busy.
 	 */
-	l->next += l->delta;
-	if (l->next < now) {
-		while ((l->next + l->delta) < now) {
+	l->next = fr_time_add(l->next, l->delta);
+	if (fr_time_lt(l->next, now)) {
+		while (fr_time_lt(l->next, now)) {
 //			l->stats.skipped += l->count;
-			l->next += l->delta;
+			l->next = fr_time_add(l->next, l->delta);
 		}
 	}
-	delta = l->next - now;
+	delta = fr_time_sub(l->next, now);
 
 	/*
 	 *	Set the timer for the next packet.
 	 */
-	if (fr_event_timer_in(l, el, &l->ev, delta, load_timer, l) < 0) {
-		l->state = FR_LOAD_STATE_DRAINING;
+	if (fr_timer_in(l, tl, &l->ev, delta, false, load_timer, l) < 0) {
+		load_drain(l, now);
 		return;
 	}
 
@@ -215,18 +276,31 @@ static void load_timer(fr_event_list_t *el, fr_time_t now, void *uctx)
  */
 int fr_load_generator_start(fr_load_t *l)
 {
+	uint32_t max;
+
 	l->stats.start = fr_time();
 	l->step_start = l->stats.start;
-	l->step_end = l->step_start + ((uint64_t) l->config->duration) * NSEC;
+	l->step_end = fr_time_add(l->step_start, l->config->duration);
+
+	l->state = FR_LOAD_STATE_SENDING;
+	l->sent_base = l->stats.sent;
 
 	l->pps = l->config->start_pps;
+
+	/*
+	 *	Check for numerical overflow.  We later multiply pps*milliseconds, and we don't want overflow.
+	 */
+	max = UINT32_MAX / l->config->milliseconds;
+
+	if (l->pps > max) l->pps = max;
+
 	l->stats.pps = l->pps;
 	l->count = l->config->parallel;
 
-	l->delta = (NSEC * ((uint64_t) l->config->parallel)) / l->pps;
-	l->next = l->step_start + l->delta;
+	l->delta = fr_time_delta_div(fr_time_delta_from_sec(l->config->parallel), fr_time_delta_wrap(l->pps));
+	l->next = fr_time_add(l->step_start, l->delta);
 
-	load_timer(l->el, l->step_start, l);
+	if (fr_timer_in(l, l->el->tl, &l->ev, fr_time_delta_wrap(0), false, load_timer, l) < 0) return -1;
 	return 0;
 }
 
@@ -237,9 +311,10 @@ int fr_load_generator_start(fr_load_t *l)
  */
 int fr_load_generator_stop(fr_load_t *l)
 {
-	if (!l->ev) return 0;
+	if (!fr_timer_armed(l->ev)) return 0;
 
-	return fr_event_timer_delete(&l->ev);
+	FR_TIMER_DELETE_RETURN(&l->ev);
+	return 0;
 }
 
 
@@ -257,7 +332,7 @@ fr_load_reply_t fr_load_generator_have_reply(fr_load_t *l, fr_time_t request_tim
 	 *	for any kind of timing.
 	 */
 	now = fr_time();
-	t = now - request_time;
+	t = fr_time_sub(now, request_time);
 
 	l->stats.rttvar = RTTVAR(l->stats.rtt, l->stats.rttvar, t);
 	l->stats.rtt = RTT(l->stats.rtt, t);
@@ -267,19 +342,19 @@ fr_load_reply_t fr_load_generator_have_reply(fr_load_t *l, fr_time_t request_tim
 	/*
 	 *	t is in nanoseconds.
 	 */
-	if (t < 1000) {
+	if (fr_time_delta_lt(t, fr_time_delta_wrap(1000))) {
 	       l->stats.times[0]++; /* < microseconds */
-	} else if (t < 10000) {
+	} else if (fr_time_delta_lt(t, fr_time_delta_wrap(10000))) {
 	       l->stats.times[1]++; /* microseconds */
-	} else if (t < 100000) {
+	} else if (fr_time_delta_lt(t, fr_time_delta_wrap(100000))) {
 	       l->stats.times[2]++; /* 10s of microseconds */
-	} else if (t < 1000000) {
-	       l->stats.times[3]++; /* 100s of microiseconds */
-	} else if (t < 10000000) {
+	} else if (fr_time_delta_lt(t, fr_time_delta_wrap(1000000))) {
+	       l->stats.times[3]++; /* 100s of microseconds */
+	} else if (fr_time_delta_lt(t, fr_time_delta_wrap(10000000))) {
 	       l->stats.times[4]++; /* milliseconds */
-	} else if (t < 100000000) {
+	} else if (fr_time_delta_lt(t, fr_time_delta_wrap(100000000))) {
 	       l->stats.times[5]++; /* 10s of milliseconds */
-	} else if (t < NSEC) {
+	} else if (fr_time_delta_lt(t, fr_time_delta_wrap(NSEC))) {
 	       l->stats.times[6]++; /* 100s of milliseconds */
 	} else {
 	       l->stats.times[7]++; /* seconds */
@@ -294,10 +369,14 @@ fr_load_reply_t fr_load_generator_have_reply(fr_load_t *l, fr_time_t request_tim
 	/*
 	 *	The send code has decided that the backlog is too
 	 *	high.  New requests are blocked until replies come in.
-	 *	Since we have a reply, send another request.
+	 *	Since we have a reply, send another request.  Unless
+	 *	we've already sent max_requests packets, in which case
+	 *	the timer will notice and start draining.
 	 */
 	if (l->state == FR_LOAD_STATE_GATED) {
-		if (l->stats.skipped > 0) {
+		if ((l->stats.skipped > 0) &&
+		    (!l->config->max_requests ||
+		     ((uint32_t) (l->stats.sent - l->sent_base) < l->config->max_requests))) {
 			l->stats.skipped--;
 			fr_load_generator_send(l, now, 1);
 		}
@@ -334,11 +413,9 @@ size_t fr_load_generator_stats_sprint(fr_load_t *l, fr_time_t now, char *buffer,
 	}
 
 
-	now_f = now - l->stats.start;
-	now_f /= NSEC;
+	now_f = fr_time_delta_to_sec_double(fr_time_sub(now, l->stats.start));
 
-	last_send_f = l->stats.last_send - l->stats.start;
-	last_send_f /= NSEC;
+	last_send_f = fr_time_delta_to_sec_double(fr_time_sub(l->stats.last_send, l->stats.start));
 
 	/*
 	 *	Track packets/s.  Since times are in nanoseconds, we
@@ -346,20 +423,24 @@ size_t fr_load_generator_stats_sprint(fr_load_t *l, fr_time_t now, char *buffer,
 	 *	is 1B, the calculations have to be done via 64-bit
 	 *	numbers, and then converted to a final 32-bit counter.
 	 */
-	if (now > l->step_start) {
-		l->stats.pps_accepted = (((uint64_t) (l->stats.received - l->step_received)) * NSEC) / (now - l->step_start);
+	if (fr_time_gt(now, l->step_start)) {
+		l->stats.pps_accepted = (int)
+			fr_time_delta_unwrap(
+				fr_time_delta_div(fr_time_delta_from_sec(l->stats.received - l->step_received),
+					  	  fr_time_sub(now, l->step_start))
+			);
 	}
 
 	return snprintf(buffer, buflen,
 			"%f,%f,"
-			"%" PRIu64 ",%" PRIu64 ","
+			"%" PRId64 ",%" PRId64 ","
 			"%d,%d,"
 			"%d,%d,"
 			"%d,%d,"
 			"%d,%d,%d,%d,%d,%d,%d,%d,"
 			"%d\n",
 			now_f, last_send_f,
-			l->stats.rtt, l->stats.rttvar,
+			fr_time_delta_unwrap(l->stats.rtt), fr_time_delta_unwrap(l->stats.rttvar),
 			l->stats.pps, l->stats.pps_accepted,
 			l->stats.sent, l->stats.received,
 			l->stats.backlog, l->stats.max_backlog,

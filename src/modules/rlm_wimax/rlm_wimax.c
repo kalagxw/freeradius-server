@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -24,10 +24,10 @@
 RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
-#define LOG_PREFIX "rlm_wimax - "
+#define LOG_PREFIX "wimax"
 
 #include <freeradius-devel/server/base.h>
-#include <freeradius-devel/server/module.h>
+#include <freeradius-devel/server/module_rlm.h>
 #include <freeradius-devel/tls/base.h>
 #include <freeradius-devel/util/base16.h>
 
@@ -43,8 +43,8 @@ typedef struct {
 	bool	delete_mppe_keys;
 } rlm_wimax_t;
 
-static const CONF_PARSER module_config[] = {
-  { FR_CONF_OFFSET("delete_mppe_keys", FR_TYPE_BOOL, rlm_wimax_t, delete_mppe_keys), .dflt = "no" },
+static const conf_parser_t module_config[] = {
+  { FR_CONF_OFFSET("delete_mppe_keys", rlm_wimax_t, delete_mppe_keys), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -55,7 +55,7 @@ extern fr_dict_autoload_t rlm_wimax_dict[];
 fr_dict_autoload_t rlm_wimax_dict[] = {
 	{ .out = &dict_radius, .proto = "radius" },
 	{ .out = &dict_freeradius, .proto = "freeradius" },
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 static fr_dict_attr_t const *attr_eap_emsk;
@@ -64,6 +64,7 @@ static fr_dict_attr_t const *attr_wimax_mn_nai;
 
 static fr_dict_attr_t const *attr_calling_station_id;
 
+static fr_dict_attr_t const *attr_wimax;
 static fr_dict_attr_t const *attr_wimax_msk;
 static fr_dict_attr_t const *attr_wimax_ip_technology;
 static fr_dict_attr_t const *attr_wimax_mn_hha_mip4_key;
@@ -89,24 +90,32 @@ fr_dict_attr_autoload_t rlm_wimax_dict_attr[] = {
 
 	{ .out = &attr_calling_station_id, .name = "Calling-Station-ID", .type = FR_TYPE_STRING, .dict = &dict_radius },
 
-	{ .out = &attr_wimax_msk, .name = "Vendor-Specific.WiMAX.MSK", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
-	{ .out = &attr_wimax_ip_technology, .name = "Vendor-Specific.WiMAX.IP-Technology", .type = FR_TYPE_UINT32, .dict = &dict_radius },
-	{ .out = &attr_wimax_mn_hha_mip4_key, .name = "Vendor-Specific.WiMAX.MN-hHA-MIP4-Key", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
-	{ .out = &attr_wimax_mn_hha_mip4_spi, .name = "Vendor-Specific.WiMAX.MN-hHA-MIP4-SPI", .type = FR_TYPE_UINT32, .dict = &dict_radius },
-	{ .out = &attr_wimax_hha_ip_mip4, .name = "Vendor-Specific.WiMAX.hHA-IP-MIP4", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_radius },
-	{ .out = &attr_wimax_hha_ip_mip6, .name = "Vendor-Specific.WiMAX.hHA-IP-MIP6", .type = FR_TYPE_IPV6_ADDR, .dict = &dict_radius },
-	{ .out = &attr_wimax_mn_hha_mip6_key, .name = "Vendor-Specific.WiMAX.MN-hHA-MIP6-Key", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
-	{ .out = &attr_wimax_mn_hha_mip6_spi, .name = "Vendor-Specific.WiMAX.MN-hHA-MIP6-SPI", .type = FR_TYPE_UINT32, .dict = &dict_radius },
-	{ .out = &attr_wimax_fa_rk_key, .name = "Vendor-Specific.WiMAX.FA-RK-Key", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
-	{ .out = &attr_wimax_fa_rk_spi, .name = "Vendor-Specific.WiMAX.FA-RK-SPI", .type = FR_TYPE_UINT32, .dict = &dict_radius },
-	{ .out = &attr_wimax_rrq_mn_ha_spi, .name = "Vendor-Specific.WiMAX.RRQ-MN-HA-SPI", .type = FR_TYPE_UINT32, .dict = &dict_radius },
-	{ .out = &attr_wimax_rrq_ha_ip, .name = "Vendor-Specific.WiMAX.RRQ-HA-IP", .type = FR_TYPE_COMBO_IP_ADDR, .dict = &dict_radius },
-	{ .out = &attr_wimax_ha_rk_key_requested, .name = "Vendor-Specific.WiMAX.HA-RK-Key-Requested", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	/*
+	 *	Load the WiMAX VSA.  The children are all found under this root.
+	 */
+	{ .out = &attr_wimax, .name = "Vendor-Specific.WiMAX", .type = FR_TYPE_VENDOR, .dict = &dict_radius },
+
+	/*
+	 *	Relative names are shorter.
+	 */
+	{ .out = &attr_wimax_msk, .name = ".MSK", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_wimax_ip_technology, .name = ".IP-Technology", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ .out = &attr_wimax_mn_hha_mip4_key, .name = ".MN-hHA-MIP4-Key", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_wimax_mn_hha_mip4_spi, .name = ".MN-hHA-MIP4-SPI", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ .out = &attr_wimax_hha_ip_mip4, .name = ".hHA-IP-MIP4", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_radius },
+	{ .out = &attr_wimax_hha_ip_mip6, .name = ".hHA-IP-MIP6", .type = FR_TYPE_IPV6_ADDR, .dict = &dict_radius },
+	{ .out = &attr_wimax_mn_hha_mip6_key, .name = ".MN-hHA-MIP6-Key", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_wimax_mn_hha_mip6_spi, .name = ".MN-hHA-MIP6-SPI", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ .out = &attr_wimax_fa_rk_key, .name = ".FA-RK-Key", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_wimax_fa_rk_spi, .name = ".FA-RK-SPI", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ .out = &attr_wimax_rrq_mn_ha_spi, .name = ".RRQ-MN-HA-SPI", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ .out = &attr_wimax_rrq_ha_ip, .name = ".RRQ-HA-IP", .type = FR_TYPE_COMBO_IP_ADDR, .dict = &dict_radius },
+	{ .out = &attr_wimax_ha_rk_key_requested, .name = ".HA-RK-Key-Requested", .type = FR_TYPE_UINT32, .dict = &dict_radius },
 
 	{ .out = &attr_ms_mppe_send_key, .name = "Vendor-Specific.Microsoft.MPPE-Send-Key", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_ms_mppe_recv_key, .name = "Vendor-Specific.Microsoft.MPPE-Recv-Key", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 
-	{ NULL }
+	DICT_AUTOLOAD_TERMINATOR
 };
 
 /*
@@ -115,14 +124,14 @@ fr_dict_attr_autoload_t rlm_wimax_dict_attr[] = {
  *	from the database. The authentication code only needs to check
  *	the password, the rest is done here.
  */
-static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_authorize(unlang_result_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
 {
 	fr_pair_t *vp;
 
 	/*
 	 *	Fix Calling-Station-Id.  Damn you, WiMAX!
 	 */
-	vp = fr_pair_find_by_da(&request->request_pairs, attr_calling_station_id, 0);
+	vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_calling_station_id);
 	if (vp && (vp->vp_length == 6)) {
 		int	i;
 		char	*p;
@@ -139,20 +148,20 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, UNU
 		 */
 		for (i = 0; i < 6; i++) {
 			fr_base16_encode(&FR_SBUFF_OUT(&p[i * 3], 2 + 1), &FR_DBUFF_TMP(&buffer[i], 1));
-			p[(i * 3) + 2] = '-';
+			if (i < 5) p[(i * 3) + 2] = '-';
 		}
 
 		DEBUG2("Fixing WiMAX binary Calling-Station-Id to %pV", &vp->data);
-		RETURN_MODULE_OK;
+		RETURN_UNLANG_OK;
 	}
 
-	RETURN_MODULE_NOOP;
+	RETURN_UNLANG_NOOP;
 }
 
 /*
  *	Massage the request before recording it or proxying it
  */
-static unlang_action_t CC_HINT(nonnull) mod_preacct(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_preacct(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
 	return mod_authorize(p_result, mctx, request);
 }
@@ -160,23 +169,35 @@ static unlang_action_t CC_HINT(nonnull) mod_preacct(rlm_rcode_t *p_result, modul
 /*
  *	Generate the keys after the user has been authenticated.
  */
-static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+static unlang_action_t CC_HINT(nonnull) mod_post_auth(unlang_result_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_wimax_t const	*inst = talloc_get_type_abort_const(mctx->instance, rlm_wimax_t);
+	rlm_wimax_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_wimax_t);
 	fr_pair_t		*msk, *emsk, *vp;
 	fr_pair_t		*mn_nai, *ip, *fa_rk;
-	HMAC_CTX		*hmac;
-	unsigned int		rk1_len, rk2_len, rk_len;
+	fr_pair_t		*vsa_request, *vsa_reply;
+	EVP_MD_CTX		*hmac_ctx;
+	EVP_PKEY		*hmac_pkey;
 	uint32_t		mip_spi;
 	uint8_t			usage_data[24];
 	uint8_t			mip_rk_1[EVP_MAX_MD_SIZE], mip_rk_2[EVP_MAX_MD_SIZE];
 	uint8_t			mip_rk[2 * EVP_MAX_MD_SIZE];
+	size_t			rk1_len = sizeof(mip_rk_1), rk2_len = sizeof(mip_rk_2), rk_len = sizeof(mip_rk);
 
-	msk = fr_pair_find_by_da(&request->reply_pairs, attr_eap_msk, 0);
-	emsk = fr_pair_find_by_da(&request->reply_pairs, attr_eap_emsk, 0);
+	msk = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_eap_msk);
+	emsk = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_eap_emsk);
 	if (!msk || !emsk) {
 		REDEBUG2("No EAP-MSK or EAP-EMSK.  Cannot create WiMAX keys");
-		RETURN_MODULE_NOOP;
+		RETURN_UNLANG_NOOP;
+	}
+
+	/*
+	 *	If there's no WiMAX VSAs on input or output, we do nothing.
+	 */
+	vsa_request = fr_pair_find_by_da_nested(&request->reply_pairs, attr_wimax);
+	vsa_reply = fr_pair_find_by_da_nested(&request->reply_pairs, attr_wimax);
+	if (!vsa_request && !vsa_reply) {
+		RWDEBUG("Vendor-Specific.WiMAX not found in request or reply list, skipping all WiMAX calculations");
+		RETURN_UNLANG_NOOP;
 	}
 
 	/*
@@ -202,20 +223,22 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 	/*
 	 *	MIP-RK-1 = HMAC-SSHA256(EMSK, usage-data | 0x01)
 	 */
-	hmac = HMAC_CTX_new();
-	HMAC_Init_ex(hmac, emsk->vp_octets, emsk->vp_length, EVP_sha256(), NULL);
+	MEM(hmac_ctx = EVP_MD_CTX_new());
+	MEM(hmac_pkey = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, NULL, emsk->vp_octets, (int)emsk->vp_length));
+	EVP_DigestSignInit(hmac_ctx, NULL, EVP_sha256(), NULL, hmac_pkey);
 
-	HMAC_Update(hmac, &usage_data[0], sizeof(usage_data));
-	HMAC_Final(hmac, &mip_rk_1[0], &rk1_len);
+	EVP_DigestSignUpdate(hmac_ctx, &usage_data[0], sizeof(usage_data));
+	EVP_DigestSignFinal(hmac_ctx, &mip_rk_1[0], &rk1_len);
 
 	/*
 	 *	MIP-RK-2 = HMAC-SSHA256(EMSK, MIP-RK-1 | usage-data | 0x01)
 	 */
-	HMAC_Init_ex(hmac, emsk->vp_octets, emsk->vp_length, EVP_sha256(), NULL);
+	EVP_MD_CTX_reset(hmac_ctx);
+	EVP_DigestSignInit(hmac_ctx, NULL, EVP_sha256(), NULL, hmac_pkey);
 
-	HMAC_Update(hmac, (uint8_t const *) &mip_rk_1, rk1_len);
-	HMAC_Update(hmac, &usage_data[0], sizeof(usage_data));
-	HMAC_Final(hmac, &mip_rk_2[0], &rk2_len);
+	EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) &mip_rk_1, rk1_len);
+	EVP_DigestSignUpdate(hmac_ctx, &usage_data[0], sizeof(usage_data));
+	EVP_DigestSignFinal(hmac_ctx, &mip_rk_2[0], &rk2_len);
 
 	memcpy(mip_rk, mip_rk_1, rk1_len);
 	memcpy(mip_rk + rk1_len, mip_rk_2, rk2_len);
@@ -224,17 +247,19 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 	/*
 	 *	MIP-SPI = HMAC-SSHA256(MIP-RK, "SPI CMIP PMIP");
 	 */
-	HMAC_Init_ex(hmac, mip_rk, rk_len, EVP_sha256(), NULL);
+	EVP_MD_CTX_reset(hmac_ctx);
+	EVP_PKEY_free(hmac_pkey); /* No way to reset ? */
+	MEM(hmac_pkey = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, NULL, mip_rk, (int)rk_len));
+	EVP_DigestSignInit(hmac_ctx, NULL, EVP_sha256(), NULL, hmac_pkey);
 
-	HMAC_Update(hmac, (uint8_t const *) "SPI CMIP PMIP", 12);
-	HMAC_Final(hmac, &mip_rk_1[0], &rk1_len);
+	EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) "SPI CMIP PMIP", 13);
+	EVP_DigestSignFinal(hmac_ctx, &mip_rk_1[0], &rk1_len);
 
 	/*
 	 *	Take the 4 most significant octets.
 	 *	If less than 256, add 256.
 	 */
-	mip_spi = ((mip_rk_1[0] << 24) | (mip_rk_1[1] << 16) |
-		   (mip_rk_1[2] << 8) | mip_rk_1[3]);
+	mip_spi = fr_nbo_to_uint32(mip_rk_1);
 	if (mip_spi < 256) mip_spi += 256;
 
 	REDEBUG2("MIP-RK = 0x%pH", fr_box_octets(mip_rk, rk_len));
@@ -247,18 +272,23 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 	/*
 	 *	Calculate mobility keys
 	 */
-	mn_nai = fr_pair_find_by_da(&request->request_pairs, attr_wimax_mn_nai, 0);
-	if (!mn_nai) mn_nai = fr_pair_find_by_da(&request->reply_pairs, attr_wimax_mn_nai, 0);
+	mn_nai = fr_pair_find_by_da(&request->request_pairs, NULL, attr_wimax_mn_nai);
+	if (!mn_nai) mn_nai = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_wimax_mn_nai);
 	if (!mn_nai) {
 		RWDEBUG("%s was not found in the request or in the reply", attr_wimax_mn_nai->name);
 		RWDEBUG("We cannot calculate MN-HA keys");
+	}
+
+	if (!vsa_reply) {
+		RWDEBUG("reply.Vendor-Specific.WiMAX was not found - not calculating WiMAX keys");
+		goto check_request;
 	}
 
 	/*
 	 *	WiMAX-IP-Technology
 	 */
 	vp = NULL;
-	if (mn_nai) vp = fr_pair_find_by_da(&request->reply_pairs, attr_wimax_ip_technology, 0);
+	if (mn_nai) vp = fr_pair_find_by_da(&vsa_reply->vp_group, NULL, attr_wimax_ip_technology);
 	if (!vp) {
 		RWDEBUG("%s not found in reply", attr_wimax_ip_technology->name);
 		RWDEBUG("Not calculating MN-HA keys");
@@ -269,7 +299,7 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 		/*
 		 *	Look for WiMAX-hHA-IP-MIP4
 		 */
-		ip = fr_pair_find_by_da(&request->reply_pairs, attr_wimax_hha_ip_mip4, 0);
+		ip = fr_pair_find_by_da(&vsa_reply->vp_group, NULL, attr_wimax_hha_ip_mip4);
 		if (!ip) {
 			RWDEBUG("%s not found.  Cannot calculate MN-HA-PMIP4 key", attr_wimax_hha_ip_mip4->name);
 			break;
@@ -279,12 +309,13 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 		 *	MN-HA-PMIP4 =
 		 *	   H(MIP-RK, "PMIP4 MN HA" | HA-IPv4 | MN-NAI);
 		 */
-		HMAC_Init_ex(hmac, mip_rk, rk_len, EVP_sha1(), NULL);
+		EVP_MD_CTX_reset(hmac_ctx);
+		EVP_DigestSignInit(hmac_ctx, NULL, EVP_sha1(), NULL, hmac_pkey);
 
-		HMAC_Update(hmac, (uint8_t const *) "PMIP4 MN HA", 11);
-		HMAC_Update(hmac, (uint8_t const *) &ip->vp_ipv4addr, 4);
-		HMAC_Update(hmac, (uint8_t const *) &mn_nai->vp_strvalue, mn_nai->vp_length);
-		HMAC_Final(hmac, &mip_rk_1[0], &rk1_len);
+		EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) "PMIP4 MN HA", 11);
+		EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) &ip->vp_ipv4addr, 4);
+		EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) &mn_nai->vp_strvalue, mn_nai->vp_length);
+		EVP_DigestSignFinal(hmac_ctx, &mip_rk_1[0], &rk1_len);
 
 		/*
 		 *	Put MN-HA-PMIP4 into WiMAX-MN-hHA-MIP4-Key
@@ -303,7 +334,7 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 		/*
 		 *	Look for WiMAX-hHA-IP-MIP4
 		 */
-		ip = fr_pair_find_by_da(&request->reply_pairs, attr_wimax_hha_ip_mip4, 0);
+		ip = fr_pair_find_by_da(&vsa_reply->vp_group, NULL, attr_wimax_hha_ip_mip4);
 		if (!ip) {
 			RWDEBUG("%s not found.  Cannot calculate MN-HA-CMIP4 key", attr_wimax_hha_ip_mip4->name);
 			break;
@@ -313,12 +344,13 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 		 *	MN-HA-CMIP4 =
 		 *	   H(MIP-RK, "CMIP4 MN HA" | HA-IPv4 | MN-NAI);
 		 */
-		HMAC_Init_ex(hmac, mip_rk, rk_len, EVP_sha1(), NULL);
+		EVP_MD_CTX_reset(hmac_ctx);
+		EVP_DigestSignInit(hmac_ctx, NULL, EVP_sha1(), NULL, hmac_pkey);
 
-		HMAC_Update(hmac, (uint8_t const *) "CMIP4 MN HA", 11);
-		HMAC_Update(hmac, (uint8_t const *) &ip->vp_ipv4addr, 4);
-		HMAC_Update(hmac, (uint8_t const *) &mn_nai->vp_strvalue, mn_nai->vp_length);
-		HMAC_Final(hmac, &mip_rk_1[0], &rk1_len);
+		EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) "CMIP4 MN HA", 11);
+		EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) &ip->vp_ipv4addr, 4);
+		EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) &mn_nai->vp_strvalue, mn_nai->vp_length);
+		EVP_DigestSignFinal(hmac_ctx, &mip_rk_1[0], &rk1_len);
 
 		/*
 		 *	Put MN-HA-CMIP4 into WiMAX-MN-hHA-MIP4-Key
@@ -337,7 +369,7 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 		/*
 		 *	Look for WiMAX-hHA-IP-MIP6
 		 */
-		ip = fr_pair_find_by_da(&request->reply_pairs, attr_wimax_hha_ip_mip6, 0);
+		ip = fr_pair_find_by_da(&vsa_reply->vp_group, NULL, attr_wimax_hha_ip_mip6);
 		if (!ip) {
 			RWDEBUG("%s not found.  Cannot calculate MN-HA-CMIP6 key", attr_wimax_hha_ip_mip6->name);
 			break;
@@ -347,12 +379,13 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 		 *	MN-HA-CMIP6 =
 		 *	   H(MIP-RK, "CMIP6 MN HA" | HA-IPv6 | MN-NAI);
 		 */
-		HMAC_Init_ex(hmac, mip_rk, rk_len, EVP_sha1(), NULL);
+		EVP_MD_CTX_reset(hmac_ctx);
+		EVP_DigestSignInit(hmac_ctx, NULL, EVP_sha1(), NULL, hmac_pkey);
 
-		HMAC_Update(hmac, (uint8_t const *) "CMIP6 MN HA", 11);
-		HMAC_Update(hmac, (uint8_t const *) &ip->vp_ipv6addr, 16);
-		HMAC_Update(hmac, (uint8_t const *) &mn_nai->vp_strvalue, mn_nai->vp_length);
-		HMAC_Final(hmac, &mip_rk_1[0], &rk1_len);
+		EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) "CMIP6 MN HA", 11);
+		EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) &ip->vp_ipv6addr, 16);
+		EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) &mn_nai->vp_strvalue, mn_nai->vp_length);
+		EVP_DigestSignFinal(hmac_ctx, &mip_rk_1[0], &rk1_len);
 
 		/*
 		 *	Put MN-HA-CMIP6 into WiMAX-MN-hHA-MIP6-Key
@@ -376,13 +409,14 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 	 *
 	 *	FA-RK= H(MIP-RK, "FA-RK")
 	 */
-	fa_rk = fr_pair_find_by_da(&request->reply_pairs, attr_wimax_fa_rk_key, 0);
+	fa_rk = fr_pair_find_by_da(&vsa_reply->vp_group, NULL, attr_wimax_fa_rk_key);
 	if (fa_rk && (fa_rk->vp_length <= 1)) {
-		HMAC_Init_ex(hmac, mip_rk, rk_len, EVP_sha1(), NULL);
+		EVP_MD_CTX_reset(hmac_ctx);
+		EVP_DigestSignInit(hmac_ctx, NULL, EVP_sha1(), NULL, hmac_pkey);
 
-		HMAC_Update(hmac, (uint8_t const *) "FA-RK", 5);
+		EVP_DigestSignUpdate(hmac_ctx, (uint8_t const *) "FA-RK", 5);
 
-		HMAC_Final(hmac, &mip_rk_1[0], &rk1_len);
+		EVP_DigestSignFinal(hmac_ctx, &mip_rk_1[0], &rk1_len);
 
 		fr_pair_value_memdup(fa_rk, &mip_rk_1[0], rk1_len, false);
 	}
@@ -401,35 +435,39 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 	 *
 	 *	WiMAX-RRQ-MN-HA-SPI
 	 */
-	vp = fr_pair_find_by_da(&request->request_pairs, attr_wimax_rrq_mn_ha_spi, 0);
-	if (vp) {
-		REDEBUG2("Client requested MN-HA key: Should use SPI to look up key from storage");
-		if (!mn_nai) {
-			RWDEBUG("MN-NAI was not found!");
-		}
+check_request:
+	if (vsa_request) {
+		vp = fr_pair_find_by_da(&vsa_request->vp_group, NULL, attr_wimax_rrq_mn_ha_spi);
+		if (vp) {
+			REDEBUG2("Client requested MN-HA key: Should use SPI to look up key from storage");
+			if (!mn_nai) {
+				RWDEBUG("MN-NAI was not found!");
+			}
 
-		/*
-		 *	WiMAX-RRQ-HA-IP
-		 */
-		if (!fr_pair_find_by_da(&request->request_pairs, attr_wimax_rrq_ha_ip, 0)) {
-			RWDEBUG("HA-IP was not found!");
-		}
+			/*
+			 *	WiMAX-RRQ-HA-IP
+			 */
+			if (!fr_pair_find_by_da(&vsa_request->vp_group, NULL, attr_wimax_rrq_ha_ip)) {
+				RWDEBUG("HA-IP was not found!");
+			}
 
-		/*
-		 *	WiMAX-HA-RK-Key-Requested
-		 */
-		vp = fr_pair_find_by_da(&request->request_pairs, attr_wimax_ha_rk_key_requested, 0);
-		if (vp && (vp->vp_uint32 == 1)) {
-			REDEBUG2("Client requested HA-RK: Should use IP to look it up from storage");
+			/*
+			 *	WiMAX-HA-RK-Key-Requested
+			 */
+			vp = fr_pair_find_by_da(&vsa_request->vp_group, NULL, attr_wimax_ha_rk_key_requested);
+			if (vp && (vp->vp_uint32 == 1)) {
+				REDEBUG2("Client requested HA-RK: Should use IP to look it up from storage");
+			}
 		}
 	}
 
 	/*
 	 *	Wipe the context of all sensitive information.
 	 */
-	HMAC_CTX_free(hmac);
+	EVP_MD_CTX_free(hmac_ctx);
+	EVP_PKEY_free(hmac_pkey);
 
-	RETURN_MODULE_UPDATED;
+	RETURN_UNLANG_UPDATED;
 }
 
 /*
@@ -437,21 +475,24 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern module_t rlm_wimax;
-module_t rlm_wimax = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "wimax",
-	.type		= RLM_TYPE_THREAD_SAFE,
-	.inst_size	= sizeof(rlm_wimax_t),
-	.config		= module_config,
-	.dict		= &dict_radius,
-	.methods = {
-		[MOD_AUTHORIZE]		= mod_authorize,
-		[MOD_PREACCT]		= mod_preacct,
-		[MOD_POST_AUTH]		= mod_post_auth
+extern module_rlm_t rlm_wimax;
+module_rlm_t rlm_wimax = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "wimax",
+		.inst_size	= sizeof(rlm_wimax_t),
+		.config		= module_config,
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("recv", "Accounting-Request"), .method = mod_preacct },
+			{ .section = SECTION_NAME("recv", CF_IDENT_ANY), .method = mod_authorize },
+			{ .section = SECTION_NAME("send", CF_IDENT_ANY), .method = mod_post_auth },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

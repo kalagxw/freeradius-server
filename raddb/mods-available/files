@@ -7,13 +7,17 @@
 #
 #  = Files Module
 #
-#  The `users` file as located in `raddb/mods-config/files/authorize`. (Livingston-style format).
+#  The `users` file as located in `mods-config/files/authorize`.
+#  (Livingston-style format).
 #
-#  See "man 1 users" for more information.
+#  See the
+#  doc/antora/modules/reference/pages/raddb/mods-config/files/users.adoc
+#  file for information on the format of the input file, and how it
+#  operates.
 #
 
 #
-#  ## Configuration Settings
+#  == Configuration Settings
 #
 files {
 	#
@@ -25,9 +29,13 @@ files {
 	#
 	#  key:: The default key attribute to use for matches.
 	#
-	#  The content of this attribute is used to match the `name` of the entry.
+	#  The content of this attribute is used to match the `name` of the
+	#  entry.
 	#
-#	key = "%{%{Stripped-User-Name}:-%{User-Name}}"
+	#  Note that unlike v4, the key does not have to be a string, but
+	#  could instead be an IP address or netmask!
+	#
+#	key = "%{Stripped-User-Name || User-Name}"
 
 	#
 	#  filename:: The old `users` style file is now located here.
@@ -35,15 +43,33 @@ files {
 	filename = ${moddir}/authorize
 
 	#
-	#  usersfile:: This is accepted for backwards compatibility
-	#  It will be removed in a future release.
+	#  match_attr:: List and attribute to populate with the `name` of the
+	#  matched entry.
 	#
-#	usersfile = ${moddir}/authorize
+	#  NOTE: the attriubte type should be capable of holding data of the
+	#  type used as key values. Particularly useful if matching IP
+	#  addresses to subnets, since the populated value will be the
+	#  subnet. In that case it is best to use `0.0.0.0/0` in place of
+	#  `DEFAULT` for any catch-all entries.
+	#
+#	match_attr = control.User-Category
 
 	#
-	#  WARNING: These are accepted for backwards compatibility.
-	#  They will be renamed in a future release.
+	#  v3_compat:: Version 3 compatibility flag.
 	#
-	acctusersfile = ${moddir}/accounting
-	preproxy_usersfile = ${moddir}/pre-proxy
+	#  When this flag is set, any enumeration names (e.g. Service-Type :=
+	#  Framed-User) do not need to have the v4 "::" prefix. This flag
+	#  helps with migrating v3 configurations to v4.
+	#
+	#  Default value "false". Allowed vaues, `true` and `false`.
+	#
+#	v3_compat = false
+}
+
+#
+#  == An instance of the `files` module for use in processing accounting packets
+#
+files files_accounting {
+#	key = "%{Stripped-User-Name || User-Name}"
+	filename = ${modconfdir}/files/accounting
 }

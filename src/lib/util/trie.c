@@ -23,13 +23,10 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/util/dict.h>
-#include <freeradius-devel/util/misc.h>
+#include <freeradius-devel/util/skip.h>
 #include <freeradius-devel/util/syserror.h>
-#include <freeradius-devel/util/talloc.h>
 #include <freeradius-devel/util/trie.h>
 
-#include <ctype.h>
-#include <string.h>
 
 /*
  *	This file implements path-compressed, level-compressed
@@ -128,7 +125,7 @@ static void trie_sprint(fr_trie_t *trie, uint8_t const *key, int start_bit, int 
 #ifdef WITH_TRIE_VERIFY
 static int trie_verify(fr_trie_t *trie);
 //#define VERIFY(_x) fr_cond_assert(trie_verify((fr_trie_t *) _x) == 0)
-#define VERIFY(_x) do { if (trie_verify((fr_trie_t *) _x) < 0) { fprintf(stderr, "FAIL VERIFY at %d - %s\n", __LINE__, fr_strerror()); fr_cond_assert(0);} } while (0)
+#define VERIFY(_x) if (trie_verify((fr_trie_t *) _x) < 0) do { fprintf(stderr, "FAIL VERIFY at %d - %s\n", __LINE__, fr_strerror()); fr_cond_assert(0); } while (0)
 #else
 #define VERIFY(_x)
 #endif
@@ -334,12 +331,10 @@ static void hex_dump(FILE *fp, char const *msg, uint8_t const *key, int start_bi
 }
 #endif
 
-static uint16_t get_chunk(uint8_t const *key, int start_bit, int num_bits) CC_HINT(nonnull);
-
 /** Return a chunk of a key (in the low bits) for use in 2^N node de-indexing
  *
  */
-static uint16_t get_chunk(uint8_t const *key, int start_bit, int num_bits)
+static CC_HINT(nonnull) uint16_t get_chunk(uint8_t const *key, uint32_t start_bit, uint32_t num_bits)
 {
 	uint16_t chunk;
 	int end_bit;
@@ -370,8 +365,11 @@ static uint16_t get_chunk(uint8_t const *key, int start_bit, int num_bits)
 	if (start_bit == 0) {
 		if (num_bits < 7) return key[0] >> (8 - num_bits);
 		if (num_bits == 8) return key[0];
-		if (num_bits == 16) return (key[0] << 8) | key[1];
-		return ((key[0] << 8) | key[1]) >> (16 - num_bits);
+
+		chunk = (key[0] << 8) | key[1];
+		if (num_bits < 16) chunk >>= (16 - num_bits);
+		fr_cond_assert(chunk < (1 << num_bits));
+		return chunk;
 	}
 
 	/*
@@ -424,7 +422,7 @@ static void write_chunk(uint8_t *out, int start_bit, int num_bits, uint16_t chun
 	 *	Special-case 1-bit writes.
 	 */
 	if (num_bits == 1) {
-		out[0] &= ~((1 << (7 - start_bit)) - 1);
+		out[0] &= ~(1 << (7 - start_bit));
 		out[0] |= chunk << (7 - start_bit);
 		return;
 	}
@@ -453,7 +451,7 @@ static void write_chunk(uint8_t *out, int start_bit, int num_bits, uint16_t chun
 	}
 }
 
-typedef enum fr_trie_type_t {
+typedef enum fr_trie_type_t : uint8_t {
 	FR_TRIE_INVALID = 0,
 	FR_TRIE_USER,
 #ifdef WITH_PATH_COMPRESSION
@@ -558,7 +556,7 @@ static fr_trie_node_t *trie_node_alloc(TALLOC_CTX *ctx, int bits)
 /** Free a fr_trie_t
  *
  *  We can't use talloc_free(), because we can't talloc_parent the
- *  nodes frome each other, as talloc_steal() is O(N).  So, we just
+ *  nodes from each other, as talloc_steal() is O(N).  So, we just
  *  recurse manually.
  */
 static void trie_free(fr_trie_t *trie)
@@ -733,8 +731,9 @@ typedef struct {
 
 /** Allocate a trie
  *
- * @param ctx The talloc ctx
- * @param get_key The "get key from object" function.
+ * @param ctx		The talloc ctx.
+ * @param get_key	The "get key from object" function.
+ * @param free_data	Callback to free data.
  * @return
  *	- NULL on error
  *	- fr_trie_node_t on success
@@ -823,7 +822,7 @@ static CC_HINT(nonnull(2)) fr_trie_node_t *trie_node_split(TALLOC_CTX *ctx, fr_t
 
 	/*
 	 *	Note that we do NOT free "node".  The caller still
-	 *	needs it for some activies.
+	 *	needs it for some activities.
 	 */
 	return split;
 }
@@ -848,7 +847,10 @@ static CC_HINT(nonnull(2)) fr_trie_path_t *trie_path_split(TALLOC_CTX *ctx, fr_t
 	if (!split) return NULL;
 
 	child = fr_trie_path_alloc(ctx, &path->key[0], start_bit + lcp, start_bit + path->bits);
-	if (!child) return NULL;
+	if (!child) {
+		talloc_free(split);
+		return NULL;
+	}
 
 	split->trie = (fr_trie_t *) child;
 	child->trie = (fr_trie_t *) path->trie;
@@ -1270,7 +1272,7 @@ void *fr_trie_lookup_by_key(fr_trie_t const *ft, void const *key, size_t keylen)
 
 	user = UNCONST(fr_trie_user_t *, ft);
 
-	return trie_key_match(user->trie, key, 0, keylen, false);
+	return trie_key_match(user->trie, key, 0, (int) keylen, false);
 }
 
 /** Match a key and length in a trie and return user ctx, if any
@@ -1294,7 +1296,7 @@ void *fr_trie_match_by_key(fr_trie_t const *ft, void const *key, size_t keylen)
 
 	user = UNCONST(fr_trie_user_t *, ft);
 
-	return trie_key_match(user->trie, key, 0, keylen, true);
+	return trie_key_match(user->trie, key, 0, (int) keylen, true);
 }
 
 /* INSERT FUNCTIONS */
@@ -1892,7 +1894,7 @@ int fr_trie_insert_by_key(fr_trie_t *ft, void const *key, size_t keylen, void co
 	 *	ensures that the insertion can modify the trie in
 	 *	place without worry.
 	 */
-	if (trie_key_match(user->trie, key, 0, keylen, true) != NULL) {
+	if (trie_key_match(user->trie, key, 0, (int) keylen, true) != NULL) {
 		fr_strerror_const("Cannot insert due to pre-existing key");
 		return -1;
 	}
@@ -1902,7 +1904,7 @@ int fr_trie_insert_by_key(fr_trie_t *ft, void const *key, size_t keylen, void co
 
 	MPRINT3("%.*srecurse STARTS at %d with %.*s=%s\n", 0, spaces, __LINE__,
 		(int) keylen, key, my_data);
-	return trie_key_insert(user->data, &user->trie, key, 0, keylen, my_data);
+	return trie_key_insert(user->data, &user->trie, key, 0, (int) keylen, my_data);
 }
 
 /* REMOVE FUNCTIONS */
@@ -2477,7 +2479,7 @@ static void trie_node_dump(FILE *fp, fr_trie_t *trie, char const *key, int keyle
 	for (i = 0; i < (1 << node->bits); i++) {
 		if (!node->trie[i]) continue;
 
-		fprintf(fp, "\t%02x\t", (int) i);
+		fprintf(fp, "\t%02x\t", (unsigned int) i);
 		trie_dump_edge(fp, node->trie[i]);
 	}
 	fprintf(fp, "}\n\n");
@@ -2633,63 +2635,76 @@ int fr_trie_walk(fr_trie_t *ft, void *ctx, fr_trie_walk_t callback)
 
 /** Find an element in the trie, returning the data.
  *
+ * @param[out] found	the matching element, or NULL if no element matched.
  * @param[in] ft to search in.
  * @param[in] data to find.
  * @return
- *	- User data matching the data passed in.
- *	- NULL if nothing matched passed data.
+ *	- 0 always, tries never run a comparator.  Check found for the result.
  */
-void *fr_trie_find(fr_trie_t *ft, void const *data)
+CC_NO_UBSAN(function) /* UBSAN: false positive - htrie call with first argument of void * trips --fsanitize=function */
+int fr_trie_find(void **found, fr_trie_t *ft, void const *data)
 {
 	fr_trie_user_t *user = (fr_trie_user_t *) ft;
 	fr_trie_ctx_t *uctx = talloc_get_type_abort(user->data, fr_trie_ctx_t);
 	uint8_t *key;
 	size_t keylen;
 
+	*found = NULL;
+
 	key = &uctx->buffer[0];
 	keylen = sizeof(uctx->buffer) * 8;
 
-	if (!uctx->get_key) return false;
+	if (!uctx->get_key) return 0;
 
-	if (uctx->get_key(&key, &keylen, data) < 0) return false;
+	if (uctx->get_key(&key, &keylen, data) < 0) return 0;
 
-	return fr_trie_lookup_by_key(ft, key, keylen);
+	*found = fr_trie_lookup_by_key(ft, key, keylen);
+	return 0;
 }
 
 /** Match an element exactly in the trie, returning the data.
  *
+ * @param[out] found	the matching element, or NULL if no element matched.
  * @param[in] ft to search in.
  * @param[in] data to find.
  * @return
- *	- User data matching the data passed in.
- *	- NULL if nothing matched passed data.
+ *	- 0 always, tries never run a comparator.  Check found for the result.
  */
-void *fr_trie_match(fr_trie_t *ft, void const *data)
+CC_NO_UBSAN(function) /* UBSAN: false positive - htrie call with first argument of void * trips --fsanitize=function */
+int fr_trie_match(void **found, fr_trie_t *ft, void const *data)
 {
 	fr_trie_user_t *user = (fr_trie_user_t *) ft;
 	fr_trie_ctx_t *uctx = talloc_get_type_abort(user->data, fr_trie_ctx_t);
 	uint8_t *key;
 	size_t keylen;
 
+	*found = NULL;
+
 	key = &uctx->buffer[0];
 	keylen = sizeof(uctx->buffer) * 8;
 
-	if (!uctx->get_key) return false;
+	if (!uctx->get_key) return 0;
 
-	if (uctx->get_key(&key, &keylen, data) < 0) return false;
+	if (uctx->get_key(&key, &keylen, data) < 0) return 0;
 
-	return fr_trie_match_by_key(ft, key, keylen);
+	*found = fr_trie_match_by_key(ft, key, keylen);
+	return 0;
 }
 
 /** Insert data into a trie
  *
+ * @note Unlike the other containers, inserting a duplicate reports -1,
+ *	 not 1, as the trie key path doesn't distinguish duplicates from
+ *	 other insertion failures.
+ *
  * @param[in] ft	to insert data into.
  * @param[in] data 	to insert.
  * @return
- *	- true if data was inserted.
- *	- false if data already existed and was not inserted.
+ *	- 0 if data was inserted.
+ *	- -1 if data was not inserted, retrieve the error with fr_strerror.
  */
-bool fr_trie_insert(fr_trie_t *ft, void const *data)
+CC_NO_UBSAN(function) /* UBSAN: false positive - htrie call with first argument of void * trips --fsanitize=function */
+int fr_trie_insert(fr_trie_t *ft, void const *data)
 {
 	fr_trie_user_t *user = (fr_trie_user_t *) ft;
 	fr_trie_ctx_t *uctx = talloc_get_type_abort(user->data, fr_trie_ctx_t);
@@ -2699,13 +2714,13 @@ bool fr_trie_insert(fr_trie_t *ft, void const *data)
 	key = &uctx->buffer[0];
 	keylen = sizeof(uctx->buffer) * 8;
 
-	if (!uctx->get_key) return false;
+	if (!uctx->get_key) return -1;
 
-	if (uctx->get_key(&key, &keylen, data) < 0) return false;
+	if (uctx->get_key(&key, &keylen, data) < 0) return -1;
 
-	if (fr_trie_insert_by_key(ft, key, keylen, data) < 0) return false;
+	if (fr_trie_insert_by_key(ft, key, keylen, data) < 0) return -1;
 
-	return true;
+	return 0;
 }
 
 /** Replace old data with new data, OR insert if there is no old
@@ -2721,6 +2736,7 @@ bool fr_trie_insert(fr_trie_t *ft, void const *data)
  *      - 0 if data was inserted.
  *      - -1 if we failed to replace data
  */
+CC_NO_UBSAN(function) /* UBSAN: false positive - htrie call with first argument of void * trips --fsanitize=function */
 int fr_trie_replace(void **old, fr_trie_t *ft, void const *data)
 {
 	fr_trie_user_t	*user = (fr_trie_user_t *) ft;
@@ -2736,7 +2752,7 @@ int fr_trie_replace(void **old, fr_trie_t *ft, void const *data)
 
 	if (uctx->get_key(&key, &keylen, data) < 0) return -1;
 
-	found = trie_key_match(ft, key, 0, keylen, true); /* do exact match */
+	found = fr_trie_match_by_key(ft, key, keylen);
 	if (found) {
 		if (old) *old = found;
 		if (fr_trie_remove_by_key(ft, key, keylen) != found) return -1;
@@ -2754,27 +2770,36 @@ int fr_trie_replace(void **old, fr_trie_t *ft, void const *data)
 
 /** Remove an entry, without freeing the data
  *
+ * @param[out] removed	the data we removed, if any.  May be NULL.
  * @param[in] ft	to remove data from.
  * @param[in] data 	to remove.
  * @return
- *      - The user data we removed.
- *	- NULL if we couldn't find any matching data.
+ *      - 0 if we removed data, removed is populated.
+ *	- 1 if we couldn't find any matching data.
  */
-void *fr_trie_remove(fr_trie_t *ft, void const *data)
+CC_NO_UBSAN(function) /* UBSAN: false positive - htrie call with first argument of void * trips --fsanitize=function */
+int fr_trie_remove(void **removed, fr_trie_t *ft, void const *data)
 {
 	fr_trie_user_t *user = (fr_trie_user_t *) ft;
 	fr_trie_ctx_t *uctx = talloc_get_type_abort(user->data, fr_trie_ctx_t);
 	uint8_t *key;
 	size_t keylen;
+	void *found;
+
+	if (removed) *removed = NULL;
 
 	key = &uctx->buffer[0];
 	keylen = sizeof(uctx->buffer) * 8;
 
-	if (!uctx->get_key) return NULL;
+	if (!uctx->get_key) return 1;
 
-	if (uctx->get_key(&key, &keylen, data) < 0) return NULL;
+	if (uctx->get_key(&key, &keylen, data) < 0) return 1;
 
-	return fr_trie_remove_by_key(ft, key, keylen);
+	found = fr_trie_remove_by_key(ft, key, keylen);
+	if (!found) return 1;
+
+	if (removed) *removed = found;
+	return 0;
 }
 
 /** Remove node and free data (if a free function was specified)
@@ -2782,10 +2807,11 @@ void *fr_trie_remove(fr_trie_t *ft, void const *data)
  * @param[in] ft	to remove data from.
  * @param[in] data 	to remove/free.
  * @return
- *	- true if we removed data.
- *      - false if we couldn't find any matching data.
+ *	- 0 if we removed data.
+ *	- 1 if we couldn't find any matching data.
  */
-bool fr_trie_delete(fr_trie_t *ft, void const *data)
+CC_NO_UBSAN(function) /* UBSAN: false positive - htrie call with first argument of void * trips --fsanitize=function */
+int fr_trie_delete(fr_trie_t *ft, void const *data)
 {
 	fr_trie_user_t *user = (fr_trie_user_t *) ft;
 	fr_trie_ctx_t *uctx = talloc_get_type_abort(user->data, fr_trie_ctx_t);
@@ -2796,23 +2822,24 @@ bool fr_trie_delete(fr_trie_t *ft, void const *data)
 	key = &uctx->buffer[0];
 	keylen = sizeof(uctx->buffer) * 8;
 
-	if (!uctx->get_key) return false;
+	if (!uctx->get_key) return 1;
 
-	if (uctx->get_key(&key, &keylen, data) < 0) return false;
+	if (uctx->get_key(&key, &keylen, data) < 0) return 1;
 
 	found = fr_trie_remove_by_key(ft, key, keylen);
-	if (!found) return false;
+	if (!found) return 1;
 
-	if (!uctx->free_data) return true;
+	if (!uctx->free_data) return 0;
 
 	uctx->free_data(found);
-	return true;
+	return 0;
 }
 
 /** Return how many nodes there are in a trie
  *
  * @param[in] ft	to return node count for.
  */
+CC_NO_UBSAN(function) /* UBSAN: false positive - htrie call with first argument of void * trips --fsanitize=function */
 unsigned int fr_trie_num_elements(UNUSED fr_trie_t *ft)
 {
 	return 0;
@@ -3341,7 +3368,7 @@ static int command_lcp(UNUSED fr_trie_t *ft, int argc, char **argv, char *out, s
 		key1 = (uint8_t const *) argv[0];
 		keylen1 = atoi(argv[1]);
 		if ((keylen1 < 0) || (keylen1 > (int) BITSOF(strlen(argv[0])))) {
-			MPRINT("length of key1 %s is larger than string length %ld\n",
+			MPRINT("length of key1 %s is larger than string length %zu\n",
 				argv[1], BITSOF(strlen(argv[0])));
 			return -1;
 		}
@@ -3349,7 +3376,7 @@ static int command_lcp(UNUSED fr_trie_t *ft, int argc, char **argv, char *out, s
 		key2 = (uint8_t const *) argv[2];
 		keylen2 = atoi(argv[3]);
 		if ((keylen2 < 0) || (keylen2 > (int) BITSOF(strlen(argv[2])))) {
-			MPRINT("length of key2 %s is larger than string length %ld\n",
+			MPRINT("length of key2 %s is larger than string length %zu\n",
 				argv[3], BITSOF(strlen(argv[2])));
 			return -1;
 		}
@@ -3423,7 +3450,7 @@ static fr_trie_command_t commands[] = {
 	{ "verify",	command_verify,	0, 0, false },
 	{ "lineno",	command_lineno, 1, 1, false },
 	{ "clear",	command_clear,	0, 0, false },
-	{ NULL, NULL, 0, 0}
+	{ .name = NULL }
 };
 
 #define MAX_ARGC (16)

@@ -21,7 +21,7 @@
  * @file proto_arp.h
  * @brief Structures for the ARP protocol
  *
- * @copyright 2020 Network RADIUS SARL (legal@networkradius.com)
+ * @copyright 2020 Network RADIUS SAS (legal@networkradius.com)
  */
 #include <freeradius-devel/io/listen.h>
 #include <freeradius-devel/arp/arp.h>
@@ -30,15 +30,11 @@ typedef struct {
 	CONF_SECTION			*server_cs;			//!< server CS for this listener
 	CONF_SECTION			*cs;				//!< my configuration
 
-	dl_module_inst_t	       	*io_submodule;			//!< As provided by the transport_parse
+	module_instance_t	       	*io_submodule;			//!< As provided by the transport_parse
 									///< callback.  Broken out into the
 									///< app_io_* fields below for convenience.
 
-	CONF_SECTION			*app_io_conf;			//!< for the APP IO
-	fr_app_io_t const		*app_io;			//!< Easy access to the app_io handle.
-	void				*app_io_instance;		//!< Easy access to the app_io instance.
-
-	dl_module_inst_t		*app_process;			//!< app_process pointer
+	module_instance_t		*app_process;			//!< app_process pointer
 	void				*process_instance;		//!< app_process instance
 
 	fr_dict_t			*dict;				//!< root dictionary
@@ -49,8 +45,6 @@ typedef struct {
 
 	fr_schedule_t			*sc;				//!< the scheduler, where we insert new readers
 
-	fr_listen_t			*listen;			//!< The listener structure which describes
+	fr_listen_instance_t		*listen;			//!< The listener structure which describes
 									//!< the I/O path.
 } proto_arp_t;
-
-

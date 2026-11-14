@@ -1,3 +1,7 @@
+#  -*- text -*- $Id$
+
+#######################################################################
+
 #
 #	This file gives an example of using Challenge-Response
 #
@@ -6,61 +10,56 @@
 #	consisting of a random number 0..9.  The user has to respond
 #	with that number.
 #
-#
-#	$Id$
-#
-listen {
-	type = auth
-	ipaddr = *
-	port = 2000
-	virtual_server = challenge
-}
-
 server challenge {
+	namespace = radius
+
+	dictionary {
+		uint32 challenge-string
+	}
+
+	listen {
+		type = Access-Request
+		transport = udp
+
+		udp {
+			ipaddr = *
+			port = 2000
+		}
+	}
+
 recv Access-Request {
 
 	#
-	#  If there's no State attribute, then this is the request from
-	#  the user.
+	#  If there's no State attribute, then this is the request from the
+	#  user.
 	#
 	if (!State) {
-		update control {
-			Auth-Type := Step1
-			Password.Cleartext := "hello"
-		}
+		control.Auth-Type := ::Step1
+		control.Password.Cleartext := "hello"
 	}
 	else {
 		#
-		#  Do authentication for step 2.
-		#  Set the "known good" password to the number
-		#  saved in the session-state list.
+		#  Do authentication for step 2. Set the "known good" password to
+		#  the number saved in the session-state list.
 		#
-		update control {
-			Auth-Type := Step2
-			Password.Cleartext := &session-state.Tmp-Integer-0
-		}
+		control.Auth-Type := ::Step2
+		control.Password.Cleartext := session-state.challenge-string
 	}
 }
 
 
 authenticate step1 {
-	#  If the password doesn't match, the user is rejected
-	#  immediately.
+	#  If the password doesn't match, the user is rejected immediately.
 	pap
 
 	#
 	#  Set the random number to save.
 	#
-	update session-state {
-		Tmp-Integer-0 := "%{randstr:n}"
-	}
-	update reply {
-		Reply-Message := &session-state.Tmp-Integer-0
-	}
+	session-state.challenge-string := "%str.rand(n)"
+	reply.Reply-Message := "Please enter %{session-state.challenge-string}: "
 
 	#
-	#  Send an Access-Challenge.
-	#  See raddb/policy.d/control for the definition
+	#  Send an Access-Challenge. See policy.d/control for the definition
 	#  of "challenge"
 	#
 	challenge

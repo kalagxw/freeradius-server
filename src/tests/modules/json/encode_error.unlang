@@ -1,7 +1,11 @@
+string test_string
 #
 #       json xlat input parsing test - error with no input
 #
 
-update request {
-	&Tmp-String-1 := "%{json_object_ex_encode:}"  # ERROR
+test_string := %json_object_ex_encode()  # ERROR
+if (test_string) {
+	test_fail
 }
+
+test_pass

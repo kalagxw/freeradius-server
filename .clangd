@@ -1,0 +1,52 @@
+# Doxygen table of contents
+If:
+  PathMatch: .*doc/doxygen/.*
+Index:
+  Background: Skip
+---
+# osmocom code has many errors/warnings and seems to lock up clangd
+If:
+  PathMatch: .*/rlm_sigtran/(libosmo|asn1).*
+Index:
+  Background: Skip
+---
+# Should apply only to header files
+If:
+  PathMatch: .*\.h
+CompileFlags:
+  # macos: non-system clangd doesn't seem to include /usr/local/include in the default path
+  Add: [
+      "-I/usr/local/include"
+  ]
+  # macos: flags that come from xcrun that brewd clangd doesn't understand
+  Remove: [
+      "-clang-vendor-feature*",
+      "-fno-odr-hash-protocols"
+  ]
+Diagnostics:
+  Suppress: [
+      # Clangd doesn't register that functions or macros are used in source files which
+      # include the header files, making these warnings useless.
+      "unused-macros",
+      "unused-function"
+  ]
+---
+# Applies to all files
+CompileFlags:
+  # macos: non-system clangd doesn't seem to include /usr/local/include in the default path
+  Add: [
+      "-I/usr/local/include",
+      "-D__clangd__"
+  ]
+  # macos: flags that come from xcrun that brewed clangd doesn't understand
+  Remove: [
+      "-clang-vendor-feature*",
+      "-fno-odr-hash-protocols*"
+  ]
+Diagnostics:
+  ClangTidy:
+    Remove: [
+      # This is stupid and warns over talloc_array_length using sizeof(foo) / sizeof(foo *)
+      # to determine the number of elements in an array.
+      "bugprone-sizeof-expression"
+    ]
